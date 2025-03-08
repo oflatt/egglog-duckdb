@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::fmt::{Display, Formatter};
 
 pub use symbol_table::GlobalSymbol as Symbol;
 
@@ -13,10 +13,11 @@ lalrpop_mod!(
     "/ast/parse.rs"
 );
 
-use crate::*;
-
 mod expr;
 pub use expr::*;
+use symbolic_expressions::Sexp;
+
+use crate::HashMap;
 pub mod desugar;
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
