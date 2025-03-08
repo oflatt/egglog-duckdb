@@ -1,8 +1,9 @@
-use crate::*;
-
 use crate::ast::desugar::Desugar;
-use crate::typechecking::FuncType;
+use crate::ast::{Action, Command, CommandId, Expr, Fact, FunctionDecl, Literal, NCommand, NormAction, NormCommand, NormExpr, NormFact, NormRule, NormSchedule, Rule, RunConfig, Schedule, Schema};
+use crate::typechecking::{FuncType, TypeInfo};
+use crate::{Error, HashMap, HashSet, ListDisplay};
 
+use symbol_table::GlobalSymbol as Symbol;
 use symbolic_expressions::Sexp;
 
 pub const RULE_PROOF_KEYWORD: &str = "rule-proof";

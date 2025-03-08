@@ -1,6 +1,17 @@
-use crate::{proofs::RULE_PROOF_KEYWORD, *};
+use symbol_table::GlobalSymbol;
 
-fn desugar_datatype(name: Symbol, variants: Vec<Variant>) -> Vec<NCommand> {
+use crate::{
+    ast::{self, Action, Expr, Fact, Rule},
+    proofs::RULE_PROOF_KEYWORD,
+    Error, HashSet,
+};
+
+use super::{
+    Command, FunctionDecl, IdentSort, Metadata, NCommand, NormAction, NormCommand, NormExpr,
+    NormFact, NormRule, NormRunConfig, NormSchedule, Rewrite, RunConfig, Schedule, Schema, Variant,
+};
+
+fn desugar_datatype(name: GlobalSymbol, variants: Vec<Variant>) -> Vec<NCommand> {
     vec![NCommand::Sort(name, None)]
         .into_iter()
         .chain(variants.into_iter().map(|variant| {
@@ -20,12 +31,12 @@ fn desugar_datatype(name: Symbol, variants: Vec<Variant>) -> Vec<NCommand> {
 }
 
 fn desugar_rewrite(
-    ruleset: Symbol,
-    name: Symbol,
+    ruleset: GlobalSymbol,
+    name: GlobalSymbol,
     rewrite: &Rewrite,
     desugar: &mut Desugar,
 ) -> Vec<NCommand> {
-    let var = Symbol::from("rewrite_var__");
+    let var = GlobalSymbol::from("rewrite_var__");
     // make two rules- one to insert the rhs, and one to union
     // this way, the union rule can only be fired once,
     // which helps proofs not add too much info
@@ -46,8 +57,8 @@ fn desugar_rewrite(
 }
 
 fn desugar_birewrite(
-    ruleset: Symbol,
-    name: Symbol,
+    ruleset: GlobalSymbol,
+    name: GlobalSymbol,
     rewrite: &Rewrite,
     desugar: &mut Desugar,
 ) -> Vec<NCommand> {
@@ -67,7 +78,7 @@ fn desugar_birewrite(
         .collect()
 }
 
-fn expr_to_ssa(lhs: Symbol, expr: &Expr, desugar: &mut Desugar, res: &mut Vec<NormFact>) {
+fn expr_to_ssa(lhs: GlobalSymbol, expr: &Expr, desugar: &mut Desugar, res: &mut Vec<NormFact>) {
     match expr {
         Expr::Lit(l) => {
             res.push(NormFact::AssignLit(lhs, l.clone()));
@@ -94,7 +105,10 @@ fn expr_to_ssa(lhs: Symbol, expr: &Expr, desugar: &mut Desugar, res: &mut Vec<No
     }
 }
 
-fn flatten_equalities(equalities: Vec<(Symbol, Expr)>, desugar: &mut Desugar) -> Vec<NormFact> {
+fn flatten_equalities(
+    equalities: Vec<(GlobalSymbol, Expr)>,
+    desugar: &mut Desugar,
+) -> Vec<NormFact> {
     let mut res = vec![];
 
     for (lhs, rhs) in equalities {
@@ -133,7 +147,7 @@ fn flatten_facts(facts: &Vec<Fact>, desugar: &mut Desugar) -> Vec<NormFact> {
 
 fn flatten_actions(actions: &Vec<Action>, desugar: &mut Desugar) -> Vec<NormAction> {
     let mut memo = Default::default();
-    let mut add_expr = |expr: Expr, res: &mut Vec<NormAction>| -> Symbol {
+    let mut add_expr = |expr: Expr, res: &mut Vec<NormAction>| -> GlobalSymbol {
         desugar.expr_to_flat_actions(&expr, res, &mut memo)
     };
 
@@ -191,11 +205,11 @@ fn flatten_actions(actions: &Vec<Action>, desugar: &mut Desugar) -> Vec<NormActi
 }
 
 fn give_unique_names(desugar: &mut Desugar, facts: Vec<NormFact>) -> Vec<NormFact> {
-    let mut name_used: HashSet<Symbol> = Default::default();
+    let mut name_used: HashSet<GlobalSymbol> = Default::default();
     let mut constraints: Vec<NormFact> = Default::default();
     let mut res = vec![];
     for fact in facts {
-        let mut name_used_immediately: HashSet<Symbol> = Default::default();
+        let mut name_used_immediately: HashSet<GlobalSymbol> = Default::default();
         let mut constraints_before = vec![];
         let new_fact = fact.map_def_use(&mut |var, is_def| {
             if is_def {
@@ -628,7 +642,7 @@ impl Clone for Desugar {
 }
 
 impl Desugar {
-    pub fn get_fresh(&mut self) -> Symbol {
+    pub fn get_fresh(&mut self) -> GlobalSymbol {
         self.next_fresh += 1;
         format!(
             "v{}{}",
@@ -658,8 +672,8 @@ impl Desugar {
         &mut self,
         expr: &Expr,
         res: &mut Vec<NormAction>,
-        memo: &mut HashMap<Expr, Symbol>,
-    ) -> Symbol {
+        memo: &mut HashMap<Expr, GlobalSymbol>,
+    ) -> GlobalSymbol {
         if let Some(existing) = memo.get(expr) {
             return *existing;
         }
@@ -699,7 +713,7 @@ impl Desugar {
             .map_err(|e| e.map_token(|tok| tok.to_string()))?)
     }
 
-    pub fn declare(&mut self, name: Symbol, sort: Symbol) -> Vec<NCommand> {
+    pub fn declare(&mut self, name: GlobalSymbol, sort: GlobalSymbol) -> Vec<NCommand> {
         let fresh = self.get_fresh();
         vec![
             NCommand::Function(FunctionDecl {
@@ -711,7 +725,7 @@ impl Desugar {
                 default: None,
                 merge: None,
                 merge_action: vec![],
-                cost: Some(HIGH_COST),
+                cost: Some(100000000000000000),
             }),
             NCommand::NormAction(NormAction::Let(name, NormExpr::Call(fresh, vec![]))),
         ]
