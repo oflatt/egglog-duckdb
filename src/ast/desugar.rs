@@ -3,7 +3,7 @@ use symbol_table::GlobalSymbol;
 use crate::{
     ast::{self, Action, Expr, Fact, Rule},
     proofs::RULE_PROOF_KEYWORD,
-    Error, HashSet,
+    Error, HashSet, HashMap, CommandId
 };
 
 use super::{
