@@ -795,7 +795,12 @@ impl EGraph {
         }
     }
 
-    fn run_command(&mut self, command: NCommand, should_run: bool) -> Result<String, Error> {
+    fn run_command(
+        &mut self,
+        command: NCommand,
+        should_run: bool,
+        extractions: &mut Vec<String>,
+    ) -> Result<String, Error> {
         let pre_rebuild = Instant::now();
         self.extract_report = None;
         self.run_report = None;
@@ -847,11 +852,10 @@ impl EGraph {
                     if variants > 0 {
                         let line = "\n    ";
                         let v_exprs = ListDisplay(&report.variants, line);
-                        println!("({})", v_exprs)
+                        extractions.push(format!("({})", v_exprs));
                     } else {
-                        println!("({})", report.expr)
+                        extractions.push(format!("({})", report.expr));
                     };
-                    io::stdout().flush().unwrap();
                     msg.into()
                 } else {
                     "Skipping Extraction".into()
@@ -918,7 +922,7 @@ impl EGraph {
                 msg
             }
             NCommand::Fail(c) => {
-                if self.run_command(*c, should_run).is_ok() {
+                if self.run_command(*c, should_run, extractions).is_ok() {
                     return Err(Error::ExpectFail);
                 }
                 "Command failed as expected.".into()
@@ -1174,6 +1178,7 @@ impl EGraph {
 
     pub fn run_program(&mut self, mut program: Vec<Command>) -> Result<Vec<String>, Error> {
         let mut msgs = vec![];
+        let mut extractions = vec![];
         let should_run = true;
 
         if let Some(Command::SetOption {
@@ -1191,13 +1196,13 @@ impl EGraph {
             // Important to process each command individually
             // because push and pop create new scopes
             for processed in self.process_command(command)? {
-                let msg = self.run_command(processed.command, should_run)?;
+                let msg = self.run_command(processed.command, should_run, &mut extractions)?;
                 log::info!("{}", msg);
                 msgs.push(msg);
             }
         }
 
-        Ok(msgs)
+        Ok(extractions)
     }
 
     // this is bad because we shouldn't inspect values like this, we should use type information
