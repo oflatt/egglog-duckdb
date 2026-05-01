@@ -15,9 +15,19 @@
 //!       any subtype
 //!     - [`crate::EGraph::query`] / [`crate::EGraph::query_pattern`] for
 //!       typed iteration / pattern matching
-//! - [`rule`] / [`add_rust_rule`] — add rules whose RHS is egglog code or
-//!   a Rust closure (the closure receives an [`crate::WriteState`]). For
-//!   higher-level ergonomics use the [`rust_rule!`] macro.
+//! - [`rule`] — add rules whose RHS is egglog code.
+//! - [`rust_rule!`](crate::rust_rule) — macro form of `add_rust_rule`
+//!   that generates a typed bindings struct from `vars![...]` so the
+//!   closure body can use `b.x: i64` directly instead of indexing
+//!   `&[Value]` and calling `value_to_base::<T>` per arg. Recommended
+//!   for the common base-value case.
+//! - [`add_rust_rule`] — lower-level form that takes a closure
+//!   `Fn(&mut WriteState, &[Value]) -> Option<()>`. Use when the
+//!   `rust_rule!` macro doesn't fit (e.g. eclass-typed bindings or
+//!   dynamically-built rule shapes).
+//! - [`add_rust_rule_full`] — same shape as [`add_rust_rule`] but the
+//!   closure gets a [`crate::FullState`] (action-side reads); generated
+//!   rule is `:naive`.
 //! - [`query`] — legacy free-function form of `EGraph::query_pattern`,
 //!   returns untyped `Vec<Value>` rows.
 //! - [`BaseSort`] / [`ContainerSort`] — declare custom sort types.
