@@ -42,7 +42,7 @@ fn match_only_rust_rule_setup(case: RustRuleBenchCase) -> RustRuleBenchInput {
     let ruleset = "rust_rule_bench";
     add_ruleset(&mut egraph, ruleset).unwrap();
 
-    rust_rule(
+    add_rust_rule(
         &mut egraph,
         "rust_rule_bench",
         ruleset,
@@ -137,7 +137,7 @@ fn insert_loop_setup(case: RustRuleInsertLoopBenchCase) -> RustRuleBenchInput {
     let ruleset = "rust_rule_insert_loop";
     add_ruleset(&mut egraph, ruleset).unwrap();
 
-    rust_rule(
+    add_rust_rule(
         &mut egraph,
         "rust_rule_insert_loop",
         ruleset,
@@ -190,7 +190,7 @@ fn tableaction_hot_path_setup(case: RustRuleTableActionBenchCase) -> RustRuleBen
     add_ruleset(&mut egraph, fill_ruleset).unwrap();
     add_ruleset(&mut egraph, read_ruleset).unwrap();
 
-    rust_rule(
+    add_rust_rule(
         &mut egraph,
         "rust_rule_tableaction_hot_path_fill",
         fill_ruleset,
@@ -211,11 +211,10 @@ fn tableaction_hot_path_setup(case: RustRuleTableActionBenchCase) -> RustRuleBen
 
     // Stress the Rust API table ops in the action: do the `f(x)`
     // lookup inside the callback (not via matcher binding). This uses
-    // `rust_rule_full` so the closure receives a `FullState` with read
-    // capability; the rule auto-demotes to naive evaluation as a
-    // result, which is the cost we want to measure for action-side
-    // reads.
-    rust_rule_full(
+    // `add_rust_rule_full` so the closure receives a `FullState` with
+    // read capability; the rule needs `:naive` to call it, which is
+    // the cost we want to measure for action-side reads.
+    add_rust_rule_full(
         &mut egraph,
         "rust_rule_tableaction_hot_path_read",
         read_ruleset,
@@ -313,7 +312,7 @@ fn fib_setup() -> RustRuleBenchInput {
     egraph.parse_and_run_program(None, &program).unwrap();
     let ruleset = "fib_ruleset";
     add_ruleset(&mut egraph, ruleset).unwrap();
-    rust_rule(
+    add_rust_rule(
         &mut egraph,
         "fib_rule",
         ruleset,

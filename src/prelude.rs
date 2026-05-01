@@ -15,8 +15,9 @@
 //!       any subtype
 //!     - [`crate::EGraph::query`] / [`crate::EGraph::query_pattern`] for
 //!       typed iteration / pattern matching
-//! - [`rule`] / [`rust_rule`] — add rules whose RHS is egglog code or a
-//!   Rust closure (the closure receives an [`crate::WriteState`]).
+//! - [`rule`] / [`add_rust_rule`] — add rules whose RHS is egglog code or
+//!   a Rust closure (the closure receives an [`crate::WriteState`]). For
+//!   higher-level ergonomics use the [`rust_rule!`] macro.
 //! - [`query`] — legacy free-function form of `EGraph::query_pattern`,
 //!   returns untyped `Vec<Value>` rows.
 //! - [`BaseSort`] / [`ContainerSort`] — declare custom sort types.
@@ -37,14 +38,7 @@ pub use egglog::{CommandMacro, CommandMacroRegistry};
 pub use egglog::{Core, FullState, PureState, Read, ReadState, Write, WriteState};
 pub use egglog::{EGraph, span};
 pub use egglog::{action, actions, datatype, expr, fact, facts, sort, vars};
-pub use egglog::{rust_rule_extract, rust_rule_field_ty};
-// NOTE on `rust_rule!`: the macro shares its name with the existing
-// `rust_rule` function below, so we cannot `pub use egglog::rust_rule;`
-// from this prelude — `pub use` of a macro creates a value-namespace
-// import that collides with the function definition. The macro is
-// `#[macro_export]`-ed at the crate root, so users who want it should
-// add `use egglog::rust_rule;` alongside `use egglog::prelude::*`. See
-// the [`crate::rust_rule!`] macro docs for details.
+pub use egglog::{rust_rule, rust_rule_extract, rust_rule_field_ty};
 
 /// Trait for types that can be converted to/from Literal for use in validated primitives.
 /// This enables automatic validator generation for literal primitives.
@@ -437,7 +431,7 @@ where
 /// add_ruleset(&mut egraph, ruleset)?;
 ///
 /// // add the rule from `build_test_database` to the egraph
-/// rust_rule(
+/// add_rust_rule(
 ///     &mut egraph,
 ///     "fib_rule",
 ///     ruleset,
@@ -478,7 +472,7 @@ where
 ///
 /// # Ok::<(), egglog::Error>(())
 /// ```
-pub fn rust_rule(
+pub fn add_rust_rule(
     egraph: &mut EGraph,
     rule_name: &str,
     ruleset: &str,
@@ -571,15 +565,15 @@ where
     }
 }
 
-/// Like [`rust_rule`], but the action callback receives a [`FullState`]
-/// — it can read tables (`ctx.lookup`) in addition to writing them.
-/// Action callbacks of `FullPrim` are only valid in `Context::Full`,
-/// so this helper marks the generated rule `:naive`: the body matches
-/// against the entire database every iteration instead of using the
-/// seminaive delta. Use this when the action genuinely needs to look
-/// up rows; prefer [`rust_rule`] when the data can be bound via the
-/// matcher in the rule body.
-pub fn rust_rule_full(
+/// Like [`add_rust_rule`], but the action callback receives a
+/// [`FullState`] — it can read tables (`ctx.lookup`) in addition to
+/// writing them. Action callbacks of `FullPrim` are only valid in
+/// `Context::Full`, so this helper marks the generated rule `:naive`:
+/// the body matches against the entire database every iteration
+/// instead of using the seminaive delta. Use this when the action
+/// genuinely needs to look up rows; prefer [`add_rust_rule`] when the
+/// data can be bound via the matcher in the rule body.
+pub fn add_rust_rule_full(
     egraph: &mut EGraph,
     rule_name: &str,
     ruleset: &str,
@@ -766,7 +760,7 @@ macro_rules! rust_rule {
             $(pub $v: $crate::rust_rule_field_ty!($t),)*
         }
 
-        $crate::prelude::rust_rule(
+        $crate::prelude::add_rust_rule(
             $egraph,
             $rule_name,
             $ruleset,
@@ -864,7 +858,7 @@ pub fn query(
     let ruleset = egraph.parser.symbol_gen.fresh("query_ruleset");
     add_ruleset(egraph, &ruleset)?;
 
-    rust_rule(egraph, "query", &ruleset, vars, facts, move |_, values| {
+    add_rust_rule(egraph, "query", &ruleset, vars, facts, move |_, values| {
         let arc = results_weak.upgrade().unwrap();
         let mut results = arc.lock().unwrap();
         results.rows += 1;
@@ -1285,7 +1279,7 @@ mod tests {
         add_ruleset(&mut egraph, ruleset)?;
 
         // add the rule from `build_test_database` to the egraph
-        rust_rule(
+        add_rust_rule(
             &mut egraph,
             "demo_rule",
             ruleset,
