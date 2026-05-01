@@ -690,11 +690,7 @@ impl Primitive for SumMultisets {
 }
 
 impl PurePrim for SumMultisets {
-    fn apply<'a, 'db>(
-        &self,
-        mut state: crate::PureState<'a, 'db>,
-        args: &[Value],
-    ) -> Option<Value> {
+    fn apply<'a, 'db>(&self, state: crate::PureState<'a, 'db>, args: &[Value]) -> Option<Value> {
         let mut data = MultiSet::<Value>::new();
         let ms_of_ms = state
             .container_values()
