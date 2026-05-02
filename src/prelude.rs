@@ -15,6 +15,9 @@
 //!       any subtype
 //!     - [`crate::EGraph::query`] / [`crate::EGraph::query_pattern`] for
 //!       typed iteration / pattern matching
+//! - [`crate::EGraph::declare`] — chainable builder for declaring a
+//!   `(function ...)`, `(constructor ...)`, or `(relation ...)` table
+//!   without constructing a raw `Schema`.
 //! - [`rule`] — add rules whose RHS is egglog code.
 //! - [`rust_rule!`](crate::rust_rule) — macro form of `add_rust_rule`
 //!   that generates a typed bindings struct from `vars![...]` so the
