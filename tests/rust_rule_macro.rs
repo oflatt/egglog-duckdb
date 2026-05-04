@@ -1,10 +1,12 @@
-//! Tests for the `rust_rule!` macro (PR 6 of the API redesign).
+//! Tests for the `rust_rule!` macro.
 
 use egglog::Error;
 use egglog::prelude::*;
 use egglog::rust_rule;
 
-fn fib_setup() -> Result<(EGraph, &'static str), Error> {
+const FIB_RULESET: &str = "fib_ruleset";
+
+fn fib_setup() -> Result<EGraph, Error> {
     let mut egraph = EGraph::default();
     egraph.parse_and_run_program(
         None,
@@ -14,15 +16,15 @@ fn fib_setup() -> Result<(EGraph, &'static str), Error> {
 (set (fib 1) 1)
         ",
     )?;
-    let ruleset = "fib_ruleset";
-    add_ruleset(&mut egraph, ruleset)?;
-    Ok((egraph, ruleset))
+    add_ruleset(&mut egraph, FIB_RULESET)?;
+    Ok(egraph)
 }
 
 /// Basic case: i64 vars, parallel to `benches/rust_api_benchmarking.rs:fib_setup`.
 #[test]
 fn rust_rule_macro_basic_i64() -> Result<(), Error> {
-    let (mut egraph, ruleset) = fib_setup()?;
+    let mut egraph = fib_setup()?;
+    let ruleset = FIB_RULESET;
 
     rust_rule!(
         &mut egraph,
@@ -35,9 +37,7 @@ fn rust_rule_macro_basic_i64() -> Result<(), Error> {
         ],
         |ctx, b| {
             // b.x, b.f0, b.f1 are typed i64 — no per-arg `value_to_base`.
-            let y = ctx.base_to_value::<i64>(b.x + 2);
-            let f2 = ctx.base_to_value::<i64>(b.f0 + b.f1);
-            ctx.insert("fib", [y, f2].into_iter());
+            ctx.set("fib", (b.x + 2,), b.f0 + b.f1);
             Some(())
         }
     )?;
@@ -88,9 +88,7 @@ fn rust_rule_macro_mixed_types() -> Result<(), Error> {
         |ctx, b| {
             // b.name: String, b.a: i64
             assert!(b.name == "alice" || b.name == "bob");
-            let key = ctx.base_to_value::<egglog::sort::S>(b.name.clone().into());
-            let val = ctx.base_to_value::<i64>(b.a * b.a);
-            ctx.insert("age_squared", [key, val].into_iter());
+            ctx.set("age_squared", (b.name.clone(),), b.a * b.a);
             Some(())
         }
     )?;
@@ -136,8 +134,8 @@ fn rust_rule_macro_empty_vars() -> Result<(), Error> {
         facts![(trigger)],
         |ctx, _b| {
             counter_clone.fetch_add(1, Ordering::SeqCst);
-            let v = ctx.base_to_value::<i64>(42);
-            ctx.insert("flag", [v].into_iter());
+            // Zero-arg function key uses RawValues(vec![]) (see add_node docs).
+            ctx.set("flag", egglog::RawValues(vec![]), 42_i64);
             Some(())
         }
     )?;
@@ -153,7 +151,8 @@ fn rust_rule_macro_empty_vars() -> Result<(), Error> {
 /// generated struct's field were the wrong type.
 #[test]
 fn rust_rule_macro_typed_fields() -> Result<(), Error> {
-    let (mut egraph, ruleset) = fib_setup()?;
+    let mut egraph = fib_setup()?;
+    let ruleset = FIB_RULESET;
 
     use std::sync::{Arc, Mutex};
     let captured: Arc<Mutex<Vec<(i64, i64, i64)>>> = Arc::new(Mutex::new(Vec::new()));
