@@ -148,7 +148,7 @@ fn insert_loop_setup(case: RustRuleInsertLoopBenchCase) -> RustRuleBenchInput {
             for i in 0..case.n_ops {
                 let k = ctx.base_to_value::<i64>(i as i64);
                 let y = ctx.base_to_value::<i64>(i as i64 + 1);
-                ctx.insert("f", [k, y].into_iter());
+                ctx.set("f", (k,), y);
             }
             Some(())
         },
@@ -203,7 +203,7 @@ fn tableaction_hot_path_setup(case: RustRuleTableActionBenchCase) -> RustRuleBen
             let y = ctx.base_to_value::<i64>(x + 1);
 
             // Populate f(x)=x+1. (No lookup here; it may not be visible within the same callback.)
-            ctx.insert("f", [k, y].into_iter());
+            ctx.set("f", (k,), y);
             Some(())
         },
     )
@@ -228,7 +228,7 @@ fn tableaction_hot_path_setup(case: RustRuleTableActionBenchCase) -> RustRuleBen
             let y = ctx.base_to_value::<i64>(x + 1);
 
             // lookup should succeed because we pre-filled the table.
-            let out = ctx.lookup("f", &[k]).expect("f(x) should exist");
+            let out = ctx.lookup_raw("f", &[k]).expect("f(x) should exist");
             ctx.union(out, y);
             Some(())
         },
@@ -250,7 +250,12 @@ fn tableaction_hot_path_setup(case: RustRuleTableActionBenchCase) -> RustRuleBen
 // which is more representative of real-world Rust rule usage patterns than insert_loop_setup.
 #[divan::bench(
     args = [
+        // Sweep n_dummy_funcs to gauge how the per-call ActionRegistry
+        // HashMap lookup scales with table count. Both `fs.set` (fill)
+        // and `fs.lookup_raw` (read) hit the registry per match.
+        RustRuleTableActionBenchCase { n_facts_input: 50_000, n_dummy_funcs: 0 },
         RustRuleTableActionBenchCase { n_facts_input: 50_000, n_dummy_funcs: 200 },
+        RustRuleTableActionBenchCase { n_facts_input: 50_000, n_dummy_funcs: 2_000 },
     ],
     sample_count = 10
 )]
@@ -266,7 +271,17 @@ fn rust_rule_tableaction_hot_path(bencher: divan::Bencher, case: RustRuleTableAc
 
 #[divan::bench(
     args = [
+        // Sweep n_dummy_funcs to isolate per-call HashMap-lookup cost in
+        // the rust_rule action surface. The action does 1_000 `ctx.set`
+        // calls per rule fire — each call resolves "f" by name through
+        // the ActionRegistry's HashMap. If string lookups are O(1)
+        // bounded, these three cases should be ~identical.
+        RustRuleInsertLoopBenchCase { n_ops: 1_000, n_dummy_funcs: 0 },
         RustRuleInsertLoopBenchCase { n_ops: 1_000, n_dummy_funcs: 200 },
+        RustRuleInsertLoopBenchCase { n_ops: 1_000, n_dummy_funcs: 2_000 },
+        RustRuleInsertLoopBenchCase { n_ops: 100_000, n_dummy_funcs: 0 },
+        RustRuleInsertLoopBenchCase { n_ops: 100_000, n_dummy_funcs: 200 },
+        RustRuleInsertLoopBenchCase { n_ops: 100_000, n_dummy_funcs: 2_000 },
     ],
     sample_count = 10
 )]
@@ -279,6 +294,7 @@ fn rust_rule_insert_loop(bencher: divan::Bencher, case: RustRuleInsertLoopBenchC
             run_ruleset(&mut input.egraph, &input.ruleset).unwrap();
         });
 }
+
 
 fn main() {
     divan::main();
@@ -314,7 +330,7 @@ fn fib_setup() -> RustRuleBenchInput {
 
             let y = ctx.base_to_value::<i64>(x + 2);
             let f2 = ctx.base_to_value::<i64>(f0 + f1);
-            ctx.insert("fib", [y, f2].into_iter());
+            ctx.set("fib", (y,), f2);
 
             Some(())
         },

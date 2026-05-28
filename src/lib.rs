@@ -10,6 +10,65 @@
 //! We have a [text tutorial](https://egraphs-good.github.io/egglog-tutorial/01-basics.html) on egglog and how to use it.
 //! We also have a slightly outdated [video tutorial](https://www.youtube.com/watch?v=N2RDQGRBrSY).
 //!
+//! # Using egglog from Rust
+//!
+//! Start with the [**`prelude`**](prelude) module — it re-exports the
+//! types and macros most Rust callers need. Almost every example in
+//! this crate's docs assumes `use egglog::prelude::*;`.
+//!
+//! Two ways to drive an [`EGraph`]:
+//!
+//! 1. **Egglog DSL via `parse_and_run_program`** —
+//!    [`EGraph::parse_and_run_program`] takes a string of egglog
+//!    commands. Good when you have a self-contained egglog program.
+//! 2. **Typed Rust methods on the `Read` / `Write` traits** — the same
+//!    surface a `rust_rule` / `add_rust_rule_full` callback sees. Outside a
+//!    rule, [`EGraph::with_full_state`] hands out the same handle:
+//!     - `Write::set(name, key, value)` writes a function table cell.
+//!     - `Write::add_node(name, inputs)` mints / looks up a
+//!       constructor eclass; the returned `Value` is the eclass id.
+//!     - `Read::lookup::<_, V: BaseValue>(name, key)` reads a function's
+//!       output value.
+//!     - `Read::eclass_of(name, inputs) -> Option<Value>` reads a
+//!       constructor's eclass without minting.
+//!     - `Read::contains(name, key)` / `Write::remove(name, key)` work on
+//!       any subtype.
+//!     - [`EGraph::query`] iterates table rows as typed tuples;
+//!       [`EGraph::query_pattern`] does pattern-style queries with
+//!       typed return rows.
+//!     - [`EGraph::intern`] / [`EGraph::extract`] convert between Rust
+//!       base values and egglog [`Value`]s.
+//!
+//! The Rust API does not currently track egglog sort identity at the
+//! type level — a [`Value`] returned from one constructor is
+//! indistinguishable from one returned by another at the Rust type
+//! level. Keep track yourself.
+//!
+//! ## Extending egglog with your own native code
+//!
+//! When the prelude isn't enough — when you want to plug Rust functions
+//! or types into the egraph — the extension points are:
+//!
+//! - **Custom primitives**: implement [`PrimitiveCommon`] plus one of
+//!   the four kind-specific traits ([`PurePrim`],
+//!   [`WritePrim`], [`ReadPrim`], [`FullPrim`])
+//!   and register via the matching `EGraph::add_*_primitive` method.
+//!   The chosen trait names the state wrapper its body sees —
+//!   [`PureState`] for pure ops, [`WriteState`] for writes,
+//!   etc. The Rust type checker enforces that the body only uses
+//!   capabilities that wrapper exposes; the typechecker enforces that
+//!   the primitive is only invoked from contexts the wrapper is valid
+//!   in. See each kind trait's docs for the state→context details.
+//! - **Rust-bodied rule RHS**: register via [`prelude::rust_rule`]; the
+//!   closure receives an [`crate::WriteState`].
+//! - **Sorts and container types**: see [`Sort`], [`BaseSort`], and
+//!   [`ContainerSort`] (re-exported from the [`prelude`]).
+//!
+//! See issue #772 in the repo for the seminaive-safety reasoning
+//! behind the typed primitive surface.
+//!
+//!
+pub mod api;
 pub mod ast;
 #[cfg(feature = "bin")]
 mod cli;
@@ -1888,6 +1947,49 @@ impl EGraph {
         })
     }
 
+    /// Convert a Rust base value into an interned egglog [`Value`].
+    ///
+    /// This is the preferred way to obtain a [`Value`] for a primitive
+    /// (`i64`, `String`, `bool`, ...) without having to spawn a rule.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use egglog::*;
+    ///
+    /// let mut egraph = EGraph::default();
+    /// egraph
+    ///     .parse_and_run_program(None, "(function f (i64) i64 :no-merge) (set (f 1) 42)")
+    ///     .unwrap();
+    ///
+    /// // Look up `(f 1)` in the e-graph.
+    /// let key = egraph.intern::<i64>(1);
+    /// let out = egraph.lookup_function("f", &[key]).unwrap();
+    /// assert_eq!(egraph.extract::<i64>(out), 42);
+    /// ```
+    pub fn intern<T: BaseValue>(&self, x: T) -> Value {
+        self.base_to_value::<T>(x)
+    }
+
+    /// Read out a Rust base value from an egglog [`Value`].
+    ///
+    /// Panics if the value isn't of type `T`.
+    ///
+    /// See [`EGraph::intern`] for an example.
+    pub fn extract<T: BaseValue>(&self, v: Value) -> T {
+        self.value_to_base::<T>(v)
+    }
+
+    /// Convert a Rust container value into an interned egglog [`Value`].
+    ///
+    /// This is currently an alias for [`EGraph::container_to_value`] and
+    /// requires `&mut self`. A future change will relax this to `&self`
+    /// once the underlying container store's interior mutability is
+    /// surfaced.
+    pub fn intern_container<T: ContainerValue>(&mut self, x: T) -> Value {
+        self.container_to_value::<T>(x)
+    }
+
     /// Get the size of a function in the e-graph.
     ///
     /// `panics` if the function does not exist.
@@ -1937,7 +2039,109 @@ impl EGraph {
     pub fn new_union_action(&self) -> egglog_bridge::UnionAction {
         UnionAction::new(&self.backend)
     }
+
+    /// Run `f` with a [`FullState`] handle on this EGraph's database
+    /// — the same handle a `:naive` rule's `add_rust_rule_full`
+    /// callback receives. Use to drive typed reads / writes
+    /// (`fs.set`, `fs.add_node`, `fs.lookup`, `fs.eclass_of`,
+    /// `fs.contains`, `fs.remove`, …) from outside a rule.
+    ///
+    /// # Flush semantics
+    ///
+    /// Pending writes flush once, **after** `f` returns. Two
+    /// consequences:
+    ///
+    /// 1. A `set` / `add_node` / `remove` inside the closure is *not*
+    ///    visible to a subsequent `lookup` / `contains` / `eclass_of`
+    ///    in the **same** closure. Split write-then-read into separate
+    ///    `with_full_state` calls.
+    /// 2. Conversely, batching multiple writes in one closure is the
+    ///    fast path — only one flush + rebuild happens, regardless of
+    ///    how many writes occurred.
+    ///
+    /// # Example
+    /// ```
+    /// use egglog::prelude::*;
+    /// let mut eg = EGraph::default();
+    /// eg.parse_and_run_program(None, "(function f (i64) i64 :no-merge)")?;
+    /// eg.with_full_state(|mut fs| fs.set("f", (1_i64,), 42_i64));
+    /// let got: Option<i64> = eg.with_full_state(|fs| fs.lookup::<_, i64>("f", 1_i64));
+    /// assert_eq!(got, Some(42));
+    /// # Ok::<(), egglog::Error>(())
+    /// ```
+    pub fn with_full_state<R>(&mut self, f: impl FnOnce(FullState<'_, '_>) -> R) -> R {
+        let registry = self.backend.action_registry().clone();
+        let guard = registry.read().unwrap();
+        let result = self
+            .backend
+            .with_execution_state(|es| f(FullState::wrap(es, &guard, Context::Full)));
+        drop(guard);
+        self.backend.flush_updates();
+        result
+    }
+
+    /// Iterate all rows of a function, constructor, or relation as typed
+    /// tuples.
+    ///
+    /// For relations declared with `(relation R (i64 ...))`, the
+    /// internal table has an extra synthetic eq-sort output column —
+    /// this method strips it, so `query::<(i64,)>("R")` returns just
+    /// the input column. For constructors with a non-base output (e.g.
+    /// `(constructor Add (i64 i64) Math)`), use `Vec<Value>` and
+    /// extract the eclass id manually.
+    pub fn query<R: FromRow>(&self, table: &str) -> Result<Vec<R>, Error> {
+        let func = self.functions.get(table).ok_or_else(|| {
+            Error::TypeError(TypeError::UnboundFunction(table.to_string(), span!()))
+        })?;
+        let backend_id = func.backend_id;
+        let strip_synthetic = matches!(func.decl.subtype, FunctionSubtype::Constructor)
+            && self.is_synthetic_relation_sort(&func.decl.schema.output);
+        let bv = self.backend.base_values();
+        let mut out = Vec::new();
+        self.backend.for_each(backend_id, |row| {
+            let slice = row.vals;
+            let view: &[Value] = if strip_synthetic {
+                &slice[..slice.len() - 1]
+            } else {
+                slice
+            };
+            out.push(R::from_values(view, bv));
+        });
+        Ok(out)
+    }
+
+    /// Pattern query — bind the named variables against the facts and
+    /// return one typed row per match.
+    ///
+    /// With zero vars, returns one empty `R` per match (so `Vec<()>`
+    /// has length = number of matches).
+    pub fn query_pattern<R: FromRow>(
+        &mut self,
+        vars: &[(&str, ArcSort)],
+        facts: ast::Facts<String, String>,
+    ) -> Result<Vec<R>, Error> {
+        let raw = prelude::query(self, vars, facts)?;
+        let bv = self.backend.base_values();
+        if vars.is_empty() {
+            // QueryResult::iter() panics on cols == 0; use rows count.
+            let n = if raw.any_matches() { 1 } else { 0 };
+            Ok((0..n).map(|_| R::from_values(&[], bv)).collect())
+        } else {
+            Ok(raw.iter().map(|row| R::from_values(row, bv)).collect())
+        }
+    }
+
+    /// True iff this output sort name is the synthetic non-unionable
+    /// eq-sort generated when a `(relation R ...)` desugars into a
+    /// constructor. Keeps relation rows looking like just-their-inputs
+    /// to users of [`EGraph::query`].
+    fn is_synthetic_relation_sort(&self, sort_name: &str) -> bool {
+        self.type_info.non_unionable_sorts.contains(sort_name)
+    }
+
 }
+
+pub use crate::api::{FromColumn, FromRow, IntoColumn, IntoRow, RawValues};
 
 struct BackendRule<'a> {
     rb: egglog_bridge::RuleBuilder<'a>,

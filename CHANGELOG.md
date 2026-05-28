@@ -12,6 +12,19 @@
 - **Typed primitive surface for seminaive safety (#772).** Custom primitives now pick one of `PurePrim` / `ReadPrim` / `WritePrim` / `FullPrim` based on what the body needs, and register via the matching `add_*_primitive`. Rust enforces capability bounds via the state wrapper passed to the body; the egglog typechecker enforces context bounds. See the `egglog::exec_state` module docs and the `*Prim` trait docs for the full picture. Migration: `rust_rule` callbacks now take `&mut WriteState` (replacing `RustRuleContext`); a new `rust_rule_full` gives action callbacks read access. Higher-order primitives over `unstable-fn` values dispatch via `state.apply_function(&fc, args)`.
 - Expose `Read::table_size(name)` and `Read::table_sizes()` so read-capable primitives can inspect row counts without raw execution-state access, while avoiding an all-table scan when only one table is needed.
 - **`:naive` rule option.** Individual rules can opt out of seminaive evaluation with `:naive` (e.g. `(rule (...) (...) :ruleset r :naive)`). The query and actions then typecheck under the permissive `Read` / `Full` contexts so primitives that read or write the database — including HOFs that wrap custom-function lookups — can run inside the rule. The rule is matched against the entire database every iteration. Use this when correctness depends on reading e-graph state from inside a query and the seminaive trade-offs (untracked dependencies, missed re-firings) are unacceptable.
+- **Typed read/write API on the `Read` / `Write` traits (#745, #751).** Name-indexed methods that mirror the egglog DSL one-to-one. Same surface inside and outside a rule:
+  - Inside a rule: `add_rust_rule` / `add_rust_rule_full` callbacks already receive a `WriteState` / `FullState` with these methods.
+  - Outside a rule: call `EGraph::with_full_state(|fs| ...)` to drive the same methods. Pending writes flush once, **after** the closure returns — a read-after-write in the same closure is not visible. Split write and read into separate `with_full_state` calls; batching many writes in one closure is the fast path (one flush + rebuild).
+  - `Write::set(table, key, value)` — `(set (f k) v)`.
+  - `Write::add_node(table, inputs)` — mint or look up a constructor / relation eclass.
+  - `Write::remove(table, key)` — remove a row from any subtype.
+  - `Read::lookup::<_, V: BaseValue>(table, key)` — read a function's output value, returns `Option<V>`.
+  - `Read::eclass_of(table, inputs) -> Option<Value>` — read a constructor's eclass without minting.
+  - `Read::contains(table, key)` — row presence, any subtype.
+  - `Read::lookup_raw(name, &[Value]) -> Option<Value>` — untyped escape hatch when the caller already has a `&[Value]`.
+  - Subtype-mismatched calls (`set` on a constructor, `add_node` on a function, `lookup` on a constructor, `eclass_of` on a function) **panic** with a message naming the offending table. The check is plumbed through a new `egglog_bridge::TableKind` enum on `TableAction`.
+  - `EGraph::query::<R: FromRow>(table)` / `EGraph::query_pattern::<R>(vars, facts)` stay as `EGraph` methods (they compile a fresh query against the rule registry, can't run inside a rule callback). `EGraph::intern::<T>(x)` / `EGraph::extract::<T>(v)` cover base-value conversion outside a rule.
+  - Row trait surface in `crate::api`: `IntoRow`, `IntoColumn`, `FromRow`, `FromColumn`, plus `RawValues` escape hatch. The Rust API does not currently track egglog sort identity on `Value`s — a `Value` returned from one constructor is indistinguishable at the Rust type level from one returned by another; callers track sort themselves.
 
 ## [2.0.0] - 2026-02-11
 

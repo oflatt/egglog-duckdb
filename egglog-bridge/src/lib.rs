@@ -1228,6 +1228,16 @@ impl ResolvedMergeFn {
     }
 }
 
+/// Coarse classification of a table — `Constructor` mints a fresh
+/// eclass id when a row is missed; `Function` does not. Mirrors the
+/// `FunctionSubtype` split on the egglog side without dragging that
+/// type into the bridge crate.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub enum TableKind {
+    Function,
+    Constructor,
+}
+
 /// This is an intern-able struct that holds all the data needed
 /// to do table operations with an [`ExecutionState`], assuming
 /// that the [`FunctionId`] for the table is known ahead of time.
@@ -1237,6 +1247,7 @@ pub struct TableAction {
     table_math: SchemaMath,
     default: Option<MergeVal>,
     timestamp: CounterId,
+    kind: TableKind,
 }
 
 impl TableAction {
@@ -1244,6 +1255,10 @@ impl TableAction {
     /// This requires access to the `egglog_bridge::EGraph`.
     pub fn new(egraph: &EGraph, func: FunctionId) -> TableAction {
         let func_info = &egraph.funcs[func];
+        let kind = match &func_info.default_val {
+            DefaultVal::FreshId => TableKind::Constructor,
+            DefaultVal::Fail | DefaultVal::Const(_) => TableKind::Function,
+        };
         TableAction {
             table: func_info.table,
             table_math: SchemaMath {
@@ -1256,7 +1271,14 @@ impl TableAction {
                 DefaultVal::Const(val) => Some(MergeVal::Constant(*val)),
             },
             timestamp: egraph.timestamp_counter,
+            kind,
         }
+    }
+
+    /// Whether this table is a `Function` (no auto-insert) or a
+    /// `Constructor` (mints a fresh eclass id on miss).
+    pub fn kind(&self) -> TableKind {
+        self.kind
     }
 
     /// Look up a row and return its return-value column, or `None` if the

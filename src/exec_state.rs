@@ -17,8 +17,9 @@
 //!   sugar. Implemented for all four wrappers.
 //! - [`Read`] — name-indexed table lookup (`state.lookup("name", &[…])`).
 //!   Implemented for [`ReadState`] and [`FullState`].
-//! - [`Write`] — name-indexed writes (`insert`/`remove`/`subsume`/
-//!   `union`/`panic`). Implemented for [`WriteState`] and [`FullState`].
+//! - [`Write`] — name-indexed writes (`set`/`add_node`/`remove`/
+//!   `subsume`/`union`/`panic`). Implemented for [`WriteState`] and
+//!   [`FullState`].
 //!
 //! Privileged seams (`call_external_func`, `table_lookup`, raw
 //! `&mut ExecutionState`) used by the `FunctionContainer` higher-order
@@ -34,7 +35,7 @@ use std::ops::Deref;
 
 use crate::core_relations::{
     BaseValue, BaseValues, ContainerValue, ContainerValues, ExecutionState, ExternalFunctionId,
-    TableId, Value,
+    Value,
 };
 use egglog_bridge::{ActionRegistry, TableAction};
 
@@ -132,11 +133,6 @@ pub trait Core<'a, 'db: 'a>: Internal<'a, 'db> {
     fn should_stop(&self) -> bool {
         self.es().should_stop()
     }
-    /// Human-readable name for a table id, if registered.
-    fn table_name(&self, table: TableId) -> Option<&'a str> {
-        self.es().table_name(table)
-    }
-
     /// Container values for this EGraph.
     fn container_values(&self) -> &'a ContainerValues {
         self.es().container_values()
@@ -205,9 +201,51 @@ pub trait Core<'a, 'db: 'a>: Internal<'a, 'db> {
 /// state). Returns `None` if the row is absent — never inserts.
 #[allow(private_bounds)]
 pub trait Read<'a, 'db: 'a>: Core<'a, 'db> + RegistrySealed<'a, 'db> {
-    /// Look up the return-value column of a row in the named table.
-    /// Returns `None` if the key is not present.
-    fn lookup(&self, name: &str, key: &[Value]) -> Option<Value> {
+    /// Look up a function's output value at the given key, mirroring
+    /// [`crate::EGraph::with_full_state`]-`.lookup`. Returns `None` if
+    /// the row is absent.
+    ///
+    /// **Only valid for `function` tables.** Panics on a constructor —
+    /// use [`Read::eclass_of`] for those.
+    fn lookup<K: crate::api::IntoRow, V: BaseValue>(&self, name: &str, key: K) -> Option<V> {
+        let action = lookup_action(self.registry(), name);
+        assert!(
+            matches!(action.kind(), egglog_bridge::TableKind::Function),
+            "Read::lookup called on constructor `{name}` — use eclass_of instead",
+        );
+        let bv = self.base_values();
+        let key_values = key.into_values(bv);
+        action.lookup(self.es(), &key_values).map(|v| bv.unwrap::<V>(v))
+    }
+
+    /// Look up a constructor's eclass at the given inputs, without
+    /// minting a fresh one on miss. Returns `None` if absent.
+    ///
+    /// **Only valid for constructor tables.** Panics on a function.
+    /// (Functions return base values; route those through
+    /// [`Read::lookup`].)
+    fn eclass_of<K: crate::api::IntoRow>(&self, name: &str, inputs: K) -> Option<Value> {
+        let action = lookup_action(self.registry(), name);
+        assert!(
+            matches!(action.kind(), egglog_bridge::TableKind::Constructor),
+            "Read::eclass_of called on function `{name}` — use lookup instead",
+        );
+        let key_values = inputs.into_values(self.base_values());
+        action.lookup(self.es(), &key_values)
+    }
+
+    /// True iff a row with the given key exists in the table. Works
+    /// for any subtype — never mints.
+    fn contains<K: crate::api::IntoRow>(&self, name: &str, key: K) -> bool {
+        let action = lookup_action(self.registry(), name);
+        let key_values = key.into_values(self.base_values());
+        action.lookup(self.es(), &key_values).is_some()
+    }
+
+    /// Untyped raw-`Value` lookup, escape hatch for code that already
+    /// has `&[Value]` and doesn't want to round-trip through
+    /// [`Read::lookup`]'s base-value conversion.
+    fn lookup_raw(&self, name: &str, key: &[Value]) -> Option<Value> {
         let action = lookup_action(self.registry(), name);
         action.lookup(self.es(), key)
     }
@@ -231,16 +269,49 @@ pub trait Read<'a, 'db: 'a>: Core<'a, 'db> + RegistrySealed<'a, 'db> {
 /// [`FullState`]; *not* for [`PureState`] or [`ReadState`].
 #[allow(private_bounds)]
 pub trait Write<'a, 'db: 'a>: Core<'a, 'db> + RegistrySealed<'a, 'db> {
-    /// Insert a row into the named table.
-    fn insert(&mut self, name: &str, row: impl Iterator<Item = Value>) {
+    /// Set a function table's value at the given key — mirrors the
+    /// egglog `(set (f k) v)` action.
+    ///
+    /// **Only valid for `function` tables.** Panics on a constructor.
+    fn set<K: crate::api::IntoRow, V: crate::api::IntoColumn>(
+        &mut self,
+        name: &str,
+        key: K,
+        value: V,
+    ) {
         let action = lookup_action(self.registry(), name).clone();
-        action.insert(self.es_mut(), row);
+        assert!(
+            matches!(action.kind(), egglog_bridge::TableKind::Function),
+            "Write::set called on constructor `{name}` — use add_node instead",
+        );
+        let bv = self.base_values();
+        let mut row = key.into_values(bv);
+        row.push(value.into_value(bv));
+        action.insert(self.es_mut(), row.into_iter());
     }
 
-    /// Remove a row from the named table.
-    fn remove(&mut self, name: &str, key: &[Value]) {
+    /// Mint or look up an eclass for a constructor — mirrors the
+    /// egglog `(Cons k1 k2 ...)` expression form. Pass inputs only;
+    /// the output eclass is minted (or returned if a row with these
+    /// inputs already exists).
+    ///
+    /// **Only valid for constructor tables.** Panics on a function.
+    fn add_node<R: crate::api::IntoRow>(&mut self, name: &str, inputs: R) -> Option<Value> {
         let action = lookup_action(self.registry(), name).clone();
-        action.remove(self.es_mut(), key);
+        assert!(
+            matches!(action.kind(), egglog_bridge::TableKind::Constructor),
+            "Write::add_node called on function `{name}` — use set instead",
+        );
+        let bv = self.base_values();
+        let key = inputs.into_values(bv);
+        action.lookup_or_insert(self.es_mut(), &key)
+    }
+
+    /// Remove a row from the named table. Works for any subtype.
+    fn remove<K: crate::api::IntoRow>(&mut self, name: &str, key: K) {
+        let action = lookup_action(self.registry(), name).clone();
+        let key_values = key.into_values(self.base_values());
+        action.remove(self.es_mut(), &key_values);
     }
 
     /// Subsume a row in the named table.
@@ -277,10 +348,10 @@ fn lookup_action<'r>(registry: &'r ActionRegistry, name: &str) -> &'r TableActio
 /// Wrapper for [`Context::Pure`]. Implements [`Core`] only.
 ///
 /// ```compile_fail
-/// // Pure context cannot insert: `Write` is not implemented.
+/// // Pure context cannot write: `Write` is not implemented.
 /// use egglog::Write;
 /// fn _no_writes<'a, 'db>(state: &mut egglog::PureState<'a, 'db>) {
-///     state.insert("foo", std::iter::empty());
+///     state.set("foo", (1_i64,), 2_i64);
 /// }
 /// ```
 ///
