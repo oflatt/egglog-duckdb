@@ -206,6 +206,15 @@ pub struct TypeInfo {
     pub(crate) global_sorts: HashMap<String, ArcSort>,
     /// Sorts that do not allow union (e.g., from `:no-union` sorts or relations).
     pub(crate) non_unionable_sorts: HashSet<String>,
+    /// Reverse index from a registered sort's underlying Rust type
+    /// to its egglog sort name. Populated when a [`Sort`] is added
+    /// and `Sort::value_type()` returns `Some(TypeId)`. Used by the
+    /// typed Rust API ([`crate::EGraph::intern`],
+    /// [`crate::EGraph::extract`]) to tag [`crate::api::Id`]s with
+    /// the right sort name without requiring a per-Rust-type trait
+    /// impl. Custom user-defined base sorts and container sorts
+    /// inherit this for free.
+    pub(crate) rust_type_to_sort_name: HashMap<std::any::TypeId, std::sync::Arc<str>>,
 }
 
 // These methods need to be on the `EGraph` in order to
@@ -254,6 +263,12 @@ impl EGraph {
         match self.type_info.sorts.entry(name.to_owned()) {
             HEntry::Occupied(_) => Err(TypeError::SortAlreadyBound(name.to_owned(), span)),
             HEntry::Vacant(e) => {
+                let name_arc: std::sync::Arc<str> = name.into();
+                if let Some(ty) = sort.value_type() {
+                    self.type_info
+                        .rust_type_to_sort_name
+                        .insert(ty, name_arc);
+                }
                 e.insert(sort.clone());
                 sort.register_primitives(self);
                 Ok(())
