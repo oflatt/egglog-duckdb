@@ -17,9 +17,49 @@
 
 use std::sync::Arc;
 
-use crate::core_relations::{BaseValues, Value};
+use crate::core_relations::{BaseValue, BaseValues, Value};
 use crate::sort;
 use thiserror::Error;
+
+// ---------------------------------------------------------------------
+// BaseSortName — egglog sort name as a compile-time const for the
+// standard Rust base types. Used internally by the `add_primitive!`
+// macro and by [`IntoColumn`] impls to attach the correct sort tag
+// to base [`Id`]s and [`ColumnSort::Named`] without a runtime lookup.
+// ---------------------------------------------------------------------
+
+/// Maps a Rust [`BaseValue`] type to its egglog sort name as a
+/// compile-time const. Implemented for the standard base types
+/// (`i64`, `bool`, `()`, `f64`-via-[`sort::F`], `String`-via-[`sort::S`],
+/// [`sort::Z`], [`sort::Q`]). User-defined base sorts don't need to
+/// implement this trait — [`crate::EGraph::intern`] /
+/// [`crate::EGraph::extract`] look up the sort name by `TypeId` at
+/// runtime from the registered sorts.
+pub trait BaseSortName: BaseValue {
+    const SORT_NAME: &'static str;
+}
+
+impl BaseSortName for i64 {
+    const SORT_NAME: &'static str = "i64";
+}
+impl BaseSortName for bool {
+    const SORT_NAME: &'static str = "bool";
+}
+impl BaseSortName for () {
+    const SORT_NAME: &'static str = "Unit";
+}
+impl BaseSortName for sort::F {
+    const SORT_NAME: &'static str = "f64";
+}
+impl BaseSortName for sort::S {
+    const SORT_NAME: &'static str = "String";
+}
+impl BaseSortName for sort::Z {
+    const SORT_NAME: &'static str = "BigInt";
+}
+impl BaseSortName for sort::Q {
+    const SORT_NAME: &'static str = "BigRat";
+}
 
 // ---------------------------------------------------------------------
 // ApiError — runtime check failures from the typed `Read` / `Write`

@@ -178,19 +178,20 @@ fn build_add_primitive_impl(parsed: AddPrimitive, validator: Option<Expr>) -> To
             quote!(let [#(#x),*] = args else { panic!("wrong number of arguments") };)
         };
 
-        // Cast the arguments to the desired type. `state` is a
-        // `PureState<'a, 'db>` whose `base_values()` and
-        // `container_values()` come from the `Core` trait (re-exported
-        // via the `egglog::*` glob below).
+        // Cast the arguments to the desired type. Each binding `x` is
+        // an `&egglog::Id` (the new Stage-2 primitive surface); use
+        // `x.value()` to get the underlying raw `Value` for the
+        // `base_values()` / `container_values()` accessors on the
+        // `Core` trait.
         let cast1 = |x, t: &syn::Type, is_container| match is_container {
-            false => quote!(state.base_values().unwrap::<#t>(*#x)),
-            true => quote!(state.container_values().get_val::<#t>(*#x).unwrap().clone()),
+            false => quote!(state.base_values().unwrap::<#t>(#x.value())),
+            true => quote!(state.container_values().get_val::<#t>(#x.value()).unwrap().clone()),
         };
         let cast = if is_varargs {
             let Arg { x, t, is_mutable } = &args[0];
             let mutable = if *is_mutable { quote!(mut) } else { quote!() };
             match &t.cast {
-                None => quote!(let #mutable #x = #x.copied();),
+                None => quote!(let #mutable #x = #x.map(|id| id.value());),
                 Some((t, is_container)) => {
                     let cast = cast1(x, t, *is_container);
                     quote!(let #mutable #x = #x.map(|#x| #cast);)
@@ -201,7 +202,7 @@ fn build_add_primitive_impl(parsed: AddPrimitive, validator: Option<Expr>) -> To
                 .map(|Arg { x, t, is_mutable }| {
                     let mutable = if *is_mutable { quote!(mut) } else { quote!() };
                     match &t.cast {
-                        None => quote!(let #mutable #x: Value = *#x;),
+                        None => quote!(let #mutable #x: egglog::Value = #x.value();),
                         Some((t, is_container)) => {
                             let cast = cast1(x, t, *is_container);
                             quote!(let #mutable #x: #t = #cast;)
@@ -213,17 +214,27 @@ fn build_add_primitive_impl(parsed: AddPrimitive, validator: Option<Expr>) -> To
 
         // If the primitive is fallible, put a `?` after the body.
         let fail = if is_fallible { quote!(?) } else { quote!() };
-        // Cast the result back to an interned value. For container
-        // returns we go through `state.register_container`, which is a
-        // `Core` method and (per #772) safe in every context since
-        // container interning is idempotent.
+        // Wrap the result back into an `egglog::Id` tagged with the
+        // appropriate sort name. For base types we look up the sort
+        // name via `BaseSortName::SORT_NAME` (a compile-time const for
+        // the standard set). For container types we go through
+        // `register_container` and the egraph-level
+        // `rust_type_to_sort_name` lookup at runtime — but since the
+        // macro is only used with statically-known types here, we
+        // could in principle hardcode. For now `state.register_container`
+        // returns a `Value`; the surrounding wrapper tags with the
+        // empty sort name and the egraph's `with_full_state` /
+        // typed-API users can re-tag explicitly if needed.
         let (yt, ret) = match &ret.cast {
-            None => (&value_type, quote!(#y)),
+            None => (
+                &value_type,
+                quote!(egglog::Id::new(#y, "")),
+            ),
             Some((t, is_container)) => (
                 t,
                 match is_container {
-                    false => quote!(state.base_values().get::<#t>(#y)),
-                    true => quote!(state.register_container::<#t>(#y)),
+                    false => quote!(state.intern_typed::<#t>(#y)),
+                    true => quote!(egglog::Id::new(state.register_container::<#t>(#y), "")),
                 },
             ),
         };
@@ -273,8 +284,8 @@ fn build_add_primitive_impl(parsed: AddPrimitive, validator: Option<Expr>) -> To
             fn apply<'a, 'db>(
                 &self,
                 #[allow(unused_mut)] mut state: PureState<'a, 'db>,
-                args: &[Value],
-            ) -> Option<Value> {
+                args: &[egglog::Id],
+            ) -> Option<egglog::Id> {
                 #apply
             }
         }

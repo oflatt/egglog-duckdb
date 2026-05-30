@@ -256,16 +256,16 @@ impl PurePrim for VecMap {
     fn apply<'a, 'db>(
         &self,
         mut state: crate::PureState<'a, 'db>,
-        args: &[Value],
-    ) -> Option<Value> {
+        args: &[crate::Id],
+    ) -> Option<crate::Id> {
         let fc = state
             .container_values()
-            .get_val::<FunctionContainer>(args[0])
+            .get_val::<FunctionContainer>(args[0].value())
             .unwrap()
             .clone();
         let vec = state
             .container_values()
-            .get_val::<VecContainer>(args[1])
+            .get_val::<VecContainer>(args[1].value())
             .unwrap()
             .clone();
         let mut new_data = Vec::with_capacity(vec.data.len());
@@ -278,7 +278,10 @@ impl PurePrim for VecMap {
             do_rebuild: self.output_vec.is_eq_container_sort(),
             data: new_data,
         };
-        Some(state.register_container(new_vec))
+        Some(crate::Id::new(
+            state.register_container(new_vec),
+            self.output_vec.name(),
+        ))
     }
 }
 
@@ -315,16 +318,16 @@ impl WritePrim for Union {
     fn apply<'a, 'db>(
         &self,
         mut state: crate::WriteState<'a, 'db>,
-        args: &[Value],
-    ) -> Option<Value> {
+        args: &[crate::Id],
+    ) -> Option<crate::Id> {
         let left = state
             .container_values()
-            .get_val::<VecContainer>(args[0])?
+            .get_val::<VecContainer>(args[0].value())?
             .clone()
             .data;
         let right = state
             .container_values()
-            .get_val::<VecContainer>(args[1])?
+            .get_val::<VecContainer>(args[1].value())?
             .clone()
             .data;
         if left.len() != right.len() {
@@ -335,7 +338,7 @@ impl WritePrim for Union {
         for (l, r) in zip(left, right) {
             action.union(es, l, r);
         }
-        Some(args[0])
+        Some(args[0].clone())
     }
 }
 

@@ -12,6 +12,18 @@ use egglog_bridge::ActionRegistry;
 use enum_map::EnumMap;
 use std::sync::{Arc, RwLock};
 
+use crate::api::Id;
+
+/// Convert raw `&[Value]` from the bridge into `Vec<Id>` for the
+/// typed primitive `apply`. Inputs are tagged with the empty sort
+/// name (treated as `ColumnSort::Unchecked` by the typed user API)
+/// when the wrapper doesn't know per-call signatures. Per-signature
+/// wrappers can be added later to populate sort tags.
+#[inline]
+fn values_to_ids(args: &[Value]) -> Vec<Id> {
+    args.iter().map(|v| Id::new(*v, "")).collect()
+}
+
 // `ExternalFunction` wrapper for `PurePrim`. Holds the primitive
 // directly so the dispatch chain `external_funcs[id].invoke(...)` →
 // `T::apply(...)` is just one vtable hop plus a direct call — no
@@ -19,28 +31,22 @@ use std::sync::{Arc, RwLock};
 #[derive(Clone)]
 struct PurePrimWrapper<T> {
     prim: T,
-    /// The call-site [`Context`] this wrapper stamps onto the
-    /// `PureState` before dispatching. `register_per_context` commits
-    /// one wrapper per valid `Context` for the trait, so the
-    /// typechecker's pick at each call site is encoded directly here.
     ctx: Context,
 }
 
 impl<T: PurePrim + Clone> ExternalFunction for PurePrimWrapper<T> {
     fn invoke(&self, exec_state: &mut ExecutionState, args: &[Value]) -> Option<Value> {
-        self.prim.apply(PureState::wrap(exec_state, self.ctx), args)
+        let ids = values_to_ids(args);
+        self.prim
+            .apply(PureState::wrap(exec_state, self.ctx), &ids)
+            .map(|id| id.value())
     }
 }
 
-// `ExternalFunction` wrapper for primitives that need the
-// `ActionRegistry` (`ReadPrim`, `WritePrim`, `FullPrim`). One generic
-// over the `Wrap` strategy that knows how to construct the right
-// state type and dispatch to the primitive's `apply`.
 #[derive(Clone)]
 struct RegistryPrimWrapper<T, S> {
     prim: T,
     registry: Arc<RwLock<ActionRegistry>>,
-    /// Stamped onto the state wrapper.
     ctx: Context,
     _wrap: std::marker::PhantomData<fn() -> S>,
 }
@@ -50,9 +56,9 @@ trait RegistryWrap<T>: Clone + Send + Sync {
         prim: &T,
         exec_state: &mut ExecutionState,
         ctx: Context,
-        args: &[Value],
+        args: &[Id],
         registry: &ActionRegistry,
-    ) -> Option<Value>;
+    ) -> Option<Id>;
 }
 
 #[derive(Clone)]
@@ -63,9 +69,9 @@ impl<T: ReadPrim> RegistryWrap<T> for WrapRead {
         prim: &T,
         exec_state: &mut ExecutionState,
         ctx: Context,
-        args: &[Value],
+        args: &[Id],
         registry: &ActionRegistry,
-    ) -> Option<Value> {
+    ) -> Option<Id> {
         prim.apply(ReadState::wrap(exec_state, registry, ctx), args)
     }
 }
@@ -77,9 +83,9 @@ impl<T: WritePrim> RegistryWrap<T> for WrapWrite {
         prim: &T,
         exec_state: &mut ExecutionState,
         ctx: Context,
-        args: &[Value],
+        args: &[Id],
         registry: &ActionRegistry,
-    ) -> Option<Value> {
+    ) -> Option<Id> {
         prim.apply(WriteState::wrap(exec_state, registry, ctx), args)
     }
 }
@@ -91,9 +97,9 @@ impl<T: FullPrim> RegistryWrap<T> for WrapFull {
         prim: &T,
         exec_state: &mut ExecutionState,
         ctx: Context,
-        args: &[Value],
+        args: &[Id],
         registry: &ActionRegistry,
-    ) -> Option<Value> {
+    ) -> Option<Id> {
         prim.apply(FullState::wrap(exec_state, registry, ctx), args)
     }
 }
@@ -103,7 +109,8 @@ impl<T: Clone + Send + Sync + 'static, S: RegistryWrap<T> + 'static> ExternalFun
 {
     fn invoke(&self, exec_state: &mut ExecutionState, args: &[Value]) -> Option<Value> {
         let registry = self.registry.read().unwrap();
-        S::invoke(&self.prim, exec_state, self.ctx, args, &registry)
+        let ids = values_to_ids(args);
+        S::invoke(&self.prim, exec_state, self.ctx, &ids, &registry).map(|id| id.value())
     }
 }
 

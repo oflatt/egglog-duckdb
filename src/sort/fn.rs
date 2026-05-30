@@ -367,15 +367,15 @@ impl PurePrim for Ctor {
     fn apply<'a, 'db>(
         &self,
         mut state: crate::PureState<'a, 'db>,
-        args: &[Value],
-    ) -> Option<Value> {
+        args: &[crate::Id],
+    ) -> Option<crate::Id> {
         let (rf, args) = args.split_first().unwrap();
         let ResolvedFunction {
             id,
             partial_arcsorts,
             name,
             panic_id,
-        } = state.base_values().unwrap(*rf);
+        } = state.base_values().unwrap(rf.value());
         self.function
             .partial_arcsorts
             .lock()
@@ -384,10 +384,10 @@ impl PurePrim for Ctor {
         let args = partial_arcsorts
             .iter()
             .zip(args)
-            .map(|(b, x)| (b.clone(), *x))
+            .map(|(b, x)| (b.clone(), x.value()))
             .collect();
         let y = FunctionContainer(id, args, name, panic_id);
-        Some(state.register_container(y))
+        Some(crate::Id::new(state.register_container(y), self.function.name()))
     }
 }
 
@@ -492,15 +492,20 @@ impl PurePrim for Apply {
     fn apply<'a, 'db>(
         &self,
         mut state: crate::PureState<'a, 'db>,
-        args: &[Value],
-    ) -> Option<Value> {
-        let (fc_val, args) = args.split_first().unwrap();
+        args: &[crate::Id],
+    ) -> Option<crate::Id> {
+        let (fc_id, args) = args.split_first().unwrap();
         let fc = state
             .container_values()
-            .get_val::<FunctionContainer>(*fc_val)
+            .get_val::<FunctionContainer>(fc_id.value())
             .unwrap()
             .clone();
-        state.apply_function(&fc, args)
+        let arg_values: Vec<Value> = args.iter().map(|id| id.value()).collect();
+        // Output sort isn't known statically here; tag with the empty
+        // sort name. Downstream typed API can re-tag if needed.
+        state
+            .apply_function(&fc, &arg_values)
+            .map(|v| crate::Id::new(v, ""))
     }
 }
 

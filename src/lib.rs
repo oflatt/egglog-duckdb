@@ -124,31 +124,29 @@ pub trait Primitive: Send + Sync + 'static {
 /// A primitive whose body sees a [`PureState`]. Register via
 /// [`EGraph::add_pure_primitive`].
 ///
-/// Primitive `apply` signatures use raw [`Value`] — primitive authors
-/// are the one audience that still works at the [`Value`] level. The
-/// rest of the typed user API uses [`crate::Id`]. Inside the body,
-/// use [`Core::base`] / [`Core::id_of`] for [`Id`]-style conversion
-/// when convenient.
+/// Inputs and outputs are [`Id`]s tagged with their egglog sort. Use
+/// [`Core::base`] to extract base values and [`Core::id_of`] /
+/// `Id::new` to construct returns.
 pub trait PurePrim: Primitive {
-    fn apply<'a, 'db>(&self, state: PureState<'a, 'db>, args: &[Value]) -> Option<Value>;
+    fn apply<'a, 'db>(&self, state: PureState<'a, 'db>, args: &[Id]) -> Option<Id>;
 }
 
 /// A primitive whose body sees a [`WriteState`]. Register via
 /// [`EGraph::add_write_primitive`].
 pub trait WritePrim: Primitive {
-    fn apply<'a, 'db>(&self, state: WriteState<'a, 'db>, args: &[Value]) -> Option<Value>;
+    fn apply<'a, 'db>(&self, state: WriteState<'a, 'db>, args: &[Id]) -> Option<Id>;
 }
 
 /// A primitive whose body sees a [`ReadState`]. Register via
 /// [`EGraph::add_read_primitive`].
 pub trait ReadPrim: Primitive {
-    fn apply<'a, 'db>(&self, state: ReadState<'a, 'db>, args: &[Value]) -> Option<Value>;
+    fn apply<'a, 'db>(&self, state: ReadState<'a, 'db>, args: &[Id]) -> Option<Id>;
 }
 
 /// A primitive whose body sees a [`FullState`]. Register via
 /// [`EGraph::add_full_primitive`].
 pub trait FullPrim: Primitive {
-    fn apply<'a, 'db>(&self, state: FullState<'a, 'db>, args: &[Value]) -> Option<Value>;
+    fn apply<'a, 'db>(&self, state: FullState<'a, 'db>, args: &[Id]) -> Option<Id>;
 }
 
 /// A user-defined command output trait.
@@ -2140,11 +2138,9 @@ impl EGraph {
 
 }
 
-pub use crate::api::{ApiError, ColumnSort, FromColumn, FromRow, Id, IntoColumn, IntoRow, RawValues};
-// Note: previously `BaseSortName` was a re-export here. It's been
-// removed — `EGraph::intern::<T>` now looks the sort name up by
-// `TypeId` from the registered sorts, so user-added base sorts work
-// without any extra trait impls.
+pub use crate::api::{
+    ApiError, BaseSortName, ColumnSort, FromColumn, FromRow, Id, IntoColumn, IntoRow, RawValues,
+};
 
 struct BackendRule<'a> {
     rb: egglog_bridge::RuleBuilder<'a>,
@@ -2534,15 +2530,15 @@ mod tests {
     }
 
     impl PurePrim for InnerProduct {
-        fn apply<'a, 'db>(&self, state: PureState<'a, 'db>, args: &[Value]) -> Option<Value> {
+        fn apply<'a, 'db>(&self, state: PureState<'a, 'db>, args: &[crate::Id]) -> Option<crate::Id> {
             let mut sum = 0;
             let vec1 = state
                 .container_values()
-                .get_val::<VecContainer>(args[0])
+                .get_val::<VecContainer>(args[0].value())
                 .unwrap();
             let vec2 = state
                 .container_values()
-                .get_val::<VecContainer>(args[1])
+                .get_val::<VecContainer>(args[1].value())
                 .unwrap();
             assert_eq!(vec1.data.len(), vec2.data.len());
             for (a, b) in vec1.data.iter().zip(vec2.data.iter()) {
@@ -2550,7 +2546,7 @@ mod tests {
                 let b = state.base_values().unwrap::<i64>(*b);
                 sum += a * b;
             }
-            Some(state.base_values().get::<i64>(sum))
+            Some(state.intern_typed::<i64>(sum))
         }
     }
 

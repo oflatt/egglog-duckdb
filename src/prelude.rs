@@ -422,10 +422,16 @@ where
         + Sync
         + 'static,
 {
-    fn apply<'a, 'db>(&self, state: crate::WriteState<'a, 'db>, values: &[Value]) -> Option<Value> {
-        let unit = state.base_values().get(());
-        (self.func)(state, values)?;
-        Some(unit)
+    fn apply<'a, 'db>(
+        &self,
+        state: crate::WriteState<'a, 'db>,
+        values: &[crate::Id],
+    ) -> Option<crate::Id> {
+        let raw: Vec<Value> = values.iter().map(|id| id.value()).collect();
+        let mut state = state;
+        let unit_id = crate::Core::intern_typed::<()>(&mut state, ());
+        (self.func)(state, &raw)?;
+        Some(unit_id)
     }
 }
 
@@ -592,10 +598,16 @@ where
         + Sync
         + 'static,
 {
-    fn apply<'a, 'db>(&self, state: crate::FullState<'a, 'db>, values: &[Value]) -> Option<Value> {
-        let unit = state.base_values().get(());
-        (self.func)(state, values)?;
-        Some(unit)
+    fn apply<'a, 'db>(
+        &self,
+        state: crate::FullState<'a, 'db>,
+        values: &[crate::Id],
+    ) -> Option<crate::Id> {
+        let raw: Vec<Value> = values.iter().map(|id| id.value()).collect();
+        let mut state = state;
+        let unit_id = crate::Core::intern_typed::<()>(&mut state, ());
+        (self.func)(state, &raw)?;
+        Some(unit_id)
     }
 }
 

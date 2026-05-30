@@ -382,16 +382,16 @@ impl PurePrim for Map {
     fn apply<'a, 'db>(
         &self,
         mut state: crate::PureState<'a, 'db>,
-        args: &[Value],
-    ) -> Option<Value> {
+        args: &[crate::Id],
+    ) -> Option<crate::Id> {
         let fc = state
             .container_values()
-            .get_val::<FunctionContainer>(args[0])
+            .get_val::<FunctionContainer>(args[0].value())
             .unwrap()
             .clone();
         let multiset = state
             .container_values()
-            .get_val::<MultiSetContainer>(args[1])
+            .get_val::<MultiSetContainer>(args[1].value())
             .unwrap()
             .clone();
         let mut new_data = MultiSet::<Value>::new();
@@ -404,7 +404,10 @@ impl PurePrim for Map {
             data: new_data,
             ..multiset
         };
-        Some(state.register_container(new_ms))
+        Some(crate::Id::new(
+            state.register_container(new_ms),
+            self.output_multiset.name(),
+        ))
     }
 }
 
@@ -443,16 +446,16 @@ impl FullPrim for FillIndex {
     fn apply<'a, 'db>(
         &self,
         mut state: crate::FullState<'a, 'db>,
-        args: &[Value],
-    ) -> Option<Value> {
+        args: &[crate::Id],
+    ) -> Option<crate::Id> {
         let fc = state
             .container_values()
-            .get_val::<FunctionContainer>(args[1])
+            .get_val::<FunctionContainer>(args[1].value())
             .unwrap()
             .clone();
         let multiset = state
             .container_values()
-            .get_val::<MultiSetContainer>(args[0])
+            .get_val::<MultiSetContainer>(args[0].value())
             .unwrap()
             .clone();
         let action = match fc.0 {
@@ -461,10 +464,11 @@ impl FullPrim for FillIndex {
                 "Primitive functions cannot be used with unstable-multiset-fill-index, since they cannot be set"
             ),
         };
-        let unit_val = state.base_values().get::<()>(());
+        let ms_value = args[0].value();
+        let unit_id = state.intern_typed::<()>(());
         let es = state.raw_exec_state();
         for (v, c) in multiset.data.iter_counts() {
-            let mut row = vec![args[0], v];
+            let mut row = vec![ms_value, v];
             // Skip the whole fill if any index row already exists.
             // This relies on `unstable-multiset-fill-index` writing all
             // rows for a given multiset in one pass.
@@ -474,7 +478,7 @@ impl FullPrim for FillIndex {
             row.push(es.base_values().get::<i64>(c.try_into().unwrap()));
             action.insert(es, row.into_iter());
         }
-        Some(unit_val)
+        Some(unit_id)
     }
 }
 
@@ -508,16 +512,16 @@ impl WritePrim for ClearIndex {
     fn apply<'a, 'db>(
         &self,
         mut state: crate::WriteState<'a, 'db>,
-        args: &[Value],
-    ) -> Option<Value> {
+        args: &[crate::Id],
+    ) -> Option<crate::Id> {
         let fc = state
             .container_values()
-            .get_val::<FunctionContainer>(args[1])
+            .get_val::<FunctionContainer>(args[1].value())
             .unwrap()
             .clone();
         let multiset = state
             .container_values()
-            .get_val::<MultiSetContainer>(args[0])
+            .get_val::<MultiSetContainer>(args[0].value())
             .unwrap()
             .clone();
         let action = match fc.0 {
@@ -526,12 +530,13 @@ impl WritePrim for ClearIndex {
                 "Primitive functions cannot be used with unstable-multiset-clear-index, since they cannot be deleted"
             ),
         };
-        let unit_val = state.base_values().get::<()>(());
+        let ms_value = args[0].value();
+        let unit_id = state.intern_typed::<()>(());
         let es = state.raw_exec_state();
         for (v, _) in multiset.data.iter_counts() {
-            action.remove(es, &[args[0], v]);
+            action.remove(es, &[ms_value, v]);
         }
-        Some(unit_val)
+        Some(unit_id)
     }
 }
 
@@ -567,16 +572,16 @@ impl PurePrim for FlatMap {
     fn apply<'a, 'db>(
         &self,
         mut state: crate::PureState<'a, 'db>,
-        args: &[Value],
-    ) -> Option<Value> {
+        args: &[crate::Id],
+    ) -> Option<crate::Id> {
         let fc = state
             .container_values()
-            .get_val::<FunctionContainer>(args[0])
+            .get_val::<FunctionContainer>(args[0].value())
             .unwrap()
             .clone();
         let multiset = state
             .container_values()
-            .get_val::<MultiSetContainer>(args[1])
+            .get_val::<MultiSetContainer>(args[1].value())
             .unwrap()
             .clone();
         let mut new_data = MultiSet::<Value>::new();
@@ -598,7 +603,10 @@ impl PurePrim for FlatMap {
             data: new_data,
             ..multiset
         };
-        Some(state.register_container(new_container))
+        Some(crate::Id::new(
+            state.register_container(new_container),
+            self.multiset.name(),
+        ))
     }
 }
 
@@ -635,16 +643,16 @@ impl PurePrim for Filter {
     fn apply<'a, 'db>(
         &self,
         mut state: crate::PureState<'a, 'db>,
-        args: &[Value],
-    ) -> Option<Value> {
+        args: &[crate::Id],
+    ) -> Option<crate::Id> {
         let fc = state
             .container_values()
-            .get_val::<FunctionContainer>(args[0])
+            .get_val::<FunctionContainer>(args[0].value())
             .unwrap()
             .clone();
         let multiset = state
             .container_values()
-            .get_val::<MultiSetContainer>(args[1])
+            .get_val::<MultiSetContainer>(args[1].value())
             .unwrap()
             .clone();
         let mut new_data = MultiSet::<Value>::new();
@@ -658,7 +666,10 @@ impl PurePrim for Filter {
             data: new_data,
             ..multiset
         };
-        Some(state.register_container(new_ms))
+        Some(crate::Id::new(
+            state.register_container(new_ms),
+            self.multiset.name(),
+        ))
     }
 }
 
@@ -693,12 +704,12 @@ impl PurePrim for SumMultisets {
     fn apply<'a, 'db>(
         &self,
         mut state: crate::PureState<'a, 'db>,
-        args: &[Value],
-    ) -> Option<Value> {
+        args: &[crate::Id],
+    ) -> Option<crate::Id> {
         let mut data = MultiSet::<Value>::new();
         let ms_of_ms = state
             .container_values()
-            .get_val::<MultiSetContainer>(args[0])
+            .get_val::<MultiSetContainer>(args[0].value())
             .unwrap()
             .clone();
         for (ms_value, counts) in ms_of_ms.data.iter_counts() {
@@ -714,7 +725,10 @@ impl PurePrim for SumMultisets {
             data,
             do_rebuild: self.multiset.is_eq_container_sort(),
         };
-        Some(state.register_container(multiset))
+        Some(crate::Id::new(
+            state.register_container(multiset),
+            self.multiset.name(),
+        ))
     }
 }
 
@@ -752,17 +766,17 @@ impl PurePrim for Reduce {
     fn apply<'a, 'db>(
         &self,
         mut state: crate::PureState<'a, 'db>,
-        args: &[Value],
-    ) -> Option<Value> {
+        args: &[crate::Id],
+    ) -> Option<crate::Id> {
         let fc = state
             .container_values()
-            .get_val::<FunctionContainer>(args[0])
+            .get_val::<FunctionContainer>(args[0].value())
             .unwrap()
             .clone();
-        let initial = args[1];
+        let initial = args[1].value();
         let multiset = state
             .container_values()
-            .get_val::<MultiSetContainer>(args[2])
+            .get_val::<MultiSetContainer>(args[2].value())
             .unwrap()
             .clone();
         let mut values = multiset.data.iter().cloned().collect::<Vec<_>>();
@@ -774,7 +788,7 @@ impl PurePrim for Reduce {
         for v in values {
             acc = state.apply_function(&fc, &[acc, v])?;
         }
-        Some(acc)
+        Some(crate::Id::new(acc, self.element.name()))
     }
 }
 
@@ -809,11 +823,11 @@ impl WritePrim for UnionValues {
     fn apply<'a, 'db>(
         &self,
         mut state: crate::WriteState<'a, 'db>,
-        args: &[Value],
-    ) -> Option<Value> {
+        args: &[crate::Id],
+    ) -> Option<crate::Id> {
         let values = state
             .container_values()
-            .get_val::<MultiSetContainer>(args[0])?
+            .get_val::<MultiSetContainer>(args[0].value())?
             .clone()
             .data;
         let values: Vec<_> = values.iter_counts().map(|(v, _c)| v).collect();
@@ -826,7 +840,7 @@ impl WritePrim for UnionValues {
         for v in values.into_iter().skip(1) {
             action.union(es, first, v);
         }
-        Some(first)
+        Some(crate::Id::new(first, self.element.name()))
     }
 }
 

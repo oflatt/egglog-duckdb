@@ -68,10 +68,14 @@ fn test_add_pure_primitive_with_validator() {
         }
     }
     impl PurePrim for TestAdd {
-        fn apply<'a, 'db>(&self, state: PureState<'a, 'db>, args: &[Value]) -> Option<Value> {
-            let a = state.base_values().unwrap::<i64>(args[0]);
-            let b = state.base_values().unwrap::<i64>(args[1]);
-            Some(state.base_values().get(a + b))
+        fn apply<'a, 'db>(
+            &self,
+            state: PureState<'a, 'db>,
+            args: &[egglog::Id],
+        ) -> Option<egglog::Id> {
+            let a: i64 = state.base(&args[0]);
+            let b: i64 = state.base(&args[1]);
+            Some(state.intern_typed::<i64>(a + b))
         }
     }
 

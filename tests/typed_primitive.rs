@@ -16,8 +16,8 @@ use egglog::ast::Span;
 use egglog::constraint::{SimpleTypeConstraint, TypeConstraint};
 use egglog::sort::{I64Sort, S, StringSort};
 use egglog::{
-    EGraph, FullPrim, FullState, Primitive, PurePrim, PureState, Read, ReadPrim, ReadState, Value,
-    WritePrim, WriteState, prelude::*,
+    Core, EGraph, FullPrim, FullState, Id, Primitive, PurePrim, PureState, Read, ReadPrim,
+    ReadState, Value, WritePrim, WriteState, prelude::*,
 };
 
 // --- shared test fixtures ---
@@ -43,10 +43,10 @@ impl Primitive for PureAdd {
     }
 }
 impl PurePrim for PureAdd {
-    fn apply<'a, 'db>(&self, state: PureState<'a, 'db>, args: &[Value]) -> Option<Value> {
-        let a = state.base_values().unwrap::<i64>(args[0]);
-        let b = state.base_values().unwrap::<i64>(args[1]);
-        Some(state.base_values().get(a + b))
+    fn apply<'a, 'db>(&self, state: PureState<'a, 'db>, args: &[Id]) -> Option<Id> {
+        let a: i64 = state.base(&args[0]);
+        let b: i64 = state.base(&args[1]);
+        Some(state.intern_typed::<i64>(a + b))
     }
 }
 
@@ -69,9 +69,9 @@ impl Primitive for WriteEcho {
     }
 }
 impl WritePrim for WriteEcho {
-    fn apply<'a, 'db>(&self, state: WriteState<'a, 'db>, args: &[Value]) -> Option<Value> {
+    fn apply<'a, 'db>(&self, state: WriteState<'a, 'db>, args: &[Id]) -> Option<Id> {
         let _ = state.base_values();
-        Some(args[0])
+        Some(args[0].clone())
     }
 }
 
@@ -97,8 +97,13 @@ impl Primitive for ReadLookup {
     }
 }
 impl ReadPrim for ReadLookup {
-    fn apply<'a, 'db>(&self, state: ReadState<'a, 'db>, args: &[Value]) -> Option<Value> {
-        state.lookup_raw(self.table_name, args).ok().flatten()
+    fn apply<'a, 'db>(&self, state: ReadState<'a, 'db>, args: &[Id]) -> Option<Id> {
+        let raw: Vec<Value> = args.iter().map(|id| id.value()).collect();
+        state
+            .lookup_raw(self.table_name, &raw)
+            .ok()
+            .flatten()
+            .map(|v| Id::new(v, "i64"))
     }
 }
 
@@ -119,11 +124,11 @@ impl Primitive for ReadTableSize {
     }
 }
 impl ReadPrim for ReadTableSize {
-    fn apply<'a, 'db>(&self, state: ReadState<'a, 'db>, args: &[Value]) -> Option<Value> {
-        let table_name = state.base_values().unwrap::<S>(args[0]).0;
+    fn apply<'a, 'db>(&self, state: ReadState<'a, 'db>, args: &[Id]) -> Option<Id> {
+        let table_name = state.base::<S>(&args[0]).0;
         let size = state.table_size(&table_name).unwrap_or(0);
         let size = i64::try_from(size).ok()?;
-        Some(state.base_values().get::<i64>(size))
+        Some(state.intern_typed::<i64>(size))
     }
 }
 
@@ -139,10 +144,10 @@ impl Primitive for ReadAllTableSizes {
     }
 }
 impl ReadPrim for ReadAllTableSizes {
-    fn apply<'a, 'db>(&self, state: ReadState<'a, 'db>, _args: &[Value]) -> Option<Value> {
+    fn apply<'a, 'db>(&self, state: ReadState<'a, 'db>, _args: &[Id]) -> Option<Id> {
         let size: usize = state.table_sizes().into_iter().map(|(_, size)| size).sum();
         let size = i64::try_from(size).ok()?;
-        Some(state.base_values().get::<i64>(size))
+        Some(state.intern_typed::<i64>(size))
     }
 }
 
@@ -163,9 +168,9 @@ impl Primitive for FullEcho {
     }
 }
 impl FullPrim for FullEcho {
-    fn apply<'a, 'db>(&self, state: FullState<'a, 'db>, args: &[Value]) -> Option<Value> {
+    fn apply<'a, 'db>(&self, state: FullState<'a, 'db>, args: &[Id]) -> Option<Id> {
         let _ = state.base_values();
-        Some(args[0])
+        Some(args[0].clone())
     }
 }
 
@@ -189,8 +194,8 @@ impl Primitive for PureEcho {
     }
 }
 impl PurePrim for PureEcho {
-    fn apply<'a, 'db>(&self, _state: PureState<'a, 'db>, args: &[Value]) -> Option<Value> {
-        Some(args[0])
+    fn apply<'a, 'db>(&self, _state: PureState<'a, 'db>, args: &[Id]) -> Option<Id> {
+        Some(args[0].clone())
     }
 }
 
@@ -213,8 +218,8 @@ impl Primitive for ReadEcho {
     }
 }
 impl ReadPrim for ReadEcho {
-    fn apply<'a, 'db>(&self, _state: ReadState<'a, 'db>, args: &[Value]) -> Option<Value> {
-        Some(args[0])
+    fn apply<'a, 'db>(&self, _state: ReadState<'a, 'db>, args: &[Id]) -> Option<Id> {
+        Some(args[0].clone())
     }
 }
 

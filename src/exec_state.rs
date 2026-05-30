@@ -33,7 +33,7 @@
 
 use std::ops::Deref;
 
-use crate::api::{ApiError, ColumnSort, Id, IntoColumn, IntoRow};
+use crate::api::{ApiError, BaseSortName, ColumnSort, Id, IntoColumn, IntoRow};
 use crate::core_relations::{
     BaseValue, BaseValues, ContainerValue, ContainerValues, ExecutionState, ExternalFunctionId,
     Value,
@@ -180,6 +180,15 @@ pub trait Core<'a, 'db: 'a>: Internal<'a, 'db> {
     /// values without going through the registry.
     fn id_of<T: BaseValue>(&self, x: T, sort: &str) -> Id {
         Id::new(self.base_to_value::<T>(x), sort)
+    }
+
+    /// Construct an [`Id`] from a Rust base value whose sort name is
+    /// known at compile time via [`BaseSortName`]. Shorthand for
+    /// `id_of(x, T::SORT_NAME)`. Used by the [`add_primitive!`] macro
+    /// and other internals to produce return [`Id`]s without
+    /// duplicating the sort name string.
+    fn intern_typed<T: BaseSortName>(&self, x: T) -> Id {
+        Id::new(self.base_to_value::<T>(x), T::SORT_NAME)
     }
 
     /// Look up the Rust container behind an egglog [`Value`], if any.
