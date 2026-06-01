@@ -21,7 +21,15 @@ use std::sync::Arc;
 
 use crate::core_relations::{BaseValue, BaseValues, Value};
 use crate::sort;
+use smallvec::{smallvec, SmallVec};
 use thiserror::Error;
+
+/// Row buffer used by [`IntoRow::into_values`]. Inline up to 4 columns
+/// so common keys (1–3 args + an output) don't allocate.
+pub type RowValues = SmallVec<[Value; 4]>;
+/// Sort tags returned by [`IntoRow::column_sorts`]. Same inline budget
+/// as [`RowValues`].
+pub type RowSorts = SmallVec<[ColumnSort; 4]>;
 
 // ---------------------------------------------------------------------
 // BaseSortName — egglog sort name as a compile-time const for the
@@ -39,28 +47,35 @@ use thiserror::Error;
 /// runtime from the registered sorts.
 pub trait BaseSortName: BaseValue {
     const SORT_NAME: &'static str;
+    /// Per-type cached `Arc<str>` for [`Self::SORT_NAME`]. Returning a
+    /// clone of a static avoids allocating a fresh `Arc<str>` on every
+    /// [`crate::Core::intern_typed`] call — see issue PR #901 perf
+    /// discussion.
+    fn sort_name_arc() -> Arc<str>;
 }
 
-impl BaseSortName for i64 {
-    const SORT_NAME: &'static str = "i64";
+macro_rules! impl_base_sort_name {
+    ($($ty:ty => $name:literal),+ $(,)?) => {
+        $(
+            impl BaseSortName for $ty {
+                const SORT_NAME: &'static str = $name;
+                fn sort_name_arc() -> Arc<str> {
+                    static CACHE: std::sync::OnceLock<Arc<str>> = std::sync::OnceLock::new();
+                    CACHE.get_or_init(|| Arc::from($name)).clone()
+                }
+            }
+        )+
+    };
 }
-impl BaseSortName for bool {
-    const SORT_NAME: &'static str = "bool";
-}
-impl BaseSortName for () {
-    const SORT_NAME: &'static str = "Unit";
-}
-impl BaseSortName for sort::F {
-    const SORT_NAME: &'static str = "f64";
-}
-impl BaseSortName for sort::S {
-    const SORT_NAME: &'static str = "String";
-}
-impl BaseSortName for sort::Z {
-    const SORT_NAME: &'static str = "BigInt";
-}
-impl BaseSortName for sort::Q {
-    const SORT_NAME: &'static str = "BigRat";
+
+impl_base_sort_name! {
+    i64 => "i64",
+    bool => "bool",
+    () => "Unit",
+    sort::F => "f64",
+    sort::S => "String",
+    sort::Z => "BigInt",
+    sort::Q => "BigRat",
 }
 
 // ---------------------------------------------------------------------
@@ -148,13 +163,45 @@ pub struct Id {
     sort: Arc<str>,
 }
 
+/// Shared empty `Arc<str>` cloned by transient untagged ids inside the
+/// crate (primitive dispatch wrappers). Never observable from outside —
+/// every user-facing `Id` carries a real sort name.
+pub(crate) fn empty_sort() -> Arc<str> {
+    static EMPTY: std::sync::OnceLock<Arc<str>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| Arc::from("")).clone()
+}
+
 impl Id {
     /// Wrap a raw [`Value`] with the given sort name. The caller
     /// asserts the value really is of that sort — no runtime check
     /// happens here; the tag is consulted later when the `Id` flows
     /// through a typed API call.
     pub fn new(value: Value, sort: impl Into<Arc<str>>) -> Self {
-        Self { value, sort: sort.into() }
+        Self {
+            value,
+            sort: sort.into(),
+        }
+    }
+
+    /// Transient untagged id for internal dispatch use only. The
+    /// primitive wrapper produces these when handing `&[Value]` to a
+    /// primitive's `apply`; the wrapper immediately unwraps the
+    /// returned id via [`Id::value`] before anything sort-checked sees
+    /// it, so users never observe an untagged id.
+    #[inline]
+    pub(crate) fn untagged(value: Value) -> Self {
+        Self {
+            value,
+            sort: empty_sort(),
+        }
+    }
+
+    /// Internal constructor for read paths — the sort `Arc<str>` is
+    /// reused from the table's stored schema (one atomic increment, no
+    /// allocation).
+    #[inline]
+    pub(crate) fn with_sort(value: Value, sort: Arc<str>) -> Self {
+        Self { value, sort }
     }
 
     pub fn value(&self) -> Value {
@@ -177,10 +224,26 @@ pub enum ColumnSort {
     /// The column has a known sort name. Compared exactly against the
     /// table's expected sort for that column position.
     Named(Arc<str>),
+    /// Compile-time sort name. Same semantics as [`ColumnSort::Named`]
+    /// but avoids an `Arc` allocation on the hot path — base type
+    /// [`IntoColumn`] impls use this.
+    Static(&'static str),
     /// No sort information attached. Skip the runtime check — the
     /// caller is responsible for getting the column right. Used by
     /// the bare [`Value`] [`IntoColumn`] impl.
     Unchecked,
+}
+
+impl ColumnSort {
+    /// Returns the sort name if this is a checked variant.
+    #[inline]
+    pub(crate) fn name(&self) -> Option<&str> {
+        match self {
+            ColumnSort::Named(s) => Some(s.as_ref()),
+            ColumnSort::Static(s) => Some(s),
+            ColumnSort::Unchecked => None,
+        }
+    }
 }
 
 /// Convert a Rust value into a row of egglog [`Value`]s, with a sort
@@ -193,10 +256,10 @@ pub enum ColumnSort {
 /// - [`RawValues`] as an escape hatch for already-converted multi-column
 ///   rows (sort checks are skipped for every column).
 pub trait IntoRow {
-    fn into_values(self, bv: &BaseValues) -> Vec<Value>;
+    fn into_values(self, bv: &BaseValues) -> RowValues;
     /// Sort tags for each column, in order. Length must equal the
     /// `into_values` result length.
-    fn column_sorts(&self) -> Vec<ColumnSort>;
+    fn column_sorts(&self) -> RowSorts;
 }
 
 /// A single column of an egglog row, on the input side.
@@ -219,11 +282,11 @@ pub trait IntoColumn: sealed::Sealed {
 pub struct RawValues(pub Vec<Value>);
 
 impl IntoRow for RawValues {
-    fn into_values(self, _bv: &BaseValues) -> Vec<Value> {
-        self.0
+    fn into_values(self, _bv: &BaseValues) -> RowValues {
+        self.0.into_iter().collect()
     }
-    fn column_sorts(&self) -> Vec<ColumnSort> {
-        vec![ColumnSort::Unchecked; self.0.len()]
+    fn column_sorts(&self) -> RowSorts {
+        smallvec![ColumnSort::Unchecked; self.0.len()]
     }
 }
 
@@ -240,7 +303,7 @@ macro_rules! impl_column_for_base {
                     bv.get::<$ty>(self)
                 }
                 fn column_sort(&self) -> ColumnSort {
-                    ColumnSort::Named(Arc::from($sort_name))
+                    ColumnSort::Static($sort_name)
                 }
             }
         )+
@@ -264,7 +327,7 @@ impl IntoColumn for String {
         bv.get::<sort::S>(self.into())
     }
     fn column_sort(&self) -> ColumnSort {
-        ColumnSort::Named(Arc::from("String"))
+        ColumnSort::Static("String")
     }
 }
 // `&str` is one-directional input sugar.
@@ -274,7 +337,7 @@ impl IntoColumn for &str {
         bv.get::<sort::S>(self.to_string().into())
     }
     fn column_sort(&self) -> ColumnSort {
-        ColumnSort::Named(Arc::from("String"))
+        ColumnSort::Static("String")
     }
 }
 
@@ -286,7 +349,7 @@ impl IntoColumn for f64 {
         bv.get::<sort::F>(OrderedFloat(self).into())
     }
     fn column_sort(&self) -> ColumnSort {
-        ColumnSort::Named(Arc::from("f64"))
+        ColumnSort::Static("f64")
     }
 }
 // `Id` carries its sort tag from construction.
@@ -315,11 +378,11 @@ impl IntoColumn for Value {
 // ---------------------------------------------------------------------
 
 impl<A: IntoColumn> IntoRow for A {
-    fn into_values(self, bv: &BaseValues) -> Vec<Value> {
-        vec![self.into_value(bv)]
+    fn into_values(self, bv: &BaseValues) -> RowValues {
+        smallvec![self.into_value(bv)]
     }
-    fn column_sorts(&self) -> Vec<ColumnSort> {
-        vec![self.column_sort()]
+    fn column_sorts(&self) -> RowSorts {
+        smallvec![self.column_sort()]
     }
 }
 
@@ -333,13 +396,13 @@ macro_rules! impl_row_for_tuple {
         $(
             #[allow(non_snake_case)]
             impl<$($name: IntoColumn),+> IntoRow for ($($name,)+) {
-                fn into_values(self, bv: &BaseValues) -> Vec<Value> {
+                fn into_values(self, bv: &BaseValues) -> RowValues {
                     let ($($name,)+) = self;
-                    vec![ $( $name.into_value(bv) ),+ ]
+                    smallvec![ $( $name.into_value(bv) ),+ ]
                 }
-                fn column_sorts(&self) -> Vec<ColumnSort> {
+                fn column_sorts(&self) -> RowSorts {
                     let ($($name,)+) = self;
-                    vec![ $( $name.column_sort() ),+ ]
+                    smallvec![ $( $name.column_sort() ),+ ]
                 }
             }
         )+

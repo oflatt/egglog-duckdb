@@ -411,11 +411,12 @@ where
         state: crate::WriteState<'a, 'db>,
         values: &[crate::Id],
     ) -> Option<crate::Id> {
-        let raw: Vec<Value> = values.iter().map(|id| id.value()).collect();
+        let raw: smallvec::SmallVec<[Value; 4]> =
+            values.iter().map(|id| id.value()).collect();
         let mut state = state;
-        let unit_id = crate::Core::intern_typed::<()>(&mut state, ());
+        let unit_value = crate::Core::base_to_value::<()>(&mut state, ());
         (self.func)(state, &raw)?;
-        Some(unit_id)
+        Some(crate::Id::untagged(unit_value))
     }
 }
 
@@ -584,11 +585,12 @@ where
         state: crate::FullState<'a, 'db>,
         values: &[crate::Id],
     ) -> Option<crate::Id> {
-        let raw: Vec<Value> = values.iter().map(|id| id.value()).collect();
+        let raw: smallvec::SmallVec<[Value; 4]> =
+            values.iter().map(|id| id.value()).collect();
         let mut state = state;
-        let unit_id = crate::Core::intern_typed::<()>(&mut state, ());
+        let unit_value = crate::Core::base_to_value::<()>(&mut state, ());
         (self.func)(state, &raw)?;
-        Some(unit_id)
+        Some(crate::Id::untagged(unit_value))
     }
 }
 

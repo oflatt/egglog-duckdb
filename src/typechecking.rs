@@ -13,15 +13,22 @@ use enum_map::EnumMap;
 use std::sync::{Arc, RwLock};
 
 use crate::api::Id;
+use smallvec::SmallVec;
 
-/// Convert raw `&[Value]` from the bridge into `Vec<Id>` for the
-/// typed primitive `apply`. Inputs are tagged with the empty sort
-/// name (treated as `ColumnSort::Unchecked` by the typed user API)
-/// when the wrapper doesn't know per-call signatures. Per-signature
-/// wrappers can be added later to populate sort tags.
+type IdBuf = SmallVec<[Id; 4]>;
+
+/// Convert raw `&[Value]` from the bridge into a buffer of [`Id`]s
+/// for the typed primitive `apply`. Inputs are constructed
+/// **untagged** (no sort name attached) — primitive `apply` impls
+/// read raw values via `Id::value()` and don't need the tag. Per-
+/// signature wrappers can be added later to populate sort tags for
+/// dynamic-type-error reporting.
+///
+/// Returns a [`SmallVec`] sized for the common case of ≤ 4 args so
+/// no heap allocation happens on the hot path.
 #[inline]
-fn values_to_ids(args: &[Value]) -> Vec<Id> {
-    args.iter().map(|v| Id::new(*v, "")).collect()
+fn values_to_ids(args: &[Value]) -> IdBuf {
+    args.iter().map(|v| Id::untagged(*v)).collect()
 }
 
 // `ExternalFunction` wrapper for `PurePrim`. Holds the primitive

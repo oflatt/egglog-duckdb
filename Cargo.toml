@@ -156,6 +156,7 @@ egglog-add-primitive = { workspace = true }
 egglog-reports = { workspace = true }
 rayon = { workspace = true }
 serde_json = { workspace = true }
+smallvec = { workspace = true }
 
 [build-dependencies]
 chrono = { workspace = true, features = ["now"], optional = true }

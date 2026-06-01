@@ -1882,13 +1882,7 @@ impl EGraph {
         self.backend.base_values().get::<T>(x)
     }
 
-    /// Unchecked [`Id`] → Rust base value. Internal — public callers
-    /// should use [`EGraph::extract`] (sort-checked).
-    pub(crate) fn base<T: BaseValue>(&self, id: &Id) -> T {
-        self.value_to_base::<T>(id.value())
-    }
-
-    /// Convert from an egglog value to a reference of a Rust container type.
+/// Convert from an egglog value to a reference of a Rust container type.
     ///
     /// Returns `None` if the value cannot be converted to the requested container type.
     ///

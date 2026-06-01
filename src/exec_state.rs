@@ -181,7 +181,7 @@ pub trait Core<'a, 'db: 'a>: Internal<'a, 'db> {
     /// Standard base types only; for user-defined sorts pass the name
     /// explicitly via [`Core::id_of`].
     fn intern_typed<T: BaseSortName>(&self, x: T) -> Id {
-        Id::new(self.base_to_value::<T>(x), T::SORT_NAME)
+        Id::with_sort(self.base_to_value::<T>(x), T::sort_name_arc())
     }
 
     /// Sort-checked `Id` → `T`. State-side counterpart to
@@ -254,10 +254,10 @@ pub trait Read<'a, 'db: 'a>: Core<'a, 'db> + RegistrySealed<'a, 'db> {
         let sort = action
             .output_sort_name()
             .cloned()
-            .unwrap_or_else(|| std::sync::Arc::from(""));
+            .unwrap_or_else(crate::api::empty_sort);
         Ok(action
             .lookup(self.es(), &key_values)
-            .map(|v| Id::new(v, sort)))
+            .map(|v| Id::with_sort(v, sort)))
     }
 
     /// Read a constructor row's eclass without minting on miss.
@@ -280,13 +280,13 @@ pub trait Read<'a, 'db: 'a>: Core<'a, 'db> + RegistrySealed<'a, 'db> {
         let sorts = inputs.column_sorts();
         check_input_sorts(name, &action, &sorts)?;
         let key_values = inputs.into_values(self.base_values());
-        Ok(action.lookup(self.es(), &key_values).map(|v| {
-            let sort = action
-                .output_sort_name()
-                .cloned()
-                .unwrap_or_else(|| std::sync::Arc::from(""));
-            Id::new(v, sort)
-        }))
+        let sort = action
+            .output_sort_name()
+            .cloned()
+            .unwrap_or_else(crate::api::empty_sort);
+        Ok(action
+            .lookup(self.es(), &key_values)
+            .map(|v| Id::with_sort(v, sort)))
     }
 
     /// Whether a row with the given key exists. Any subtype; never mints.
@@ -311,8 +311,10 @@ pub trait Read<'a, 'db: 'a>: Core<'a, 'db> + RegistrySealed<'a, 'db> {
         let sort = action
             .output_sort_name()
             .cloned()
-            .unwrap_or_else(|| std::sync::Arc::from(""));
-        Ok(action.lookup(self.es(), &raw).map(|v| Id::new(v, sort)))
+            .unwrap_or_else(crate::api::empty_sort);
+        Ok(action
+            .lookup(self.es(), &raw)
+            .map(|v| Id::with_sort(v, sort)))
     }
 
     /// Return the current row count for the named table, or `None` if no table
@@ -379,8 +381,8 @@ pub trait Write<'a, 'db: 'a>: Core<'a, 'db> + RegistrySealed<'a, 'db> {
         let sort = action
             .output_sort_name()
             .cloned()
-            .unwrap_or_else(|| std::sync::Arc::from(""));
-        Ok(Id::new(value, sort))
+            .unwrap_or_else(crate::api::empty_sort);
+        Ok(Id::with_sort(value, sort))
     }
 
     /// Remove a row from the named table. Works for any subtype.
@@ -486,8 +488,8 @@ fn check_input_sorts(
         .into());
     }
     for (i, (got, want)) in provided.iter().zip(expected.iter()).enumerate() {
-        if let ColumnSort::Named(got) = got {
-            if got.as_ref() != want.as_ref() {
+        if let Some(got) = got.name() {
+            if got != want.as_ref() {
                 return Err(ApiError::WrongColumnSort {
                     table: table.to_string(),
                     column: i,
@@ -511,8 +513,8 @@ fn check_output_sort(
         // No sort name registered — skip.
         return Ok(());
     };
-    if let ColumnSort::Named(got) = provided {
-        if got.as_ref() != expected.as_ref() {
+    if let Some(got) = provided.name() {
+        if got != expected.as_ref() {
             return Err(ApiError::WrongOutputSort {
                 table: table.to_string(),
                 expected: expected.to_string(),
