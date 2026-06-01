@@ -1,67 +1,54 @@
-//! Rust entry point for egglog.
+//! Rust entry point for egglog. `use egglog::prelude::*;`.
 //!
-//! ```
-//! use egglog::prelude::*;
-//! ```
+//! Typical workflow: declare your program once (rules, datatypes,
+//! functions) via [`crate::EGraph::parse_and_run_program`], then
+//! drive the e-graph from Rust.
 //!
-//! The typical Rust workflow is: declare your program once (rules,
-//! datatypes, functions) via [`crate::EGraph::parse_and_run_program`],
-//! then drive the e-graph from Rust — adding/reading facts and
-//! stepping rulesets.
-//!
-//! ## Adding and reading facts
+//! ## Reading and writing facts
 //!
 //! [`crate::EGraph::with_full_state`] hands the closure a
-//! [`crate::FullState`] that implements [`crate::Read`] and
-//! [`crate::Write`]. From there:
+//! [`crate::FullState`] that implements [`crate::Read`] + [`crate::Write`].
+//! Inside it: [`crate::Write::set`] / [`crate::Write::add_node`] /
+//! [`crate::Write::remove`] / [`crate::Write::union`] for writes;
+//! [`crate::Read::lookup`] / [`crate::Read::eclass_of`] /
+//! [`crate::Read::contains`] for reads. The same trait methods are
+//! available inside a [`rust_rule`] / [`rust_rule_full`] callback.
 //!
-//! - [`crate::Write::set`] writes a function-table cell `(set (f k) v)`.
-//! - [`crate::Write::add_node`] mints / looks up a constructor eclass.
-//! - [`crate::Write::remove`] removes a row from any subtype.
-//! - [`crate::Read::lookup`] reads a function's output value.
-//! - [`crate::Read::eclass_of`] reads a constructor's eclass without
-//!   minting.
-//! - [`crate::Read::contains`] checks row presence on any subtype.
-//!
-//! The same trait methods are available on [`crate::WriteState`] and
-//! [`crate::FullState`] inside a [`rust_rule`] / [`rust_rule_full`]
-//! callback — same surface inside and outside a rule.
+//! Reads return [`crate::Id`]s tagged with the table's declared
+//! sort — users never supply a Rust output type at the read site.
+//! Convert an `Id` to a Rust base value at the system boundary via
+//! [`crate::EGraph::extract`] (errors on sort mismatch).
 //!
 //! ## Iterating and querying
 //!
-//! - [`crate::EGraph::table_rows`] iterates a named table; the row
-//!   shape depends on the table's subtype (`(input..., output)` for
-//!   functions, `(input..., eclass)` for constructors and relations).
-//! - [`crate::EGraph::query`] runs a pattern query and binds the
-//!   named variables. Compiles against the rule registry, so it stays
-//!   on `EGraph`.
+//! - [`crate::EGraph::table_rows`] iterates a named table; each row
+//!   is `Vec<Id>` with one tagged `Id` per column.
+//! - [`crate::EGraph::query`] runs a pattern query binding the given
+//!   `vars![…]`; each match row is `Vec<Id>` (one `Id` per declared
+//!   variable, tagged with its sort).
 //!
 //! ## Rules
 //!
-//! - [`rule`] — add a rule whose RHS is egglog code.
-//! - [`rust_rule`] / [`rust_rule_full`] — add a rule whose RHS is a Rust
-//!   closure `Fn(&mut WriteState, &[Value]) -> Option<()>` (or
-//!   `FullState` for action-side reads).
+//! - [`rule`] — RHS is egglog code.
+//! - [`rust_rule`] / [`rust_rule_full`] — RHS is a Rust closure
+//!   (with `FullState` for action-side reads).
 //! - [`run_ruleset`] / [`add_ruleset`] step rules forward.
 //!
 //! ## Extending egglog
 //!
 //! - **Custom sort types:** [`BaseSort`] / [`ContainerSort`].
-//! - **Custom primitives:** implement [`crate::Primitive`] plus one of
-//!   [`crate::PurePrim`] / [`crate::ReadPrim`] / [`crate::WritePrim`] /
-//!   [`crate::FullPrim`] and register via the matching
-//!   `EGraph::add_*_primitive`. The state wrapper the body sees
-//!   enforces what the body can do. See the trait docs and issue #772
-//!   for the seminaive-safety reasoning.
+//! - **Custom primitives:** implement [`crate::Primitive`] plus one
+//!   of [`crate::PurePrim`] / [`crate::ReadPrim`] /
+//!   [`crate::WritePrim`] / [`crate::FullPrim`] and register via the
+//!   matching `EGraph::add_*_primitive`. The state wrapper enforces
+//!   the body's capabilities (see issue #772).
 //! - **Simple pure primitives:** the [`add_primitive!`] /
-//!   [`add_primitive_with_validator!`] / [`add_literal_prim!`] macros
-//!   handle the common "pure native function" case.
+//!   [`add_primitive_with_validator!`] / [`add_literal_prim!`] macros.
 //!
 //! ## Legacy
 //!
-//! [`query`] is the older free-function pattern query — returns
-//! untyped `Vec<Value>` rows. New code should use
-//! [`crate::EGraph::query`].
+//! [`query`] (the free function) predates [`crate::EGraph::query`]
+//! and returns untagged raw values. New code should use the method.
 
 use crate::*;
 use std::any::{Any, TypeId};
@@ -346,15 +333,12 @@ macro_rules! actions {
 /// }
 ///
 /// // check that `(fib 20)` is now in the e-graph
-/// let results = query(
-///     &mut egraph,
+/// let results = egraph.query(
 ///     vars![f: i64],
 ///     facts![(= (fib (unquote exprs::int(big_number))) f)],
 /// )?;
-///
-/// let results: Vec<_> = results.iter().collect();
 /// assert_eq!(results.len(), 1);
-/// assert_eq!(egraph.base::<i64>(&Id::new(results[0][0], "")), 6765);
+/// assert_eq!(egraph.extract::<i64>(results[0][0].clone())?, 6765);
 ///
 /// # Ok::<(), egglog::Error>(())
 /// ```
@@ -500,15 +484,12 @@ where
 /// }
 ///
 /// // check that `(fib 20)` is now in the e-graph
-/// let results = query(
-///     &mut egraph,
+/// let results = egraph.query(
 ///     vars![f: i64],
 ///     facts![(= (fib (unquote exprs::int(big_number))) f)],
 /// )?;
-///
-/// let results: Vec<_> = results.iter().collect();
 /// assert_eq!(results.len(), 1);
-/// assert_eq!(egraph.base::<i64>(&Id::new(results[0][0], "")), 6765);
+/// assert_eq!(egraph.extract::<i64>(results[0][0].clone())?, 6765);
 ///
 /// # Ok::<(), egglog::Error>(())
 /// ```
@@ -706,19 +687,17 @@ impl QueryResult {
 ///     ",
 /// )?;
 ///
-/// let results = query(
-///     &mut egraph,
+/// // New code should use `EGraph::query`, which returns sort-tagged Ids.
+/// let results = egraph.query(
 ///     vars![x: i64, y: i64],
 ///     facts![
 ///         (= (fib x) y)
 ///         (= y 13)
 ///     ],
 /// )?;
-///
-/// let results: Vec<_> = results.iter().collect();
 /// assert_eq!(results.len(), 1);
-/// assert_eq!(egraph.base::<i64>(&Id::new(results[0][0], "")), 7);
-/// assert_eq!(egraph.base::<i64>(&Id::new(results[0][1], "")), 13);
+/// assert_eq!(egraph.extract::<i64>(results[0][0].clone())?, 7);
+/// assert_eq!(egraph.extract::<i64>(results[0][1].clone())?, 13);
 ///
 /// # Ok::<(), egglog::Error>(())
 /// ```

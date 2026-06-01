@@ -153,52 +153,41 @@ pub trait Core<'a, 'db: 'a>: Internal<'a, 'db> {
         cv.register_val(container, es)
     }
 
-    /// Convert an egglog [`Value`] to a Rust base type. Untyped:
-    /// trust that `x` belongs to sort `T`. Most primitive bodies use
-    /// [`Core::base`] which works in terms of [`Id`].
+    /// Untyped `Value` → `T`. Skip-the-check escape; prefer
+    /// [`Core::base`] (unchecked) or [`Core::extract`] (sort-checked).
     fn value_to_base<T: BaseValue>(&self, x: Value) -> T {
         self.es().base_values().unwrap::<T>(x)
     }
 
-    /// Convert a Rust base type to an egglog [`Value`]. Untyped — see
-    /// [`Core::id_of`] for the [`Id`] form.
+    /// Untyped `T` → `Value`. Prefer [`Core::id_of`] / [`Core::intern_typed`].
     fn base_to_value<T: BaseValue>(&self, x: T) -> Value {
         self.es().base_values().get::<T>(x)
     }
 
-    /// Extract a Rust base value from an [`Id`]. Untyped: assumes the
-    /// `Id`'s sort matches `T`. The typed primitive surface receives
-    /// `Id`s whose sort matches the primitive's declared signature, so
-    /// this is safe in primitive bodies.
+    /// Unchecked `Id` → `T`. Trusts the `Id`'s sort matches `T` (which
+    /// holds for primitive bodies, where dispatch already filtered by
+    /// signature). Use [`Core::extract`] for the sort-checked form.
     fn base<T: BaseValue>(&self, id: &Id) -> T {
         self.value_to_base::<T>(id.value())
     }
 
-    /// Construct an [`Id`] from a Rust base value and an explicit
-    /// sort name. The sort name is the egglog name, e.g. `"i64"`,
-    /// `"String"`. Used by primitive bodies to produce typed return
-    /// values without going through the registry.
+    /// `T` → `Id` with an explicit sort name. Use [`Core::intern_typed`]
+    /// when the sort name is known at compile time via [`BaseSortName`].
     fn id_of<T: BaseValue>(&self, x: T, sort: &str) -> Id {
         Id::new(self.base_to_value::<T>(x), sort)
     }
 
-    /// Construct an [`Id`] from a Rust base value whose sort name is
-    /// known at compile time via [`BaseSortName`]. Shorthand for
-    /// `id_of(x, T::SORT_NAME)`. Used by the `add_primitive!` macro
-    /// and other internals to produce return [`Id`]s without
-    /// duplicating the sort name string.
+    /// `T` → `Id`, sort name baked in at compile time via [`BaseSortName`].
+    /// Standard base types only; for user-defined sorts pass the name
+    /// explicitly via [`Core::id_of`].
     fn intern_typed<T: BaseSortName>(&self, x: T) -> Id {
         Id::new(self.base_to_value::<T>(x), T::SORT_NAME)
     }
 
-    /// Extract a Rust base value from an [`Id`], checking the sort
-    /// tag against the compile-time sort name of `T` via
-    /// [`BaseSortName`]. Errors with [`ApiError::WrongOutputSort`]
-    /// if the sort doesn't match. State-side counterpart to
-    /// [`crate::EGraph::extract`]; works only for the standard base
-    /// types (which impl [`BaseSortName`]). For user-defined base
-    /// sorts, use `EGraph::extract::<T>` (which looks the sort up
-    /// by `TypeId` at runtime).
+    /// Sort-checked `Id` → `T`. State-side counterpart to
+    /// [`crate::EGraph::extract`]; standard base types only (the
+    /// generic [`crate::EGraph::extract`] handles user-defined sorts
+    /// via runtime `TypeId` lookup).
     fn extract<T: BaseSortName>(&self, id: &Id) -> Result<T, Error> {
         if id.sort() != T::SORT_NAME {
             return Err(ApiError::WrongOutputSort {
@@ -246,22 +235,16 @@ pub trait Core<'a, 'db: 'a>: Internal<'a, 'db> {
 }
 
 /// Read-side methods — name-indexed table lookup. Implemented for
-/// [`ReadState`] and [`FullState`]; *not* for [`PureState`] or
-/// [`WriteState`] (a `Write` context body must not depend on live DB
-/// state). Returns `None` if the row is absent — never inserts.
-///
-/// Misuse (wrong table subtype, wrong arity, mismatched column sort)
-/// is reported as [`crate::ApiError`] via the method's `Result`.
+/// [`ReadState`] and [`FullState`] (not for [`PureState`] or
+/// [`WriteState`] — a `Write` context can't depend on live DB state).
+/// All methods return `Result`; misuse surfaces as [`crate::ApiError`].
 #[allow(private_bounds)]
 pub trait Read<'a, 'db: 'a>: Core<'a, 'db> + RegistrySealed<'a, 'db> {
-    /// Look up a function's output value at the given key. Returns
-    /// `Ok(None)` if the row is absent. The returned [`Id`] is
-    /// tagged with the function's declared output sort, so it can
-    /// be passed back into the typed API or converted to a Rust
-    /// base value via [`crate::EGraph::extract`] / `EGraph::as_*`.
+    /// Read a function row's output. Returned [`Id`] carries the
+    /// function's declared output sort.
     ///
-    /// **Only valid for `function` tables.** Constructors error;
-    /// use [`Read::eclass_of`] for those.
+    /// Function tables only. On a constructor, errors with
+    /// `WrongSubtype` — use [`Read::eclass_of`] instead.
     fn lookup<K: IntoRow>(&self, name: &str, key: K) -> Result<Option<Id>, Error> {
         let action = lookup_action(self.registry(), name)?;
         check_subtype(name, &action, TableKind::Function, "function")?;
@@ -277,11 +260,11 @@ pub trait Read<'a, 'db: 'a>: Core<'a, 'db> + RegistrySealed<'a, 'db> {
             .map(|v| Id::new(v, sort)))
     }
 
-    /// Look up a constructor's eclass at the given inputs, without
-    /// minting a fresh one on miss. Returns `Ok(None)` if absent.
+    /// Read a constructor row's eclass without minting on miss.
+    /// Returned [`Id`] carries the constructor's output sort.
     ///
-    /// **Only valid for constructor tables.** Functions error;
-    /// use [`Read::lookup`] for those.
+    /// Constructor / relation tables only. On a function, errors
+    /// with `WrongSubtype` — use [`Read::lookup`] instead.
     fn eclass_of<K: IntoRow>(
         &self,
         name: &str,
@@ -306,8 +289,7 @@ pub trait Read<'a, 'db: 'a>: Core<'a, 'db> + RegistrySealed<'a, 'db> {
         }))
     }
 
-    /// True iff a row with the given key exists in the table. Works
-    /// for any subtype — never mints.
+    /// Whether a row with the given key exists. Any subtype; never mints.
     fn contains<K: IntoRow>(
         &self,
         name: &str,
@@ -320,11 +302,9 @@ pub trait Read<'a, 'db: 'a>: Core<'a, 'db> + RegistrySealed<'a, 'db> {
         Ok(action.lookup(self.es(), &key_values).is_some())
     }
 
-    /// Untyped-key lookup escape hatch — accepts any [`Id`]s as
-    /// inputs (sort tags ignored), but the returned [`Id`] still
-    /// carries the table's declared output sort tag. Use when the
-    /// caller has already-constructed [`Id`]s and doesn't want the
-    /// typed [`Read::lookup`] input-side sort check.
+    /// Lookup with input sort-checking disabled. Returned [`Id`]
+    /// still carries the output sort tag. Use when the caller's
+    /// inputs lack reliable sort tags (e.g., from `Vec<Id>` rows).
     fn lookup_raw(&self, name: &str, key: &[Id]) -> Result<Option<Id>, Error> {
         let action = lookup_action(self.registry(), name)?;
         let raw: Vec<Value> = key.iter().map(|id| id.value()).collect();
@@ -349,20 +329,13 @@ pub trait Read<'a, 'db: 'a>: Core<'a, 'db> + RegistrySealed<'a, 'db> {
     }
 }
 
-/// Action-side write methods — name-indexed inserts/removes/subsumes
-/// plus union and panic. Implemented for [`WriteState`] and
-/// [`FullState`]; *not* for [`PureState`] or [`ReadState`].
-///
-/// Misuse (wrong table subtype, wrong arity, mismatched column or
-/// output sort, cross-sort union) is reported as [`crate::ApiError`]
-/// via the method's `Result`.
+/// Write-side methods — name-indexed inserts/removes/subsumes plus
+/// union and panic. Implemented for [`WriteState`] and [`FullState`].
+/// All methods return `Result`; misuse surfaces as [`crate::ApiError`].
 #[allow(private_bounds)]
 pub trait Write<'a, 'db: 'a>: Core<'a, 'db> + RegistrySealed<'a, 'db> {
-    /// Set a function table's value at the given key — mirrors the
-    /// egglog `(set (f k) v)` action.
-    ///
-    /// **Only valid for `function` tables.** Constructors error;
-    /// use [`Write::add_node`] for those.
+    /// `(set (f k) v)`. Function tables only — constructors error
+    /// (use [`Write::add_node`]).
     fn set<K: IntoRow, V: IntoColumn>(
         &mut self,
         name: &str,
@@ -381,13 +354,9 @@ pub trait Write<'a, 'db: 'a>: Core<'a, 'db> + RegistrySealed<'a, 'db> {
         Ok(())
     }
 
-    /// Mint or look up an eclass for a constructor — mirrors the
-    /// egglog `(Cons k1 k2 ...)` expression form. Pass inputs only;
-    /// the output eclass is minted (or returned if a row with these
-    /// inputs already exists).
-    ///
-    /// **Only valid for constructor tables.** Functions error;
-    /// use [`Write::set`] for those.
+    /// `(Cons k1 k2 ...)` — mint or look up a constructor's eclass.
+    /// Constructor / relation tables only — functions error (use
+    /// [`Write::set`]). Returned [`Id`] carries the output sort.
     fn add_node<R: IntoRow>(
         &mut self,
         name: &str,

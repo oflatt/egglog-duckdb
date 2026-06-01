@@ -369,3 +369,57 @@ fn test_extract_unknown_base_sort_errors() -> Result<(), Error> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------
+// Sort-tag propagation through reads.
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_lookup_returns_id_with_output_sort() -> Result<(), Error> {
+    let mut eg = EGraph::default();
+    eg.parse_and_run_program(None, "(function len (String) i64 :no-merge)")?;
+    eg.with_full_state(|mut fs| fs.set("len", ("hi".to_string(),), 2_i64))?;
+
+    let id = eg
+        .with_full_state(|fs| fs.lookup("len", "hi".to_string()))?
+        .unwrap();
+    assert_eq!(id.sort(), "i64");
+    // Extracting as i64 succeeds, as String errors.
+    assert_eq!(eg.extract::<i64>(id.clone())?, 2);
+    let err = eg.extract::<egglog::sort::S>(id).unwrap_err().to_string();
+    assert!(err.contains("expected sort `String`"), "got: {err}");
+    Ok(())
+}
+
+#[test]
+fn test_eclass_of_returns_id_with_output_sort() -> Result<(), Error> {
+    let mut eg = EGraph::default();
+    eg.parse_and_run_program(None, "(datatype Math (Num i64))")?;
+    let math = eg.with_full_state(|mut fs| fs.add_node("Num", 7_i64))?;
+    assert_eq!(math.sort(), "Math", "add_node tags the returned Id");
+
+    let looked = eg
+        .with_full_state(|fs| fs.eclass_of("Num", 7_i64))?
+        .unwrap();
+    assert_eq!(looked.sort(), "Math", "eclass_of tags the returned Id");
+    assert_eq!(looked.value(), math.value());
+    Ok(())
+}
+
+#[test]
+fn test_lookup_raw_preserves_output_sort() -> Result<(), Error> {
+    let mut eg = EGraph::default();
+    eg.parse_and_run_program(None, "(function f (i64) i64 :no-merge)")?;
+    eg.with_full_state(|mut fs| fs.set("f", (1_i64,), 99_i64))?;
+
+    // Pass an Id with an empty sort tag (unchecked input). The
+    // returned Id should still carry the table's declared output
+    // sort tag.
+    let key_id = eg.intern::<i64>(1)?;
+    let raw_key = egglog::Id::new(key_id.value(), "");
+    let id = eg
+        .with_full_state(|fs| fs.lookup_raw("f", &[raw_key]))?
+        .unwrap();
+    assert_eq!(id.sort(), "i64");
+    Ok(())
+}

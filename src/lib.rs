@@ -7,21 +7,7 @@
 //! - **Tutorial:** [text](https://egraphs-good.github.io/egglog-tutorial/01-basics.html),
 //!   [video (slightly outdated)](https://www.youtube.com/watch?v=N2RDQGRBrSY).
 //! - **Egglog language reference:** [`Command`].
-//! - **Using egglog from Rust:** see [`prelude`] — it's the entry point
-//!   for everything below.
-//!
-//! ## Using egglog from Rust
-//!
-//! Start with `use egglog::prelude::*;`. The [`prelude`] module docs
-//! list the common entry points (declaring rules and tables, adding
-//! and reading facts, writing custom primitives, etc.) and link to
-//! the underlying types and methods.
-//!
-//! The typical workflow is: declare your program (rules, datatypes,
-//! functions) once — usually via a static egglog block passed to
-//! [`EGraph::parse_and_run_program`] — then drive the e-graph from
-//! Rust via [`EGraph::with_full_state`] and stepping rulesets with
-//! [`prelude::run_ruleset`].
+//! - **Rust API:** start at [`prelude`] — `use egglog::prelude::*;`.
 pub mod api;
 pub mod ast;
 #[cfg(feature = "bin")]
@@ -1896,15 +1882,9 @@ impl EGraph {
         self.backend.base_values().get::<T>(x)
     }
 
-    /// Extract a Rust base value from an [`Id`] without checking the
-    /// sort tag. Use [`EGraph::extract`] when you want the runtime
-    /// sort check.
-    ///
-    /// Useful for reading raw row data from
-    /// [`EGraph::table_rows::<Vec<Id>>`], whose `Id`s come back with
-    /// empty sort tags (the table-row escape hatch doesn't preserve
-    /// per-column sort metadata).
-    pub fn base<T: BaseValue>(&self, id: &Id) -> T {
+    /// Unchecked [`Id`] → Rust base value. Internal — public callers
+    /// should use [`EGraph::extract`] (sort-checked).
+    pub(crate) fn base<T: BaseValue>(&self, id: &Id) -> T {
         self.value_to_base::<T>(id.value())
     }
 
@@ -1928,19 +1908,11 @@ impl EGraph {
         })
     }
 
-    /// Intern a Rust base value into an egglog [`Id`] — a [`Value`]
-    /// tagged with the egglog sort name.
-    ///
-    /// Looks up the egglog sort name corresponding to `T` by
-    /// [`TypeId`](std::any::TypeId), so user-added base sorts work
-    /// automatically as long as their `Sort` impl returns
-    /// `Some(TypeId)` from `value_type()` (which the standard
-    /// [`crate::BaseSort`] wrapper does for you).
-    ///
-    /// Returns [`crate::ApiError::UnknownBaseSort`] if no egglog
-    /// sort has been registered for the Rust type `T`.
-    ///
-    /// # Examples
+    /// Rust base value → tagged [`Id`]. Errors with
+    /// [`ApiError::UnknownBaseSort`] if `T` has no egglog sort
+    /// registered. User-defined base sorts work automatically —
+    /// the sort name is looked up by `TypeId` from the registered
+    /// sorts.
     ///
     /// ```
     /// use egglog::prelude::*;
@@ -1950,8 +1922,8 @@ impl EGraph {
     ///     "(function f (i64) i64 :no-merge) (set (f 1) 42)",
     /// )?;
     /// let key = egraph.intern::<i64>(1)?;
-    /// let out_id = egraph.with_full_state(|fs| fs.lookup("f", key))?.unwrap();
-    /// assert_eq!(egraph.extract::<i64>(out_id)?, 42);
+    /// let out = egraph.with_full_state(|fs| fs.lookup("f", key))?.unwrap();
+    /// assert_eq!(egraph.extract::<i64>(out)?, 42);
     /// # Ok::<(), egglog::Error>(())
     /// ```
     pub fn intern<T: BaseValue>(&self, x: T) -> Result<crate::api::Id, Error> {
@@ -1968,12 +1940,10 @@ impl EGraph {
         Ok(crate::api::Id::new(value, sort_name))
     }
 
-    /// Read a Rust base value out of an [`Id`].
-    ///
-    /// Errors if no egglog sort is registered for `T`
-    /// ([`crate::ApiError::UnknownBaseSort`]) or if the `Id`'s sort
-    /// tag doesn't name the same sort as `T`
-    /// ([`crate::ApiError::WrongOutputSort`]).
+    /// Sort-checked [`Id`] → Rust base value. Errors with
+    /// [`ApiError::UnknownBaseSort`] if `T` has no registered sort,
+    /// or [`ApiError::WrongOutputSort`] if the `Id`'s sort doesn't
+    /// match.
     pub fn extract<T: BaseValue>(&self, id: crate::api::Id) -> Result<T, Error> {
         let type_id = std::any::TypeId::of::<T>();
         let sort_name = self
@@ -2057,26 +2027,16 @@ impl EGraph {
         UnionAction::new(&self.backend)
     }
 
-    /// Run `f` with a [`FullState`] handle on this EGraph's database
-    /// — the same handle a `:naive` rule's `add_rust_rule_full`
-    /// callback receives. Use to drive typed reads / writes
-    /// (`fs.set`, `fs.add_node`, `fs.lookup`, `fs.eclass_of`,
-    /// `fs.contains`, `fs.remove`, …) from outside a rule.
+    /// Run `f` with a [`FullState`] — same handle a `:naive` rule's
+    /// `add_rust_rule_full` callback gets. Use for typed reads /
+    /// writes from outside a rule.
     ///
-    /// # Flush semantics
+    /// Pending writes flush once, **after** `f` returns. So a `set`
+    /// inside the closure isn't visible to a `lookup` later in the
+    /// same closure — split write and read into separate calls.
+    /// Batching multiple writes per closure is the fast path: one
+    /// flush + rebuild covers all of them.
     ///
-    /// Pending writes flush once, **after** `f` returns. Two
-    /// consequences:
-    ///
-    /// 1. A `set` / `add_node` / `remove` inside the closure is *not*
-    ///    visible to a subsequent `lookup` / `contains` / `eclass_of`
-    ///    in the **same** closure. Split write-then-read into separate
-    ///    `with_full_state` calls.
-    /// 2. Conversely, batching multiple writes in one closure is the
-    ///    fast path — only one flush + rebuild happens, regardless of
-    ///    how many writes occurred.
-    ///
-    /// # Example
     /// ```
     /// use egglog::prelude::*;
     /// let mut eg = EGraph::default();
