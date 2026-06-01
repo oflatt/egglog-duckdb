@@ -37,7 +37,11 @@
 - **Primitive trait `apply` signatures (`PurePrim` / `WritePrim` / `ReadPrim` / `FullPrim`) use `&[Id] -> Option<Id>`** — `Id` is now the currency throughout the typed API, including primitive authoring. The bridge dispatch wrappers convert `&[Value]` → `&[Id]` (currently with empty / unchecked sort tags; per-signature input sort tagging is a future refinement) and unwrap the returned `Id` for the bridge.
 - **`Core::base<T>(&id)` / `Core::id_of<T>(x, sort)` / `Core::intern_typed<T: BaseSortName>(x)`** helpers on the state-wrapper trait for ergonomic `Id` handling inside primitive bodies. `base` extracts a Rust base value from an `Id`; `id_of` and `intern_typed` construct an `Id` from a Rust base value (the latter with the sort name baked in via the [`BaseSortName`] trait for the standard set). The lower-level `value_to_base` / `base_to_value` remain available.
 - **`BaseSortName`** trait — egglog sort name as a compile-time `const` for the standard Rust base types (`i64`, `bool`, `()`, `f64`, `String`, `BigInt`, `BigRat`). Used internally by `add_primitive!` and by `Core::intern_typed`. User-defined base sorts don't implement this — `EGraph::intern` / `EGraph::extract` look up sort names by `TypeId` at runtime.
-- `Value` stays a `pub use` re-export at the crate root, documented as the primitive-author / advanced surface. Hiding it entirely would cascade into container conversions and escape-hatch APIs (`RawValues`, `Vec<Value>: FromRow`, `IntoColumn for Value`) — deferred as a separate cleanup.
+- **`Value` is no longer re-exported from `egglog`** — `pub use core_relations::Value` was demoted to `pub(crate)`. `Id` is now the sole user-visible identifier type. Two API surfaces shifted with it:
+  - `FromRow for Vec<Value>` → `FromRow for Vec<Id>`. Untagged-row escape now yields `Id`s with empty sort tags.
+  - `Read::lookup_raw(name, &[Value]) -> Option<Value>` → `Read::lookup_raw(name, &[Id]) -> Option<Id>`. Takes / returns `Id` with empty sort tags.
+  
+  Callers needing raw `Value` access (e.g., to pass into low-level `Core::value_to_base`) can still reach it via `Id::value()` — but the type name itself is no longer publicly nameable from `egglog`. Internal users (sort impls, primitives in the `egglog` crate) continue to use `Value` via `crate::Value`. Anyone who really wants the raw type can import `core_relations::Value` directly, but it is no longer the documented path.
 
 ## [2.0.0] - 2026-02-11
 

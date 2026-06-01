@@ -2,7 +2,7 @@
 //! See `src/lib.rs` for `FromRow` and these methods.
 
 use egglog::prelude::*;
-use egglog::{Error, Value};
+use egglog::{Error, Id};
 
 /// Test 1: `eg.table_rows::<(i64, i64)>("f")` returns all rows of a
 /// function table as typed tuples. Order is `(input..., output)`.
@@ -25,7 +25,7 @@ fn query_table_i64_to_i64() -> Result<(), Error> {
     Ok(())
 }
 
-/// `table_rows::<Vec<Value>>` is the escape hatch — useful when the
+/// `table_rows::<Vec<Id>>` is the escape hatch — useful when the
 /// schema contains eq-sort or container columns and you want raw `Value`s.
 #[test]
 fn query_table_raw_values() -> Result<(), Error> {
@@ -38,11 +38,11 @@ fn query_table_raw_values() -> Result<(), Error> {
 ",
     )?;
 
-    let rows: Vec<Vec<Value>> = egraph.table_rows::<Vec<Value>>("g")?;
+    let rows: Vec<Vec<Id>> = egraph.table_rows::<Vec<Id>>("g")?;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].len(), 2);
-    assert_eq!(egraph.value_to_base::<i64>(rows[0][0]), 5);
-    assert_eq!(egraph.value_to_base::<i64>(rows[0][1]), 50);
+    assert_eq!(egraph.value_to_base::<i64>(rows[0][0].value()), 5);
+    assert_eq!(egraph.value_to_base::<i64>(rows[0][1].value()), 50);
     Ok(())
 }
 
@@ -123,23 +123,23 @@ fn query_constructor_table_eclass_values() -> Result<(), Error> {
 ",
     )?;
 
-    let rows: Vec<Vec<Value>> = egraph.table_rows::<Vec<Value>>("Add")?;
+    let rows: Vec<Vec<Id>> = egraph.table_rows::<Vec<Id>>("Add")?;
     assert_eq!(rows.len(), 2);
     for row in &rows {
         // Two i64 inputs and one eq-sort output.
         assert_eq!(row.len(), 3);
-        let _x = egraph.value_to_base::<i64>(row[0]);
-        let _y = egraph.value_to_base::<i64>(row[1]);
-        // row[2] is an eq-sort id; we just verify we get back a Value.
-        let _: Value = row[2];
+        let _x = egraph.value_to_base::<i64>(row[0].value());
+        let _y = egraph.value_to_base::<i64>(row[1].value());
+        // row[2] is an eq-sort id; we just verify we get back an Id.
+        let _ = &row[2];
     }
 
     let mut input_pairs: Vec<(i64, i64)> = rows
         .iter()
         .map(|r| {
             (
-                egraph.value_to_base::<i64>(r[0]),
-                egraph.value_to_base::<i64>(r[1]),
+                egraph.value_to_base::<i64>(r[0].value()),
+                egraph.value_to_base::<i64>(r[1].value()),
             )
         })
         .collect();
@@ -151,7 +151,7 @@ fn query_constructor_table_eclass_values() -> Result<(), Error> {
 /// A relation table is sugar for a constructor with a synthetic
 /// non-unionable eq-sort output. `EGraph::table_rows` does not
 /// special-case relations — it returns whatever the backend stores,
-/// which is `(input..., eclass)`. Use `Vec<Value>` (or `query` which
+/// which is `(input..., eclass)`. Use `Vec<Id>` (or `query` which
 /// binds only the inputs you name) to inspect such rows.
 #[test]
 fn query_relation_exposes_synthetic_output() -> Result<(), Error> {
@@ -167,7 +167,7 @@ fn query_relation_exposes_synthetic_output() -> Result<(), Error> {
 
     // The backend stores the synthetic eclass column, so the row has
     // 2 columns: the i64 input + the eclass Value.
-    let raw: Vec<Vec<Value>> = egraph.table_rows::<Vec<Value>>("R")?;
+    let raw: Vec<Vec<Id>> = egraph.table_rows::<Vec<Id>>("R")?;
     for row in &raw {
         assert_eq!(row.len(), 2, "relation row exposes (input, eclass)");
     }
@@ -224,7 +224,7 @@ fn query_missing_table_errors() {
 }
 
 /// Test: the legacy free `query()` helper still works (it just goes
-/// through `EGraph::query::<Vec<Value>>` internally now).
+/// through `EGraph::query::<Vec<Id>>` internally now).
 #[test]
 #[allow(deprecated)]
 fn legacy_query_still_works() -> Result<(), Error> {
@@ -239,7 +239,10 @@ fn legacy_query_still_works() -> Result<(), Error> {
 
     let results = query(&mut egraph, vars![x: i64, y: i64], facts![(= (f x) y)])?;
     assert!(results.any_matches());
-    let rows: Vec<&[Value]> = results.iter().collect();
+    // Legacy `query()` yields untyped slices; let inference name the
+    // inner type so the test doesn't need to mention the (now
+    // `pub(crate)`) raw `Value` type.
+    let rows: Vec<_> = results.iter().collect();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].len(), 2);
     assert_eq!(egraph.value_to_base::<i64>(rows[0][0]), 1);

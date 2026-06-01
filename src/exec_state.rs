@@ -184,7 +184,7 @@ pub trait Core<'a, 'db: 'a>: Internal<'a, 'db> {
 
     /// Construct an [`Id`] from a Rust base value whose sort name is
     /// known at compile time via [`BaseSortName`]. Shorthand for
-    /// `id_of(x, T::SORT_NAME)`. Used by the [`add_primitive!`] macro
+    /// `id_of(x, T::SORT_NAME)`. Used by the `add_primitive!` macro
     /// and other internals to produce return [`Id`]s without
     /// duplicating the sort name string.
     fn intern_typed<T: BaseSortName>(&self, x: T) -> Id {
@@ -296,12 +296,15 @@ pub trait Read<'a, 'db: 'a>: Core<'a, 'db> + RegistrySealed<'a, 'db> {
         Ok(action.lookup(self.es(), &key_values).is_some())
     }
 
-    /// Untyped raw-`Value` lookup, escape hatch for code that already
-    /// has `&[Value]` and doesn't want to round-trip through
-    /// [`Read::lookup`]'s base-value conversion. Skips sort checking.
-    fn lookup_raw(&self, name: &str, key: &[Value]) -> Result<Option<Value>, Error> {
+    /// Untyped lookup escape hatch — takes a raw `&[Id]` (each `Id`'s
+    /// underlying value is used as-is, sort tags are ignored) and
+    /// returns the row's output as an `Id` with no sort tag. Use when
+    /// the caller has already-constructed [`Id`]s and doesn't want
+    /// the typed [`Read::lookup`] sort check.
+    fn lookup_raw(&self, name: &str, key: &[Id]) -> Result<Option<Id>, Error> {
         let action = lookup_action(self.registry(), name)?;
-        Ok(action.lookup(self.es(), key))
+        let raw: Vec<Value> = key.iter().map(|id| id.value()).collect();
+        Ok(action.lookup(self.es(), &raw).map(|v| Id::new(v, "")))
     }
 
     /// Return the current row count for the named table, or `None` if no table

@@ -247,9 +247,13 @@ impl IntoRow for RawValues {
     }
 }
 
-impl FromRow for Vec<Value> {
+impl FromRow for Vec<Id> {
     fn from_values(values: &[Value], _bv: &BaseValues) -> Self {
-        values.to_vec()
+        // Sort tags are not known at decode time — table_rows passes
+        // raw values from the bridge with no per-column sort
+        // metadata. Callers who need typed sorts should use the
+        // tuple impls instead.
+        values.iter().map(|v| Id::new(*v, "")).collect()
     }
 }
 

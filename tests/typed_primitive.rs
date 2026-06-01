@@ -17,7 +17,7 @@ use egglog::constraint::{SimpleTypeConstraint, TypeConstraint};
 use egglog::sort::{I64Sort, S, StringSort};
 use egglog::{
     Core, EGraph, FullPrim, FullState, Id, Primitive, PurePrim, PureState, Read, ReadPrim,
-    ReadState, Value, WritePrim, WriteState, prelude::*,
+    ReadState, WritePrim, WriteState, prelude::*,
 };
 
 // --- shared test fixtures ---
@@ -98,12 +98,7 @@ impl Primitive for ReadLookup {
 }
 impl ReadPrim for ReadLookup {
     fn apply<'a, 'db>(&self, state: ReadState<'a, 'db>, args: &[Id]) -> Option<Id> {
-        let raw: Vec<Value> = args.iter().map(|id| id.value()).collect();
-        state
-            .lookup_raw(self.table_name, &raw)
-            .ok()
-            .flatten()
-            .map(|v| Id::new(v, "i64"))
+        state.lookup_raw(self.table_name, args).ok().flatten()
     }
 }
 
