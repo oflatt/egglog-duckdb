@@ -298,3 +298,65 @@ fn test_string_inputs() -> Result<(), Error> {
     assert_eq!(got, Some(5));
     Ok(())
 }
+
+// ---------------------------------------------------------------------
+// Dynamic type-error tests for the EGraph::intern / extract path.
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_intern_roundtrip() -> Result<(), Error> {
+    let eg = EGraph::default();
+    let id = eg.intern::<i64>(42)?;
+    assert_eq!(id.sort(), "i64");
+    assert_eq!(eg.extract::<i64>(id)?, 42);
+    Ok(())
+}
+
+#[test]
+fn test_extract_wrong_sort_errors() -> Result<(), Error> {
+    let eg = EGraph::default();
+    // Intern as String, try to extract as i64 — sort mismatch should error.
+    let s_id = eg.intern::<egglog::sort::S>(egglog::sort::S::new("hello".to_string()))?;
+    let result = eg.extract::<i64>(s_id);
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("expected sort `i64`") && err.contains("got value of sort `String`"),
+        "got: {err}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_intern_unknown_base_sort_errors() {
+    // Make a fresh BaseValue Rust type with no egglog sort registered.
+    #[derive(Clone, Hash, PartialEq, Eq, Debug)]
+    struct MyCustomBase(i64);
+    impl egglog::BaseValue for MyCustomBase {}
+
+    let eg = EGraph::default();
+    let result = eg.intern::<MyCustomBase>(MyCustomBase(7));
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("MyCustomBase") && err.contains("no egglog sort is registered"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_extract_unknown_base_sort_errors() -> Result<(), Error> {
+    #[derive(Clone, Hash, PartialEq, Eq, Debug)]
+    struct AnotherCustom(bool);
+    impl egglog::BaseValue for AnotherCustom {}
+
+    let eg = EGraph::default();
+    // We have a valid Id from an i64 intern, but we'll try to extract
+    // as a type that has no registered sort.
+    let id = eg.intern::<i64>(0)?;
+    let result = eg.extract::<AnotherCustom>(id);
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("AnotherCustom") && err.contains("no egglog sort is registered"),
+        "got: {err}"
+    );
+    Ok(())
+}

@@ -71,7 +71,7 @@ pub use egglog::ast::{Action, Fact, Facts, GenericActions, RustSpan, Span};
 pub use egglog::sort::{BigIntSort, BigRatSort, BoolSort, F64Sort, I64Sort, StringSort, UnitSort};
 pub use egglog::{CommandMacro, CommandMacroRegistry};
 pub use egglog::{Core, FullState, PureState, Read, ReadState, Write, WriteState};
-pub use egglog::{EGraph, span};
+pub use egglog::{EGraph, Id, span};
 pub use egglog::{action, actions, datatype, expr, fact, facts, sort, vars};
 
 /// Trait for types that can be converted to/from Literal for use in validated primitives.
@@ -352,9 +352,9 @@ macro_rules! actions {
 ///     facts![(= (fib (unquote exprs::int(big_number))) f)],
 /// )?;
 ///
-/// let y = egraph.base_to_value::<i64>(6765);
 /// let results: Vec<_> = results.iter().collect();
-/// assert_eq!(results, [[y]]);
+/// assert_eq!(results.len(), 1);
+/// assert_eq!(egraph.base::<i64>(&Id::new(results[0][0], "")), 6765);
 ///
 /// # Ok::<(), egglog::Error>(())
 /// ```
@@ -506,9 +506,9 @@ where
 ///     facts![(= (fib (unquote exprs::int(big_number))) f)],
 /// )?;
 ///
-/// let y = egraph.base_to_value::<i64>(6765);
 /// let results: Vec<_> = results.iter().collect();
-/// assert_eq!(results, [[y]]);
+/// assert_eq!(results.len(), 1);
+/// assert_eq!(egraph.base::<i64>(&Id::new(results[0][0], "")), 6765);
 ///
 /// # Ok::<(), egglog::Error>(())
 /// ```
@@ -715,10 +715,10 @@ impl QueryResult {
 ///     ],
 /// )?;
 ///
-/// let x = egraph.base_to_value::<i64>(7);
-/// let y = egraph.base_to_value::<i64>(13);
 /// let results: Vec<_> = results.iter().collect();
-/// assert_eq!(results, [[x, y]]);
+/// assert_eq!(results.len(), 1);
+/// assert_eq!(egraph.base::<i64>(&Id::new(results[0][0], "")), 7);
+/// assert_eq!(egraph.base::<i64>(&Id::new(results[0][1], "")), 13);
 ///
 /// # Ok::<(), egglog::Error>(())
 /// ```

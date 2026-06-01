@@ -1882,18 +1882,30 @@ impl EGraph {
         &self.overall_run_report
     }
 
-    /// Convert from an egglog value to a Rust type. Untyped — does
-    /// not check whether `x` actually belongs to sort `T`. Prefer
-    /// [`EGraph::extract`] which validates the [`Id`]'s sort tag.
-    pub fn value_to_base<T: BaseValue>(&self, x: Value) -> T {
+    /// Convert from an egglog value to a Rust type. Internal — the
+    /// public [`Id`]-typed alternatives are [`EGraph::base`]
+    /// (unchecked) and [`EGraph::extract`] (sort-checked).
+    pub(crate) fn value_to_base<T: BaseValue>(&self, x: Value) -> T {
         self.backend.base_values().unwrap::<T>(x)
     }
 
-    /// Convert from a Rust type to an egglog value. Untyped — for
-    /// the typed API entry point use [`EGraph::intern`] which returns
-    /// an [`Id`] tagged with the egglog sort.
-    pub fn base_to_value<T: BaseValue>(&self, x: T) -> Value {
+    /// Convert from a Rust type to an egglog value. Internal — for
+    /// the public typed entry point use [`EGraph::intern`] which
+    /// returns an [`Id`] tagged with the egglog sort.
+    pub(crate) fn base_to_value<T: BaseValue>(&self, x: T) -> Value {
         self.backend.base_values().get::<T>(x)
+    }
+
+    /// Extract a Rust base value from an [`Id`] without checking the
+    /// sort tag. Use [`EGraph::extract`] when you want the runtime
+    /// sort check.
+    ///
+    /// Useful for reading raw row data from
+    /// [`EGraph::table_rows::<Vec<Id>>`], whose `Id`s come back with
+    /// empty sort tags (the table-row escape hatch doesn't preserve
+    /// per-column sort metadata).
+    pub fn base<T: BaseValue>(&self, id: &Id) -> T {
+        self.value_to_base::<T>(id.value())
     }
 
     /// Convert from an egglog value to a reference of a Rust container type.

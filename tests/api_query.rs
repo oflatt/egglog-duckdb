@@ -41,8 +41,8 @@ fn query_table_raw_values() -> Result<(), Error> {
     let rows: Vec<Vec<Id>> = egraph.table_rows::<Vec<Id>>("g")?;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].len(), 2);
-    assert_eq!(egraph.value_to_base::<i64>(rows[0][0].value()), 5);
-    assert_eq!(egraph.value_to_base::<i64>(rows[0][1].value()), 50);
+    assert_eq!(egraph.base::<i64>(&rows[0][0]), 5);
+    assert_eq!(egraph.base::<i64>(&rows[0][1]), 50);
     Ok(())
 }
 
@@ -128,8 +128,8 @@ fn query_constructor_table_eclass_values() -> Result<(), Error> {
     for row in &rows {
         // Two i64 inputs and one eq-sort output.
         assert_eq!(row.len(), 3);
-        let _x = egraph.value_to_base::<i64>(row[0].value());
-        let _y = egraph.value_to_base::<i64>(row[1].value());
+        let _x = egraph.base::<i64>(&row[0]);
+        let _y = egraph.base::<i64>(&row[1]);
         // row[2] is an eq-sort id; we just verify we get back an Id.
         let _ = &row[2];
     }
@@ -138,8 +138,8 @@ fn query_constructor_table_eclass_values() -> Result<(), Error> {
         .iter()
         .map(|r| {
             (
-                egraph.value_to_base::<i64>(r[0].value()),
-                egraph.value_to_base::<i64>(r[1].value()),
+                egraph.base::<i64>(&r[0]),
+                egraph.base::<i64>(&r[1]),
             )
         })
         .collect();
@@ -239,13 +239,13 @@ fn legacy_query_still_works() -> Result<(), Error> {
 
     let results = query(&mut egraph, vars![x: i64, y: i64], facts![(= (f x) y)])?;
     assert!(results.any_matches());
-    // Legacy `query()` yields untyped slices; let inference name the
-    // inner type so the test doesn't need to mention the (now
-    // `pub(crate)`) raw `Value` type.
+    // Legacy `query()` yields untyped slices; wrap each raw value
+    // in an `Id` (sort tag is just the empty string — unchecked) and
+    // go through the typed `EGraph::base` accessor.
     let rows: Vec<_> = results.iter().collect();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].len(), 2);
-    assert_eq!(egraph.value_to_base::<i64>(rows[0][0]), 1);
-    assert_eq!(egraph.value_to_base::<i64>(rows[0][1]), 42);
+    assert_eq!(egraph.base::<i64>(&Id::new(rows[0][0], "")), 1);
+    assert_eq!(egraph.base::<i64>(&Id::new(rows[0][1], "")), 42);
     Ok(())
 }
