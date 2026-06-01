@@ -1950,8 +1950,8 @@ impl EGraph {
     ///     "(function f (i64) i64 :no-merge) (set (f 1) 42)",
     /// )?;
     /// let key = egraph.intern::<i64>(1)?;
-    /// let out: Option<i64> = egraph.with_full_state(|fs| fs.lookup::<_, i64>("f", key))?;
-    /// assert_eq!(out, Some(42));
+    /// let out_id = egraph.with_full_state(|fs| fs.lookup("f", key))?.unwrap();
+    /// assert_eq!(egraph.extract::<i64>(out_id)?, 42);
     /// # Ok::<(), egglog::Error>(())
     /// ```
     pub fn intern<T: BaseValue>(&self, x: T) -> Result<crate::api::Id, Error> {
@@ -2082,8 +2082,8 @@ impl EGraph {
     /// let mut eg = EGraph::default();
     /// eg.parse_and_run_program(None, "(function f (i64) i64 :no-merge)")?;
     /// eg.with_full_state(|mut fs| fs.set("f", (1_i64,), 42_i64))?;
-    /// let got: Option<i64> = eg.with_full_state(|fs| fs.lookup::<_, i64>("f", 1_i64))?;
-    /// assert_eq!(got, Some(42));
+    /// let id = eg.with_full_state(|fs| fs.lookup("f", 1_i64))?.unwrap();
+    /// assert_eq!(eg.extract::<i64>(id)?, 42);
     /// # Ok::<(), egglog::Error>(())
     /// ```
     pub fn with_full_state<R>(&mut self, f: impl FnOnce(FullState<'_, '_>) -> R) -> R {
@@ -2097,63 +2097,81 @@ impl EGraph {
         result
     }
 
-    /// Iterate all rows of a named table as typed tuples.
+    /// Iterate all rows of a named table. Each row comes back as a
+    /// `Vec<Id>` with one `Id` per column, tagged with the column's
+    /// declared sort.
     ///
-    /// The row shape matches what the backend stores, which differs
-    /// by subtype:
+    /// Row shape differs by table subtype:
     ///
     /// - **Function tables** (`(function f (i64) i64 :no-merge)`) — rows
-    ///   are `(input..., output)`. `table_rows::<(i64, i64)>("f")` gets
-    ///   `(key, value)`.
+    ///   are `[input..., output]`.
     /// - **Constructor / relation tables** (`(constructor Cons (i64 List) List)`,
-    ///   `(relation R (i64))`) — rows are `(input..., eclass)` where
-    ///   `eclass` is the minted eclass `Value`. Relations desugar to
-    ///   constructors with a synthetic non-unionable eq-sort output, so
-    ///   their rows also expose the trailing eclass column — there is
-    ///   no special-casing for relations.
+    ///   `(relation R (i64))`) — rows are `[input..., eclass]`. Relations
+    ///   desugar to constructors with a synthetic non-unionable eq-sort
+    ///   output, so they also expose the trailing eclass column — there
+    ///   is no special-casing for relations.
     ///
-    /// Use `Vec<Value>` to inspect arbitrary shapes, or
-    /// [`EGraph::query`] to bind only the columns you name.
-    pub fn table_rows<R: FromRow>(&self, table: &str) -> Result<Vec<R>, Error> {
+    /// Use [`EGraph::query`] to bind only specific columns.
+    pub fn table_rows(&self, table: &str) -> Result<Vec<Vec<Id>>, Error> {
         let func = self.functions.get(table).ok_or_else(|| {
             Error::TypeError(TypeError::UnboundFunction(table.to_string(), span!()))
         })?;
         let backend_id = func.backend_id;
-        let bv = self.backend.base_values();
+        // Sort name per column, lifted from the function's input + output schema.
+        let sort_names: Vec<std::sync::Arc<str>> = func
+            .schema
+            .input
+            .iter()
+            .chain([&func.schema.output])
+            .map(|s| std::sync::Arc::<str>::from(s.name()))
+            .collect();
         let mut out = Vec::new();
         self.backend.for_each(backend_id, |row| {
-            out.push(R::from_values(row.vals, bv));
+            let ids = row
+                .vals
+                .iter()
+                .zip(sort_names.iter())
+                .map(|(v, s)| Id::new(*v, s.clone()))
+                .collect();
+            out.push(ids);
         });
         Ok(out)
     }
 
     /// Run a pattern query: bind the variables in `vars` against
-    /// `facts` and return one typed row per match.
+    /// `facts` and return one row per match. Each returned row is a
+    /// `Vec<Id>` with one `Id` per variable in `vars`, tagged with
+    /// that variable's declared sort.
     ///
-    /// With zero vars, returns one empty `R` per match (so `Vec<()>`
-    /// has length = number of matches).
-    pub fn query<R: FromRow>(
+    /// With zero vars, returns one empty `Vec<Id>` per match.
+    pub fn query(
         &mut self,
         vars: &[(&str, ArcSort)],
         facts: ast::Facts<String, String>,
-    ) -> Result<Vec<R>, Error> {
+    ) -> Result<Vec<Vec<Id>>, Error> {
+        let var_sorts: Vec<std::sync::Arc<str>> = vars
+            .iter()
+            .map(|(_, s)| std::sync::Arc::<str>::from(s.name()))
+            .collect();
         let raw = prelude::query(self, vars, facts)?;
-        let bv = self.backend.base_values();
         if vars.is_empty() {
-            // QueryResult::iter() panics on cols == 0; use rows count.
             let n = if raw.any_matches() { 1 } else { 0 };
-            Ok((0..n).map(|_| R::from_values(&[], bv)).collect())
+            Ok((0..n).map(|_| Vec::new()).collect())
         } else {
-            Ok(raw.iter().map(|row| R::from_values(row, bv)).collect())
+            Ok(raw
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .zip(var_sorts.iter())
+                        .map(|(v, s)| Id::new(*v, s.clone()))
+                        .collect()
+                })
+                .collect())
         }
     }
-
-
 }
 
-pub use crate::api::{
-    ApiError, BaseSortName, ColumnSort, FromColumn, FromRow, Id, IntoColumn, IntoRow, RawValues,
-};
+pub use crate::api::{ApiError, BaseSortName, ColumnSort, Id, IntoColumn, IntoRow, RawValues};
 
 struct BackendRule<'a> {
     rb: egglog_bridge::RuleBuilder<'a>,

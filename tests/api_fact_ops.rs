@@ -20,7 +20,10 @@ fn make_eg_with_function() -> EGraph {
 fn test_set_then_lookup_function() -> Result<(), Error> {
     let mut eg = make_eg_with_function();
     eg.with_full_state(|mut fs| fs.set("f", (1_i64,), 42_i64))?;
-    let got: Option<i64> = eg.with_full_state(|fs| fs.lookup::<_, i64>("f", 1_i64))?;
+    let got = eg.with_full_state(|fs| -> Result<_, Error> {
+        let id = fs.lookup("f", 1_i64)?;
+        Ok(id.map(|id| fs.extract::<i64>(&id)).transpose()?)
+    })?;
     assert_eq!(got, Some(42));
     Ok(())
 }
@@ -28,8 +31,8 @@ fn test_set_then_lookup_function() -> Result<(), Error> {
 #[test]
 fn test_lookup_missing_returns_none() -> Result<(), Error> {
     let mut eg = make_eg_with_function();
-    let got: Option<i64> = eg.with_full_state(|fs| fs.lookup::<_, i64>("f", 999_i64))?;
-    assert_eq!(got, None);
+    let got = eg.with_full_state(|fs| fs.lookup("f", 999_i64))?;
+    assert!(got.is_none());
     Ok(())
 }
 
@@ -163,7 +166,7 @@ fn test_lookup_on_constructor_errors() {
     let mut eg = EGraph::default();
     eg.parse_and_run_program(None, "(datatype List (Cons i64 List) (Nil))")
         .unwrap();
-    let result = eg.with_full_state(|fs| fs.lookup::<_, i64>("Cons", (1_i64, 0_i64)));
+    let result = eg.with_full_state(|fs| fs.lookup("Cons", (1_i64, 0_i64)));
     let err = result.unwrap_err().to_string();
     assert!(err.contains("Cons") && err.contains("constructor"), "got: {err}");
 }
@@ -254,7 +257,10 @@ fn test_union_sort_mismatch_errors() -> Result<(), Error> {
 fn test_set_replaces_function_value() -> Result<(), Error> {
     let mut eg = make_eg_with_function();
     eg.with_full_state(|mut fs| fs.set("f", (5_i64,), 50_i64))?;
-    let got: Option<i64> = eg.with_full_state(|fs| fs.lookup::<_, i64>("f", 5_i64))?;
+    let got = eg.with_full_state(|fs| -> Result<_, Error> {
+        let id = fs.lookup("f", 5_i64)?;
+        Ok(id.map(|id| fs.extract::<i64>(&id)).transpose()?)
+    })?;
     assert_eq!(got, Some(50));
     Ok(())
 }
@@ -269,7 +275,7 @@ fn test_set_unknown_table_errors() {
 #[test]
 fn test_lookup_unknown_table_errors() {
     let mut eg = EGraph::default();
-    let result = eg.with_full_state(|fs| fs.lookup::<_, i64>("nope", 1_i64));
+    let result = eg.with_full_state(|fs| fs.lookup("nope", 1_i64));
     assert!(result.is_err());
 }
 
@@ -279,7 +285,8 @@ fn test_higher_arity_function() -> Result<(), Error> {
     eg.parse_and_run_program(None, "(function g (i64 i64 i64) i64 :no-merge)")?;
     eg.with_full_state(|mut fs| fs.set("g", (1_i64, 2_i64, 3_i64), 7_i64))?;
     let (v, has) = eg.with_full_state(|fs| -> Result<_, Error> {
-        let v: Option<i64> = fs.lookup::<_, i64>("g", (1_i64, 2_i64, 3_i64))?;
+        let id = fs.lookup("g", (1_i64, 2_i64, 3_i64))?;
+        let v = id.map(|id| fs.extract::<i64>(&id)).transpose()?;
         let has = fs.contains("g", (1_i64, 2_i64, 3_i64))?;
         Ok((v, has))
     })?;
@@ -293,8 +300,10 @@ fn test_string_inputs() -> Result<(), Error> {
     let mut eg = EGraph::default();
     eg.parse_and_run_program(None, "(function name-length (String) i64 :no-merge)")?;
     eg.with_full_state(|mut fs| fs.set("name-length", ("hello".to_string(),), 5_i64))?;
-    let got: Option<i64> =
-        eg.with_full_state(|fs| fs.lookup::<_, i64>("name-length", "hello".to_string()))?;
+    let got = eg.with_full_state(|fs| -> Result<_, Error> {
+        let id = fs.lookup("name-length", "hello".to_string())?;
+        Ok(id.map(|id| fs.extract::<i64>(&id)).transpose()?)
+    })?;
     assert_eq!(got, Some(5));
     Ok(())
 }

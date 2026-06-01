@@ -1,19 +1,21 @@
 //! Typed row encoding for the [`crate::EGraph`] surface API.
 //!
-//! [`IntoRow`] / [`IntoColumn`] convert Rust values into egglog row data on
-//! the way *in* (insert, lookup keys, query patterns).  [`FromRow`] /
-//! [`FromColumn`] convert row data back into Rust values on the way *out*
-//! (lookup return values, query iteration).
+//! [`IntoRow`] / [`IntoColumn`] convert Rust values into egglog row
+//! data on the way *in* (insert, lookup keys, query patterns). Reads
+//! always come back as `Vec<Id>` (or `Option<Id>` for single-result
+//! reads), with each [`Id`] tagged with the column's declared sort —
+//! users don't supply a Rust output type at the read site. Convert
+//! an [`Id`] to a Rust base value via [`crate::EGraph::extract::<T>`]
+//! at the system boundary.
 //!
 //! Every input column carries a runtime [`ColumnSort`] tag. The trait
 //! methods that consume rows ([`crate::Read::lookup`],
 //! [`crate::Write::set`], etc.) validate each column's tag against the
 //! table's declared schema and return [`crate::ApiError::WrongColumnSort`]
 //! on mismatch. Base values (`i64`, `String`, `f64`, …) tag with the
-//! corresponding egglog sort name automatically; eclass ids must come
-//! through the [`Id`] wrapper, which pairs a [`Value`] with a runtime
-//! sort name. [`Value`] itself participates as an unchecked escape
-//! hatch ([`ColumnSort::Unchecked`]).
+//! corresponding egglog sort name automatically; eclass ids and base
+//! values held by users come through the [`Id`] wrapper, which pairs
+//! a value with a runtime sort name.
 
 use std::sync::Arc;
 
@@ -208,28 +210,6 @@ pub trait IntoColumn: sealed::Sealed {
 }
 
 // ---------------------------------------------------------------------
-// Output side: FromRow + FromColumn
-// ---------------------------------------------------------------------
-
-/// Convert a row of egglog [`Value`]s back into a Rust value.
-///
-/// Implemented for:
-/// - `()` — discards the row, useful for "did this match" queries.
-/// - A bare [`FromColumn`] type — extracts a single column.
-/// - Tuples up to arity 8 of [`FromColumn`] types.
-/// - `Vec<Value>` as an escape hatch for rows with non-base columns.
-pub trait FromRow: Sized {
-    fn from_values(values: &[Value], bv: &BaseValues) -> Self;
-}
-
-/// A single column of an egglog row, on the output side.
-///
-/// This is a sealed trait — additional impls live in the egglog crate.
-pub trait FromColumn: sealed::Sealed {
-    fn from_value(value: Value, bv: &BaseValues) -> Self;
-}
-
-// ---------------------------------------------------------------------
 // Escape hatch: RawValues
 // ---------------------------------------------------------------------
 
@@ -247,22 +227,8 @@ impl IntoRow for RawValues {
     }
 }
 
-impl FromRow for Vec<Id> {
-    fn from_values(values: &[Value], _bv: &BaseValues) -> Self {
-        // Sort tags are not known at decode time — table_rows passes
-        // raw values from the bridge with no per-column sort
-        // metadata. Callers who need typed sorts should use the
-        // tuple impls instead.
-        values.iter().map(|v| Id::new(*v, "")).collect()
-    }
-}
-
-impl FromRow for () {
-    fn from_values(_values: &[Value], _bv: &BaseValues) -> Self {}
-}
-
 // ---------------------------------------------------------------------
-// Base column impls — symmetric for IntoColumn / FromColumn
+// Base column impls
 // ---------------------------------------------------------------------
 
 macro_rules! impl_column_for_base {
@@ -275,11 +241,6 @@ macro_rules! impl_column_for_base {
                 }
                 fn column_sort(&self) -> ColumnSort {
                     ColumnSort::Named(Arc::from($sort_name))
-                }
-            }
-            impl FromColumn for $ty {
-                fn from_value(value: Value, bv: &BaseValues) -> Self {
-                    bv.unwrap::<$ty>(value)
                 }
             }
         )+
@@ -306,12 +267,6 @@ impl IntoColumn for String {
         ColumnSort::Named(Arc::from("String"))
     }
 }
-impl FromColumn for String {
-    fn from_value(value: Value, bv: &BaseValues) -> Self {
-        bv.unwrap::<sort::S>(value).0
-    }
-}
-
 // `&str` is one-directional input sugar.
 impl sealed::Sealed for &str {}
 impl IntoColumn for &str {
@@ -334,12 +289,6 @@ impl IntoColumn for f64 {
         ColumnSort::Named(Arc::from("f64"))
     }
 }
-impl FromColumn for f64 {
-    fn from_value(value: Value, bv: &BaseValues) -> Self {
-        bv.unwrap::<sort::F>(value).0.0
-    }
-}
-
 // `Id` carries its sort tag from construction.
 impl sealed::Sealed for Id {}
 impl IntoColumn for Id {
@@ -361,12 +310,6 @@ impl IntoColumn for Value {
         ColumnSort::Unchecked
     }
 }
-impl FromColumn for Value {
-    fn from_value(value: Value, _bv: &BaseValues) -> Self {
-        value
-    }
-}
-
 // ---------------------------------------------------------------------
 // Single-column blanket impls
 // ---------------------------------------------------------------------
@@ -380,11 +323,9 @@ impl<A: IntoColumn> IntoRow for A {
     }
 }
 
-// Note: no blanket `impl<A: FromColumn> FromRow for A` — would conflict
-// with the `Vec<Value>` impl. Single-column outputs use the (A,) tuple form.
-
 // ---------------------------------------------------------------------
-// Tuple impls — symmetric for IntoRow / FromRow
+// Tuple impls — IntoRow only (FromRow was dropped; reads always
+// return `Vec<Id>` so users never write a tuple type for a read).
 // ---------------------------------------------------------------------
 
 macro_rules! impl_row_for_tuple {
@@ -399,20 +340,6 @@ macro_rules! impl_row_for_tuple {
                 fn column_sorts(&self) -> Vec<ColumnSort> {
                     let ($($name,)+) = self;
                     vec![ $( $name.column_sort() ),+ ]
-                }
-            }
-
-            #[allow(non_snake_case)]
-            impl<$($name: FromColumn),+> FromRow for ($($name,)+) {
-                fn from_values(values: &[Value], bv: &BaseValues) -> Self {
-                    let arity = [$(stringify!($name)),+].len();
-                    assert!(
-                        values.len() == arity,
-                        "FromRow: expected {} values for tuple of arity {}, got {} (use Vec<Value> or () to discard extras)",
-                        arity, arity, values.len(),
-                    );
-                    let mut iter = values.iter().copied();
-                    ( $( $name::from_value(iter.next().unwrap(), bv), )+ )
                 }
             }
         )+

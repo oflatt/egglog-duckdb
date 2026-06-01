@@ -191,6 +191,26 @@ pub trait Core<'a, 'db: 'a>: Internal<'a, 'db> {
         Id::new(self.base_to_value::<T>(x), T::SORT_NAME)
     }
 
+    /// Extract a Rust base value from an [`Id`], checking the sort
+    /// tag against the compile-time sort name of `T` via
+    /// [`BaseSortName`]. Errors with [`ApiError::WrongOutputSort`]
+    /// if the sort doesn't match. State-side counterpart to
+    /// [`crate::EGraph::extract`]; works only for the standard base
+    /// types (which impl [`BaseSortName`]). For user-defined base
+    /// sorts, use `EGraph::extract::<T>` (which looks the sort up
+    /// by `TypeId` at runtime).
+    fn extract<T: BaseSortName>(&self, id: &Id) -> Result<T, Error> {
+        if id.sort() != T::SORT_NAME {
+            return Err(ApiError::WrongOutputSort {
+                table: format!("(extract::<{}>)", T::SORT_NAME),
+                expected: T::SORT_NAME.to_string(),
+                actual: id.sort().to_string(),
+            }
+            .into());
+        }
+        Ok(self.value_to_base::<T>(id.value()))
+    }
+
     /// Look up the Rust container behind an egglog [`Value`], if any.
     fn value_to_container<T: ContainerValue>(
         &self,
@@ -235,22 +255,26 @@ pub trait Core<'a, 'db: 'a>: Internal<'a, 'db> {
 #[allow(private_bounds)]
 pub trait Read<'a, 'db: 'a>: Core<'a, 'db> + RegistrySealed<'a, 'db> {
     /// Look up a function's output value at the given key. Returns
-    /// `Ok(None)` if the row is absent.
+    /// `Ok(None)` if the row is absent. The returned [`Id`] is
+    /// tagged with the function's declared output sort, so it can
+    /// be passed back into the typed API or converted to a Rust
+    /// base value via [`crate::EGraph::extract`] / `EGraph::as_*`.
     ///
     /// **Only valid for `function` tables.** Constructors error;
     /// use [`Read::eclass_of`] for those.
-    fn lookup<K: IntoRow, V: BaseValue>(
-        &self,
-        name: &str,
-        key: K,
-    ) -> Result<Option<V>, Error> {
+    fn lookup<K: IntoRow>(&self, name: &str, key: K) -> Result<Option<Id>, Error> {
         let action = lookup_action(self.registry(), name)?;
         check_subtype(name, &action, TableKind::Function, "function")?;
         let sorts = key.column_sorts();
         check_input_sorts(name, &action, &sorts)?;
-        let bv = self.base_values();
-        let key_values = key.into_values(bv);
-        Ok(action.lookup(self.es(), &key_values).map(|v| bv.unwrap::<V>(v)))
+        let key_values = key.into_values(self.base_values());
+        let sort = action
+            .output_sort_name()
+            .cloned()
+            .unwrap_or_else(|| std::sync::Arc::from(""));
+        Ok(action
+            .lookup(self.es(), &key_values)
+            .map(|v| Id::new(v, sort)))
     }
 
     /// Look up a constructor's eclass at the given inputs, without
@@ -296,15 +320,19 @@ pub trait Read<'a, 'db: 'a>: Core<'a, 'db> + RegistrySealed<'a, 'db> {
         Ok(action.lookup(self.es(), &key_values).is_some())
     }
 
-    /// Untyped lookup escape hatch — takes a raw `&[Id]` (each `Id`'s
-    /// underlying value is used as-is, sort tags are ignored) and
-    /// returns the row's output as an `Id` with no sort tag. Use when
-    /// the caller has already-constructed [`Id`]s and doesn't want
-    /// the typed [`Read::lookup`] sort check.
+    /// Untyped-key lookup escape hatch — accepts any [`Id`]s as
+    /// inputs (sort tags ignored), but the returned [`Id`] still
+    /// carries the table's declared output sort tag. Use when the
+    /// caller has already-constructed [`Id`]s and doesn't want the
+    /// typed [`Read::lookup`] input-side sort check.
     fn lookup_raw(&self, name: &str, key: &[Id]) -> Result<Option<Id>, Error> {
         let action = lookup_action(self.registry(), name)?;
         let raw: Vec<Value> = key.iter().map(|id| id.value()).collect();
-        Ok(action.lookup(self.es(), &raw).map(|v| Id::new(v, "")))
+        let sort = action
+            .output_sort_name()
+            .cloned()
+            .unwrap_or_else(|| std::sync::Arc::from(""));
+        Ok(action.lookup(self.es(), &raw).map(|v| Id::new(v, sort)))
     }
 
     /// Return the current row count for the named table, or `None` if no table
