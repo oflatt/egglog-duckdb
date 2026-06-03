@@ -139,8 +139,8 @@ impl SortedOffsetSlice {
         // incremental hash index, violating `add_row_sorted`'s monotonic-
         // RowId assumption (subset ends up like `[3655,4274,3655,4274]`).
         // Release builds already skip this assert; we drop it in debug so the
-        // back-off scheduler test isn't blocked. Filed upstream — see the
-        // issue linked in the merge commit / fork README.
+        // back-off scheduler test isn't blocked. Filed upstream:
+        // https://github.com/egraphs-good/egglog/issues/911
         // The transmute below is sound regardless of sortedness.
         // SAFETY: SortedOffsetSlice is repr(transparent), so the two layouts are compatible.
         unsafe { mem::transmute::<&[RowId], &SortedOffsetSlice>(slice) }
