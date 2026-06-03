@@ -895,7 +895,7 @@ impl TypeInfo {
             body,
             name,
             ruleset,
-            allow_action_lookups,
+            unsafe_seminaive,
             naive,
             no_decomp,
         } = rule;
@@ -947,7 +947,7 @@ impl TypeInfo {
         // `unsafe-lookup` rules opt out of the "no function lookups in
         // actions" check — that's the whole point of the form. Every
         // other rule is still checked.
-        if !allow_action_lookups {
+        if !unsafe_seminaive {
             self.check_lookup_actions(&actions)?;
         }
 
@@ -957,7 +957,7 @@ impl TypeInfo {
             head: actions,
             name: name.clone(),
             ruleset: ruleset.clone(),
-            allow_action_lookups: *allow_action_lookups,
+            unsafe_seminaive: *unsafe_seminaive,
             naive: *naive,
             no_decomp: *no_decomp,
         })

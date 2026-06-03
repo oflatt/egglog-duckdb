@@ -93,13 +93,19 @@ where
     pub name: String,
     /// The ruleset this rule belongs to. Defaults to `""`.
     pub ruleset: String,
-    /// When true, the typechecker skips its "no function lookups in
-    /// actions" check for this rule's head. Set by desugaring when the
-    /// rule uses the `(unsafe-lookup ...)` form, which opts into looking
-    /// up a (custom, non-constructor) function's output in an action —
-    /// returning the function's `:default` on a miss, or panicking if it
-    /// has none. Defaults to `false`.
-    pub allow_action_lookups: bool,
+    /// When true (the `:unsafe-seminaive` rule option), the rule keeps
+    /// seminaive (delta) evaluation but its query/action are compiled
+    /// with the permissive `Read`/`Full` primitive contexts instead of
+    /// `Pure`/`Write`, and the typechecker's "no function lookups in
+    /// actions" check is skipped. This lets the RHS perform arbitrary
+    /// database reads — read-primitives and function-table lookups —
+    /// without paying for `:naive`'s whole-database matching.
+    ///
+    /// It is **unsafe**: a read on a seminaive rule's RHS observes the
+    /// database mid-iteration (non-monotonic), so results can depend on
+    /// evaluation order. The caller takes responsibility. Defaults to
+    /// `false`.
+    pub unsafe_seminaive: bool,
     /// If `true`, this rule disables seminaive evaluation. The body is
     /// matched against the entire database every iteration and the
     /// query/action are compiled with the global (read+write) primitive

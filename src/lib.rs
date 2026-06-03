@@ -1217,6 +1217,15 @@ impl EGraph {
         // Pure/Write to Read/Full, so primitives that read or write the
         // database can run inside this rule.
         let seminaive = self.seminaive && !rule.naive;
+        // The `:unsafe-seminaive` rule option decouples evaluation from
+        // primitive context: the rule is still evaluated seminaive-ly
+        // (delta matching, via `new_rule(seminaive)` below), but its
+        // query/action are compiled with the permissive Read/Full
+        // contexts so the RHS can perform arbitrary database reads
+        // (read-primitives and, together with the typecheck skip,
+        // function-table lookups). Unsound in general — see the field
+        // docs on `GenericRule::unsafe_seminaive`.
+        let context_seminaive = seminaive && !rule.unsafe_seminaive;
         // The `:no-decomp` rule option (and the global `--no-decomp`
         // flag) skips tree-decomposition in query planning, forcing
         // the single-bag fast path.
@@ -1244,7 +1253,7 @@ impl EGraph {
                 unsafe { &*backend_ptr },
                 &self.functions,
                 &self.type_info,
-                seminaive,
+                context_seminaive,
             );
             translator.query(query, false);
             translator.actions(actions)?;
@@ -1496,7 +1505,7 @@ impl EGraph {
             body: facts.to_vec(),
             name: fresh_name.clone(),
             ruleset: fresh_ruleset.clone(),
-            allow_action_lookups: false,
+            unsafe_seminaive: false,
             naive: false,
             no_decomp: false,
         };
@@ -2037,7 +2046,7 @@ impl EGraph {
             body: facts,
             name: fresh_name.clone(),
             ruleset: fresh_ruleset.clone(),
-            allow_action_lookups: false,
+            unsafe_seminaive: false,
             naive: false,
             no_decomp: false,
         };
@@ -2065,7 +2074,7 @@ impl EGraph {
             body: resolved_body,
             name: fresh_name,
             ruleset: fresh_ruleset,
-            allow_action_lookups: false,
+            unsafe_seminaive: false,
             naive: false,
             no_decomp: false,
         }

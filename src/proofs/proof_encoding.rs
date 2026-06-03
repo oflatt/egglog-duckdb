@@ -776,13 +776,15 @@ impl<'a> ProofInstrumentor<'a> {
                         // Every eq-sort term in the e-graph has its term_proof
                         // set at constructor-creation time, so this proof is
                         // guaranteed present when the rule fires. Instead of a
-                        // body join, fetch it directly in the action via
-                        // `unsafe-lookup` — one fewer join per eq-sort body
-                        // variable. Query-only callers (run :until, check) keep
-                        // the body form since they have no action.
+                        // body join, fetch it directly in the action — one
+                        // fewer join per eq-sort body variable. This is an
+                        // action-side function lookup, so the generated rule is
+                        // tagged `:unsafe-seminaive` (see instrument_rule).
+                        // Query-only callers (run :until, check) keep the body
+                        // form since they have no action.
                         if lookups_to_action {
                             action_lookups.push(format!(
-                                "(let {fresh_proof} (unsafe-lookup ({term_proof_name} {var})))"
+                                "(let {fresh_proof} ({term_proof_name} {var}))"
                             ));
                         } else {
                             res.push(format!("(= {fresh_proof} ({term_proof_name} {var}))"));
@@ -887,8 +889,9 @@ impl<'a> ProofInstrumentor<'a> {
     /// Returns `(body_facts, action_lookups, proof)`. When
     /// `lookups_to_action` is set, eq-sort variables' `term_proof`
     /// fetches are emitted into `action_lookups` as
-    /// `(let p (unsafe-lookup (term_proof v)))` lines for the caller to
-    /// splice into the rule's actions, rather than as body joins.
+    /// `(let p (term_proof v))` lines for the caller to splice into the
+    /// rule's actions (the rule must then be `:unsafe-seminaive`),
+    /// rather than as body joins.
     fn instrument_facts(
         &mut self,
         facts: &[ResolvedFact],
@@ -1142,13 +1145,16 @@ impl<'a> ProofInstrumentor<'a> {
     /// When proofs are enabled we query proof tables, then build a proof for the rule in the actions.
     /// Finally, each view update also updates the proof tables.
     fn instrument_rule(&mut self, rule: &ResolvedRule) -> Vec<Command> {
-        // Fetch eq-sort variables' term_proofs in the action via
-        // `unsafe-lookup` instead of as body joins (see instrument_facts).
+        // Fetch eq-sort variables' term_proofs in the action as direct
+        // lookups instead of body joins (see instrument_facts).
         let (facts, action_lookups, proof_str) = self.instrument_facts(&rule.body, true);
         let proof_var = self.fresh_var();
         let proof = Justification::Rule(rule.name.clone(), proof_var.clone());
-        // The looked-up proofs feed `proof_str`, so they must be bound
-        // before the rule-proof `let`.
+        // Those action-side lookups are function lookups in a RHS, so the
+        // generated rule must opt into `:unsafe-seminaive` (keeps delta
+        // evaluation, permits the RHS reads). The looked-up proofs feed
+        // `proof_str`, so they must be bound before the rule-proof `let`.
+        let needs_unsafe_seminaive = !action_lookups.is_empty();
         let action_lookups_str = ListDisplay(&action_lookups, "\n                    ");
         let proof_var_binding = if self.egraph.proof_state.proofs_enabled {
             format!(
@@ -1162,19 +1168,24 @@ impl<'a> ProofInstrumentor<'a> {
 
         let actions = self.instrument_actions(&rule.head.0, &proof);
         let name = &rule.name;
+        let ruleset_opt = if rule.ruleset.is_empty() {
+            "".to_string()
+        } else {
+            format!(":ruleset {}", rule.ruleset)
+        };
+        let unsafe_opt = if needs_unsafe_seminaive {
+            ":unsafe-seminaive"
+        } else {
+            ""
+        };
         let instrumented = format!(
             "(rule ({})
                    ({proof_var_binding}
                     {})
-                    {}
+                    {ruleset_opt} {unsafe_opt}
                     :name \"{name}\")",
             ListDisplay(facts, " "),
             ListDisplay(actions, " "),
-            if rule.ruleset.is_empty() {
-                "".to_string()
-            } else {
-                format!(":ruleset {}", rule.ruleset)
-            }
         );
         self.parse_program(&instrumented)
     }

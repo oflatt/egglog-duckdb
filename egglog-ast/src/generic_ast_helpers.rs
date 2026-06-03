@@ -70,12 +70,8 @@ where
         } else {
             "".into()
         };
-        // Round-trip the action-lookup opt-out. `(unsafe-lookup ...)`
-        // forms are stripped during desugaring and only survive as this
-        // rule-level flag, so Display must re-emit it for parse →
-        // to_string → parse to be faithful.
-        let unsafe_lookups = if self.allow_action_lookups {
-            " :allow-unsafe-lookups"
+        let unsafe_seminaive = if self.unsafe_seminaive {
+            " :unsafe-seminaive"
         } else {
             ""
         };
@@ -83,7 +79,7 @@ where
         let no_decomp = if self.no_decomp { " :no-decomp" } else { "" };
         write!(
             f,
-            ")\n{indent} {ruleset} {name}{unsafe_lookups}{naive}{no_decomp})"
+            ")\n{indent} {ruleset} {name}{unsafe_seminaive}{naive}{no_decomp})"
         )
     }
 }
@@ -232,7 +228,7 @@ where
                 .collect(),
             name: self.name.clone(),
             ruleset: self.ruleset.clone(),
-            allow_action_lookups: self.allow_action_lookups,
+            unsafe_seminaive: self.unsafe_seminaive,
             naive: self.naive,
             no_decomp: self.no_decomp,
         }
@@ -249,7 +245,7 @@ where
             body: self.body,
             name: self.name,
             ruleset: self.ruleset,
-            allow_action_lookups: self.allow_action_lookups,
+            unsafe_seminaive: self.unsafe_seminaive,
             naive: self.naive,
             no_decomp: self.no_decomp,
         }
@@ -275,7 +271,7 @@ where
                 .collect(),
             name: self.name,
             ruleset: self.ruleset,
-            allow_action_lookups: self.allow_action_lookups,
+            unsafe_seminaive: self.unsafe_seminaive,
             naive: self.naive,
             no_decomp: self.no_decomp,
         }

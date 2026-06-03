@@ -1723,7 +1723,7 @@ where
                     ruleset: fun(rule.ruleset),
                     head: rule.head,
                     body: rule.body,
-                    allow_action_lookups: rule.allow_action_lookups,
+                    unsafe_seminaive: rule.unsafe_seminaive,
                     naive: rule.naive,
                     no_decomp: rule.no_decomp,
                 };

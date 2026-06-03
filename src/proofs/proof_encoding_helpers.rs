@@ -457,9 +457,9 @@ pub enum ProofEncodingUnsupportedReason {
     )]
     LetBindingWithNonEqSort,
     #[error(
-        "rule uses `(unsafe-lookup ...)`. Action-side function lookups are a direct-backend feature and are not representable by the term/proof encoding."
+        "rule uses `:unsafe-seminaive`. Arbitrary RHS database reads are a direct-backend feature and are not representable by the term/proof encoding."
     )]
-    UnsafeActionLookup,
+    UnsafeSeminaive,
 }
 
 /// Checks whether a desugared program supports proof encoding.
@@ -523,13 +523,13 @@ pub(crate) fn command_supports_proof_encoding(
     type_info: &TypeInfo,
     proofs_enabled: bool,
 ) -> Result<(), ProofEncodingUnsupportedReason> {
-    // `(unsafe-lookup ...)` rules opt out of the action-lookup
-    // typecheck and lower to a direct backend lookup. The term/proof
+    // `:unsafe-seminaive` rules perform arbitrary RHS reads against the
+    // live database and skip the action-lookup typecheck. The term/proof
     // encoding can't represent that, so reject such rules in *both*
     // plain term-encoding and proof modes (ungated by `proofs_enabled`).
     if let GenericCommand::Rule { rule } = command {
-        if rule.allow_action_lookups {
-            return Err(ProofEncodingUnsupportedReason::UnsafeActionLookup);
+        if rule.unsafe_seminaive {
+            return Err(ProofEncodingUnsupportedReason::UnsafeSeminaive);
         }
     }
 

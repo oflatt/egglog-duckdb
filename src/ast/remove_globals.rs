@@ -178,7 +178,7 @@ impl GlobalRemover<'_> {
                     }),
                     name: rule.name.clone(),
                     ruleset: rule.ruleset.clone(),
-                    allow_action_lookups: rule.allow_action_lookups,
+                    unsafe_seminaive: rule.unsafe_seminaive,
                     naive: rule.naive,
                     no_decomp: rule.no_decomp,
                 };
