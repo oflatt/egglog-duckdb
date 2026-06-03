@@ -709,7 +709,15 @@ pub fn query(
     let ruleset = egraph.parser.symbol_gen.fresh("query_ruleset");
     add_ruleset(egraph, &ruleset)?;
 
-    rust_rule(egraph, "query", &ruleset, vars, facts, move |_, values| {
+    // Use the `:naive` rule variant (`rust_rule_full`) so the query
+    // body is compiled in `Context::Read` rather than `Context::Pure`.
+    // A one-shot existence/row query must match against the whole
+    // database (there is no seminaive delta to ride), and — crucially —
+    // read-only primitives such as `get-size!` (a `ReadPrim`, valid in
+    // `Read`/`Full` but not `Pure`) are only admissible in the body of a
+    // naive rule. This is what makes `(run … :until (… (get-size!)))`
+    // typecheck. See `egglog_experimental::scheduling`.
+    rust_rule_full(egraph, "query", &ruleset, vars, facts, move |_, values| {
         let arc = results_weak.upgrade().unwrap();
         let mut results = arc.lock().unwrap();
         results.rows += 1;

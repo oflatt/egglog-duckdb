@@ -107,6 +107,33 @@ impl<T: Clone + Send + Sync + 'static, S: RegistryWrap<T> + 'static> ExternalFun
     }
 }
 
+// Placeholder `ExternalFunction` wrapper used on the duckdb backend for
+// registry-backed primitives (`ReadPrim`/`WritePrim`/`FullPrim`).
+//
+// DuckDB has no in-memory `ActionRegistry`: primitive *calls* are
+// compiled to SQL by the duck rule-builder, which maps each
+// `ExternalFunctionId` to its user-visible name via the
+// `set_external_func_name` side-channel (set in `register_per_context`).
+// The wrapper's `invoke` is therefore never reached on duckdb — we only
+// need a registered id + name. This placeholder satisfies the
+// `register_external_func` API without touching `action_registry()`
+// (which is `unimplemented!()` on duckdb).
+#[derive(Clone)]
+struct DuckPlaceholderPrimWrapper {
+    name: String,
+}
+
+impl ExternalFunction for DuckPlaceholderPrimWrapper {
+    fn invoke(&self, _exec_state: &mut ExecutionState, _args: &[Value]) -> Option<Value> {
+        unreachable!(
+            "registry-backed primitive `{}` was invoked through its \
+             ExternalFunction wrapper on the duckdb backend; duckdb compiles \
+             primitive calls to SQL and should never reach this path",
+            self.name
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct FuncType {
     pub name: String,
@@ -330,6 +357,26 @@ impl EGraph {
         T: Primitive + Clone,
         S: RegistryWrap<T> + 'static,
     {
+        // On the duckdb backend there is no `ActionRegistry`
+        // (`action_registry()` is `unimplemented!()`). DuckDB compiles
+        // primitive calls to SQL, so the wrapper's `invoke` is never
+        // reached — we only need the primitive registered to obtain an
+        // id + name. Register a placeholder wrapper instead of touching
+        // `action_registry()`. The bridge path is unchanged.
+        if self
+            .backend
+            .as_any()
+            .downcast_ref::<egglog_bridge_duckdb::EGraph>()
+            .is_some()
+        {
+            self.register_per_context(x, validator, valid_ctxs, move |x, _ctx| {
+                Box::new(DuckPlaceholderPrimWrapper {
+                    name: x.name().to_owned(),
+                })
+            });
+            return;
+        }
+
         let registry = self.backend.action_registry().clone();
         self.register_per_context(x, validator, valid_ctxs, move |x, ctx| {
             Box::new(RegistryPrimWrapper::<T, S> {
