@@ -1,6 +1,5 @@
 ---
 source: tests/files.rs
-assertion_line: 97
 expression: snapshot_content_across_treatments
 ---
 ((Abs 1)

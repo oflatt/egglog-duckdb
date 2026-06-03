@@ -150,6 +150,14 @@ impl<'a> RuleBuilderOps for BridgeRuleBuilderOps<'a> {
         self.inner.panic(message);
     }
 
+    fn new_panic(&mut self, message: String) -> ExternalFunctionId {
+        self.inner.new_panic(message)
+    }
+
+    fn set_no_decomp(&mut self, no_decomp: bool) {
+        self.inner.set_no_decomp(no_decomp);
+    }
+
     fn build(self: Box<Self>) -> Result<RuleId> {
         Ok(self.inner.build())
     }
@@ -337,6 +345,28 @@ impl Backend for EGraph {
 
     fn fresh_id(&mut self) -> Value {
         EGraph::fresh_id(self)
+    }
+
+    fn clear_table(&mut self, func: FunctionId) {
+        EGraph::clear_table(self, func);
+    }
+
+    fn base_values(&self) -> &BaseValues {
+        EGraph::base_values(self)
+    }
+
+    fn with_execution_state_dyn(
+        &self,
+        f: &mut dyn FnMut(&mut egglog_backend_trait::ExecutionState<'_>),
+    ) {
+        EGraph::with_execution_state(self, |es| f(es));
+    }
+
+    fn action_registry_any(&self) -> &(dyn Any + Send + Sync) {
+        // Hand back the `&Arc<RwLock<ActionRegistry>>` erased to `&dyn Any`;
+        // the trait's generic `action_registry::<ActionRegistry>()` wrapper
+        // downcasts it back at the call site.
+        EGraph::action_registry(self)
     }
 
     // -- rule management ----------------------------------------------------

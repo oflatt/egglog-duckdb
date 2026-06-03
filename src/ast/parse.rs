@@ -8,13 +8,14 @@ use ordered_float::OrderedFloat;
 
 #[macro_export]
 macro_rules! span {
-    () => {
+    () => {{
+        use $crate::ast::{RustSpan, Span};
         Span::Rust(std::sync::Arc::new(RustSpan {
             file: file!(),
             line: line!(),
             column: column!(),
         }))
-    };
+    }};
 }
 
 // We do an unidiomatic thing here by using a struct instead of an enum.
@@ -233,7 +234,6 @@ impl Parser {
             || self.exprs.contains_key(&name)
             || self.commands.contains_key(&name)
         {
-            use egglog_ast::span::{RustSpan, Span};
             return Err(Error::CommandAlreadyExists(name, span!()));
         }
         self.user_defined.insert(name);
@@ -476,11 +476,15 @@ impl Parser {
                     let mut ruleset = String::new();
                     let mut name = String::new();
                     let mut allow_action_lookups = false;
+                    let mut naive = false;
+                    let mut no_decomp = false;
                     for option in self.parse_options(rest)? {
                         match option {
                             (":ruleset", [r]) => ruleset = r.expect_atom("ruleset name")?,
                             (":name", [s]) => name = s.expect_string("rule name")?,
                             (":allow-unsafe-lookups", []) => allow_action_lookups = true,
+                            (":naive", []) => naive = true,
+                            (":no-decomp", []) => no_decomp = true,
                             _ => return error!(span, "could not parse rule option"),
                         }
                     }
@@ -493,6 +497,8 @@ impl Parser {
                             name,
                             ruleset,
                             allow_action_lookups,
+                            naive,
+                            no_decomp,
                         },
                     }]
                 }
@@ -506,6 +512,7 @@ impl Parser {
                     let mut ruleset = String::new();
                     let mut conditions = Vec::new();
                     let mut subsume = false;
+                    let mut name = String::new();
                     for option in self.parse_options(rest)? {
                         match option {
                             (":ruleset", [r]) => ruleset = r.expect_atom("ruleset name")?,
@@ -517,6 +524,7 @@ impl Parser {
                                     Self::parse_fact,
                                 )?
                             }
+                            (":name", [s]) => name = s.expect_string("rule name")?,
                             _ => return error!(span, "could not parse rewrite options"),
                         }
                     }
@@ -528,6 +536,7 @@ impl Parser {
                             lhs,
                             rhs,
                             conditions,
+                            name,
                         },
                         subsume,
                     )]
@@ -541,6 +550,7 @@ impl Parser {
 
                     let mut ruleset = String::new();
                     let mut conditions = Vec::new();
+                    let mut name = String::new();
                     for option in self.parse_options(rest)? {
                         match option {
                             (":ruleset", [r]) => ruleset = r.expect_atom("ruleset name")?,
@@ -551,6 +561,7 @@ impl Parser {
                                     Self::parse_fact,
                                 )?
                             }
+                            (":name", [s]) => name = s.expect_string("rule name")?,
                             _ => return error!(span, "could not parse birewrite options"),
                         }
                     }
@@ -562,6 +573,7 @@ impl Parser {
                             lhs,
                             rhs,
                             conditions,
+                            name,
                         },
                     )]
                 }

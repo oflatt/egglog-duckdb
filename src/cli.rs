@@ -14,6 +14,19 @@ struct Args {
     /// Turns off the seminaive optimization
     #[clap(long)]
     naive: bool,
+    /// Skips tree-decomposition during query planning. Tree decomposition
+    /// tries to decompose complex queries into smaller independent subqueries,
+    /// and evaluate them separately. It has a better theoretical guarantee,
+    /// but sometimes the decomposed subqueries (called "bags") can be much larger
+    /// than the final output, which leads to worse performance sometimes.
+    ///
+    /// Setting this flag forces the query planner to skip tree decomposition and
+    /// evaluate the query as a single bag.
+    ///
+    /// You can also disable tree decomposition on a per-rule basis with the `:no-decomp` label
+    /// on rules.
+    #[clap(long)]
+    no_decomp: bool,
     /// Prints extra information, which can be useful for debugging
     #[clap(long, default_value_t = RunMode::Normal)]
     mode: RunMode,
@@ -121,6 +134,7 @@ pub fn cli(mut egraph: EGraph) {
     // the seminaive work; the backend's built-in version would fight
     // with them).
     egraph.seminaive = !args.naive && !args.seminaive_encoding;
+    egraph.no_decomp = args.no_decomp;
     egraph.set_report_level(args.report_level);
     if args.strict_mode {
         egraph.set_strict_mode(true);
@@ -522,6 +536,21 @@ mod tests {
 
         let input = "xyz";
         let mut output: Vec<u8> = Vec::new();
+        egraph
+            .repl_with(input.as_bytes(), &mut output, RunMode::Interactive, false)
+            .unwrap();
+        assert_eq!(String::from_utf8(output).unwrap(), "(error)\n");
+
+        let missing_include = std::env::temp_dir().join(format!(
+            "egglog_missing_include_{}_{}.egg",
+            std::process::id(),
+            "repl_test"
+        ));
+        let input = format!(
+            "(include \"{}\")",
+            missing_include.to_string_lossy().replace('\\', "/")
+        );
+        let mut output = Vec::new();
         egraph
             .repl_with(input.as_bytes(), &mut output, RunMode::Interactive, false)
             .unwrap();

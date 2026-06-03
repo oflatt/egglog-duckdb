@@ -98,6 +98,9 @@ pub(crate) struct Query {
     sole_focus: Option<usize>,
     seminaive: bool,
     plan_strategy: PlanStrategy,
+    /// If `true`, skip tree-decomposition during query planning. See
+    /// [`core_relations::QueryBuilder::set_no_decomp`].
+    no_decomp: bool,
 }
 
 pub struct RuleBuilder<'a> {
@@ -128,6 +131,7 @@ impl EGraph {
                 atoms: Default::default(),
                 add_rule: Default::default(),
                 plan_strategy: Default::default(),
+                no_decomp: false,
             },
         }
     }
@@ -148,8 +152,27 @@ impl RuleBuilder<'_> {
         self.egraph
     }
 
+    /// Register a runtime panic with a custom message and return its
+    /// id. When called via [`call_external_func`], the panic writes
+    /// the message to the egraph's panic side channel and triggers
+    /// early stop, so `run_rules` returns an `Err` carrying the
+    /// message rather than the calling thread unwinding.
+    ///
+    /// [`call_external_func`]: Self::call_external_func
+    pub fn new_panic(&mut self, message: String) -> crate::ExternalFunctionId {
+        self.egraph.new_panic(message)
+    }
+
     pub(crate) fn set_plan_strategy(&mut self, strategy: PlanStrategy) {
         self.query.plan_strategy = strategy;
+    }
+
+    /// If `true`, the query planner will skip tree-decomposition for
+    /// this rule. Mirrors
+    /// [`core_relations::QueryBuilder::set_no_decomp`]; set from the
+    /// `:no-decomp` rule option or the egglog `--no-decomp` CLI flag.
+    pub fn set_no_decomp(&mut self, no_decomp: bool) {
+        self.query.no_decomp = no_decomp;
     }
 
     /// Get the canonical value of an id in the union-find. An internal-only
@@ -681,6 +704,7 @@ impl Query {
     ) -> (QueryBuilder<'outer, 'a>, Bindings) {
         let mut qb = rsb.new_rule();
         qb.set_plan_strategy(self.plan_strategy);
+        qb.set_no_decomp(self.no_decomp);
         let mut inner = Bindings {
             uf_table: self.uf_table,
             next_ts: None,

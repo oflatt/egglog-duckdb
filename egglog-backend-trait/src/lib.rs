@@ -61,8 +61,8 @@ use egglog_numeric_id::define_id;
 // caller convenience.
 
 pub use egglog_core_relations::{
-    BaseValue, BaseValueId, ContainerValue, ContainerValueId, DynamicInternTable, ExecutionState,
-    ExternalFunction, ExternalFunctionId, Value,
+    BaseValue, BaseValueId, BaseValues, ContainerValue, ContainerValueId, DynamicInternTable,
+    ExecutionState, ExternalFunction, ExternalFunctionId, Value,
 };
 
 pub use egglog_reports::{IterationReport, ReportLevel};
@@ -370,6 +370,41 @@ pub trait Backend: Send + Sync {
     /// Wraps `egglog_bridge::EGraph::fresh_id`.
     fn fresh_id(&mut self) -> Value;
 
+    /// Remove every row from the given function's table.
+    ///
+    /// Wraps `egglog_bridge::EGraph::clear_table`.
+    fn clear_table(&mut self, func: FunctionId);
+
+    /// Access the backend's [`BaseValues`] registry directly.
+    ///
+    /// Wraps `egglog_bridge::EGraph::base_values`. This returns the concrete
+    /// `egglog_core_relations::BaseValues` (re-exported here) so callers can
+    /// use the generic-over-`T` `get::<T>` / `unwrap::<T>` sugar that the
+    /// dyn-friendly [`BaseValuePool`] does not expose.
+    fn base_values(&self) -> &BaseValues;
+
+    /// Run `f` against a fresh execution state, dyn-compatible form.
+    ///
+    /// Wraps `egglog_bridge::EGraph::with_execution_state`. The generic,
+    /// result-returning ergonomic wrapper is provided as the inherent
+    /// [`Backend::with_execution_state`] method on `dyn Backend`; this
+    /// erased form exists so the trait stays object-safe.
+    fn with_execution_state_dyn(&self, f: &mut dyn FnMut(&mut ExecutionState<'_>));
+
+    /// Type-erased access to the backend's action registry handle.
+    ///
+    /// Wraps `egglog_bridge::EGraph::action_registry`, which returns a
+    /// `&Arc<RwLock<ActionRegistry>>`. `ActionRegistry` is defined in the
+    /// `egglog-bridge` crate, which depends on this crate; naming it here
+    /// would re-introduce the dependency cycle that Phase 2 deliberately
+    /// broke. So the object-safe form erases the handle to `&dyn Any`, and
+    /// the generic inherent [`Backend::action_registry`] downcasts it back
+    /// to the caller-inferred concrete registry type.
+    ///
+    /// The `&dyn Any` is expected to be an `Arc<RwLock<ActionRegistry>>`.
+    /// Backends without an action registry (e.g. duckdb) panic.
+    fn action_registry_any(&self) -> &(dyn Any + Send + Sync);
+
     // -- rule management ----------------------------------------------------
 
     /// Begin building a new rule. Returns a builder whose lifetime is tied to
@@ -556,6 +591,48 @@ impl Clone for Box<dyn Backend> {
     }
 }
 
+impl dyn Backend {
+    /// Run `f` against a fresh execution state and return its result.
+    ///
+    /// Ergonomic, generic-over-`R` wrapper around the object-safe
+    /// [`Backend::with_execution_state_dyn`]. The result is threaded back
+    /// out through a captured slot rather than `Box<dyn Any>`, so `R` does
+    /// not need to be `'static`. Mirrors
+    /// `egglog_bridge::EGraph::with_execution_state`.
+    pub fn with_execution_state<R>(
+        &self,
+        f: impl FnOnce(&mut ExecutionState<'_>) -> R,
+    ) -> R {
+        let mut f = Some(f);
+        let mut out: Option<R> = None;
+        self.with_execution_state_dyn(&mut |es| {
+            let f = f.take().expect("with_execution_state closure called once");
+            out = Some(f(es));
+        });
+        out.expect("with_execution_state_dyn must invoke its closure exactly once")
+    }
+
+    /// A handle to the live action registry for this backend.
+    ///
+    /// Generic ergonomic wrapper around [`Backend::action_registry_any`].
+    /// `R` is the concrete registry type (`egglog_bridge::ActionRegistry`),
+    /// inferred at the call site so this crate never has to name it (which
+    /// would re-introduce the `egglog-bridge -> egglog-backend-trait`
+    /// dependency cycle). Mirrors `egglog_bridge::EGraph::action_registry`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the backend has no action registry (e.g. duckdb) or if the
+    /// erased handle is not an `Arc<RwLock<R>>`.
+    pub fn action_registry<R: Any + Send + Sync>(
+        &self,
+    ) -> &std::sync::Arc<std::sync::RwLock<R>> {
+        self.action_registry_any()
+            .downcast_ref::<std::sync::Arc<std::sync::RwLock<R>>>()
+            .expect("action_registry: backend has no action registry of the requested type")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // `RuleBuilderOps` — mirrors `egglog_bridge::RuleBuilder` one-for-one
 // ---------------------------------------------------------------------------
@@ -666,6 +743,22 @@ pub trait RuleBuilderOps {
     ///
     /// Wraps `RuleBuilder::panic`.
     fn panic(&mut self, message: String);
+
+    /// Register a deferred-panic external function on the underlying egraph
+    /// and return its id. Used (e.g. by `unstable-fn`) to bake a panic id
+    /// into a wrapped function's call site.
+    ///
+    /// Wraps `RuleBuilder::new_panic`. Default panics for backends that do
+    /// not support it; the bridge forwards to its `RuleBuilder`.
+    fn new_panic(&mut self, _message: String) -> ExternalFunctionId {
+        unimplemented!("new_panic is not supported on this backend")
+    }
+
+    /// Skip tree-decomposition during query planning for this rule
+    /// (the `:no-decomp` option / `--no-decomp`). Default no-op for
+    /// backends that don't decompose (e.g. duckdb); the bridge
+    /// forwards it to its `RuleBuilder`.
+    fn set_no_decomp(&mut self, _no_decomp: bool) {}
 
     /// Finalize the rule. Returns the registered [`RuleId`].
     ///

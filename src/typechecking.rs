@@ -1,5 +1,6 @@
 use std::hash::Hasher;
 
+use crate::Context;
 use crate::{
     core::{CoreActionContext, CoreRule, GenericActionsExt, ResolvedCall},
     *,
@@ -7,6 +8,104 @@ use crate::{
 use ast::{ResolvedAction, ResolvedExpr, ResolvedFact, ResolvedRule, ResolvedVar, Rule};
 use core_relations::ExternalFunction;
 use egglog_ast::generic_ast::GenericAction;
+use egglog_bridge::ActionRegistry;
+use enum_map::EnumMap;
+use std::sync::{Arc, RwLock};
+
+// `ExternalFunction` wrapper for `PurePrim`. Holds the primitive
+// directly so the dispatch chain `external_funcs[id].invoke(...)` →
+// `T::apply(...)` is just one vtable hop plus a direct call — no
+// closure indirection that defeats inlining.
+#[derive(Clone)]
+struct PurePrimWrapper<T> {
+    prim: T,
+    /// The call-site [`Context`] this wrapper stamps onto the
+    /// `PureState` before dispatching. `register_per_context` commits
+    /// one wrapper per valid `Context` for the trait, so the
+    /// typechecker's pick at each call site is encoded directly here.
+    ctx: Context,
+}
+
+impl<T: PurePrim + Clone> ExternalFunction for PurePrimWrapper<T> {
+    fn invoke(&self, exec_state: &mut ExecutionState, args: &[Value]) -> Option<Value> {
+        self.prim.apply(PureState::wrap(exec_state, self.ctx), args)
+    }
+}
+
+// `ExternalFunction` wrapper for primitives that need the
+// `ActionRegistry` (`ReadPrim`, `WritePrim`, `FullPrim`). One generic
+// over the `Wrap` strategy that knows how to construct the right
+// state type and dispatch to the primitive's `apply`.
+#[derive(Clone)]
+struct RegistryPrimWrapper<T, S> {
+    prim: T,
+    registry: Arc<RwLock<ActionRegistry>>,
+    /// Stamped onto the state wrapper.
+    ctx: Context,
+    _wrap: std::marker::PhantomData<fn() -> S>,
+}
+
+trait RegistryWrap<T>: Clone + Send + Sync {
+    fn invoke(
+        prim: &T,
+        exec_state: &mut ExecutionState,
+        ctx: Context,
+        args: &[Value],
+        registry: &ActionRegistry,
+    ) -> Option<Value>;
+}
+
+#[derive(Clone)]
+struct WrapRead;
+impl<T: ReadPrim> RegistryWrap<T> for WrapRead {
+    #[inline]
+    fn invoke(
+        prim: &T,
+        exec_state: &mut ExecutionState,
+        ctx: Context,
+        args: &[Value],
+        registry: &ActionRegistry,
+    ) -> Option<Value> {
+        prim.apply(ReadState::wrap(exec_state, registry, ctx), args)
+    }
+}
+#[derive(Clone)]
+struct WrapWrite;
+impl<T: WritePrim> RegistryWrap<T> for WrapWrite {
+    #[inline]
+    fn invoke(
+        prim: &T,
+        exec_state: &mut ExecutionState,
+        ctx: Context,
+        args: &[Value],
+        registry: &ActionRegistry,
+    ) -> Option<Value> {
+        prim.apply(WriteState::wrap(exec_state, registry, ctx), args)
+    }
+}
+#[derive(Clone)]
+struct WrapFull;
+impl<T: FullPrim> RegistryWrap<T> for WrapFull {
+    #[inline]
+    fn invoke(
+        prim: &T,
+        exec_state: &mut ExecutionState,
+        ctx: Context,
+        args: &[Value],
+        registry: &ActionRegistry,
+    ) -> Option<Value> {
+        prim.apply(FullState::wrap(exec_state, registry, ctx), args)
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static, S: RegistryWrap<T> + 'static> ExternalFunction
+    for RegistryPrimWrapper<T, S>
+{
+    fn invoke(&self, exec_state: &mut ExecutionState, args: &[Value]) -> Option<Value> {
+        let registry = self.registry.read().unwrap();
+        S::invoke(&self.prim, exec_state, self.ctx, args, &registry)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct FuncType {
@@ -56,9 +155,13 @@ pub type PrimitiveValidator = Arc<dyn Fn(&mut TermDag, &[TermId]) -> Option<Term
 
 #[derive(Clone)]
 pub struct PrimitiveWithId {
-    pub(crate) primitive: Arc<dyn Primitive + Send + Sync>,
-    pub(crate) id: ExternalFunctionId,
+    pub(crate) primitive: Arc<dyn Primitive>,
     pub(crate) validator: Option<PrimitiveValidator>,
+    /// Runtime entrypoints for the contexts this primitive is valid in.
+    /// The primitive definition is stored once, while each context keeps
+    /// its own backend id so higher-order dispatch can still recover the
+    /// application context at runtime.
+    pub(crate) context_ids: EnumMap<Context, Option<ExternalFunctionId>>,
 }
 
 impl PrimitiveWithId {
@@ -158,74 +261,133 @@ impl EGraph {
         }
     }
 
-    /// Add a user-defined primitive
-    pub fn add_primitive<T>(&mut self, x: T)
+    /// Register a [`PurePrim`]. Pass `None` for the validator if not
+    /// using the proof checker.
+    ///
+    /// Pick the trait whose state wrapper matches the body's needs:
+    /// [`PurePrim`] for pure ops, [`WritePrim`] for writes,
+    /// [`ReadPrim`] for table reads, [`FullPrim`] for both. The Rust
+    /// type checker enforces the body only uses methods the chosen
+    /// state allows.
+    pub fn add_pure_primitive<T>(&mut self, x: T, validator: Option<PrimitiveValidator>)
     where
-        T: Clone + Primitive + Send + Sync + 'static,
+        T: PurePrim + Clone,
     {
-        self.add_primitive_with_validator(x, None)
+        if let Some(orig) = self.proof_state.original_typechecking.as_mut() {
+            orig.add_pure_primitive(x.clone(), validator.clone());
+        }
+        self.register_per_context(x, validator, PureState::valid_contexts(), |x, ctx| {
+            Box::new(PurePrimWrapper { prim: x, ctx })
+        });
     }
 
-    /// Add a user-defined primitive with an optional validator
-    pub fn add_primitive_with_validator<T>(&mut self, x: T, validator: Option<PrimitiveValidator>)
+    /// Register a [`WritePrim`]. Pass `None` for the validator if not
+    /// using the proof checker.
+    pub fn add_write_primitive<T>(&mut self, x: T, validator: Option<PrimitiveValidator>)
     where
-        T: Clone + Primitive + Send + Sync + 'static,
+        T: WritePrim + Clone,
     {
-        // We need to use a wrapper because of the orphan rule.
-        // If we just try to implement `ExternalFunction` directly on
-        // all `PrimitiveLike`s then it would be possible for a
-        // downstream crate to create a conflict.
-        #[derive(Clone)]
-        struct Wrapper<T>(T);
-        impl<T: Clone + Primitive + Send + Sync> ExternalFunction for Wrapper<T> {
-            fn invoke(&self, exec_state: &mut ExecutionState, args: &[Value]) -> Option<Value> {
-                self.0.apply(exec_state, args)
-            }
-        }
-
-        // Mirror the registration into the dedicated typechecking
-        // egraph if one is set up (term-encoding / proof mode). The
-        // typechecker uses `proof_state.original_typechecking`'s
-        // `type_info.primitives` to resolve primitive call sites
-        // before term encoding runs; without this mirroring, any
-        // primitive added *after* the initial setup (e.g. the fresh
-        // `@rust_rule_prim<N>` minted by `prelude::rust_rule` /
-        // `prelude::query`, used by egglog-experimental's
-        // `run-schedule` rebinding) is unbound at typecheck time
-        // even though it's correctly registered on the main egraph's
-        // backend. Recurse before doing the local work so the
-        // typechecker sees the new primitive on its own backend too.
         if let Some(orig) = self.proof_state.original_typechecking.as_mut() {
-            orig.add_primitive_with_validator(x.clone(), validator.clone());
+            orig.add_write_primitive(x.clone(), validator.clone());
         }
+        self.register_registry_primitive::<T, WrapWrite>(
+            x,
+            validator,
+            WriteState::valid_contexts(),
+        );
+    }
 
-        let primitive = Arc::new(x.clone());
-        let id = self.backend.register_external_func(Box::new(Wrapper(x)));
-        // If the backend is the DuckDB-backed one, register the
-        // primitive's user-visible name so the duckdb rule-builder
-        // can later translate `ExternalFunctionId` references into
-        // `Term::Prim(name, …)` calls in the duck IR. The trait
-        // surface itself doesn't carry the name; this side channel
-        // bridges the gap until a more general primitive-naming
-        // mechanism lands.
-        if let Some(duck) = self
-            .backend
-            .as_any_mut()
-            .downcast_mut::<egglog_bridge_duckdb::EGraph>()
-        {
-            duck.set_external_func_name(id, primitive.name().to_owned());
+    /// Register a [`ReadPrim`]. Pass `None` for the validator if not
+    /// using the proof checker.
+    pub fn add_read_primitive<T>(&mut self, x: T, validator: Option<PrimitiveValidator>)
+    where
+        T: ReadPrim + Clone,
+    {
+        if let Some(orig) = self.proof_state.original_typechecking.as_mut() {
+            orig.add_read_primitive(x.clone(), validator.clone());
         }
+        self.register_registry_primitive::<T, WrapRead>(x, validator, ReadState::valid_contexts());
+    }
+
+    /// Register a [`FullPrim`]. Pass `None` for the validator if not
+    /// using the proof checker.
+    pub fn add_full_primitive<T>(&mut self, x: T, validator: Option<PrimitiveValidator>)
+    where
+        T: FullPrim + Clone,
+    {
+        if let Some(orig) = self.proof_state.original_typechecking.as_mut() {
+            orig.add_full_primitive(x.clone(), validator.clone());
+        }
+        self.register_registry_primitive::<T, WrapFull>(x, validator, FullState::valid_contexts());
+    }
+
+    fn register_registry_primitive<T, S>(
+        &mut self,
+        x: T,
+        validator: Option<PrimitiveValidator>,
+        valid_ctxs: &[Context],
+    ) where
+        T: Primitive + Clone,
+        S: RegistryWrap<T> + 'static,
+    {
+        let registry = self.backend.action_registry().clone();
+        self.register_per_context(x, validator, valid_ctxs, move |x, ctx| {
+            Box::new(RegistryPrimWrapper::<T, S> {
+                prim: x,
+                registry: registry.clone(),
+                ctx,
+                _wrap: std::marker::PhantomData,
+            })
+        });
+    }
+
+    /// Shared registration engine. Stores one primitive definition, plus
+    /// one runtime id per valid [`Context`]. Each wrapper carries its
+    /// specific context stamped onto the state wrapper at invoke time.
+    fn register_per_context<T, F>(
+        &mut self,
+        x: T,
+        validator: Option<PrimitiveValidator>,
+        valid_ctxs: &[Context],
+        mut build_wrapper: F,
+    ) where
+        T: Primitive + Clone,
+        F: FnMut(T, Context) -> Box<dyn ExternalFunction>,
+    {
+        let primitive: Arc<dyn Primitive> = Arc::new(x.clone());
+        let name = primitive.name().to_owned();
+        let context_ids = EnumMap::from_fn(|ctx| {
+            valid_ctxs.contains(&ctx).then(|| {
+                let id = self
+                    .backend
+                    .register_external_func(build_wrapper(x.clone(), ctx));
+                // DuckDB side-channel: register the primitive's
+                // user-visible name so the duck rule-builder can
+                // translate `ExternalFunctionId` references into
+                // `Term::Prim(name, …)` calls in the duck IR.
+                if let Some(duck) = self
+                    .backend
+                    .as_any_mut()
+                    .downcast_mut::<egglog_bridge_duckdb::EGraph>()
+                {
+                    duck.set_external_func_name(id, name.clone());
+                }
+                id
+            })
+        });
         self.type_info
             .primitives
-            .entry(primitive.name().to_owned())
+            .entry(name)
             .or_default()
             .push(PrimitiveWithId {
                 primitive,
-                id,
                 validator,
+                context_ids,
             });
     }
+}
 
+impl EGraph {
     pub(crate) fn typecheck_program(
         &mut self,
         program: &Vec<NCommand>,
@@ -254,7 +416,9 @@ impl EGraph {
                 ResolvedNCommand::Function(resolved)
             }
             NCommand::NormRule { rule } => ResolvedNCommand::NormRule {
-                rule: self.type_info.typecheck_rule(symbol_gen, rule)?,
+                rule: self
+                    .type_info
+                    .typecheck_rule(symbol_gen, rule, self.seminaive)?,
             },
             NCommand::Sort {
                 span,
@@ -280,35 +444,44 @@ impl EGraph {
                     unionable: *unionable,
                 }
             }
-            NCommand::CoreAction(Action::Let(span, var, expr)) => {
-                let expr = self
-                    .type_info
-                    .typecheck_expr(symbol_gen, expr, &Default::default())?;
-                let output_type = expr.output_type();
+            NCommand::CoreAction(action @ Action::Let(span, var, _)) => {
+                let action = self.type_info.typecheck_standalone_action(
+                    symbol_gen,
+                    action,
+                    &Default::default(),
+                    Context::Full,
+                )?;
                 self.ensure_global_name_prefix(span, var)?;
+                let ResolvedAction::Let(_, resolved_var, _) = &action else {
+                    unreachable!("typechecking an Action::Let should return ResolvedAction::Let")
+                };
                 self.type_info
                     .global_sorts
-                    .insert(var.clone(), output_type.clone());
-                let var = ResolvedVar {
-                    name: var.clone(),
-                    sort: output_type,
-                    // not a global reference, but a global binding
-                    is_global_ref: false,
-                };
-                ResolvedNCommand::CoreAction(ResolvedAction::Let(span.clone(), var, expr))
+                    .insert(resolved_var.name.clone(), resolved_var.sort.clone());
+                ResolvedNCommand::CoreAction(action)
             }
-            NCommand::CoreAction(action) => ResolvedNCommand::CoreAction(
-                self.type_info
-                    .typecheck_action(symbol_gen, action, &Default::default())?,
-            ),
+            NCommand::CoreAction(action) => {
+                ResolvedNCommand::CoreAction(self.type_info.typecheck_standalone_action(
+                    symbol_gen,
+                    action,
+                    &Default::default(),
+                    Context::Full,
+                )?)
+            }
             NCommand::Extract(span, expr, variants) => {
-                let res_expr =
-                    self.type_info
-                        .typecheck_expr(symbol_gen, expr, &Default::default())?;
+                let res_expr = self.type_info.typecheck_standalone_expr(
+                    symbol_gen,
+                    expr,
+                    &Default::default(),
+                    Context::Full,
+                )?;
 
-                let res_variants =
-                    self.type_info
-                        .typecheck_expr(symbol_gen, variants, &Default::default())?;
+                let res_variants = self.type_info.typecheck_standalone_expr(
+                    symbol_gen,
+                    variants,
+                    &Default::default(),
+                    Context::Full,
+                )?;
                 if res_variants.output_type().name() != I64Sort.name() {
                     return Err(TypeError::Mismatch {
                         expr: variants.clone(),
@@ -374,8 +547,12 @@ impl EGraph {
                 let exprs = exprs
                     .iter()
                     .map(|expr| {
-                        self.type_info
-                            .typecheck_expr(symbol_gen, expr, &Default::default())
+                        self.type_info.typecheck_standalone_expr(
+                            symbol_gen,
+                            expr,
+                            &Default::default(),
+                            Context::Full,
+                        )
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 ResolvedNCommand::Output {
@@ -497,8 +674,19 @@ impl TypeInfo {
         assert_eq!(
             results.len(),
             1,
-            "Expected exactly one sort for type {}",
-            std::any::type_name::<S>()
+            "Expected exactly one sort matching the given predicate"
+        );
+        results.into_iter().next().unwrap()
+    }
+
+    /// Returns the unique sort whose runtime values have Rust type `T`.
+    pub fn get_arcsort_for_value_type<T: 'static>(&self) -> ArcSort {
+        let results = self.get_arcsorts_by(|s| s.value_type() == Some(std::any::TypeId::of::<T>()));
+        assert_eq!(
+            results.len(),
+            1,
+            "Expected exactly one sort for type `{}`",
+            std::any::type_name::<T>()
         );
         results.into_iter().next().unwrap()
     }
@@ -588,7 +776,15 @@ impl TypeInfo {
             schema: fdecl.schema.clone(),
             resolved_schema: ResolvedCall::Func(self.func_types.get(&fdecl.name).unwrap().clone()),
             merge: match &fdecl.merge {
-                Some(merge) => Some(self.typecheck_expr(symbol_gen, merge, &bound_vars)?),
+                // Merge expressions run as part of action-side table updates:
+                // writes are allowed, but live DB reads would be untracked by
+                // seminaive rule execution.
+                Some(merge) => Some(self.typecheck_standalone_expr(
+                    symbol_gen,
+                    merge,
+                    &bound_vars,
+                    Context::Write,
+                )?),
                 None => None,
             },
             cost: fdecl.cost,
@@ -644,6 +840,7 @@ impl TypeInfo {
         &self,
         symbol_gen: &mut SymbolGen,
         rule: &Rule,
+        global_seminaive: bool,
     ) -> Result<ResolvedRule, TypeError> {
         let Rule {
             span,
@@ -652,11 +849,26 @@ impl TypeInfo {
             name,
             ruleset,
             allow_action_lookups,
+            naive,
+            no_decomp,
         } = rule;
         let mut constraints = vec![];
 
+        // This rule runs without seminaive if either the rule-local
+        // `:naive` option or the global `EGraph::seminaive == false`
+        // applies. Both must widen primitive-context selection to
+        // Read/Full so primitives that read or write the database can
+        // run; mirrors the backend's `self.seminaive && !rule.naive`
+        // check at rule-build time.
+        let seminaive = global_seminaive && !*naive;
+        let (query_ctx, action_ctx) = if seminaive {
+            (Context::Pure, Context::Write)
+        } else {
+            (Context::Read, Context::Full)
+        };
+
         let (query, mapped_query) = Facts(body.clone()).to_query(self, symbol_gen);
-        constraints.extend(query.get_constraints(self)?);
+        constraints.extend(query.get_constraints(self, query_ctx)?);
 
         let mut binding = query.get_vars();
         // We lower to core actions with `union_to_set_optimization`
@@ -673,14 +885,17 @@ impl TypeInfo {
             },
             self,
             symbol_gen,
+            query_ctx,
+            action_ctx,
         )?;
 
         let assignment = problem
             .solve(|sort: &ArcSort| sort.name())
             .map_err(|e| e.to_type_error())?;
 
-        let body: Vec<ResolvedFact> = assignment.annotate_facts(&mapped_query, self);
-        let actions: ResolvedActions = assignment.annotate_actions(&mapped_action, self)?;
+        let body: Vec<ResolvedFact> = assignment.annotate_facts(&mapped_query, self, query_ctx);
+        let actions: ResolvedActions =
+            assignment.annotate_actions(&mapped_action, self, action_ctx)?;
 
         // `unsafe-lookup` rules opt out of the "no function lookups in
         // actions" check — that's the whole point of the form. Every
@@ -696,6 +911,8 @@ impl TypeInfo {
             name: name.clone(),
             ruleset: ruleset.clone(),
             allow_action_lookups: *allow_action_lookups,
+            naive: *naive,
+            no_decomp: *no_decomp,
         })
     }
 
@@ -742,19 +959,25 @@ impl TypeInfo {
     ) -> Result<Vec<ResolvedFact>, TypeError> {
         let (query, mapped_facts) = Facts(facts.to_vec()).to_query(self, symbol_gen);
         let mut problem = Problem::default();
-        problem.add_query(&query, self)?;
+        // Top-level query-shaped commands (e.g. `check`) are read-only:
+        // primitives may inspect the database but not write to it.
+        problem.add_query(&query, self, Context::Read)?;
         let assignment = problem
             .solve(|sort: &ArcSort| sort.name())
             .map_err(|e| e.to_type_error())?;
-        let annotated_facts = assignment.annotate_facts(&mapped_facts, self);
+        let annotated_facts = assignment.annotate_facts(&mapped_facts, self, Context::Read);
         Ok(annotated_facts)
     }
 
-    fn typecheck_actions(
+    // Standalone expressions/actions use action lowering. Top-level commands
+    // pass `Full`; function `:merge` reuses this path with `Write` because
+    // merge expressions run during table updates.
+    fn typecheck_standalone_actions(
         &self,
         symbol_gen: &mut SymbolGen,
         actions: &Actions,
         binding: &IndexMap<&str, (Span, ArcSort)>,
+        context: Context,
     ) -> Result<ResolvedActions, TypeError> {
         let mut binding_set: IndexSet<String> =
             binding.keys().copied().map(str::to_string).collect();
@@ -764,8 +987,7 @@ impl TypeInfo {
         let (actions, mapped_action) = actions.to_core_actions(&mut ctx)?;
         let mut problem = Problem::default();
 
-        // add actions to problem
-        problem.add_actions(&actions, self, symbol_gen)?;
+        problem.add_actions(&actions, self, symbol_gen, context)?;
 
         // add bindings from the context
         for (var, (span, sort)) in binding {
@@ -776,35 +998,43 @@ impl TypeInfo {
             .solve(|sort: &ArcSort| sort.name())
             .map_err(|e| e.to_type_error())?;
 
-        let annotated_actions = assignment.annotate_actions(&mapped_action, self)?;
+        let annotated_actions = assignment.annotate_actions(&mapped_action, self, context)?;
         Ok(annotated_actions)
     }
 
-    fn typecheck_expr(
+    fn typecheck_standalone_expr(
         &self,
         symbol_gen: &mut SymbolGen,
         expr: &Expr,
         binding: &IndexMap<&str, (Span, ArcSort)>,
+        context: Context,
     ) -> Result<ResolvedExpr, TypeError> {
         let action = Action::Expr(expr.span(), expr.clone());
-        let typechecked_action = self.typecheck_action(symbol_gen, &action, binding)?;
+        let typechecked_action =
+            self.typecheck_standalone_action(symbol_gen, &action, binding, context)?;
         match typechecked_action {
             ResolvedAction::Expr(_, expr) => Ok(expr),
             _ => unreachable!(),
         }
     }
 
-    fn typecheck_action(
+    fn typecheck_standalone_action(
         &self,
         symbol_gen: &mut SymbolGen,
         action: &Action,
         binding: &IndexMap<&str, (Span, ArcSort)>,
+        context: Context,
     ) -> Result<ResolvedAction, TypeError> {
-        self.typecheck_actions(symbol_gen, &Actions::singleton(action.clone()), binding)
-            .map(|v| {
-                assert_eq!(v.len(), 1);
-                v.0.into_iter().next().unwrap()
-            })
+        self.typecheck_standalone_actions(
+            symbol_gen,
+            &Actions::singleton(action.clone()),
+            binding,
+            context,
+        )
+        .map(|v| {
+            assert_eq!(v.len(), 1);
+            v.0.into_iter().next().unwrap()
+        })
     }
 
     pub fn get_sort_by_name(&self, sym: &str) -> Option<&ArcSort> {
@@ -823,7 +1053,7 @@ impl TypeInfo {
         self.primitives
             .values()
             .flat_map(|v| v.iter())
-            .any(|p| p.id == id && p.validator.is_some())
+            .any(|p| p.context_ids.iter().any(|(_, pid)| *pid == Some(id)) && p.validator.is_some())
     }
 
     pub fn get_func_type(&self, sym: &str) -> Option<&FuncType> {
@@ -877,7 +1107,9 @@ pub enum TypeError {
     },
     #[error("{1}\nUnbound symbol {0}")]
     Unbound(String, Span),
-    #[error("{1}\nVariable {0} is ungrounded")]
+    #[error(
+        "{1}\nVariable {0} is ungrounded. A variable is grounded when it appears as an argument to a constructor or function in the query, not just under primitives or equalities."
+    )]
     Ungrounded(String, Span),
     #[error("{1}\nUndefined sort {0}")]
     UndefinedSort(String, Span),

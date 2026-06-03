@@ -920,6 +920,39 @@ impl Backend for EGraph {
         Value::new(id as u32)
     }
 
+    fn clear_table(&mut self, table: FunctionId) {
+        // Real delegation: empty the backing SQL table for this function.
+        let name = self.name_for_function_id(table).to_string();
+        let sql = format!("DELETE FROM {}", crate::q(&name));
+        self.conn
+            .execute(&sql, [])
+            .unwrap_or_else(|e| panic!("clear_table: DELETE FROM {name} failed: {e}"));
+    }
+
+    fn base_values(&self) -> &egglog_core_relations::BaseValues {
+        // Same `&BaseValues` the frontend extraction path reaches through
+        // `base_value_pool_typed().inner()`.
+        self.base_value_pool_typed().inner()
+    }
+
+    fn with_execution_state_dyn(
+        &self,
+        _f: &mut dyn FnMut(&mut egglog_backend_trait::ExecutionState<'_>),
+    ) {
+        // The duckdb backend has no in-memory `ExecutionState`; its
+        // mutations go through SQL. The only frontend caller
+        // (`with_full_state`) drives the action-registry primitive
+        // machinery, which is bridge-only.
+        unimplemented!("with_execution_state is not supported on the duckdb backend")
+    }
+
+    fn action_registry_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+        // DuckDB has no in-memory action registry: its actions commit
+        // through SQL rather than name-indexed `TableAction`s. The
+        // action-registry primitive machinery is bridge-only.
+        unimplemented!("action_registry is not supported on the duckdb backend")
+    }
+
     // -- rule management ----------------------------------------------------
 
     fn new_rule<'a>(

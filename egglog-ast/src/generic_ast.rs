@@ -100,6 +100,16 @@ where
     /// returning the function's `:default` on a miss, or panicking if it
     /// has none. Defaults to `false`.
     pub allow_action_lookups: bool,
+    /// If `true`, this rule disables seminaive evaluation. The body is
+    /// matched against the entire database every iteration and the
+    /// query/action are compiled with the global (read+write) primitive
+    /// contexts, allowing primitives that read or write the database
+    /// inside queries and actions. Set via the `:naive` rule option.
+    pub naive: bool,
+    /// If `true`, this rule skips tree-decomposition during query
+    /// planning and evaluate rules as a single-bag (without decomposing
+    /// it into smaller queries). Set via the `:no-decomp` rule option.
+    pub no_decomp: bool,
 }
 
 /// Change a function entry.

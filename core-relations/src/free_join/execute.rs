@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    common::HashMap,
+    common::{HashMap, IndexMap},
     free_join::plan::{JoinStages, MatId, MatScanMode, MatSpec},
     numeric_id::{DenseIdMap, IdVec, NumericId},
     query::Atom,
@@ -54,6 +54,24 @@ struct SparseColumnIndex {
     subset_ids: [RowId; SMALL_RESIDUAL],
 }
 
+/// Return a SubsetRef for the given range of rows in a SparseColumnIndex.
+/// Single-row ranges become Dense to skip pool allocation in to_owned.
+///
+/// # Safety
+/// `ids[range]` must be sorted in non-decreasing order. The wider `ids` slice
+/// need not be sorted as a whole; only the indicated sub-range. This is the
+/// invariant of `SortedOffsetSlice::new_unchecked`.
+#[inline]
+unsafe fn sparse_subset_ref(ids: &[RowId], range: Range<usize>) -> SubsetRef<'_> {
+    if range.len() == 1 {
+        let row = ids[range.start];
+        SubsetRef::Dense(OffsetRange::new(row, row.inc()))
+    } else {
+        // SAFETY: caller guarantees `ids[range]` is sorted.
+        SubsetRef::Sparse(unsafe { SortedOffsetSlice::new_unchecked(&ids[range]) })
+    }
+}
+
 impl SparseColumnIndex {
     fn keys(&self) -> &[Value] {
         &self.keys[..self.n_keys]
@@ -71,20 +89,11 @@ impl SparseColumnIndex {
 
     fn new(table: WrappedTableRef<'_>, subset: SubsetRef<'_>, col: ColumnId) -> Self {
         let mut rows = [(Value::new_const(0), RowId::new_const(0)); SMALL_RESIDUAL];
-        let mut buf = TaggedRowBuffer::<SmallValueVec>::new_inline(1);
         let mut pos = 0;
-        table.scan_project(
-            subset,
-            &[col],
-            Offset::new_const(0),
-            subset.size(),
-            &[],
-            &mut buf,
-        );
-        for (row_id, key) in buf.iter() {
-            rows[pos] = (key[0], row_id);
+        table.for_each_col(subset, col, &mut |row_id, val| {
+            rows[pos] = (val, row_id);
             pos += 1;
-        }
+        });
         let n_subsets = pos;
 
         rows[..pos].sort_unstable();
@@ -120,10 +129,10 @@ impl SparseColumnIndex {
         }
         let found = self.keys().binary_search(&key).ok()?;
         let range = self.get_offset_for(found);
-
-        Some(SubsetRef::Sparse(unsafe {
-            SortedOffsetSlice::new_unchecked(&self.subset_ids[range])
-        }))
+        // SAFETY: `subset_ids` was populated from rows sorted by (Value, RowId),
+        // so RowIds within any single per-key range (as returned by
+        // `get_offset_for`) are in non-decreasing order.
+        Some(unsafe { sparse_subset_ref(&self.subset_ids, range) })
     }
 
     fn for_each(&self, mut f: impl FnMut(&[Value], SubsetRef)) {
@@ -132,9 +141,8 @@ impl SparseColumnIndex {
         }
         for i in 0..self.n_keys {
             let range = self.get_offset_for(i);
-            let subset = SubsetRef::Sparse(unsafe {
-                SortedOffsetSlice::new_unchecked(&self.subset_ids[range])
-            });
+            // SAFETY: see `get_subset` — each per-key range of `subset_ids` is sorted.
+            let subset = unsafe { sparse_subset_ref(&self.subset_ids, range) };
             f(&self.keys[i..i + 1], subset);
         }
     }
@@ -455,7 +463,7 @@ impl Database {
                                                 .unwrap(),
                                         )
                                         .into_iter()
-                                        .collect::<HashMap<_, _>>();
+                                        .collect::<IndexMap<_, _>>();
                                         binding_info
                                             .materializations
                                             .insert(mat_id, Arc::new(materialization));
@@ -543,7 +551,7 @@ impl Database {
                             let mut materializations =
                                 DenseIdMap::with_capacity(plan.stages.blocks.len());
                             for i in 0..plan.stages.blocks.len() {
-                                materializations.insert(MatId::from_usize(i), HashMap::default());
+                                materializations.insert(MatId::from_usize(i), Default::default());
                             }
                             let mut materializer = InPlaceMaterializer {
                                 specs: &plan
@@ -653,10 +661,10 @@ struct JoinState<'a> {
 
 /// Per-column indexes on a trie node's subset, lazily initialized on first access per column.
 type ColumnIndexes = IdVec<ColumnId, OnceLock<Arc<ColumnIndex>>>;
-
-/// Per-column maps from a value to the child trie node for that value, lazily populated on first
-/// lookup per (column, value) pair.
-pub(crate) type ChildrenMaps = IdVec<ColumnId, RwLock<HashMap<Value, Arc<TrieNode>>>>;
+// Each TrieNode is probed with exactly one column in practice, so we store a single
+// (ColumnId, map) pair instead of a per-column IdVec of Mutexes. Boxed to keep
+// TrieNode size small for the many short-lived TrieNodes that never need caching.
+type ChildrenMaps = IdVec<ColumnId, RwLock<HashMap<Value, Arc<TrieNode>>>>;
 
 /// Information about the current subset of an atom's relation that is being considered, along with
 /// lazily-initialized, cached indexes on that subset.
@@ -752,18 +760,28 @@ impl FrameUpdates {
     }
 }
 
+type BindingSet = Vec<(SmallVec<[Variable; 4]>, Arc<TaggedRowBuffer<SmallValueVec>>)>;
+
 #[derive(Default, Clone)]
 struct BindingInfo {
     bindings: DenseIdMap<Variable, Value>,
+    binding_sets: BindingSet,
     subsets: DenseIdMap<AtomId, Arc<TrieNode>>,
-    materializations: DenseIdMap<MatId, Arc<HashMap<Vec<Value>, RowBuffer>>>,
+    materializations: DenseIdMap<MatId, Arc<IndexMap<Vec<Value>, RowBuffer>>>,
 }
 
 impl BindingInfo {
     /// Initializes the atom-related metadata in the [`BindingInfo`].    
     fn insert_subset(&mut self, atom: AtomId, subset: Subset) {
-        let node = Arc::new(TrieNode::new(subset));
-        self.subsets.insert(atom, node);
+        if let Some(slot) = self.subsets.get_mut(atom)
+            && let Some(node) = Arc::get_mut(slot)
+        {
+            node.cached_subsets.take();
+            node.cached_children.take();
+            node.subset = subset;
+            return;
+        }
+        self.subsets.insert(atom, Arc::new(TrieNode::new(subset)));
     }
 
     fn insert_node(&mut self, atom: AtomId, node: Arc<TrieNode>) {
@@ -811,51 +829,53 @@ impl<'a> JoinState<'a> {
 
         let table_id = atoms[atom].table;
         let info = &self.db.tables[table_id];
-        let all_cacheable = cols.iter().all(|col| {
-            !info
-                .spec
-                .uncacheable_columns
-                .get(*col)
-                .copied()
-                .unwrap_or(false)
-        });
-        let whole_table = info.table.all();
         let dyn_index = if subset.size() <= SMALL_RESIDUAL && cols.len() == 1 {
             DynamicIndex::SparseColumn(SparseColumnIndex::new(
                 info.table.as_ref(),
                 subset.as_ref(),
                 cols[0],
             ))
-        } else if let Subset::Dense(range) = subset
-            && all_cacheable
-            && whole_table.size() / 2 < subset.size()
-        {
-            // Skip intersecting with the subset if we are just looking at the
-            // whole table.
-            let needs_intersect =
-                !(whole_table.is_dense() && subset.bounds() == whole_table.bounds());
-            // When intersecting, store the Dense range directly so we can do a
-            // combined copy+filter without a runtime match on subset type later.
-            let intersect_outer = if needs_intersect { Some(*range) } else { None };
-            // heuristic: if the subset we are scanning is somewhat
-            // large _or_ it is most of the table, or we already have a cached
-            // index for it, then return it.
-            if cols.len() != 1 {
-                DynamicIndex::Cached {
-                    intersect_outer,
-                    table: get_index_from_tableinfo(info, &cols),
-                }
-            } else {
-                DynamicIndex::CachedColumn {
-                    intersect_outer,
-                    table: get_column_index_from_tableinfo(info, cols[0]).clone(),
-                }
-            }
-        } else if cols.len() != 1 {
-            // NB: we should have a caching strategy for non-column indexes.
-            DynamicIndex::Dynamic(info.table.group_by_key(subset.as_ref(), &cols))
         } else {
-            DynamicIndex::DynamicColumn(trie_node.get_cached_index(cols[0], info))
+            let all_cacheable = cols.iter().all(|col| {
+                !info
+                    .spec
+                    .uncacheable_columns
+                    .get(*col)
+                    .copied()
+                    .unwrap_or(false)
+            });
+            let whole_table = info.table.all();
+            if let Subset::Dense(range) = subset
+                && all_cacheable
+                && whole_table.size() / 2 < subset.size()
+            {
+                // Skip intersecting with the subset if we are just looking at the
+                // whole table.
+                let needs_intersect =
+                    !(whole_table.is_dense() && subset.bounds() == whole_table.bounds());
+                // When intersecting, store the Dense range directly so we can do a
+                // combined copy+filter without a runtime match on subset type later.
+                let intersect_outer = if needs_intersect { Some(*range) } else { None };
+                // heuristic: if the subset we are scanning is somewhat
+                // large _or_ it is most of the table, or we already have a cached
+                // index for it, then return it.
+                if cols.len() != 1 {
+                    DynamicIndex::Cached {
+                        intersect_outer,
+                        table: get_index_from_tableinfo(info, &cols),
+                    }
+                } else {
+                    DynamicIndex::CachedColumn {
+                        intersect_outer,
+                        table: get_column_index_from_tableinfo(info, cols[0]).clone(),
+                    }
+                }
+            } else if cols.len() != 1 {
+                // NB: we should have a caching strategy for non-column indexes.
+                DynamicIndex::Dynamic(info.table.group_by_key(subset.as_ref(), &cols))
+            } else {
+                DynamicIndex::DynamicColumn(trie_node.get_cached_index(cols[0], info))
+            }
         };
         Prober {
             node: trie_node,
@@ -938,12 +958,16 @@ impl<'a> JoinState<'a> {
         }
 
         if cur >= instr_order.len() {
-            action_buf.push_bindings(action, &binding_info.bindings, || self.exec_state.clone());
+            action_buf.push_bindings_factorized(
+                action,
+                &mut binding_info.bindings,
+                &binding_info.binding_sets,
+                &self.exec_state,
+            );
             return;
         }
         let chunk_size = action_buf.morsel_size(cur, instr_order.len());
         let mut cur_size = estimate_size(&stages.instrs[instr_order.get(cur)], binding_info);
-        // TODO: add dynamic sort plan back
         if cur_size > 32 && cur % 3 == 1 && cur < instr_order.len() - 1 {
             // If we have a reasonable number of tuples to process, adjust the variable order every
             // 3 rounds, but always make sure to readjust on the second roung.
@@ -957,6 +981,8 @@ impl<'a> JoinState<'a> {
                 if self.exec_state.should_stop() {
                     return;
                 }
+                // TODO: `supports_parallel_drain`` is a hack because currently
+                // `drain_updates_parallel!`` is a bit slower because of the additional ExecutionState clone.
                 if (cur == 0 || cur == 1) && action_buf.supports_parallel_drain() {
                     drain_updates_parallel!($updates)
                 } else {
@@ -976,9 +1002,12 @@ impl<'a> JoinState<'a> {
                             // a recursive run_plan call, avoiding function call
                             // overhead + an extra should_stop() check.
                             if cur + 1 >= instr_order.len() {
-                                action_buf.push_bindings(action, &binding_info.bindings, || {
-                                    self.exec_state.clone()
-                                });
+                                action_buf.push_bindings_factorized(
+                                    action,
+                                    &mut binding_info.bindings,
+                                    &binding_info.binding_sets,
+                                    &self.exec_state,
+                                );
                             } else {
                                 self.run_plan(
                                     stages,
@@ -1341,6 +1370,44 @@ impl<'a> JoinState<'a> {
                 cover,
                 bind,
                 to_intersect,
+                is_leaf_scan: true,
+            } if to_intersect.is_empty() => {
+                let cover_atom = cover.to_index.atom;
+                if binding_info.has_empty_subset(cover_atom) {
+                    return;
+                }
+                let table = self.db.tables[atoms[cover_atom].table].table.as_ref();
+                let cover_node = binding_info.unwrap_val(cover_atom);
+                let cover_subset = cover_node.subset.as_ref();
+
+                let proj = SmallVec::<[ColumnId; 4]>::from_iter(bind.iter().map(|(col, _)| *col));
+                let vars = bind.iter().map(|(_, var)| *var).collect();
+                let mut buf = TaggedRowBuffer::new_inline(bind.len());
+                table.scan_project(
+                    cover_subset,
+                    &proj,
+                    Offset::new(0),
+                    usize::MAX,
+                    &cover.constraints,
+                    &mut buf,
+                );
+
+                if buf.is_empty() {
+                    return;
+                }
+
+                binding_info.binding_sets.push((vars, Arc::new(buf)));
+                let mut updates = FrameUpdates::with_capacity(1);
+                updates.finish_frame();
+                drain_updates!(updates);
+                binding_info.binding_sets.pop();
+                binding_info.move_back_node(cover_atom, cover_node);
+            }
+            JoinStage::FusedIntersect {
+                cover,
+                bind,
+                to_intersect,
+                is_leaf_scan: false,
             } if to_intersect.is_empty() => {
                 let cover_atom = cover.to_index.atom;
                 if binding_info.has_empty_subset(cover_atom) {
@@ -1388,6 +1455,7 @@ impl<'a> JoinState<'a> {
                 cover,
                 bind,
                 to_intersect,
+                is_leaf_scan: _,
             } => {
                 let cover_atom = cover.to_index.atom;
                 if binding_info.has_empty_subset(cover_atom) {
@@ -1672,6 +1740,19 @@ trait ActionBuffer<'state, A: NumericId>: Send {
     type AsLocal<'a>: ActionBuffer<'state, A>
     where
         'state: 'a;
+
+    /// Expand the binding sets to individual bindings and
+    /// call push_bindings
+    fn push_bindings_factorized(
+        &mut self,
+        action: A,
+        bindings: &mut DenseIdMap<Variable, Value>,
+        binding_sets: &BindingSet,
+        exec_state: &ExecutionState<'state>,
+    ) {
+        expand_binding_sets(self, action, bindings, binding_sets, 0, exec_state);
+    }
+
     /// Push the given bindings to be executed for the specified action. If this
     /// buffer has built up a sufficient batch size, it may execute
     /// `to_exec_state` and then execute the action.
@@ -1891,6 +1972,50 @@ impl<'scope> ActionBuffer<'scope, ActionId> for ScopedActionBuffer<'_, 'scope> {
     }
 }
 
+fn expand_binding_sets<'state, A: NumericId, BUF: ActionBuffer<'state, A> + ?Sized>(
+    action_buf: &mut BUF,
+    action: A,
+    bindings: &mut DenseIdMap<Variable, Value>,
+    binding_sets: &BindingSet,
+    idx: usize,
+    exec_state: &ExecutionState<'state>,
+) {
+    if exec_state.should_stop() {
+        return;
+    }
+    if idx >= binding_sets.len() {
+        action_buf.push_bindings(action, bindings, || exec_state.clone());
+        return;
+    }
+    if idx + 1 == binding_sets.len() {
+        let (vars, buf) = &binding_sets[idx];
+        for (_, row) in buf.iter() {
+            if exec_state.should_stop() {
+                return;
+            }
+            for (var, val) in vars.iter().zip(row.iter()) {
+                bindings.insert(*var, *val);
+            }
+            action_buf.push_bindings(action, bindings, || exec_state.clone());
+        }
+        return;
+    }
+    let (vars, buf) = &binding_sets[idx];
+    for (_, row) in buf.iter() {
+        for (var, val) in vars.iter().zip(row.iter()) {
+            bindings.insert(*var, *val);
+        }
+        expand_binding_sets(
+            action_buf,
+            action,
+            bindings,
+            binding_sets,
+            idx + 1,
+            exec_state,
+        );
+    }
+}
+
 fn flush_action_states(
     exec_state: &mut ExecutionState,
     actions: &mut DenseIdMap<ActionId, ActionState>,
@@ -1909,7 +2034,7 @@ fn flush_action_states(
 
 struct InPlaceMaterializer<'a> {
     specs: &'a DenseIdMap<MatId, MatSpec>,
-    materializations: DenseIdMap<MatId, HashMap<Vec<Value>, RowBuffer>>,
+    materializations: DenseIdMap<MatId, IndexMap<Vec<Value>, RowBuffer>>,
     scratch_key: Vec<Value>,
     scratch_val: Vec<Value>,
 }
@@ -2148,8 +2273,12 @@ fn sort_plan_by_size_inner(
     // We prioritize variables by
     //
     //   (1) how many times an atom with this variable has been refined,
-    //   (2) then by how many relations joins on this variable
-    //   (3) then by the cardinality of the variable to be enumerated
+    //   (2) then by the cardinality of the variable to be enumerated (smaller → earlier)
+    //   (3) then by how many relations join on this variable (more → earlier)
+    //
+    // Estimate size is second so that stages with very small cardinality (e.g. FunDep
+    // consequents with exactly 1 value) are run before multi-relation stages that happen
+    // to have a larger current estimate.
     let key_fn = |join_stage: &JoinStage,
                   binding_info: &BindingInfo,
                   times_refined: &DenseIdMap<AtomId, i64>| {
@@ -2167,17 +2296,18 @@ fn sort_plan_by_size_inner(
         };
         (
             -refine,
-            -num_intersected_rels(join_stage),
             estimate_size(join_stage, binding_info),
+            -num_intersected_rels(join_stage),
         )
     };
 
     for i in range.clone() {
+        let mut key_i = key_fn(&instrs[order.get(i)], binding_info, &times_refined);
         for j in (i + 1)..range.end {
-            let key_i = key_fn(&instrs[order.get(i)], binding_info, &times_refined);
             let key_j = key_fn(&instrs[order.get(j)], binding_info, &times_refined);
             if key_j < key_i {
                 order.data.swap(i, j);
+                key_i = key_j;
             }
         }
         // Update the counts after a new instruction is selected.
