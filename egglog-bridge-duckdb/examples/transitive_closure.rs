@@ -61,10 +61,7 @@ fn main() -> Result<()> {
     let (iters, ts) = eg.run_to_saturation()?;
     let run_ms = run_start.elapsed().as_secs_f64() * 1000.0;
 
-    let final_path = eg.check_exists(
-        "path",
-        &[Literal::I64(0), Literal::I64(chain_len)],
-    )?;
+    let final_path = eg.check_exists("path", &[Literal::I64(0), Literal::I64(chain_len)])?;
     let total = eg.count("path")?;
     let expected = chain_len * (chain_len + 1) / 2;
 

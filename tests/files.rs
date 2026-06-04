@@ -214,7 +214,10 @@ impl Run {
                     if self.should_fail() {
                         panic!(
                             "Program should have failed under --duckdb! Outputs:\n{}",
-                            msgs.iter().map(|m| m.to_string()).collect::<Vec<_>>().join("")
+                            msgs.iter()
+                                .map(|m| m.to_string())
+                                .collect::<Vec<_>>()
+                                .join("")
                         );
                     }
                     Ok(msgs)
@@ -466,12 +469,11 @@ fn generate_tests(glob: &str) -> Vec<Trial> {
             && !requires_proofs
             && supports_proofs
             && !duckdb_static_skip.iter().any(|f| run.path.ends_with(f));
-        if duckdb_supported {
-            if let Ok(src) = std::fs::read_to_string(&run.path) {
-                if src.contains("(push") || src.contains("(pop") {
-                    duckdb_supported = false;
-                }
-            }
+        if duckdb_supported
+            && let Ok(src) = std::fs::read_to_string(&run.path)
+            && (src.contains("(push") || src.contains("(pop"))
+        {
+            duckdb_supported = false;
         }
         if duckdb_supported {
             push_trial(Run {
@@ -492,15 +494,13 @@ fn generate_tests(glob: &str) -> Vec<Trial> {
         // duckdb feature, so files relying on them would diverge
         // from the shared snapshot just because every run gets
         // appended onto the previous run's state.
-        let mut duckdb_proofs_supported = !should_fail
-            && !requires_proofs
-            && file_supports_proofs(&run.path);
-        if duckdb_proofs_supported {
-            if let Ok(src) = std::fs::read_to_string(&run.path) {
-                if src.contains("(push") || src.contains("(pop") {
-                    duckdb_proofs_supported = false;
-                }
-            }
+        let mut duckdb_proofs_supported =
+            !should_fail && !requires_proofs && file_supports_proofs(&run.path);
+        if duckdb_proofs_supported
+            && let Ok(src) = std::fs::read_to_string(&run.path)
+            && (src.contains("(push") || src.contains("(pop"))
+        {
+            duckdb_proofs_supported = false;
         }
         if duckdb_proofs_supported {
             push_trial(Run {

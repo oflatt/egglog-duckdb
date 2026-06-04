@@ -16,11 +16,9 @@
 
 use anyhow::{Result, anyhow};
 use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
-use duckdb::types::DuckString;
 use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
 use duckdb::vtab::arrow::WritableVector;
 use duckdb::{Connection, ToSql};
-use duckdb::ffi::duckdb_string_t;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -42,16 +40,18 @@ impl VScalar for UfFindScalar {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let n = input.len();
-        let input_vec = input.flat_vector(0);
-        let inputs = input_vec.as_slice_with_len::<i64>(n);
-        let mut output_vec = output.flat_vector();
-        let outputs = output_vec.as_mut_slice::<i64>();
-        let uf = state.lock().unwrap();
-        for i in 0..n {
-            outputs[i] = uf.find_ro(inputs[i]);
+        unsafe {
+            let n = input.len();
+            let input_vec = input.flat_vector(0);
+            let inputs = input_vec.as_slice_with_len::<i64>(n);
+            let mut output_vec = output.flat_vector();
+            let outputs = output_vec.as_mut_slice::<i64>();
+            let uf = state.lock().unwrap();
+            for i in 0..n {
+                outputs[i] = uf.find_ro(inputs[i]);
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
@@ -99,58 +99,59 @@ impl VScalar for FromStringScalar {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        use egglog_backend_trait::{BaseValuePool, Value};
-        use egglog_numeric_id::NumericId;
-        use num::BigInt;
-        use std::any::TypeId;
-        use std::str::FromStr;
+        unsafe {
+            use egglog_backend_trait::{BaseValuePool, Value};
+            use egglog_numeric_id::NumericId;
+            use num::BigInt;
+            use std::any::TypeId;
+            use std::str::FromStr;
 
-        // Strings on duck are stored as interned `Boxed<String>`
-        // handles in BIGINT columns (matches bridge encoding). So
-        // this UDF's input is a BIGINT handle, not a raw VARCHAR.
-        // Unwrap the handle to get the string, then parse as BigInt.
-        let string_ty = state
-            .pool
-            .get_ty_by_type_id(TypeId::of::<egglog_core_relations::Boxed<String>>());
+            // Strings on duck are stored as interned `Boxed<String>`
+            // handles in BIGINT columns (matches bridge encoding). So
+            // this UDF's input is a BIGINT handle, not a raw VARCHAR.
+            // Unwrap the handle to get the string, then parse as BigInt.
+            let string_ty = state
+                .pool
+                .get_ty_by_type_id(TypeId::of::<egglog_core_relations::Boxed<String>>());
 
-        let n = input.len();
-        let in_vec = input.flat_vector(0);
-        let in_slice = in_vec.as_slice_with_len::<i64>(n);
+            let n = input.len();
+            let in_vec = input.flat_vector(0);
+            let in_slice = in_vec.as_slice_with_len::<i64>(n);
 
-        let mut results: Vec<Option<i64>> = Vec::with_capacity(n);
-        for i in 0..n {
-            let handle = Value::new(in_slice[i] as u32);
-            let boxed = state.pool.unwrap_dyn(string_ty, handle);
-            let s_boxed: &egglog_core_relations::Boxed<String> =
-                boxed.downcast_ref().ok_or_else(
-                    || -> Box<dyn std::error::Error> {
+            let mut results: Vec<Option<i64>> = Vec::with_capacity(n);
+            for i in 0..n {
+                let handle = Value::new(in_slice[i] as u32);
+                let boxed = state.pool.unwrap_dyn(string_ty, handle);
+                let s_boxed: &egglog_core_relations::Boxed<String> = boxed
+                    .downcast_ref()
+                    .ok_or_else(|| -> Box<dyn std::error::Error> {
                         "FromStringScalar: handle did not refer to a Boxed<String>".into()
-                    },
-                )?;
-            // Mirror the bridge's `-?>` semantics: parse failure
-            // means the rule firing should not produce a value.
-            // Encode as NULL so downstream actions/filters drop
-            // rows that resolve to NULL.
-            results.push(BigInt::from_str(s_boxed.0.as_str()).ok().map(|bi| {
-                let z = egglog_core_relations::Boxed::new(bi);
-                let val = state.pool.intern_dyn(state.bigint_ty, Box::new(z));
-                val.rep() as i64
-            }));
-        }
+                    })?;
+                // Mirror the bridge's `-?>` semantics: parse failure
+                // means the rule firing should not produce a value.
+                // Encode as NULL so downstream actions/filters drop
+                // rows that resolve to NULL.
+                results.push(BigInt::from_str(s_boxed.0.as_str()).ok().map(|bi| {
+                    let z = egglog_core_relations::Boxed::new(bi);
+                    let val = state.pool.intern_dyn(state.bigint_ty, Box::new(z));
+                    val.rep() as i64
+                }));
+            }
 
-        let mut out_vec = output.flat_vector();
-        {
-            let out_slice = out_vec.as_mut_slice::<i64>();
+            let mut out_vec = output.flat_vector();
+            {
+                let out_slice = out_vec.as_mut_slice::<i64>();
+                for (i, r) in results.iter().enumerate() {
+                    out_slice[i] = r.unwrap_or(0);
+                }
+            }
             for (i, r) in results.iter().enumerate() {
-                out_slice[i] = r.unwrap_or(0);
+                if r.is_none() {
+                    out_vec.set_null(i);
+                }
             }
+            Ok(())
         }
-        for (i, r) in results.iter().enumerate() {
-            if r.is_none() {
-                out_vec.set_null(i);
-            }
-        }
-        Ok(())
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
@@ -180,50 +181,52 @@ impl VScalar for BigratScalar {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        use egglog_backend_trait::{BaseValuePool, Value};
-        use egglog_numeric_id::NumericId;
-        use num::{BigInt, BigRational};
+        unsafe {
+            use egglog_backend_trait::{BaseValuePool, Value};
+            use egglog_numeric_id::NumericId;
+            use num::{BigInt, BigRational};
 
-        let bigrat_ty = state
-            .bigrat_ty
-            .ok_or_else(|| -> Box<dyn std::error::Error> {
-                "BigratScalar: bigrat type id missing (BigRatSort not registered before \
+            let bigrat_ty = state
+                .bigrat_ty
+                .ok_or_else(|| -> Box<dyn std::error::Error> {
+                    "BigratScalar: bigrat type id missing (BigRatSort not registered before \
                  __egglog_bigrat was called)"
-                    .into()
-            })?;
-
-        let n = input.len();
-        let num_col = input.flat_vector(0);
-        let den_col = input.flat_vector(1);
-        let num_slice = num_col.as_slice_with_len::<i64>(n);
-        let den_slice = den_col.as_slice_with_len::<i64>(n);
-
-        let mut out_vec = output.flat_vector();
-        let out_slice = out_vec.as_mut_slice::<i64>();
-
-        for i in 0..n {
-            let num_val = Value::new(num_slice[i] as u32);
-            let den_val = Value::new(den_slice[i] as u32);
-            let num_boxed = state.pool.unwrap_dyn(state.bigint_ty, num_val);
-            let den_boxed = state.pool.unwrap_dyn(state.bigint_ty, den_val);
-            let num_bigint: &egglog_core_relations::Boxed<BigInt> = num_boxed
-                .downcast_ref()
-                .ok_or_else(|| -> Box<dyn std::error::Error> {
-                    "BigratScalar: numerator was not a Boxed<BigInt>".into()
+                        .into()
                 })?;
-            let den_bigint: &egglog_core_relations::Boxed<BigInt> = den_boxed
-                .downcast_ref()
-                .ok_or_else(|| -> Box<dyn std::error::Error> {
-                    "BigratScalar: denominator was not a Boxed<BigInt>".into()
-                })?;
-            let q = egglog_core_relations::Boxed::new(BigRational::new(
-                num_bigint.0.clone(),
-                den_bigint.0.clone(),
-            ));
-            let val = state.pool.intern_dyn(bigrat_ty, Box::new(q));
-            out_slice[i] = val.rep() as i64;
+
+            let n = input.len();
+            let num_col = input.flat_vector(0);
+            let den_col = input.flat_vector(1);
+            let num_slice = num_col.as_slice_with_len::<i64>(n);
+            let den_slice = den_col.as_slice_with_len::<i64>(n);
+
+            let mut out_vec = output.flat_vector();
+            let out_slice = out_vec.as_mut_slice::<i64>();
+
+            for i in 0..n {
+                let num_val = Value::new(num_slice[i] as u32);
+                let den_val = Value::new(den_slice[i] as u32);
+                let num_boxed = state.pool.unwrap_dyn(state.bigint_ty, num_val);
+                let den_boxed = state.pool.unwrap_dyn(state.bigint_ty, den_val);
+                let num_bigint: &egglog_core_relations::Boxed<BigInt> = num_boxed
+                    .downcast_ref()
+                    .ok_or_else(|| -> Box<dyn std::error::Error> {
+                        "BigratScalar: numerator was not a Boxed<BigInt>".into()
+                    })?;
+                let den_bigint: &egglog_core_relations::Boxed<BigInt> = den_boxed
+                    .downcast_ref()
+                    .ok_or_else(|| -> Box<dyn std::error::Error> {
+                        "BigratScalar: denominator was not a Boxed<BigInt>".into()
+                    })?;
+                let q = egglog_core_relations::Boxed::new(BigRational::new(
+                    num_bigint.0.clone(),
+                    den_bigint.0.clone(),
+                ));
+                let val = state.pool.intern_dyn(bigrat_ty, Box::new(q));
+                out_slice[i] = val.rep() as i64;
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
@@ -458,11 +461,12 @@ fn unwrap_bigrat(
     use egglog_numeric_id::NumericId;
     let val = Value::new(raw as u32);
     let boxed = pool.unwrap_dyn(bigrat_ty, val);
-    let q: &egglog_core_relations::Boxed<num::BigRational> = boxed
-        .downcast_ref()
-        .ok_or_else(|| -> Box<dyn std::error::Error> {
-            "expected Boxed<BigRational> from pool".into()
-        })?;
+    let q: &egglog_core_relations::Boxed<num::BigRational> =
+        boxed
+            .downcast_ref()
+            .ok_or_else(|| -> Box<dyn std::error::Error> {
+                "expected Boxed<BigRational> from pool".into()
+            })?;
     Ok(q.0.clone())
 }
 
@@ -478,37 +482,39 @@ impl VScalar for BigratUnaryQScalar {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        use egglog_backend_trait::BaseValuePool;
-        use egglog_numeric_id::NumericId;
-        let n = input.len();
-        let in_vec = input.flat_vector(0);
-        let in_slice = in_vec.as_slice_with_len::<i64>(n);
+        unsafe {
+            use egglog_backend_trait::BaseValuePool;
+            use egglog_numeric_id::NumericId;
+            let n = input.len();
+            let in_vec = input.flat_vector(0);
+            let in_slice = in_vec.as_slice_with_len::<i64>(n);
 
-        let mut results: Vec<Option<i64>> = Vec::with_capacity(n);
-        for i in 0..n {
-            let q = unwrap_bigrat(&state.pool, state.bigrat_ty, in_slice[i])?;
-            let out = run_bigrat_q(state.op, &[q]);
-            results.push(out.map(|r| {
-                let boxed = egglog_core_relations::Boxed::new(r);
-                state
-                    .pool
-                    .intern_dyn(state.bigrat_ty, Box::new(boxed))
-                    .rep() as i64
-            }));
-        }
-        let mut out_vec = output.flat_vector();
-        {
-            let out_slice = out_vec.as_mut_slice::<i64>();
+            let mut results: Vec<Option<i64>> = Vec::with_capacity(n);
+            for i in 0..n {
+                let q = unwrap_bigrat(&state.pool, state.bigrat_ty, in_slice[i])?;
+                let out = run_bigrat_q(state.op, &[q]);
+                results.push(out.map(|r| {
+                    let boxed = egglog_core_relations::Boxed::new(r);
+                    state
+                        .pool
+                        .intern_dyn(state.bigrat_ty, Box::new(boxed))
+                        .rep() as i64
+                }));
+            }
+            let mut out_vec = output.flat_vector();
+            {
+                let out_slice = out_vec.as_mut_slice::<i64>();
+                for (i, r) in results.iter().enumerate() {
+                    out_slice[i] = r.unwrap_or(0);
+                }
+            }
             for (i, r) in results.iter().enumerate() {
-                out_slice[i] = r.unwrap_or(0);
+                if r.is_none() {
+                    out_vec.set_null(i);
+                }
             }
+            Ok(())
         }
-        for (i, r) in results.iter().enumerate() {
-            if r.is_none() {
-                out_vec.set_null(i);
-            }
-        }
-        Ok(())
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
@@ -530,40 +536,42 @@ impl VScalar for BigratBinaryQScalar {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        use egglog_backend_trait::BaseValuePool;
-        use egglog_numeric_id::NumericId;
-        let n = input.len();
-        let a_vec = input.flat_vector(0);
-        let b_vec = input.flat_vector(1);
-        let a_slice = a_vec.as_slice_with_len::<i64>(n);
-        let b_slice = b_vec.as_slice_with_len::<i64>(n);
+        unsafe {
+            use egglog_backend_trait::BaseValuePool;
+            use egglog_numeric_id::NumericId;
+            let n = input.len();
+            let a_vec = input.flat_vector(0);
+            let b_vec = input.flat_vector(1);
+            let a_slice = a_vec.as_slice_with_len::<i64>(n);
+            let b_slice = b_vec.as_slice_with_len::<i64>(n);
 
-        let mut results: Vec<Option<i64>> = Vec::with_capacity(n);
-        for i in 0..n {
-            let a = unwrap_bigrat(&state.pool, state.bigrat_ty, a_slice[i])?;
-            let b = unwrap_bigrat(&state.pool, state.bigrat_ty, b_slice[i])?;
-            let out = run_bigrat_q(state.op, &[a, b]);
-            results.push(out.map(|r| {
-                let boxed = egglog_core_relations::Boxed::new(r);
-                state
-                    .pool
-                    .intern_dyn(state.bigrat_ty, Box::new(boxed))
-                    .rep() as i64
-            }));
-        }
-        let mut out_vec = output.flat_vector();
-        {
-            let out_slice = out_vec.as_mut_slice::<i64>();
+            let mut results: Vec<Option<i64>> = Vec::with_capacity(n);
+            for i in 0..n {
+                let a = unwrap_bigrat(&state.pool, state.bigrat_ty, a_slice[i])?;
+                let b = unwrap_bigrat(&state.pool, state.bigrat_ty, b_slice[i])?;
+                let out = run_bigrat_q(state.op, &[a, b]);
+                results.push(out.map(|r| {
+                    let boxed = egglog_core_relations::Boxed::new(r);
+                    state
+                        .pool
+                        .intern_dyn(state.bigrat_ty, Box::new(boxed))
+                        .rep() as i64
+                }));
+            }
+            let mut out_vec = output.flat_vector();
+            {
+                let out_slice = out_vec.as_mut_slice::<i64>();
+                for (i, r) in results.iter().enumerate() {
+                    out_slice[i] = r.unwrap_or(0);
+                }
+            }
             for (i, r) in results.iter().enumerate() {
-                out_slice[i] = r.unwrap_or(0);
+                if r.is_none() {
+                    out_vec.set_null(i);
+                }
             }
+            Ok(())
         }
-        for (i, r) in results.iter().enumerate() {
-            if r.is_none() {
-                out_vec.set_null(i);
-            }
-        }
-        Ok(())
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
@@ -590,26 +598,28 @@ impl VScalar for BigratCmpScalar {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let n = input.len();
-        let a_vec = input.flat_vector(0);
-        let b_vec = input.flat_vector(1);
-        let a_slice = a_vec.as_slice_with_len::<i64>(n);
-        let b_slice = b_vec.as_slice_with_len::<i64>(n);
+        unsafe {
+            let n = input.len();
+            let a_vec = input.flat_vector(0);
+            let b_vec = input.flat_vector(1);
+            let a_slice = a_vec.as_slice_with_len::<i64>(n);
+            let b_slice = b_vec.as_slice_with_len::<i64>(n);
 
-        let mut out_vec = output.flat_vector();
-        let out_slice = out_vec.as_mut_slice::<bool>();
-        for i in 0..n {
-            let a = unwrap_bigrat(&state.pool, state.bigrat_ty, a_slice[i])?;
-            let b = unwrap_bigrat(&state.pool, state.bigrat_ty, b_slice[i])?;
-            out_slice[i] = match state.op {
-                BigratOp::Lt => a < b,
-                BigratOp::Gt => a > b,
-                BigratOp::Le => a <= b,
-                BigratOp::Ge => a >= b,
-                _ => unreachable!("not a comparison op: {:?}", state.op),
-            };
+            let mut out_vec = output.flat_vector();
+            let out_slice = out_vec.as_mut_slice::<bool>();
+            for i in 0..n {
+                let a = unwrap_bigrat(&state.pool, state.bigrat_ty, a_slice[i])?;
+                let b = unwrap_bigrat(&state.pool, state.bigrat_ty, b_slice[i])?;
+                out_slice[i] = match state.op {
+                    BigratOp::Lt => a < b,
+                    BigratOp::Gt => a > b,
+                    BigratOp::Le => a <= b,
+                    BigratOp::Ge => a >= b,
+                    _ => unreachable!("not a comparison op: {:?}", state.op),
+                };
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
@@ -634,25 +644,27 @@ impl VScalar for BigratNumDenomScalar {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        use egglog_backend_trait::BaseValuePool;
-        use egglog_numeric_id::NumericId;
-        let n = input.len();
-        let in_vec = input.flat_vector(0);
-        let in_slice = in_vec.as_slice_with_len::<i64>(n);
+        unsafe {
+            use egglog_backend_trait::BaseValuePool;
+            use egglog_numeric_id::NumericId;
+            let n = input.len();
+            let in_vec = input.flat_vector(0);
+            let in_slice = in_vec.as_slice_with_len::<i64>(n);
 
-        let mut out_vec = output.flat_vector();
-        let out_slice = out_vec.as_mut_slice::<i64>();
-        for i in 0..n {
-            let q = unwrap_bigrat(&state.pool, state.bigrat_ty, in_slice[i])?;
-            let bi = match state.op {
-                BigratOp::Numer => q.numer().clone(),
-                BigratOp::Denom => q.denom().clone(),
-                _ => unreachable!(),
-            };
-            let z = egglog_core_relations::Boxed::new(bi);
-            out_slice[i] = state.pool.intern_dyn(state.bigint_ty, Box::new(z)).rep() as i64;
+            let mut out_vec = output.flat_vector();
+            let out_slice = out_vec.as_mut_slice::<i64>();
+            for i in 0..n {
+                let q = unwrap_bigrat(&state.pool, state.bigrat_ty, in_slice[i])?;
+                let bi = match state.op {
+                    BigratOp::Numer => q.numer().clone(),
+                    BigratOp::Denom => q.denom().clone(),
+                    _ => unreachable!(),
+                };
+                let z = egglog_core_relations::Boxed::new(bi);
+                out_slice[i] = state.pool.intern_dyn(state.bigint_ty, Box::new(z)).rep() as i64;
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
@@ -686,11 +698,12 @@ fn unwrap_string(
     use egglog_numeric_id::NumericId;
     let val = Value::new(raw as u32);
     let boxed = pool.unwrap_dyn(string_ty, val);
-    let s: &egglog_core_relations::Boxed<String> = boxed
-        .downcast_ref()
-        .ok_or_else(|| -> Box<dyn std::error::Error> {
-            "expected Boxed<String> from pool".into()
-        })?;
+    let s: &egglog_core_relations::Boxed<String> =
+        boxed
+            .downcast_ref()
+            .ok_or_else(|| -> Box<dyn std::error::Error> {
+                "expected Boxed<String> from pool".into()
+            })?;
     Ok(s.0.clone())
 }
 
@@ -719,30 +732,32 @@ impl VScalar for StringConcatScalar {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let n = input.len();
-        let arity = input.num_columns();
-        // Materialize per-column handle values up-front so we can
-        // drop the borrowed `FlatVector` wrappers before the
-        // `unwrap_string` pool calls (which need `&state.pool`
-        // unborrowed).
-        let mut cols: Vec<Vec<i64>> = Vec::with_capacity(arity);
-        for c in 0..arity {
-            let v = input.flat_vector(c);
-            cols.push(v.as_slice_with_len::<i64>(n).to_vec());
-        }
-        let mut results: Vec<i64> = Vec::with_capacity(n);
-        for i in 0..n {
-            let mut buf = String::new();
+        unsafe {
+            let n = input.len();
+            let arity = input.num_columns();
+            // Materialize per-column handle values up-front so we can
+            // drop the borrowed `FlatVector` wrappers before the
+            // `unwrap_string` pool calls (which need `&state.pool`
+            // unborrowed).
+            let mut cols: Vec<Vec<i64>> = Vec::with_capacity(arity);
             for c in 0..arity {
-                let s = unwrap_string(&state.pool, state.string_ty, cols[c][i])?;
-                buf.push_str(&s);
+                let v = input.flat_vector(c);
+                cols.push(v.as_slice_with_len::<i64>(n).to_vec());
             }
-            results.push(intern_string(&state.pool, state.string_ty, buf));
+            let mut results: Vec<i64> = Vec::with_capacity(n);
+            for i in 0..n {
+                let mut buf = String::new();
+                for c in 0..arity {
+                    let s = unwrap_string(&state.pool, state.string_ty, cols[c][i])?;
+                    buf.push_str(&s);
+                }
+                results.push(intern_string(&state.pool, state.string_ty, buf));
+            }
+            let mut out_vec = output.flat_vector();
+            let out_slice = out_vec.as_mut_slice::<i64>();
+            out_slice[..n].copy_from_slice(&results);
+            Ok(())
         }
-        let mut out_vec = output.flat_vector();
-        let out_slice = out_vec.as_mut_slice::<i64>();
-        out_slice[..n].copy_from_slice(&results);
-        Ok(())
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
@@ -765,24 +780,30 @@ impl VScalar for ReplaceScalar {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let n = input.len();
-        let hay_col = input.flat_vector(0);
-        let needle_col = input.flat_vector(1);
-        let repl_col = input.flat_vector(2);
-        let hay = hay_col.as_slice_with_len::<i64>(n);
-        let needle = needle_col.as_slice_with_len::<i64>(n);
-        let repl = repl_col.as_slice_with_len::<i64>(n);
-        let mut results: Vec<i64> = Vec::with_capacity(n);
-        for i in 0..n {
-            let h = unwrap_string(&state.pool, state.string_ty, hay[i])?;
-            let n_s = unwrap_string(&state.pool, state.string_ty, needle[i])?;
-            let r = unwrap_string(&state.pool, state.string_ty, repl[i])?;
-            results.push(intern_string(&state.pool, state.string_ty, h.replace(&n_s, &r)));
+        unsafe {
+            let n = input.len();
+            let hay_col = input.flat_vector(0);
+            let needle_col = input.flat_vector(1);
+            let repl_col = input.flat_vector(2);
+            let hay = hay_col.as_slice_with_len::<i64>(n);
+            let needle = needle_col.as_slice_with_len::<i64>(n);
+            let repl = repl_col.as_slice_with_len::<i64>(n);
+            let mut results: Vec<i64> = Vec::with_capacity(n);
+            for i in 0..n {
+                let h = unwrap_string(&state.pool, state.string_ty, hay[i])?;
+                let n_s = unwrap_string(&state.pool, state.string_ty, needle[i])?;
+                let r = unwrap_string(&state.pool, state.string_ty, repl[i])?;
+                results.push(intern_string(
+                    &state.pool,
+                    state.string_ty,
+                    h.replace(&n_s, &r),
+                ));
+            }
+            let mut out_vec = output.flat_vector();
+            let out_slice = out_vec.as_mut_slice::<i64>();
+            out_slice[..n].copy_from_slice(&results);
+            Ok(())
         }
-        let mut out_vec = output.flat_vector();
-        let out_slice = out_vec.as_mut_slice::<i64>();
-        out_slice[..n].copy_from_slice(&results);
-        Ok(())
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
@@ -811,23 +832,25 @@ impl VScalar for CountMatchesScalar {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let n = input.len();
-        let hay_col = input.flat_vector(0);
-        let needle_col = input.flat_vector(1);
-        let hay = hay_col.as_slice_with_len::<i64>(n);
-        let needle = needle_col.as_slice_with_len::<i64>(n);
-        let mut out_vec = output.flat_vector();
-        let out_slice = out_vec.as_mut_slice::<i64>();
-        for i in 0..n {
-            let h = unwrap_string(&state.pool, state.string_ty, hay[i])?;
-            let n_s = unwrap_string(&state.pool, state.string_ty, needle[i])?;
-            out_slice[i] = if n_s.is_empty() {
-                0
-            } else {
-                h.matches(&n_s).count() as i64
-            };
+        unsafe {
+            let n = input.len();
+            let hay_col = input.flat_vector(0);
+            let needle_col = input.flat_vector(1);
+            let hay = hay_col.as_slice_with_len::<i64>(n);
+            let needle = needle_col.as_slice_with_len::<i64>(n);
+            let mut out_vec = output.flat_vector();
+            let out_slice = out_vec.as_mut_slice::<i64>();
+            for i in 0..n {
+                let h = unwrap_string(&state.pool, state.string_ty, hay[i])?;
+                let n_s = unwrap_string(&state.pool, state.string_ty, needle[i])?;
+                out_slice[i] = if n_s.is_empty() {
+                    0
+                } else {
+                    h.matches(&n_s).count() as i64
+                };
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
@@ -855,19 +878,21 @@ impl VScalar for I64ToStringScalar {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        use egglog_backend_trait::Value;
-        use egglog_numeric_id::NumericId;
-        let n = input.len();
-        let in_vec = input.flat_vector(0);
-        let in_slice = in_vec.as_slice_with_len::<i64>(n);
-        let mut out_vec = output.flat_vector();
-        let out_slice = out_vec.as_mut_slice::<i64>();
-        for i in 0..n {
-            let val = Value::new(in_slice[i] as u32);
-            let v: i64 = egglog_backend_trait::pool_unwrap::<i64>(&state.pool, val);
-            out_slice[i] = intern_string(&state.pool, state.string_ty, v.to_string());
+        unsafe {
+            use egglog_backend_trait::Value;
+            use egglog_numeric_id::NumericId;
+            let n = input.len();
+            let in_vec = input.flat_vector(0);
+            let in_slice = in_vec.as_slice_with_len::<i64>(n);
+            let mut out_vec = output.flat_vector();
+            let out_slice = out_vec.as_mut_slice::<i64>();
+            for i in 0..n {
+                let val = Value::new(in_slice[i] as u32);
+                let v: i64 = egglog_backend_trait::pool_unwrap::<i64>(&state.pool, val);
+                out_slice[i] = intern_string(&state.pool, state.string_ty, v.to_string());
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
@@ -890,18 +915,21 @@ impl VScalar for F64ToStringScalar {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let n = input.len();
-        let in_vec = input.flat_vector(0);
-        let in_slice = in_vec.as_slice_with_len::<f64>(n);
-        let mut out_vec = output.flat_vector();
-        let out_slice = out_vec.as_mut_slice::<i64>();
-        for i in 0..n {
-            // Match the bridge's `to-string` for f64: `format!("{:?}",
-            // a.0.0)` (see src/sort/f64.rs:43) — uses Debug formatting,
-            // which gives back a decimal that parses round-trip.
-            out_slice[i] = intern_string(&state.pool, state.string_ty, format!("{:?}", in_slice[i]));
+        unsafe {
+            let n = input.len();
+            let in_vec = input.flat_vector(0);
+            let in_slice = in_vec.as_slice_with_len::<f64>(n);
+            let mut out_vec = output.flat_vector();
+            let out_slice = out_vec.as_mut_slice::<i64>();
+            for i in 0..n {
+                // Match the bridge's `to-string` for f64: `format!("{:?}",
+                // a.0.0)` (see src/sort/f64.rs:43) — uses Debug formatting,
+                // which gives back a decimal that parses round-trip.
+                out_slice[i] =
+                    intern_string(&state.pool, state.string_ty, format!("{:?}", in_slice[i]));
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
@@ -924,31 +952,33 @@ impl VScalar for BigIntToStringScalar {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        use egglog_backend_trait::{BaseValuePool, Value};
-        use egglog_numeric_id::NumericId;
-        let bigint_ty = state
-            .bigint_ty
-            .ok_or_else(|| -> Box<dyn std::error::Error> {
-                "BigIntToStringScalar: bigint_ty missing (BigIntSort not registered before \
-                 bigint-to-string was called)"
-                    .into()
-            })?;
-        let n = input.len();
-        let in_vec = input.flat_vector(0);
-        let in_slice = in_vec.as_slice_with_len::<i64>(n);
-        let mut out_vec = output.flat_vector();
-        let out_slice = out_vec.as_mut_slice::<i64>();
-        for i in 0..n {
-            let val = Value::new(in_slice[i] as u32);
-            let boxed = state.pool.unwrap_dyn(bigint_ty, val);
-            let z: &egglog_core_relations::Boxed<num::BigInt> = boxed
-                .downcast_ref()
+        unsafe {
+            use egglog_backend_trait::{BaseValuePool, Value};
+            use egglog_numeric_id::NumericId;
+            let bigint_ty = state
+                .bigint_ty
                 .ok_or_else(|| -> Box<dyn std::error::Error> {
-                    "BigIntToStringScalar: handle not a Boxed<BigInt>".into()
+                    "BigIntToStringScalar: bigint_ty missing (BigIntSort not registered before \
+                 bigint-to-string was called)"
+                        .into()
                 })?;
-            out_slice[i] = intern_string(&state.pool, state.string_ty, z.0.to_string());
+            let n = input.len();
+            let in_vec = input.flat_vector(0);
+            let in_slice = in_vec.as_slice_with_len::<i64>(n);
+            let mut out_vec = output.flat_vector();
+            let out_slice = out_vec.as_mut_slice::<i64>();
+            for i in 0..n {
+                let val = Value::new(in_slice[i] as u32);
+                let boxed = state.pool.unwrap_dyn(bigint_ty, val);
+                let z: &egglog_core_relations::Boxed<num::BigInt> = boxed
+                    .downcast_ref()
+                    .ok_or_else(|| -> Box<dyn std::error::Error> {
+                        "BigIntToStringScalar: handle not a Boxed<BigInt>".into()
+                    })?;
+                out_slice[i] = intern_string(&state.pool, state.string_ty, z.0.to_string());
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
@@ -988,22 +1018,24 @@ impl VScalar for GetSizeScalar {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let n = input.len();
-        let total: i64 = state
-            .table_sizes
-            .lock()
-            .map_err(|e| -> Box<dyn std::error::Error> {
-                format!("GetSizeScalar: mutex poisoned: {e}").into()
-            })?
-            .values()
-            .copied()
-            .sum();
-        let mut out_vec = output.flat_vector();
-        let out_slice = out_vec.as_mut_slice::<i64>();
-        for i in 0..n {
-            out_slice[i] = total;
+        unsafe {
+            let n = input.len();
+            let total: i64 = state
+                .table_sizes
+                .lock()
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    format!("GetSizeScalar: mutex poisoned: {e}").into()
+                })?
+                .values()
+                .copied()
+                .sum();
+            let mut out_vec = output.flat_vector();
+            let out_slice = out_vec.as_mut_slice::<i64>();
+            for i in 0..n {
+                out_slice[i] = total;
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
@@ -1025,29 +1057,31 @@ impl VScalar for BigratToF64Scalar {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        use num::ToPrimitive;
-        let n = input.len();
-        let in_vec = input.flat_vector(0);
-        let in_slice = in_vec.as_slice_with_len::<i64>(n);
+        unsafe {
+            use num::ToPrimitive;
+            let n = input.len();
+            let in_vec = input.flat_vector(0);
+            let in_slice = in_vec.as_slice_with_len::<i64>(n);
 
-        let mut results: Vec<Option<f64>> = Vec::with_capacity(n);
-        for i in 0..n {
-            let q = unwrap_bigrat(&state.pool, state.bigrat_ty, in_slice[i])?;
-            results.push(q.to_f64());
-        }
-        let mut out_vec = output.flat_vector();
-        {
-            let out_slice = out_vec.as_mut_slice::<f64>();
+            let mut results: Vec<Option<f64>> = Vec::with_capacity(n);
+            for i in 0..n {
+                let q = unwrap_bigrat(&state.pool, state.bigrat_ty, in_slice[i])?;
+                results.push(q.to_f64());
+            }
+            let mut out_vec = output.flat_vector();
+            {
+                let out_slice = out_vec.as_mut_slice::<f64>();
+                for (i, r) in results.iter().enumerate() {
+                    out_slice[i] = r.unwrap_or(0.0);
+                }
+            }
             for (i, r) in results.iter().enumerate() {
-                out_slice[i] = r.unwrap_or(0.0);
+                if r.is_none() {
+                    out_vec.set_null(i);
+                }
             }
+            Ok(())
         }
-        for (i, r) in results.iter().enumerate() {
-            if r.is_none() {
-                out_vec.set_null(i);
-            }
-        }
-        Ok(())
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
@@ -1165,12 +1199,7 @@ pub fn q(name: &str) -> String {
 /// duckdb-rust 1.5 didn't actually keep the planned representation
 /// across calls in our setup — overall wall time roughly doubled.
 /// Plain `execute` with string substitution beats it.
-pub(crate) fn exec_bound(
-    conn: &Connection,
-    sql: &str,
-    last: i64,
-    cur: i64,
-) -> Result<usize> {
+pub(crate) fn exec_bound(conn: &Connection, sql: &str, last: i64, cur: i64) -> Result<usize> {
     let bound = sql
         .replace("?1", &last.to_string())
         .replace("?2", &cur.to_string());
@@ -1265,7 +1294,11 @@ fn run_rule_variants(
             if trace_sql {
                 eprintln!(
                     "[duck/{}] {}",
-                    if variant.materialize.is_some() { "mat-act" } else { "act" },
+                    if variant.materialize.is_some() {
+                        "mat-act"
+                    } else {
+                        "act"
+                    },
                     act.sql,
                 );
             }
@@ -1442,7 +1475,10 @@ pub enum Term {
     /// a synthetic `(function v () Sort :no-merge)` plus `(set (v)
     /// ...)`, and later references `(v)` are reads of this function.
     /// Cannot be used on relations (no output column).
-    FuncCall { name: String, args: Vec<Term> },
+    FuncCall {
+        name: String,
+        args: Vec<Term>,
+    },
 }
 
 impl Term {
@@ -1866,7 +1902,6 @@ impl EGraph {
         egglog_backend_trait::ColumnTy::Base(id)
     }
 
-
     /// Associate a primitive name with a previously registered
     /// [`egglog_backend_trait::ExternalFunctionId`]. The frontend's
     /// typechecker calls this after `register_external_func` when the
@@ -1942,10 +1977,11 @@ impl EGraph {
                     string_ty,
                     bigint_ty: bigint_ty_opt,
                 };
-                self.conn.register_scalar_function_with_state::<StringConcatScalar>(
-                    "__egglog_string_concat",
-                    &state,
-                )
+                self.conn
+                    .register_scalar_function_with_state::<StringConcatScalar>(
+                        "__egglog_string_concat",
+                        &state,
+                    )
             }),
             "replace" => string_ty_opt.map(|string_ty| {
                 let state = StringPoolState {
@@ -1953,10 +1989,11 @@ impl EGraph {
                     string_ty,
                     bigint_ty: bigint_ty_opt,
                 };
-                self.conn.register_scalar_function_with_state::<ReplaceScalar>(
-                    "__egglog_replace",
-                    &state,
-                )
+                self.conn
+                    .register_scalar_function_with_state::<ReplaceScalar>(
+                        "__egglog_replace",
+                        &state,
+                    )
             }),
             "count-matches" => string_ty_opt.map(|string_ty| {
                 let state = StringPoolState {
@@ -1964,10 +2001,11 @@ impl EGraph {
                     string_ty,
                     bigint_ty: bigint_ty_opt,
                 };
-                self.conn.register_scalar_function_with_state::<CountMatchesScalar>(
-                    "__egglog_count_matches",
-                    &state,
-                )
+                self.conn
+                    .register_scalar_function_with_state::<CountMatchesScalar>(
+                        "__egglog_count_matches",
+                        &state,
+                    )
             }),
             "i64-to-string" => string_ty_opt.map(|string_ty| {
                 let state = StringPoolState {
@@ -1975,10 +2013,11 @@ impl EGraph {
                     string_ty,
                     bigint_ty: bigint_ty_opt,
                 };
-                self.conn.register_scalar_function_with_state::<I64ToStringScalar>(
-                    "__egglog_i64_to_string",
-                    &state,
-                )
+                self.conn
+                    .register_scalar_function_with_state::<I64ToStringScalar>(
+                        "__egglog_i64_to_string",
+                        &state,
+                    )
             }),
             "f64-to-string" => string_ty_opt.map(|string_ty| {
                 let state = StringPoolState {
@@ -1986,24 +2025,28 @@ impl EGraph {
                     string_ty,
                     bigint_ty: bigint_ty_opt,
                 };
-                self.conn.register_scalar_function_with_state::<F64ToStringScalar>(
-                    "__egglog_f64_to_string",
-                    &state,
-                )
-            }),
-            "bigint-to-string" => string_ty_opt.zip(bigint_ty_opt).map(
-                |(string_ty, _bigint_ty)| {
-                    let state = StringPoolState {
-                        pool: self.backend_base_value_pool.clone(),
-                        string_ty,
-                        bigint_ty: bigint_ty_opt,
-                    };
-                    self.conn.register_scalar_function_with_state::<BigIntToStringScalar>(
-                        "__egglog_bigint_to_string",
+                self.conn
+                    .register_scalar_function_with_state::<F64ToStringScalar>(
+                        "__egglog_f64_to_string",
                         &state,
                     )
-                },
-            ),
+            }),
+            "bigint-to-string" => {
+                string_ty_opt
+                    .zip(bigint_ty_opt)
+                    .map(|(string_ty, _bigint_ty)| {
+                        let state = StringPoolState {
+                            pool: self.backend_base_value_pool.clone(),
+                            string_ty,
+                            bigint_ty: bigint_ty_opt,
+                        };
+                        self.conn
+                            .register_scalar_function_with_state::<BigIntToStringScalar>(
+                                "__egglog_bigint_to_string",
+                                &state,
+                            )
+                    })
+            }
             _ => None,
         };
         if let Some(r) = result_str {
@@ -2017,7 +2060,9 @@ impl EGraph {
         }
 
         // Bigrat-family UDFs require BigInt; bail if not registered.
-        let Some(bigint_ty) = bigint_ty_opt else { return };
+        let Some(bigint_ty) = bigint_ty_opt else {
+            return;
+        };
         let bigrat_type_id = TypeId::of::<egglog_core_relations::Boxed<BigRational>>();
         let bigrat_ty = if pool_dyn.has_ty(bigrat_type_id) {
             Some(pool_dyn.get_ty_by_type_id(bigrat_type_id))
@@ -2047,10 +2092,7 @@ impl EGraph {
                     bigrat_ty,
                 };
                 self.conn
-                    .register_scalar_function_with_state::<BigratScalar>(
-                        "__egglog_bigrat",
-                        &state,
-                    )
+                    .register_scalar_function_with_state::<BigratScalar>("__egglog_bigrat", &state)
             }
             "get-size!" => {
                 let state = GetSizeState {
@@ -2109,10 +2151,7 @@ impl EGraph {
 
     /// Look up the primitive name associated with `id`, if any.
     /// Returns `None` for unregistered or unnamed ids.
-    pub fn external_func_name(
-        &self,
-        id: egglog_backend_trait::ExternalFunctionId,
-    ) -> Option<&str> {
+    pub fn external_func_name(&self, id: egglog_backend_trait::ExternalFunctionId) -> Option<&str> {
         self.backend_external_funcs.name(id)
     }
 
@@ -2163,11 +2202,8 @@ impl EGraph {
         // Helper: extract a string from an interned-handle arg.
         // Strings live in the base-value pool now (matches bridge
         // encoding); the arg's `Literal::I64` is the handle.
-        let string_ty = if pool_dyn.has_ty(TypeId::of::<egglog_core_relations::Boxed<String>>())
-        {
-            Some(pool_dyn.get_ty_by_type_id(
-                TypeId::of::<egglog_core_relations::Boxed<String>>(),
-            ))
+        let string_ty = if pool_dyn.has_ty(TypeId::of::<egglog_core_relations::Boxed<String>>()) {
+            Some(pool_dyn.get_ty_by_type_id(TypeId::of::<egglog_core_relations::Boxed<String>>()))
         } else {
             None
         };
@@ -2372,11 +2408,7 @@ impl EGraph {
             // Watermark check: if pname's max-ts watermark hasn't
             // advanced past what we synced, there's nothing new.
             let pname_wm = self.table_watermarks.get(&pname).copied().unwrap_or(0);
-            let last_synced = self
-                .last_uf_sync_ts
-                .get(&uf_name)
-                .copied()
-                .unwrap_or(-1);
+            let last_synced = self.last_uf_sync_ts.get(&uf_name).copied().unwrap_or(-1);
             if pname_wm <= last_synced {
                 continue;
             }
@@ -2408,8 +2440,7 @@ impl EGraph {
                     total_displaced += drained.len();
                 }
             }
-            self.native_uf_unions_synced =
-                self.native_uf_unions_synced.wrapping_add(count);
+            self.native_uf_unions_synced = self.native_uf_unions_synced.wrapping_add(count);
             self.last_uf_sync_ts.insert(uf_name, max_ts_seen);
         }
         Ok(total_displaced)
@@ -2434,11 +2465,7 @@ impl EGraph {
     /// Returns `(materialize, materialized_action, simple_action)`.
     /// Read after `run_program` to see where time goes.
     pub fn perf_timings_ns(&self) -> (u64, u64, u64) {
-        (
-            self.time_mat_ns,
-            self.time_mat_act_ns,
-            self.time_act_ns,
-        )
+        (self.time_mat_ns, self.time_mat_act_ns, self.time_act_ns)
     }
 
     /// Run `EXPLAIN ANALYZE` against the materialize SELECT of each
@@ -2519,11 +2546,7 @@ impl EGraph {
             .rule_perf_ns
             .iter()
             .map(|(rn, &(m, a))| {
-                let rs = self
-                    .rule_to_ruleset
-                    .get(rn)
-                    .cloned()
-                    .unwrap_or_default();
+                let rs = self.rule_to_ruleset.get(rn).cloned().unwrap_or_default();
                 (rn.clone(), rs, m, a)
             })
             .collect();
@@ -2759,11 +2782,9 @@ impl EGraph {
             // naming convention: pname is the function name with a
             // trailing `f` stripped. Resolve and check up front so
             // we don't half-register if the convention is broken.
-            let pname = name
-                .strip_suffix('f')
-                .ok_or_else(|| anyhow!(
-                    "native UF {name}: name doesn't end in `f`; can't derive pname"
-                ))?;
+            let pname = name.strip_suffix('f').ok_or_else(|| {
+                anyhow!("native UF {name}: name doesn't end in `f`; can't derive pname")
+            })?;
             if !self.functions.contains_key(pname) {
                 return Err(anyhow!(
                     "native UF {name}: expected pname `{pname}` to be declared first"
@@ -2787,7 +2808,10 @@ impl EGraph {
     /// statement per (variant × action).
     pub fn add_rule(&mut self, rule: Rule) -> Result<()> {
         if std::env::var("DUCK_DUMP_RULES").is_ok() {
-            eprintln!("[duck/add_rule] name={} ruleset={}", rule.name, rule.ruleset);
+            eprintln!(
+                "[duck/add_rule] name={} ruleset={}",
+                rule.name, rule.ruleset
+            );
             for atom in &rule.body {
                 eprintln!("  body: {atom:?}");
             }
@@ -3131,11 +3155,7 @@ impl EGraph {
                 // we'd still want to pick up pairs that involve it
                 // until they've been scanned.)
                 let wm = self.table_watermarks.get(name).copied().unwrap_or(0);
-                let last_at = self
-                    .last_inline_cong_at
-                    .get(name)
-                    .copied()
-                    .unwrap_or(0);
+                let last_at = self.last_inline_cong_at.get(name).copied().unwrap_or(0);
                 if wm < last_at {
                     return None;
                 }
@@ -3155,11 +3175,7 @@ impl EGraph {
             // v2=old) with the two halves swapped, so we don't need
             // to emit a second branch — `ON CONFLICT DO NOTHING` on
             // pname dedupes if v1 and v2 are both new.
-            let last_at = self
-                .last_inline_cong_at
-                .get(&view)
-                .copied()
-                .unwrap_or(0);
+            let last_at = self.last_inline_cong_at.get(&view).copied().unwrap_or(0);
             let sql = format!(
                 "INSERT INTO {} (c0, c1, ts) \
                  SELECT GREATEST(v1.c{id_col}, v2.c{id_col}), \
@@ -3269,10 +3285,7 @@ impl EGraph {
         } else {
             format!(" WHERE {}", where_parts.join(" AND "))
         };
-        let sql = format!(
-            "SELECT c{out_col} FROM {}{where_clause}",
-            q(name),
-        );
+        let sql = format!("SELECT c{out_col} FROM {}{where_clause}", q(name),);
         let params: Vec<&dyn ToSql> = inputs.iter().map(|a| a as &dyn ToSql).collect();
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(params.as_slice())?;
@@ -3315,11 +3328,11 @@ impl EGraph {
     }
 
     pub fn count(&self, name: &str) -> Result<i64> {
-        Ok(self.conn.query_row(
-            &format!("SELECT COUNT(*) FROM {}", q(name)),
-            [],
-            |r| r.get(0),
-        )?)
+        Ok(self
+            .conn
+            .query_row(&format!("SELECT COUNT(*) FROM {}", q(name)), [], |r| {
+                r.get(0)
+            })?)
     }
 }
 
@@ -3355,9 +3368,7 @@ pub(crate) fn conflict_clause(info: &FunctionInfo) -> String {
         Some(MergeMode::Old) => "ON CONFLICT DO NOTHING".to_string(),
         Some(MergeMode::New) => {
             let out_col = info.inputs_len;
-            format!(
-                "ON CONFLICT DO UPDATE SET c{out_col} = EXCLUDED.c{out_col}, ts = EXCLUDED.ts"
-            )
+            format!("ON CONFLICT DO UPDATE SET c{out_col} = EXCLUDED.c{out_col}, ts = EXCLUDED.ts")
         }
         Some(MergeMode::Min) => {
             let out_col = info.inputs_len;

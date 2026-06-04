@@ -143,37 +143,38 @@ impl EGraph {
                 continue;
             }
             let mut rows = 0;
-            self.backend.for_each_while(function.backend_id, &mut |row| {
-                if rows >= max_calls_per_function {
-                    truncated_functions.push(name.clone());
-                    return false;
-                }
-                let (out, inps) = row.vals.split_last().unwrap();
-                let class_id = self.value_to_class_id(&function.schema.output, *out);
-                if function.decl.internal_let {
-                    let_bindings
-                        .entry(class_id.clone())
-                        .or_insert_with(Vec::new)
-                        .push(name.clone());
-                } else {
-                    all_calls.push((
-                        function,
-                        inps.to_vec(),
-                        *out,
-                        row.subsumed,
-                        class_id,
-                        self.to_node_id(
-                            None,
-                            SerializedNode::Function {
-                                name: name.clone(),
-                                offset: rows,
-                            },
-                        ),
-                    ));
-                    rows += 1;
-                }
-                true
-            });
+            self.backend
+                .for_each_while(function.backend_id, &mut |row| {
+                    if rows >= max_calls_per_function {
+                        truncated_functions.push(name.clone());
+                        return false;
+                    }
+                    let (out, inps) = row.vals.split_last().unwrap();
+                    let class_id = self.value_to_class_id(&function.schema.output, *out);
+                    if function.decl.internal_let {
+                        let_bindings
+                            .entry(class_id.clone())
+                            .or_insert_with(Vec::new)
+                            .push(name.clone());
+                    } else {
+                        all_calls.push((
+                            function,
+                            inps.to_vec(),
+                            *out,
+                            row.subsumed,
+                            class_id,
+                            self.to_node_id(
+                                None,
+                                SerializedNode::Function {
+                                    name: name.clone(),
+                                    offset: rows,
+                                },
+                            ),
+                        ));
+                        rows += 1;
+                    }
+                    true
+                });
             if rows != 0 {
                 functions_kept += 1;
             }

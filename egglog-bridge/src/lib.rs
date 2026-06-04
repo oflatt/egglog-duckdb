@@ -1057,11 +1057,7 @@ fn merge_fn_to_callback(
     })
 }
 
-fn merge_fn_resolve(
-    merge: &MergeFn,
-    function_name: &str,
-    egraph: &mut EGraph,
-) -> ResolvedMergeFn {
+fn merge_fn_resolve(merge: &MergeFn, function_name: &str, egraph: &mut EGraph) -> ResolvedMergeFn {
     match merge {
         MergeFn::Const(v) => ResolvedMergeFn::Const(*v),
         MergeFn::Old => ResolvedMergeFn::Old,

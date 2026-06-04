@@ -634,14 +634,15 @@ impl<C: Cost + Ord + Eq + Clone + Debug> Extractor<C> {
 
         // Single lookup in UF table - it's guaranteed to be one hop to canonical
         let mut canonical = value;
-        egraph
-            .backend
-            .for_each(uf_func.backend_id, &mut |row: egglog_bridge::FunctionRow| {
+        egraph.backend.for_each(
+            uf_func.backend_id,
+            &mut |row: egglog_bridge::FunctionRow| {
                 // UF table has (child, parent) as inputs
                 if row.vals[0] == value {
                     canonical = row.vals[1];
                 }
-            });
+            },
+        );
 
         canonical
     }

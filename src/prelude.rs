@@ -953,8 +953,7 @@ impl<T: ContainerSort> Sort for ContainerSortImpl<T> {
             use std::any::TypeId as Tid;
             let pool: &dyn BaseValuePool = backend.base_value_pool();
             if pool.has_ty(Tid::of::<egglog_bridge_duckdb::DuckPairMarker>()) {
-                let id =
-                    pool.get_ty_by_type_id(Tid::of::<egglog_bridge_duckdb::DuckPairMarker>());
+                let id = pool.get_ty_by_type_id(Tid::of::<egglog_bridge_duckdb::DuckPairMarker>());
                 return ColumnTy::Base(id);
             }
         }
@@ -970,10 +969,7 @@ impl<T: ContainerSort> Sort for ContainerSortImpl<T> {
         // direct SQL `STRUCT` column (used by proof encoding's
         // `Pair<sort, proof>`); seed the duck-side marker now so
         // later `column_ty` calls can return `ColumnTy::Base(marker)`.
-        if let Some(bridge) = backend
-            .as_any_mut()
-            .downcast_mut::<egglog_bridge::EGraph>()
-        {
+        if let Some(bridge) = backend.as_any_mut().downcast_mut::<egglog_bridge::EGraph>() {
             bridge.register_container_ty::<T::Container>();
         }
         if TypeId::of::<T>() == TypeId::of::<crate::sort::PairSort>()

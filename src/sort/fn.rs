@@ -159,14 +159,9 @@ impl Sort for FunctionSort {
     fn register_type(&self, backend: &mut dyn egglog_backend_trait::Backend) {
         // Container sorts are only registered on the reference bridge.
         // The DuckDB backend has `supports_containers() == false`.
-        if let Some(bridge) = backend
-            .as_any_mut()
-            .downcast_mut::<egglog_bridge::EGraph>()
-        {
+        if let Some(bridge) = backend.as_any_mut().downcast_mut::<egglog_bridge::EGraph>() {
             bridge.register_container_ty::<FunctionContainer>();
-            bridge
-                .base_values_mut()
-                .register_type::<ResolvedFunction>();
+            bridge.base_values_mut().register_type::<ResolvedFunction>();
         } else {
             // For non-bridge backends, still register the base value type
             // through the trait pool. Containers are unsupported.

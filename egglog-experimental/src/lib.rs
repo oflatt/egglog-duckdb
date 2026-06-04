@@ -21,7 +21,7 @@
 //! The rest of this crate exposes the Rust APIs and helpers that back these extensions.
 //!
 use egglog::ast::Parser;
-use egglog::prelude::{RustSpan, Span, add_base_sort};
+use egglog::prelude::add_base_sort;
 pub use egglog::*;
 use std::sync::Arc;
 
@@ -56,9 +56,7 @@ pub fn new_experimental_egraph() -> EGraph {
 /// up front (e.g. `egglog-experimental`'s `main`, which has to
 /// register `run-schedule` / `multi-extract` and the rational
 /// primitives *before* `cli` runs its program).
-pub fn new_experimental_egraph_duckdb(
-    config: egglog::DuckBackendConfig,
-) -> anyhow::Result<EGraph> {
+pub fn new_experimental_egraph_duckdb(config: egglog::DuckBackendConfig) -> anyhow::Result<EGraph> {
     let mut egraph = EGraph::with_duckdb_backend(config)?;
     extend_with_experimental(&mut egraph);
     Ok(egraph)

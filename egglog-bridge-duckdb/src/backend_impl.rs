@@ -175,8 +175,7 @@ fn trait_col_ty_to_duck(ty: ColumnTy, pool: &dyn BaseValuePool) -> DuckColumnTy 
                 // Pair marker — see `EGraph::pair_column_ty`.
                 return DuckColumnTy::PairI64;
             }
-            if pool.has_ty(TypeId::of::<i64>())
-                && bv == pool.get_ty_by_type_id(TypeId::of::<i64>())
+            if pool.has_ty(TypeId::of::<i64>()) && bv == pool.get_ty_by_type_id(TypeId::of::<i64>())
             {
                 return DuckColumnTy::I64;
             }
@@ -230,11 +229,7 @@ fn trait_col_ty_to_duck(ty: ColumnTy, pool: &dyn BaseValuePool) -> DuckColumnTy 
 /// row whose column was registered as `STR`/`BOOL`/`F64` gets the
 /// matching SQL literal (not `Literal::I64(value.rep() as i64)`,
 /// which would produce a SQL type-conversion error).
-fn duck_value_to_literal(
-    val: Value,
-    col: DuckColumnTy,
-    pool: &DuckdbBaseValuePool,
-) -> Literal {
+fn duck_value_to_literal(val: Value, col: DuckColumnTy, pool: &DuckdbBaseValuePool) -> Literal {
     use ordered_float::OrderedFloat;
     use std::any::TypeId;
     let pool_dyn: &dyn BaseValuePool = pool;
@@ -249,9 +244,7 @@ fn duck_value_to_literal(
             // (`duck_value_to_trait_value`) re-interns the raw value
             // back to a handle so callers that expect `Value`s
             // (the trait API contract) get a usable rep.
-            if pool_dyn.has_ty(TypeId::of::<i64>())
-                && val.rep() & (1 << 31) != 0
-            {
+            if pool_dyn.has_ty(TypeId::of::<i64>()) && val.rep() & (1 << 31) != 0 {
                 let i = egglog_backend_trait::pool_unwrap::<i64>(pool_dyn, val);
                 return Literal::I64(i);
             }
@@ -298,8 +291,7 @@ fn value_to_literal(val: Value, ty: ColumnTy, pool: &dyn BaseValuePool) -> Liter
     match ty {
         ColumnTy::Id => Literal::I64(val.rep() as i64),
         ColumnTy::Base(bv) => {
-            if pool.has_ty(TypeId::of::<i64>())
-                && bv == pool.get_ty_by_type_id(TypeId::of::<i64>())
+            if pool.has_ty(TypeId::of::<i64>()) && bv == pool.get_ty_by_type_id(TypeId::of::<i64>())
             {
                 let v = egglog_backend_trait::pool_unwrap::<i64>(pool, val);
                 return Literal::I64(v);
@@ -391,8 +383,7 @@ fn duck_value_to_trait_value(v: ValueRef<'_>, pool: &dyn BaseValuePool) -> Value
             type FBoxed = egglog_core_relations::Boxed<OrderedFloat<f64>>;
             if pool.has_ty(TypeId::of::<FBoxed>()) {
                 let ty = pool.get_ty_by_type_id(TypeId::of::<FBoxed>());
-                return pool
-                    .intern_dyn(ty, Box::new(FBoxed::new(OrderedFloat(f as f64))));
+                return pool.intern_dyn(ty, Box::new(FBoxed::new(OrderedFloat(f as f64))));
             }
             return Value::new(u32::MAX);
         }
@@ -401,8 +392,7 @@ fn duck_value_to_trait_value(v: ValueRef<'_>, pool: &dyn BaseValuePool) -> Value
             type FBoxed = egglog_core_relations::Boxed<OrderedFloat<f64>>;
             if pool.has_ty(TypeId::of::<FBoxed>()) {
                 let ty = pool.get_ty_by_type_id(TypeId::of::<FBoxed>());
-                return pool
-                    .intern_dyn(ty, Box::new(FBoxed::new(OrderedFloat(f))));
+                return pool.intern_dyn(ty, Box::new(FBoxed::new(OrderedFloat(f))));
             }
             return Value::new(u32::MAX);
         }
@@ -648,8 +638,7 @@ impl Backend for EGraph {
 
     fn table_size(&self, table: FunctionId) -> usize {
         let name = self.name_for_function_id(table);
-        self.count(name)
-            .expect("table_size: COUNT(*) query failed") as usize
+        self.count(name).expect("table_size: COUNT(*) query failed") as usize
     }
 
     fn approx_table_size(&self, table: FunctionId) -> usize {
@@ -853,9 +842,7 @@ impl Backend for EGraph {
         let info = self
             .functions
             .get(&name)
-            .unwrap_or_else(|| {
-                panic!("lookup_constructor_rows: function `{name}` not registered")
-            });
+            .unwrap_or_else(|| panic!("lookup_constructor_rows: function `{name}` not registered"));
         let inputs_len = info.inputs_len;
 
         for row in rows {
@@ -955,11 +942,7 @@ impl Backend for EGraph {
 
     // -- rule management ----------------------------------------------------
 
-    fn new_rule<'a>(
-        &'a mut self,
-        desc: &str,
-        seminaive: bool,
-    ) -> Box<dyn RuleBuilderOps + 'a> {
+    fn new_rule<'a>(&'a mut self, desc: &str, seminaive: bool) -> Box<dyn RuleBuilderOps + 'a> {
         // The DuckDB backend's seminaive variant generation lives in
         // `compile.rs` and runs unconditionally for every rule. The
         // bridge-side `seminaive` flag has no DuckDB analog — we
@@ -1145,7 +1128,11 @@ impl Backend for EGraph {
             // +1 for the ts column.
             let cols_str: Vec<String> = (0..arity + 1)
                 .map(|i| {
-                    let cn = if i == arity { "ts".to_string() } else { format!("c{i}") };
+                    let cn = if i == arity {
+                        "ts".to_string()
+                    } else {
+                        format!("c{i}")
+                    };
                     format!("CAST({cn} AS VARCHAR)")
                 })
                 .collect();
@@ -1308,7 +1295,7 @@ mod tests {
     /// eq-sort ids that have not been unioned. Phase 2 Commit 11.
     #[test]
     fn dyn_backend_get_canon_repr_identity() {
-        use egglog_backend_trait::{pool_register_type, BaseValueId};
+        use egglog_backend_trait::{BaseValueId, pool_register_type};
 
         let mut backend: Box<dyn Backend> =
             Box::new(EGraph::new().expect("DuckDB EGraph::new failed"));
@@ -1376,8 +1363,14 @@ mod tests {
         // Inspect via the concrete downcast (the trait surface itself
         // does not expose `panic_message`).
         let concrete = backend.as_any().downcast_ref::<EGraph>().unwrap();
-        assert_eq!(concrete.backend_external_funcs.panic_message(p1), Some("msg1"));
-        assert_eq!(concrete.backend_external_funcs.panic_message(p2), Some("msg2"));
+        assert_eq!(
+            concrete.backend_external_funcs.panic_message(p1),
+            Some("msg1")
+        );
+        assert_eq!(
+            concrete.backend_external_funcs.panic_message(p2),
+            Some("msg2")
+        );
     }
 
     /// `register_external_func` stores the func and returns an id;
@@ -1475,6 +1468,9 @@ mod tests {
         ];
         backend.insert_rows(func, &rows);
         assert_eq!(backend.table_size(func), 2);
-        assert_eq!(backend.lookup_id(func, &[Value::new(7)]), Some(Value::new(70)));
+        assert_eq!(
+            backend.lookup_id(func, &[Value::new(7)]),
+            Some(Value::new(70))
+        );
     }
 }

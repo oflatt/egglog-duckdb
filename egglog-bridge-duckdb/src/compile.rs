@@ -69,10 +69,7 @@ fn action_target(a: &Action, functions: &HashMap<String, FunctionInfo>) -> Optio
 /// Walks the body greedily in source order. A demoted atom only
 /// contributes its output binding, so later atoms that depend on
 /// it can still resolve.
-fn compute_native_uf_demote(
-    body: &[Atom],
-    functions: &HashMap<String, FunctionInfo>,
-) -> Vec<bool> {
+fn compute_native_uf_demote(body: &[Atom], functions: &HashMap<String, FunctionInfo>) -> Vec<bool> {
     let mut demote = vec![false; body.len()];
     let mut bound: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (i, atom) in body.iter().enumerate() {
@@ -128,10 +125,7 @@ fn compute_native_uf_demote(
 /// Only Calls whose target is `eq_sort_ctor` get lifted: regular
 /// functions still resolve via a lookup, which is what the encoder
 /// expects for them.
-fn lift_nested_eq_sort_calls(
-    rule: &Rule,
-    functions: &HashMap<String, FunctionInfo>,
-) -> Rule {
+fn lift_nested_eq_sort_calls(rule: &Rule, functions: &HashMap<String, FunctionInfo>) -> Rule {
     let mut counter: usize = 0;
     let mut new_actions: Vec<Action> = Vec::with_capacity(rule.actions.len());
     for action in &rule.actions {
@@ -223,7 +217,6 @@ fn lift_term(
         other => other,
     }
 }
-
 
 pub(crate) fn compile_rule(
     rule: &Rule,
@@ -360,10 +353,10 @@ pub(crate) fn compile_rule(
         if !demote[i] {
             continue;
         }
-        if let Atom::Func { name, .. } = atom {
-            if !demote_tables.iter().any(|n| n == name) {
-                demote_tables.push(name.clone());
-            }
+        if let Atom::Func { name, .. } = atom
+            && !demote_tables.iter().any(|n| n == name)
+        {
+            demote_tables.push(name.clone());
         }
     }
     for gated in &demote_tables {
@@ -373,7 +366,10 @@ pub(crate) fn compile_rule(
         // by the term-encoding naming convention so the runner can
         // skip the gated variant when nothing new has unified this
         // iteration.
-        let gate_pname = gated.strip_suffix('f').unwrap_or(gated.as_str()).to_string();
+        let gate_pname = gated
+            .strip_suffix('f')
+            .unwrap_or(gated.as_str())
+            .to_string();
         variants.push(compile_fused_variant(
             rule,
             &func_atom_indices,
@@ -490,7 +486,10 @@ fn compile_fused_variant(
                     &rule.name,
                     functions,
                 )?;
-                Ok(CompiledAction { sql, target: action_target(a, functions) })
+                Ok(CompiledAction {
+                    sql,
+                    target: action_target(a, functions),
+                })
             })
             .collect::<Result<_>>()?;
         return Ok(CompiledVariant {
@@ -603,8 +602,7 @@ fn compile_fused_variant(
                         .collect::<Result<_>>()?;
                     let hc_alias = format!("hc{}", hc_joins.len());
                     let id_col_idx = arg_sqls.len();
-                    let in_cols: Vec<String> =
-                        (0..id_col_idx).map(|i| format!("c{i}")).collect();
+                    let in_cols: Vec<String> = (0..id_col_idx).map(|i| format!("c{i}")).collect();
                     if arg_sqls.is_empty() {
                         // 0-input: there's only ever one such row.
                         // Cross join with a 1-row aggregate.
@@ -640,12 +638,12 @@ fn compile_fused_variant(
                 // can't reference each other within the same SELECT,
                 // so just re-point the alias instead of emitting a
                 // column.
-                if let Term::Var(other) = expr {
-                    if let Some(src) = mat_binding.get(other) {
-                        let src = src.clone();
-                        mat_binding.insert(var.clone(), src);
-                        continue;
-                    }
+                if let Term::Var(other) = expr
+                    && let Some(src) = mat_binding.get(other)
+                {
+                    let src = src.clone();
+                    mat_binding.insert(var.clone(), src);
+                    continue;
                 }
                 let expr_sql = term_sql(expr, &binding, &rule.name)?;
                 select_cols.push(format!("{expr_sql} AS {}", q(var)));
@@ -683,13 +681,8 @@ fn compile_fused_variant(
     // 4) Build per-action SQLs that select FROM the temp table.
     let mut action_sqls: Vec<CompiledAction> = Vec::new();
     for action in &rule.actions {
-        let sql = compile_materialized_action(
-            action,
-            &mat_binding,
-            &temp_table,
-            &rule.name,
-            functions,
-        )?;
+        let sql =
+            compile_materialized_action(action, &mat_binding, &temp_table, &rule.name, functions)?;
         action_sqls.push(CompiledAction {
             sql,
             target: action_target(action, functions),
@@ -738,8 +731,7 @@ pub(crate) fn compile_body_select(
     // demote applies (we want the literal join, not a UDF lookup
     // bypass) so all-false `demote`.
     let no_demote = vec![false; atoms.len()];
-    let (from, where_parts, _binding) =
-        walk_body(atoms, "<check>", functions, &no_demote)?;
+    let (from, where_parts, _binding) = walk_body(atoms, "<check>", functions, &no_demote)?;
     let where_clause = format_where(&where_parts);
     if from.is_empty() {
         // No function atoms: a pure-primitive `(check (= 1 1))`-style
@@ -1022,8 +1014,7 @@ fn compile_simple_action_fused(
                 .iter()
                 .map(|t| term_sql(t, binding, rule_name))
                 .collect::<Result<_>>()?;
-            let target_cols: Vec<String> =
-                (0..targs.len()).map(|i| format!("c{i}")).collect();
+            let target_cols: Vec<String> = (0..targs.len()).map(|i| format!("c{i}")).collect();
             let select_list = format!("{}?2", prefix_with_comma(&select_cols));
             let insert_cols = format!("{}ts", prefix_with_comma(&target_cols));
             let conflict = conflict_clause(info);
@@ -1049,8 +1040,7 @@ fn compile_simple_action_fused(
                     union_branches(&body),
                 ));
             }
-            let key_cols: Vec<String> =
-                (0..key_args.len()).map(|i| format!("c{i}")).collect();
+            let key_cols: Vec<String> = (0..key_args.len()).map(|i| format!("c{i}")).collect();
             let key_select: Vec<String> = key_args
                 .iter()
                 .map(|t| term_sql(t, binding, rule_name))
@@ -1103,8 +1093,7 @@ fn compile_materialized_action(
                 .iter()
                 .map(|t| term_sql(t, mat_binding, rule_name))
                 .collect::<Result<_>>()?;
-            let target_cols: Vec<String> =
-                (0..targs.len()).map(|i| format!("c{i}")).collect();
+            let target_cols: Vec<String> = (0..targs.len()).map(|i| format!("c{i}")).collect();
             let select_list = format!("{}?2", prefix_with_comma(&select_cols));
             let insert_cols = format!("{}ts", prefix_with_comma(&target_cols));
             let conflict = conflict_clause(info);
@@ -1189,8 +1178,7 @@ fn compile_materialized_action(
                     info.inputs_len
                 ));
             }
-            let target_cols: Vec<String> =
-                (0..info.cols.len()).map(|i| format!("c{i}")).collect();
+            let target_cols: Vec<String> = (0..info.cols.len()).map(|i| format!("c{i}")).collect();
             let select_list = format!("{}{}, ?2", prefix_with_comma(&arg_sqls), q(var));
             let conflict = conflict_clause(info);
             Ok(format!(
@@ -1201,9 +1189,7 @@ fn compile_materialized_action(
         }
         Action::Panic { msg } => {
             let safe = msg.replace('\'', "''");
-            Ok(format!(
-                "SELECT error('panic: {safe}') FROM {from} LIMIT 1"
-            ))
+            Ok(format!("SELECT error('panic: {safe}') FROM {from} LIMIT 1"))
         }
     }
 }
@@ -1271,9 +1257,8 @@ fn prim_sql(op: &str, args: &[String], rule_name: &str) -> Result<String> {
         }
         Ok(format!("({sql_op} {})", args[0]))
     };
-    let func = |sql_func: &str| -> Result<String> {
-        Ok(format!("{sql_func}({})", args.join(", ")))
-    };
+    let func =
+        |sql_func: &str| -> Result<String> { Ok(format!("{sql_func}({})", args.join(", "))) };
     let variadic_join = |sql_op: &str, identity: &str| -> Result<String> {
         if args.is_empty() {
             return Ok(format!("({identity})"));

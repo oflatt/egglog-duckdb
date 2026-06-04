@@ -527,10 +527,10 @@ pub(crate) fn command_supports_proof_encoding(
     // live database and skip the action-lookup typecheck. The term/proof
     // encoding can't represent that, so reject such rules in *both*
     // plain term-encoding and proof modes (ungated by `proofs_enabled`).
-    if let GenericCommand::Rule { rule } = command {
-        if rule.unsafe_seminaive {
-            return Err(ProofEncodingUnsupportedReason::UnsafeSeminaive);
-        }
+    if let GenericCommand::Rule { rule } = command
+        && rule.unsafe_seminaive
+    {
+        return Err(ProofEncodingUnsupportedReason::UnsafeSeminaive);
     }
 
     // Check all expressions for primitives without validators —

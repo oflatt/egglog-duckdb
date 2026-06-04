@@ -115,10 +115,7 @@ impl UfTable {
                 self.parent.insert(node, smaller);
                 self.displaced.push(node);
             }
-            self.children
-                .entry(smaller)
-                .or_default()
-                .extend(subtree);
+            self.children.entry(smaller).or_default().extend(subtree);
         }
         n
     }
