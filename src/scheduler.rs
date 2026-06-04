@@ -237,18 +237,15 @@ impl EGraph {
         // Trait-level pool access — see `SchedulerRuleInfo::new` for
         // the rationale. The bridge backend's pool and the duckdb
         // pool both implement `BaseValuePool`, so this works on either.
-        let unit =
-            egglog_backend_trait::pool_get::<()>(self.backend.base_value_pool(), ());
+        let unit = egglog_backend_trait::pool_get::<()>(self.backend.base_value_pool(), ());
         for (rule_id, _rule) in rules.iter() {
             let rule_info = record.rule_info.get_mut(rule_id).unwrap();
 
-            let matches: Vec<Value> =
-                std::mem::take(rule_info.matches.lock().unwrap().as_mut());
+            let matches: Vec<Value> = std::mem::take(rule_info.matches.lock().unwrap().as_mut());
             let mut matches = Matches::new(matches, rule_info.free_vars.clone());
-            rule_info.should_seek =
-                record
-                    .scheduler
-                    .filter_matches(rule_id, ruleset, &mut matches);
+            rule_info.should_seek = record
+                .scheduler
+                .filter_matches(rule_id, ruleset, &mut matches);
             let (rows_to_insert, residual) = matches.instantiate(unit);
             self.backend.insert_rows(rule_info.decided, &rows_to_insert);
             *rule_info.matches.lock().unwrap() = residual;
@@ -363,10 +360,7 @@ impl SchedulerRuleInfo {
             .as_any_mut()
             .downcast_mut::<egglog_bridge_duckdb::EGraph>()
         {
-            duck.set_external_func_name(
-                collect_matches,
-                "__scheduler_collect_matches".to_string(),
-            );
+            duck.set_external_func_name(collect_matches, "__scheduler_collect_matches".to_string());
         }
         let schema = free_vars
             .iter()
@@ -412,7 +406,7 @@ impl SchedulerRuleInfo {
                 collect_matches,
                 &entries,
                 ColumnTy::Base(unit_type),
-                "collect_matches".to_string(),
+                Box::new(|| "collect_matches".to_string()),
             );
             qrule_builder.build()
         };

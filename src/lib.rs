@@ -1437,7 +1437,7 @@ impl EGraph {
                 ext_id,
                 &[arg],
                 egglog_bridge::ColumnTy::Base(unit_id),
-                "this function will never panic".to_string(),
+                Box::new(|| "this function will never panic".to_string()),
             );
 
             translator.build()
@@ -1548,7 +1548,7 @@ impl EGraph {
                 ext_id,
                 &[],
                 egglog_bridge::ColumnTy::Id,
-                "this function will never panic".to_string(),
+                Box::new(|| "this function will never panic".to_string()),
             );
             translator.build()
         };
@@ -2819,7 +2819,9 @@ impl<'a> BackendRule<'a> {
                             self.rb.lookup(
                                 f,
                                 &args,
-                                format!("{span}: lookup of function {name} failed"),
+                                Box::new(move || {
+                                    format!("{span}: lookup of function {name} failed")
+                                }),
                             )
                         }
                         ResolvedCall::Primitive(p) => {
@@ -2831,7 +2833,9 @@ impl<'a> BackendRule<'a> {
                                 p,
                                 &args,
                                 ty,
-                                format!("{span}: call of primitive {name} failed"),
+                                Box::new(move || {
+                                    format!("{span}: call of primitive {name} failed")
+                                }),
                             )
                         }
                     };

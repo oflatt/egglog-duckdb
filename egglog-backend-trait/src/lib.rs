@@ -281,11 +281,7 @@ pub trait Backend: Send + Sync {
     /// buffer (a `TaggedRowBuffer` in the bridge; a row cursor in DuckDB).
     /// The HRTB lifetime `for<'r>` reflects that the row reference is
     /// scoped to the closure invocation, not the outer `&self` borrow.
-    fn for_each(
-        &self,
-        table: FunctionId,
-        f: &mut dyn for<'r> FnMut(FunctionRow<'r>),
-    ) {
+    fn for_each(&self, table: FunctionId, f: &mut dyn for<'r> FnMut(FunctionRow<'r>)) {
         // The default implementation cannot be written here without a wrapper
         // because the closure types differ. Implementations should override
         // this to avoid the boolean threading overhead; the no-default
@@ -303,11 +299,7 @@ pub trait Backend: Send + Sync {
     /// Wraps `egglog_bridge::EGraph::for_each_while`.
     ///
     /// See [`Backend::for_each`] for why the closure uses an HRTB.
-    fn for_each_while(
-        &self,
-        table: FunctionId,
-        f: &mut dyn for<'r> FnMut(FunctionRow<'r>) -> bool,
-    );
+    fn for_each_while(&self, table: FunctionId, f: &mut dyn for<'r> FnMut(FunctionRow<'r>) -> bool);
 
     // -- direct access ------------------------------------------------------
 
@@ -412,11 +404,7 @@ pub trait Backend: Send + Sync {
     /// finalize with [`RuleBuilderOps::build`].
     ///
     /// Wraps `egglog_bridge::EGraph::new_rule`.
-    fn new_rule<'a>(
-        &'a mut self,
-        desc: &str,
-        seminaive: bool,
-    ) -> Box<dyn RuleBuilderOps + 'a>;
+    fn new_rule<'a>(&'a mut self, desc: &str, seminaive: bool) -> Box<dyn RuleBuilderOps + 'a>;
 
     /// Drop a registered rule. The handle becomes invalid.
     ///
@@ -599,10 +587,7 @@ impl dyn Backend {
     /// out through a captured slot rather than `Box<dyn Any>`, so `R` does
     /// not need to be `'static`. Mirrors
     /// `egglog_bridge::EGraph::with_execution_state`.
-    pub fn with_execution_state<R>(
-        &self,
-        f: impl FnOnce(&mut ExecutionState<'_>) -> R,
-    ) -> R {
+    pub fn with_execution_state<R>(&self, f: impl FnOnce(&mut ExecutionState<'_>) -> R) -> R {
         let mut f = Some(f);
         let mut out: Option<R> = None;
         self.with_execution_state_dyn(&mut |es| {
@@ -624,9 +609,7 @@ impl dyn Backend {
     ///
     /// Panics if the backend has no action registry (e.g. duckdb) or if the
     /// erased handle is not an `Arc<RwLock<R>>`.
-    pub fn action_registry<R: Any + Send + Sync>(
-        &self,
-    ) -> &std::sync::Arc<std::sync::RwLock<R>> {
+    pub fn action_registry<R: Any + Send + Sync>(&self) -> &std::sync::Arc<std::sync::RwLock<R>> {
         self.action_registry_any()
             .downcast_ref::<std::sync::Arc<std::sync::RwLock<R>>>()
             .expect("action_registry: backend has no action registry of the requested type")
@@ -636,6 +619,17 @@ impl dyn Backend {
 // ---------------------------------------------------------------------------
 // `RuleBuilderOps` — mirrors `egglog_bridge::RuleBuilder` one-for-one
 // ---------------------------------------------------------------------------
+
+/// A lazily-computed failure message for RHS lookups / external calls.
+///
+/// The message is only built if the lookup or call actually fails at
+/// runtime. Deferring it matters because the usual message form is
+/// `format!("{span}: ...")`, and formatting a `Span` calls
+/// `SrcFile::get_location`, which scans the source-file prefix. Building it
+/// eagerly for every action in every rule is `O(rules * file)` — quadratic
+/// when many generated rules (term/proof encoding) are compiled against a
+/// large source file. Boxed so the trait stays dyn-compatible.
+pub type PanicMsg = Box<dyn FnOnce() -> String + Send>;
 
 /// Operations on an in-progress rule.
 ///
@@ -694,26 +688,26 @@ pub trait RuleBuilderOps {
     /// Call an external function in the RHS, panicking with `panic_msg` on
     /// failure. Returns the result variable.
     ///
-    /// Wraps `RuleBuilder::call_external_func`. The closure is collapsed
-    /// into a `String` here to keep the trait dyn-compatible.
+    /// Wraps `RuleBuilder::call_external_func`. `panic_msg` is a [`PanicMsg`]
+    /// closure, evaluated only if the call actually fails.
     fn call_external_func(
         &mut self,
         func: ExternalFunctionId,
         args: &[QueryEntry],
         ret_ty: ColumnTy,
-        panic_msg: String,
+        panic_msg: PanicMsg,
     ) -> QueryEntry;
 
     /// RHS: look up the value of `func(entries)`, with the function's
     /// configured default behavior on miss.
     ///
-    /// Wraps `RuleBuilder::lookup`. `panic_msg` is the message used when
-    /// the function is configured with `DefaultVal::Fail`.
+    /// Wraps `RuleBuilder::lookup`. `panic_msg` is a [`PanicMsg`] closure
+    /// (evaluated only on miss when the function is `DefaultVal::Fail`).
     fn lookup(
         &mut self,
         func: FunctionId,
         entries: &[QueryEntry],
-        panic_msg: String,
+        panic_msg: PanicMsg,
     ) -> QueryEntry;
 
     /// RHS: subsume the row keyed by `entries` in `func`.
@@ -955,11 +949,7 @@ pub trait ContainerPool: Send + Sync {
     /// Register a Rust container value, returning a fresh `Value` handle.
     ///
     /// On DuckDB this returns an error (containers unsupported).
-    fn register_val_dyn(
-        &mut self,
-        ty: TypeId,
-        value: Box<dyn Any + Send + Sync>,
-    ) -> Result<Value>;
+    fn register_val_dyn(&mut self, ty: TypeId, value: Box<dyn Any + Send + Sync>) -> Result<Value>;
 
     /// Iterate (id, container) pairs for all registered values of a
     /// container type. The callback receives the container as a
@@ -967,11 +957,7 @@ pub trait ContainerPool: Send + Sync {
     ///
     /// Wraps `ContainerValues::for_each<C>`. On DuckDB this is a no-op
     /// (the stub registry is empty).
-    fn for_each_dyn(
-        &self,
-        ty: TypeId,
-        f: &mut dyn FnMut(Value, &dyn Any),
-    );
+    fn for_each_dyn(&self, ty: TypeId, f: &mut dyn FnMut(Value, &dyn Any));
 
     /// Number of registered values of the given container type.
     fn size(&self, ty: TypeId) -> usize;

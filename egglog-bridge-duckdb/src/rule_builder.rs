@@ -60,7 +60,7 @@
 
 use anyhow::{Result, anyhow};
 use egglog_backend_trait::{
-    BaseValueId, BaseValuePool, ColumnTy, ExternalFunctionId, FunctionId, QueryEntry,
+    BaseValueId, BaseValuePool, ColumnTy, ExternalFunctionId, FunctionId, PanicMsg, QueryEntry,
     RuleBuilderOps, RuleId, Value, Variable, VariableId,
 };
 use egglog_numeric_id::NumericId;
@@ -72,17 +72,12 @@ use crate::{Action, Atom, EGraph, Literal, Rule, Term};
 /// consulting the [`BaseValuePool`]. Supported types: `i64`, `bool`,
 /// `f64`, `String`, `()`, `BigInt`, `BigRat`. Unsupported types yield
 /// an error.
-fn decode_base_const(
-    pool: &DuckdbBaseValuePool,
-    val: Value,
-    ty: BaseValueId,
-) -> Result<Term> {
+fn decode_base_const(pool: &DuckdbBaseValuePool, val: Value, ty: BaseValueId) -> Result<Term> {
     use ordered_float::OrderedFloat;
     use std::any::TypeId;
     let pool_dyn: &dyn BaseValuePool = pool;
     // Try common types. Order chosen for frequency in test programs.
-    if pool_dyn.has_ty(TypeId::of::<i64>())
-        && ty == pool_dyn.get_ty_by_type_id(TypeId::of::<i64>())
+    if pool_dyn.has_ty(TypeId::of::<i64>()) && ty == pool_dyn.get_ty_by_type_id(TypeId::of::<i64>())
     {
         // Store the raw i64 value (not the handle). SQL operations
         // (`+`, `-`, `~`, `&`, …) on BIGINT columns operate on the
@@ -101,9 +96,7 @@ fn decode_base_const(
         let v = egglog_backend_trait::pool_unwrap::<bool>(pool_dyn, val);
         return Ok(Term::Lit(Literal::Bool(v)));
     }
-    if pool_dyn.has_ty(TypeId::of::<()>())
-        && ty == pool_dyn.get_ty_by_type_id(TypeId::of::<()>())
-    {
+    if pool_dyn.has_ty(TypeId::of::<()>()) && ty == pool_dyn.get_ty_by_type_id(TypeId::of::<()>()) {
         // Unit values: emit a sentinel i64(0) per the duck IR's
         // existing handling of unit constants.
         return Ok(Term::Lit(Literal::I64(0)));
@@ -116,8 +109,7 @@ fn decode_base_const(
         return Ok(Term::Lit(Literal::F64((*v).into_inner())));
     }
     if pool_dyn.has_ty(TypeId::of::<egglog_core_relations::Boxed<String>>())
-        && ty == pool_dyn
-            .get_ty_by_type_id(TypeId::of::<egglog_core_relations::Boxed<String>>())
+        && ty == pool_dyn.get_ty_by_type_id(TypeId::of::<egglog_core_relations::Boxed<String>>())
     {
         // Match the bridge's uniform encoding: strings live in the
         // base-value pool and tables store the interned `Value`
@@ -289,7 +281,9 @@ impl<'a> DuckRuleBuilderOps<'a> {
             }
             QueryEntry::Const { val, ty } => match ty {
                 ColumnTy::Id => Ok(Term::Lit(Literal::I64(val.rep() as i64))),
-                ColumnTy::Base(bv) => decode_base_const(&self.egraph.backend_base_value_pool, *val, *bv),
+                ColumnTy::Base(bv) => {
+                    decode_base_const(&self.egraph.backend_base_value_pool, *val, *bv)
+                }
             },
         }
     }
@@ -460,9 +454,7 @@ impl<'a> RuleBuilderOps for DuckRuleBuilderOps<'a> {
         // …) (from-string …))` constants and ensures shared interning
         // — same value, same handle, same SQL i64 across every rule
         // that mentions it. See `EGraph::fold_builtin_prim`.
-        let call = if translated
-            .iter()
-            .all(|t| matches!(t, Term::Lit(_)))
+        let call = if translated.iter().all(|t| matches!(t, Term::Lit(_)))
             && let Some(folded) = self.egraph.fold_builtin_prim(&name, &translated)
         {
             folded
@@ -492,9 +484,7 @@ impl<'a> RuleBuilderOps for DuckRuleBuilderOps<'a> {
         // atom so the rule actually has a body-level WHERE clause.
         // Without this the rule would fire unconditionally.
         match (&expected, entries.last().unwrap()) {
-            (Term::Var(varname), QueryEntry::Var(v))
-                if !self.bound_vars.contains(varname) =>
-            {
+            (Term::Var(varname), QueryEntry::Var(v)) if !self.bound_vars.contains(varname) => {
                 // Fresh ungrounded var: bind it inline.
                 let _ = v;
                 self.inline_terms.insert(v.id.rep(), call.clone());
@@ -502,10 +492,9 @@ impl<'a> RuleBuilderOps for DuckRuleBuilderOps<'a> {
             _ => {
                 // The expected return is already bound or is a
                 // literal: emit an equality filter `call = expected`.
-                self.rule.body.push(Atom::Filter(Term::prim(
-                    "=",
-                    vec![call.clone(), expected],
-                )));
+                self.rule
+                    .body
+                    .push(Atom::Filter(Term::prim("=", vec![call.clone(), expected])));
             }
         }
         // Standalone `guard` calls turn into a body-level Filter.
@@ -518,10 +507,9 @@ impl<'a> RuleBuilderOps for DuckRuleBuilderOps<'a> {
             if let Term::Prim(_, args) = &call
                 && let Some(arg) = args.first()
             {
-                self.rule.body.push(Atom::Filter(Term::prim(
-                    "guard",
-                    vec![arg.clone()],
-                )));
+                self.rule
+                    .body
+                    .push(Atom::Filter(Term::prim("guard", vec![arg.clone()])));
             }
         }
         // Primitives whose return type is `()` (Unit) act as body
@@ -556,7 +544,9 @@ impl<'a> RuleBuilderOps for DuckRuleBuilderOps<'a> {
         func: ExternalFunctionId,
         args: &[QueryEntry],
         _ret_ty: ColumnTy,
-        _panic_msg: String,
+        // DuckDB compiles primitive calls to SQL and never panics through
+        // this path, so the lazy message is dropped unevaluated.
+        _panic_msg: PanicMsg,
     ) -> QueryEntry {
         let name = match self.egraph.external_func_name(func) {
             Some(n) => n.to_string(),
@@ -587,9 +577,7 @@ impl<'a> RuleBuilderOps for DuckRuleBuilderOps<'a> {
         };
         // Same constant-fold as `query_prim` — see that comment for
         // why this is load-bearing on Herbie.
-        let inline_term = if translated_args
-            .iter()
-            .all(|t| matches!(t, Term::Lit(_)))
+        let inline_term = if translated_args.iter().all(|t| matches!(t, Term::Lit(_)))
             && let Some(folded) = self.egraph.fold_builtin_prim(&name, &translated_args)
         {
             folded
@@ -609,7 +597,7 @@ impl<'a> RuleBuilderOps for DuckRuleBuilderOps<'a> {
         &mut self,
         func: FunctionId,
         entries: &[QueryEntry],
-        _panic_msg: String,
+        _panic_msg: PanicMsg,
     ) -> QueryEntry {
         // The bridge's `lookup` is "look up the function's output for
         // these inputs; if missing, use the function's `DefaultVal`".
@@ -838,10 +826,10 @@ impl<'a> RuleBuilderOps for DuckRuleBuilderOps<'a> {
             // Skip the check-facts sentinel call: it has no
             // semantic content on duckdb (it's the bridge's
             // side-channel hook, which we ignore here).
-            if let Term::Prim(name, _) = &term {
-                if name == "__check_facts_sentinel" {
-                    continue;
-                }
+            if let Term::Prim(name, _) = &term
+                && name == "__check_facts_sentinel"
+            {
+                continue;
             }
             if matches!(term, Term::Prim(_, _) | Term::FuncCall { .. }) {
                 rule.body.push(Atom::Filter(term));
@@ -914,17 +902,16 @@ mod tests {
         // Sanity: the rule id maps back to a registered name. Use
         // the as_any escape hatch to peek at the registry.
         {
-            let eg = backend
-                .as_any()
-                .downcast_ref::<EGraph>()
-                .expect("downcast");
+            let eg = backend.as_any().downcast_ref::<EGraph>().expect("downcast");
             let stored_idx = eg
                 .backend_rule_indices
                 .get(rule_id.rep() as usize)
                 .and_then(|x| *x);
             assert!(stored_idx.is_some(), "rule index should be stored");
             assert_eq!(
-                stored_idx.and_then(|i| eg.rules.get(i)).map(|r| &r.name[..]),
+                stored_idx
+                    .and_then(|i| eg.rules.get(i))
+                    .map(|r| &r.name[..]),
                 Some("copy_rule_smoke#0")
             );
         }
@@ -938,10 +925,7 @@ mod tests {
 
         // free_rule: clears the slot, doesn't panic.
         backend.free_rule(rule_id);
-        let eg = backend
-            .as_any()
-            .downcast_ref::<EGraph>()
-            .expect("downcast");
+        let eg = backend.as_any().downcast_ref::<EGraph>().expect("downcast");
         assert!(
             eg.backend_rule_indices
                 .get(rule_id.rep() as usize)

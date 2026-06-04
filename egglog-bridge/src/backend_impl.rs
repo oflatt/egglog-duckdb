@@ -51,8 +51,8 @@ use std::any::{Any, TypeId};
 use anyhow::{Result, anyhow};
 use egglog_backend_trait::{
     Backend, BaseValuePool, ColumnTy, ContainerPool, ExternalFunction, ExternalFunctionId,
-    FunctionConfig, FunctionId, FunctionRow, IterationReport, QueryEntry, ReportLevel, RuleId,
-    RuleBuilderOps, Value, Variable,
+    FunctionConfig, FunctionId, FunctionRow, IterationReport, PanicMsg, QueryEntry, ReportLevel,
+    RuleBuilderOps, RuleId, Value, Variable,
 };
 use egglog_core_relations::{BaseValueId, BaseValues, ContainerValues, DynamicInternTable};
 
@@ -90,7 +90,9 @@ impl<'a> RuleBuilderOps for BridgeRuleBuilderOps<'a> {
     ) -> Result<()> {
         // The bridge returns an `AtomId` we don't use through the trait
         // boundary; map it to `()`.
-        self.inner.query_table(func, entries, is_subsumed).map(|_| ())
+        self.inner
+            .query_table(func, entries, is_subsumed)
+            .map(|_| ())
     }
 
     fn query_prim(
@@ -107,13 +109,12 @@ impl<'a> RuleBuilderOps for BridgeRuleBuilderOps<'a> {
         func: ExternalFunctionId,
         args: &[QueryEntry],
         ret_ty: ColumnTy,
-        panic_msg: String,
+        panic_msg: PanicMsg,
     ) -> QueryEntry {
-        // The bridge takes a `FnOnce -> String`; we collapse the closure
-        // form to the eager `String` form here.
-        let var = self
-            .inner
-            .call_external_func(func, args, ret_ty, move || panic_msg);
+        // The bridge's `RuleBuilder` already takes a `FnOnce -> String`, so
+        // the lazy message flows straight through — it's only invoked if the
+        // call fails at runtime.
+        let var = self.inner.call_external_func(func, args, ret_ty, panic_msg);
         QueryEntry::Var(var)
     }
 
@@ -121,9 +122,9 @@ impl<'a> RuleBuilderOps for BridgeRuleBuilderOps<'a> {
         &mut self,
         func: FunctionId,
         entries: &[QueryEntry],
-        panic_msg: String,
+        panic_msg: PanicMsg,
     ) -> QueryEntry {
-        let var = self.inner.lookup(func, entries, move || panic_msg);
+        let var = self.inner.lookup(func, entries, panic_msg);
         QueryEntry::Var(var)
     }
 
@@ -283,12 +284,8 @@ impl Backend for EGraph {
 
     // -- iteration ----------------------------------------------------------
 
-    fn for_each(
-        &self,
-        table: FunctionId,
-        f: &mut dyn for<'r> FnMut(FunctionRow<'r>),
-    ) {
-        EGraph::for_each(self, table, |row| f(row));
+    fn for_each(&self, table: FunctionId, f: &mut dyn for<'r> FnMut(FunctionRow<'r>)) {
+        EGraph::for_each(self, table, f);
     }
 
     fn for_each_while(
@@ -296,7 +293,7 @@ impl Backend for EGraph {
         table: FunctionId,
         f: &mut dyn for<'r> FnMut(FunctionRow<'r>) -> bool,
     ) {
-        EGraph::for_each_while(self, table, |row| f(row));
+        EGraph::for_each_while(self, table, f);
     }
 
     // -- direct access ------------------------------------------------------
@@ -371,11 +368,7 @@ impl Backend for EGraph {
 
     // -- rule management ----------------------------------------------------
 
-    fn new_rule<'a>(
-        &'a mut self,
-        desc: &str,
-        seminaive: bool,
-    ) -> Box<dyn RuleBuilderOps + 'a> {
+    fn new_rule<'a>(&'a mut self, desc: &str, seminaive: bool) -> Box<dyn RuleBuilderOps + 'a> {
         let inner = EGraph::new_rule(self, desc, seminaive);
         Box::new(BridgeRuleBuilderOps { inner })
     }
@@ -416,7 +409,8 @@ impl Backend for EGraph {
         // `BaseValues`, so transmuting `&BaseValues` to `&BaseValuesAsPool`
         // is sound — they share the same memory layout.
         let bvs: &BaseValues = self.base_values();
-        let as_pool: &BaseValuesAsPool = unsafe { &*(bvs as *const BaseValues as *const BaseValuesAsPool) };
+        let as_pool: &BaseValuesAsPool =
+            unsafe { &*(bvs as *const BaseValues as *const BaseValuesAsPool) };
         as_pool
     }
 
