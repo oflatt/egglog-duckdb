@@ -74,11 +74,6 @@ struct Args {
     /// Enable proof testing, turning all `check` statements into `prove` statements
     #[clap(long)]
     proof_testing: bool,
-    /// Enable the seminaive-as-encoding experiment. Implies `--term-encoding`
-    /// and `--naive` (the latter so the backend's built-in seminaive doesn't
-    /// duplicate the encoded predicates).
-    #[clap(long)]
-    seminaive_encoding: bool,
     /// Run the program on the experimental DuckDB backend (Phase 1.3).
     /// Bypasses the default `egglog-bridge` execution path. Many features
     /// are not yet supported; see `src/backend_duckdb.rs` for current scope.
@@ -109,7 +104,7 @@ pub fn cli(mut egraph: EGraph) {
 
     let args = Args::parse();
 
-    if args.term_encoding || args.seminaive_encoding {
+    if args.term_encoding {
         egraph = egraph.with_term_encoding_enabled();
     }
 
@@ -124,16 +119,9 @@ pub fn cli(mut egraph: EGraph) {
         egraph = egraph.with_proof_testing();
     }
 
-    if args.seminaive_encoding {
-        egraph = egraph.with_seminaive_encoding_enabled();
-    }
-
     EGraph::set_num_threads(args.threads);
     egraph.fact_directory.clone_from(&args.fact_directory);
-    // --seminaive-encoding implies --naive (the encoded predicates do
-    // the seminaive work; the backend's built-in version would fight
-    // with them).
-    egraph.seminaive = !args.naive && !args.seminaive_encoding;
+    egraph.seminaive = !args.naive;
     egraph.no_decomp = args.no_decomp;
     egraph.set_report_level(args.report_level);
     if args.strict_mode {
@@ -180,23 +168,20 @@ pub fn cli(mut egraph: EGraph) {
                         let input_str = input.to_str().unwrap().to_owned();
                         let mut tmp = std::mem::replace(
                             &mut egraph,
-                            EGraph::with_duckdb_backend(egglog::DuckBackendConfig::default()).unwrap(),
+                            EGraph::with_duckdb_backend(egglog::DuckBackendConfig::default())
+                                .unwrap(),
                         );
-                        let result = std::panic::catch_unwind(
-                            std::panic::AssertUnwindSafe(|| {
-                                tmp.parse_and_run_program(Some(input_str), &program)
-                            }),
-                        );
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            tmp.parse_and_run_program(Some(input_str), &program)
+                        }));
                         if let Err(e) = result {
                             eprintln!("== panicked during run: {e:?} ==");
                         }
                         tmp.dump_debug_info();
                         continue;
                     }
-                    let result = egraph.parse_and_run_program(
-                        Some(input.to_str().unwrap().into()),
-                        &program,
-                    );
+                    let result = egraph
+                        .parse_and_run_program(Some(input.to_str().unwrap().into()), &program);
                     // Dump per-rule timing if DUCK_PERF_DUMP is set
                     // (env-flag activated; no CLI flag). Reads the
                     // duckdb backend's per-rule counters directly.
@@ -210,8 +195,8 @@ pub fn cli(mut egraph: EGraph) {
                         let mut rows = duck.perf_per_rule();
                         rows.truncate(20);
                         eprintln!(
-                            "{:>10} {:>10} {:>10}  {:<40} {}",
-                            "total_s", "mat_s", "act_s", "ruleset", "rule"
+                            "{:>10} {:>10} {:>10}  {:<40} rule",
+                            "total_s", "mat_s", "act_s", "ruleset"
                         );
                         for (rn, rs, m, a) in &rows {
                             eprintln!(
@@ -237,12 +222,10 @@ pub fn cli(mut egraph: EGraph) {
                     }
                     continue;
                 }
-                let mut duck_eg = egglog::EGraph::with_duckdb_backend(
-                    egglog::DuckBackendConfig {
-                        native_uf: args.duck_native_uf,
-                        proofs: false,
-                    },
-                )
+                let mut duck_eg = egglog::EGraph::with_duckdb_backend(egglog::DuckBackendConfig {
+                    native_uf: args.duck_native_uf,
+                    proofs: false,
+                })
                 .unwrap_or_else(|err| {
                     log::error!("failed to start DuckDB backend: {err}");
                     std::process::exit(1);
@@ -250,10 +233,9 @@ pub fn cli(mut egraph: EGraph) {
                 duck_eg.parser = std::mem::take(&mut egraph.parser);
                 duck_eg.fact_directory.clone_from(&args.fact_directory);
                 duck_eg.ensure_no_reserved_symbols(false);
-                if let Err(err) = duck_eg.parse_and_run_program(
-                    Some(input.to_str().unwrap().into()),
-                    &program,
-                ) {
+                if let Err(err) =
+                    duck_eg.parse_and_run_program(Some(input.to_str().unwrap().into()), &program)
+                {
                     log::error!("{err}");
                     std::process::exit(1);
                 }

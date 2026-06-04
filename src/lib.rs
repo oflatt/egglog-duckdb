@@ -276,18 +276,6 @@ pub struct EGraph {
     rulesets: IndexMap<String, Ruleset>,
     pub fact_directory: Option<PathBuf>,
     pub seminaive: bool,
-    /// Enable the seminaive-as-encoding pass. See
-    /// `seminaive-encoding-experiment.md` at the repo root.
-    pub seminaive_encoding_enabled: bool,
-    /// Whether the seminaive-encoding pass has already emitted its
-    /// `next_ts` header. The pass is invoked once per command, but
-    /// `next_ts` should only be declared once per session.
-    pub(crate) seminaive_encoding_header_emitted: bool,
-    /// Functions/constructors/relations seen so far by the
-    /// seminaive-encoding pass, accumulated across per-command
-    /// invocations. Needed because a rule in command N can reference
-    /// a function declared in command M < N.
-    pub(crate) seminaive_tracked: HashSet<String>,
     pub no_decomp: bool,
     type_info: TypeInfo,
     /// The run report unioned over all runs so far.
@@ -408,9 +396,6 @@ impl EGraph {
             rulesets: Default::default(),
             fact_directory: None,
             seminaive: true,
-            seminaive_encoding_enabled: false,
-            seminaive_encoding_header_emitted: false,
-            seminaive_tracked: HashSet::default(),
             no_decomp: false,
             overall_run_report: Default::default(),
             type_info: Default::default(),
@@ -630,16 +615,6 @@ impl EGraph {
     /// Enable testing of getting proofs for all `check` commands.
     pub fn with_proof_testing(mut self) -> Self {
         self.proof_state.proof_testing = true;
-        self
-    }
-
-    /// Enable the seminaive-as-encoding experiment. Adds a pass after
-    /// term encoding that lifts seminaive evaluation into the IR via
-    /// per-rule timestamp predicates. Requires term encoding to also
-    /// be enabled. See `seminaive-encoding-experiment.md` at the repo
-    /// root.
-    pub fn with_seminaive_encoding_enabled(mut self) -> Self {
-        self.seminaive_encoding_enabled = true;
         self
     }
 
@@ -1393,9 +1368,7 @@ impl EGraph {
             }
         }
         let resolved_expr = expr_action.ok_or_else(|| {
-            Error::BackendError(
-                "eval_expr: resolver did not produce an expression action".into(),
-            )
+            Error::BackendError("eval_expr: resolver did not produce an expression action".into())
         })?;
         let sort = resolved_expr.output_type();
         let value = self.eval_resolved_expr(span, &resolved_expr)?;
@@ -1406,10 +1379,8 @@ impl EGraph {
         // Use trait-level pool helpers so this path doesn't require a
         // bridge backend — `multi-extract` reaches here on duckdb
         // via `MultiExtract::update → eval_expr`.
-        let unit_id =
-            egglog_backend_trait::pool_get_ty::<()>(self.backend.base_value_pool());
-        let unit_val =
-            egglog_backend_trait::pool_get::<()>(self.backend.base_value_pool(), ());
+        let unit_id = egglog_backend_trait::pool_get_ty::<()>(self.backend.base_value_pool());
+        let unit_val = egglog_backend_trait::pool_get::<()>(self.backend.base_value_pool(), ());
 
         let result: egglog_bridge::SideChannel<Value> = Default::default();
         let result_ref = result.clone();
@@ -1934,10 +1905,9 @@ impl EGraph {
                                 return Err(Error::InputFileFormatError(file));
                             }
                         }
-                        "String" => pool_get::<S>(
-                            self.backend.base_value_pool(),
-                            raw.to_string().into(),
-                        ),
+                        "String" => {
+                            pool_get::<S>(self.backend.base_value_pool(), raw.to_string().into())
+                        }
                         "Unit" => unit_val,
                         _ => panic!("Unreachable"),
                     };
@@ -1988,9 +1958,7 @@ impl EGraph {
     /// register commands / primitives up front and need them to
     /// survive into the run.
     pub fn has_duckdb_backend(&self) -> bool {
-        self.backend
-            .as_any()
-            .is::<egglog_bridge_duckdb::EGraph>()
+        self.backend.as_any().is::<egglog_bridge_duckdb::EGraph>()
     }
 
     /// Borrow the underlying backend trait object for diagnostic
@@ -2010,10 +1978,7 @@ impl EGraph {
     /// Unlike [`Self::check_facts`] (private, returns
     /// `Err(CheckError)` on a non-match), this returns the boolean
     /// directly so the caller can decide what to do with it.
-    pub fn run_check_facts_any(
-        &mut self,
-        facts: Vec<Fact>,
-    ) -> Result<bool, Error> {
+    pub fn run_check_facts_any(&mut self, facts: Vec<Fact>) -> Result<bool, Error> {
         // Refresh the row-count snapshot that the duckdb `get-size!`
         // UDF reads from. The snapshot lives in the duckdb EGraph
         // (out of reach for the bridge backend), so down-cast and
@@ -2161,18 +2126,8 @@ impl EGraph {
                 self.names.check_shadowing(command)?;
             }
 
-            let mut term_encoding_added =
+            let term_encoding_added =
                 ProofInstrumentor::add_term_encoding(self, typechecked_no_globals);
-            if self.seminaive_encoding_enabled {
-                let emit_header = !self.seminaive_encoding_header_emitted;
-                term_encoding_added = proofs::seminaive_encoding::add_seminaive_encoding(
-                    term_encoding_added,
-                    &mut self.parser,
-                    &mut self.seminaive_tracked,
-                    emit_header,
-                );
-                self.seminaive_encoding_header_emitted = true;
-            }
             let mut new_typechecked = vec![];
             for new_cmd in term_encoding_added {
                 let desugared =
@@ -2776,7 +2731,7 @@ impl<'a> BackendRule<'a> {
         // BigRat operations that have no SQL equivalent — to per-op
         // UDFs registered on demand via
         // `EGraph::set_external_func_name` → `register_builtin_prim_udf`.
-        let duck_name: Option<&str> = match (pname, &*pout, in0) {
+        let duck_name: Option<&str> = match (pname, pout, in0) {
             ("^", "i64", _) => Some("i64-xor"),
             ("/", "i64", _) => Some("int-div"),
             ("+", "String", _) => Some("string-concat"),
@@ -2819,11 +2774,7 @@ impl<'a> BackendRule<'a> {
             self.rb.rename_prim(prim.external_id(ctx), name.to_owned());
         }
 
-        (
-            resolved_id,
-            qe_args,
-            prim.output().column_ty(self.backend),
-        )
+        (resolved_id, qe_args, prim.output().column_ty(self.backend))
     }
 
     fn args<'b>(
@@ -2909,9 +2860,9 @@ impl<'a> BackendRule<'a> {
                         match change {
                             Change::Delete => self.rb.remove(f, &args),
                             Change::Subsume if can_subsume => {
-                                self.rb
-                                    .subsume(f, &args)
-                                    .map_err(|e| Error::BackendError(format!("subsume failed: {e}")))?;
+                                self.rb.subsume(f, &args).map_err(|e| {
+                                    Error::BackendError(format!("subsume failed: {e}"))
+                                })?;
                             }
                             Change::Subsume => {
                                 return Err(Error::SubsumeMergeError(name, span.clone()));
@@ -2942,10 +2893,7 @@ impl<'a> BackendRule<'a> {
 /// Trait-routed literal-to-entry helper. Constructs a typed
 /// `QueryEntry::Const` via the backend's `BaseValuePool` so the
 /// caller doesn't need to downcast to the concrete bridge.
-fn literal_to_entry_dyn(
-    backend: &dyn egglog_backend_trait::Backend,
-    l: &Literal,
-) -> QueryEntry {
+fn literal_to_entry_dyn(backend: &dyn egglog_backend_trait::Backend, l: &Literal) -> QueryEntry {
     use egglog_backend_trait::{pool_get, pool_get_ty};
     let pool = backend.base_value_pool();
     match l {

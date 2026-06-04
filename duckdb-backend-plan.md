@@ -15,14 +15,6 @@ takes that reduction as a given and asks what's left for the backend.
 This is a **planning document, not a commitment**. It identifies what the
 swap buys us, what fights us, and what an incremental path could look like.
 
-> **Status note**: a precursor experiment is now planned in
-> [`seminaive-encoding-experiment.md`](seminaive-encoding-experiment.md):
-> lift seminaive evaluation out of the backend and into a compilation
-> pass, then validate it on the existing egglog backend before
-> committing to a backend swap. The experiment is independent of this
-> plan but, if it succeeds, simplifies §2.6 (DuckDB just translates
-> the timestamp-aware IR; no SQL-emission-time expansion needed).
-
 ---
 
 ## 1. Why this is even plausible
