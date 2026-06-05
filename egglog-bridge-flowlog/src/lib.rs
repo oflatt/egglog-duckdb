@@ -49,10 +49,12 @@ use egglog_numeric_id::NumericId;
 use hashbrown::{HashMap, HashSet};
 
 mod base_values;
+pub mod codegen;
 pub mod compile;
 mod engine;
 mod external_func;
 mod rule_builder;
+pub mod subprocess;
 
 use base_values::base_values_as_pool_mut;
 use compile::{pack_row, row_col, unpack_row, BodyOp, HeadOp, MergeMode, Row, RuleIr, Slot};
@@ -112,6 +114,16 @@ struct RelationInfo {
 // EGraph
 // ---------------------------------------------------------------------------
 
+/// How `run_rules` executes the recognized step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecMode {
+    /// M1: drive a build-time-fixed in-process flowlog engine.
+    InProcess,
+    /// M2: translate the runtime rule to `.dl`, compile a driver crate
+    /// (cached by rule-set hash), and drive it as a subprocess over a pipe.
+    ShellOut,
+}
+
 /// The FlowLog-backed egraph.
 pub struct EGraph {
     relations: Vec<RelationInfo>,
@@ -126,6 +138,17 @@ pub struct EGraph {
     /// the first transitive-closure-step `run_rules`, which is where we know
     /// which `FunctionId`s play the `edge` / `path` / head roles.
     flow: Option<engine::FlowEngine>,
+    /// Execution mode: in-process flowlog engine (M1) or the M2 shell-out
+    /// driver subprocess (runtime rule installation via codegen + compile).
+    mode: ExecMode,
+    /// The M2 shell-out driver: a subprocess that embeds a flowlog engine
+    /// compiled at runtime from the rule IR. `None` until the first
+    /// `run_rules` under [`ExecMode::ShellOut`] (where the rule is known).
+    driver: Option<subprocess::DriverHandle>,
+    /// Per-round feedback buffer for the shell-out path: the new `path` rows
+    /// derived last round, to re-stage as the next round's `insert path` delta
+    /// (the bounded host-feedback loop, mirrored across the pipe).
+    pending_path: Vec<(i32, i32)>,
     /// A core-relations [`Database`] used purely as the base-value / primitive
     /// engine, so `Value`s are bit-for-bit identical to the reference backend.
     db: Database,
@@ -143,13 +166,27 @@ impl Default for EGraph {
 }
 
 impl EGraph {
-    /// Construct a fresh FlowLog-backed egraph.
+    /// Construct a fresh FlowLog-backed egraph (M1 in-process mode).
     pub fn new() -> Self {
+        Self::with_mode(ExecMode::InProcess)
+    }
+
+    /// Construct a fresh FlowLog-backed egraph driven by the M2 shell-out
+    /// runtime-codegen path (compile a driver subprocess from the rule IR).
+    pub fn new_shellout() -> Self {
+        Self::with_mode(ExecMode::ShellOut)
+    }
+
+    /// Construct with an explicit execution mode.
+    pub fn with_mode(mode: ExecMode) -> Self {
         EGraph {
             relations: Vec::new(),
             rules: Vec::new(),
             mirror: HashMap::new(),
             flow: None,
+            mode,
+            driver: None,
+            pending_path: Vec::new(),
             db: Database::new(),
             container_pool: FlowlogContainerPool,
             external_funcs: ExternalFuncRegistry::default(),
@@ -536,9 +573,17 @@ impl EGraph {
     /// fold the resulting `hop` deltas into the mirror. Returns whether the
     /// mirror changed.
     fn run_one_hop(&mut self, live: &[usize]) -> Result<bool> {
-        // M1 supports exactly one rule per `run_rules`: the transitive-closure
-        // step. (The frontend's `(run N)` loop calls this with the single
-        // user rule N times.)
+        match self.mode {
+            ExecMode::InProcess => self.run_one_hop_inprocess(live),
+            ExecMode::ShellOut => self.run_one_hop_shellout(live),
+        }
+    }
+
+    /// M1 in-process path: drive the build-time-fixed flowlog engine.
+    fn run_one_hop_inprocess(&mut self, live: &[usize]) -> Result<bool> {
+        // Exactly one rule per `run_rules`: the transitive-closure step. (The
+        // frontend's `(run N)` loop calls this with the single user rule N
+        // times.)
         let shape = self.recognize_step(live)?;
 
         // Lazily build the engine and do the initial seeding hop. On the first
@@ -574,6 +619,81 @@ impl EGraph {
             flow.commit_hop()
         };
         Ok(self.fold_hops(&shape, &new_hops))
+    }
+
+    /// M2 shell-out path: translate the runtime rule to `.dl`, compile (or
+    /// reuse a cached) driver subprocess, and drive ONE bounded hop over the
+    /// pipe. Same host-feedback loop as the in-process path, but the engine
+    /// lives in a subprocess compiled from the rule defined at runtime.
+    fn run_one_hop_shellout(&mut self, live: &[usize]) -> Result<bool> {
+        let shape = self.recognize_step(live)?;
+
+        // First call: emit the `.dl` from the runtime rule, build/cache + spawn
+        // the driver, then stage all current `edge` + `path` rows and commit
+        // the first (1-hop) epoch.
+        if self.driver.is_none() {
+            let dl = codegen::emit_dl();
+            let mut handle = subprocess::DriverHandle::build_or_cached(&dl)?;
+            handle.spawn()?;
+            self.driver = Some(handle);
+
+            let edge_rows = self.engine_rows(shape.edge, shape.edge_y, shape.edge_z);
+            let path_rows = self.engine_rows(shape.path, shape.path_x, shape.path_y);
+            let new_hops = {
+                let drv = self.driver.as_mut().unwrap();
+                for (a, b) in &edge_rows {
+                    drv.insert(codegen::REL_EDGE, *a, *b)?;
+                }
+                for (a, b) in &path_rows {
+                    drv.insert(codegen::REL_PATH, *a, *b)?;
+                }
+                drv.commit()?
+            };
+            return Ok(self.fold_hops_shellout(&shape, &new_hops));
+        }
+
+        // Subsequent rounds: re-stage last round's NEW path rows as the next
+        // `insert path` delta, commit one further hop, fold.
+        let to_feed = std::mem::take(&mut self.pending_path);
+        if to_feed.is_empty() {
+            return Ok(false);
+        }
+        let new_hops = {
+            let drv = self.driver.as_mut().unwrap();
+            for (a, b) in &to_feed {
+                drv.insert(codegen::REL_PATH, *a, *b)?;
+            }
+            drv.commit()?
+        };
+        Ok(self.fold_hops_shellout(&shape, &new_hops))
+    }
+
+    /// Fold the shell-out driver's `hop` deltas into the mirror and stage the
+    /// new `path` rows for next round. Mirrors `fold_hops` but writes the
+    /// feedback buffer on the egraph (the subprocess is stateless across
+    /// rounds w.r.t. host feedback).
+    fn fold_hops_shellout(&mut self, shape: &StepShape, hops: &[(i32, i32, i32)]) -> bool {
+        let mut changed = false;
+        let mut new_path_feed: Vec<(i32, i32)> = Vec::new();
+        for &(x, z, diff) in hops {
+            if diff <= 0 {
+                continue;
+            }
+            let mut full = vec![0u32; shape.head_arity];
+            for &(ci, cv) in &shape.head_consts {
+                full[ci] = cv;
+            }
+            full[shape.head_x] = x as u32;
+            full[shape.head_z] = z as u32;
+            let row: Row = full.into_boxed_slice();
+            let set = self.mirror.entry(shape.head).or_default();
+            if set.insert(row) {
+                changed = true;
+                new_path_feed.push((x, z));
+            }
+        }
+        self.pending_path = new_path_feed;
+        changed
     }
 
     /// Collect the `(a, b)` projection of relation `f`'s mirror rows at the

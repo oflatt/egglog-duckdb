@@ -21,6 +21,7 @@
 //! in ../MILESTONE1.md; it is deferred to M2.
 use flowlog_build::{Builder, ExecutionMode};
 
+#[allow(clippy::disallowed_macros)] // for println! (cargo: directives)
 fn main() {
     println!("cargo:rerun-if-changed=transitive_step.dl");
     Builder::default()

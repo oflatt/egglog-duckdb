@@ -5,7 +5,7 @@ version.workspace = true
 # dependencies are edition-2021 crates; the spike proved the embedding on 2021.
 # Keep this member on 2021 to match the proven spike configuration.
 edition = "2021"
-description = "FlowLog (Differential-Dataflow)-backed executor for egglog's resolved IR (milestone 1: bounded per-iteration (run N) stepping behind the Backend trait via flowlog-rs commit(); see ../PLAN.md, ../SPIKE_RESULTS.md)"
+description = "FlowLog (Differential-Dataflow)-backed executor for egglog's resolved IR. M1: bounded per-iteration (run N) stepping behind the Backend trait via flowlog-rs commit(). M2: runtime rule installation via shell-out — translate the runtime rule to .dl, compile a driver subprocess (cached by rule-set hash), drive it over a pipe. See ../MILESTONE1.md, ../MILESTONE2.md."
 license.workspace = true
 publish = false
 
