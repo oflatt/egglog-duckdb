@@ -55,6 +55,7 @@ use hashbrown::{HashMap, HashSet};
 
 mod base_values;
 pub mod compile;
+pub mod dbsp_join;
 mod external_func;
 mod interpret;
 mod rule_builder;
@@ -143,6 +144,11 @@ pub struct EGraph {
     /// Monotonic fresh-id counter for `fresh_id` / `add_term`.
     next_id: u32,
     report_level: ReportLevel,
+    /// Diagnostics: how many rule firings have run their body join on DBSP
+    /// (the M4 dbsp-join path) vs. the host interpreter fallback. Used to
+    /// characterize the frontier honestly (see `dbsp_join_stats`).
+    pub(crate) dbsp_rule_runs: u64,
+    pub(crate) host_rule_runs: u64,
 }
 
 impl Default for EGraph {
@@ -166,7 +172,17 @@ impl EGraph {
             // padding in the uniform Row representation).
             next_id: 1,
             report_level: ReportLevel::default(),
+            dbsp_rule_runs: 0,
+            host_rule_runs: 0,
         }
+    }
+
+    /// Diagnostics: `(dbsp_rule_runs, host_rule_runs)` — the number of rule
+    /// firings whose body join ran on DBSP vs. on the host interpreter
+    /// fallback since construction. Lets tests / surveys report exactly which
+    /// fraction of work ran genuinely on DBSP.
+    pub fn dbsp_join_stats(&self) -> (u64, u64) {
+        (self.dbsp_rule_runs, self.host_rule_runs)
     }
 
     fn info(&self, f: FunctionId) -> &RelationInfo {
@@ -188,6 +204,19 @@ impl EGraph {
     /// Resolve a function's merge mode (for FD-conflict resolution).
     fn merge_mode(&self, f: FunctionId) -> MergeMode {
         self.info(f).merge
+    }
+
+    /// Evaluate a primitive through the embedded `Database` (the inherent
+    /// counterpart of the [`Backend::eval_prim`] trait method). Both the host
+    /// interpreter and the DBSP-join path call this; neither reaches into
+    /// `self.db` directly.
+    pub(crate) fn eval_prim_internal(
+        &self,
+        id: ExternalFunctionId,
+        args: &[Value],
+    ) -> Option<Value> {
+        self.db
+            .with_execution_state(|st| st.call_external_func(id, args))
     }
 
     /// Allocate a fresh id (used by the interpreter's eq-sort constructor
@@ -544,6 +573,15 @@ impl Backend for EGraph {
         let id = self.db.add_external_function(Box::new(panic_fn));
         self.external_funcs.add_panic_at(id, message);
         id
+    }
+
+    fn eval_prim(&self, id: ExternalFunctionId, args: &[Value]) -> Option<Value> {
+        // The primitive lives in the embedded `Database`; invoke it through an
+        // execution state. This is the single backend-agnostic entry point the
+        // interpreter and the DBSP-join path both use to evaluate primitives,
+        // so neither has to reach into `self.db` directly.
+        self.db
+            .with_execution_state(|st| st.call_external_func(id, args))
     }
 
     // -- typed value handles ------------------------------------------------

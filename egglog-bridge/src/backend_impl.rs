@@ -402,6 +402,16 @@ impl Backend for EGraph {
         EGraph::new_panic(self, message)
     }
 
+    fn eval_prim(
+        &self,
+        id: egglog_backend_trait::ExternalFunctionId,
+        args: &[egglog_backend_trait::Value],
+    ) -> Option<egglog_backend_trait::Value> {
+        // The reference backend keeps its primitives in the embedded
+        // `core_relations::Database`; invoke through an execution state.
+        self.with_execution_state(|st| st.call_external_func(id, args))
+    }
+
     // -- typed value handles ------------------------------------------------
 
     fn base_value_pool(&self) -> &dyn BaseValuePool {

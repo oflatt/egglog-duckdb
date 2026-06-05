@@ -26,6 +26,7 @@ use egglog_numeric_id::NumericId;
 use hashbrown::{HashMap, HashSet};
 
 use crate::compile::{slot_lookup, BodyOp, HeadOp, Row, RuleIr, Slot};
+use crate::dbsp_join;
 use crate::EGraph;
 
 /// Binding environment: variable id → bound `u32` value.
@@ -61,6 +62,41 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
         .collect();
 
     for rule in &rules {
+        // --- DBSP-join path (Milestone 4) -------------------------------
+        // If the rule's body join is DBSP-eligible, run the relational join on
+        // DBSP's dataflow engine and evaluate only value-computing primitives +
+        // head actions on the host. Otherwise fall back to the host nested-loop
+        // interpreter (the oracle).
+        if let Some(plan) = dbsp_join::plan_join(eg, rule) {
+            let bindings = dbsp_join::run_join(eg, &plan)?;
+            eg.dbsp_rule_runs += 1;
+            let var_order = plan.var_order().to_vec();
+            for bind in bindings {
+                // Seed the env from the join's canonical binding row.
+                let mut env: Env = Env::new();
+                for (i, &v) in var_order.iter().enumerate() {
+                    env.insert(v, bind[i]);
+                }
+                // Re-run body primitives host-side over the join binding. Table
+                // atoms and `!=` guards were already handled by the DBSP join;
+                // value-computing prims (which bind fresh vars) and any other
+                // guards are evaluated here. Re-evaluating `!=` is harmless
+                // (it re-filters identically).
+                let mut envs: Vec<Env> = vec![env];
+                for op in &rule.body {
+                    if let BodyOp::Prim { .. } = op {
+                        envs = step_body(eg, &read, op, envs)?;
+                    }
+                }
+                for mut env in envs {
+                    apply_head(eg, &rule.head, &mut env, &mut writes, &mut touched)?;
+                }
+            }
+            continue;
+        }
+
+        // --- Host interpreter fallback ----------------------------------
+        eg.host_rule_runs += 1;
         // Enumerate all body matches as a list of binding environments.
         let mut envs: Vec<Env> = vec![Env::new()];
         for op in &rule.body {
@@ -202,9 +238,7 @@ fn step_body(
                     .map(|s| slot_lookup(s, &|v| env.get(&v).copied()).map(Value::new))
                     .collect();
                 let Some(argv) = resolved else { continue };
-                let result = eg
-                    .db
-                    .with_execution_state(|st| st.call_external_func(*id, &argv));
+                let result = eg.eval_prim_internal(*id, &argv);
                 let Some(result) = result else {
                     // Primitive failed (e.g. `!=` of equal args) — prune.
                     continue;
@@ -298,9 +332,7 @@ fn apply_head(
                     .iter()
                     .map(|s| resolve(s, env).map(Value::new))
                     .collect::<Result<_>>()?;
-                let result = eg
-                    .db
-                    .with_execution_state(|st| st.call_external_func(*id, &argv));
+                let result = eg.eval_prim_internal(*id, &argv);
                 if let Some(v) = result {
                     env.insert(*ret, v.rep());
                 }

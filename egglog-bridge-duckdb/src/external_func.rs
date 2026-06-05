@@ -161,6 +161,21 @@ impl DuckdbExternalFuncRegistry {
         self.slots.get(id.rep() as usize)
     }
 
+    /// Clone the registered primitive at `id`, if the slot holds a `Func`.
+    /// Used by `Backend::eval_prim` to invoke the primitive against an
+    /// ephemeral execution state (pure primitives — comparisons, arithmetic —
+    /// do not touch table state, so an empty database suffices). The clone is
+    /// cheap (most primitives are zero-sized closures).
+    pub(crate) fn clone_func(
+        &self,
+        id: ExternalFunctionId,
+    ) -> Option<Box<dyn ExternalFunction + 'static>> {
+        match self.slots.get(id.rep() as usize)? {
+            ExternalFuncSlot::Func(f) => Some(dyn_clone::clone_box(f.as_ref())),
+            _ => None,
+        }
+    }
+
     /// Look up the panic message stored at `id`. Returns `None` if `id`
     /// does not refer to a `Panic` slot (e.g. was freed, or holds a
     /// regular `Func`).

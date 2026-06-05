@@ -1048,6 +1048,27 @@ impl Backend for EGraph {
         self.backend_external_funcs.add_panic(message)
     }
 
+    fn eval_prim(
+        &self,
+        id: egglog_backend_trait::ExternalFunctionId,
+        args: &[egglog_backend_trait::Value],
+    ) -> Option<egglog_backend_trait::Value> {
+        // DuckDB evaluates primitives via SQL on its own execution path, so
+        // this entry point is not used by duckdb's rule engine. It is provided
+        // for trait completeness: the stored `ExternalFunction` is invoked
+        // against an ephemeral `core_relations` execution state. Pure
+        // primitives (comparisons, arithmetic on inline-encodable base values)
+        // evaluate correctly this way. Primitives that intern new heap base
+        // values (e.g. string concatenation) would intern into the ephemeral
+        // database rather than duckdb's own registry — duckdb does not route
+        // such primitives through this method, so that mismatch is unreachable
+        // on the duckdb path.
+        let cloned = self.backend_external_funcs.clone_func(id)?;
+        let mut db = egglog_core_relations::Database::new();
+        let ephemeral_id = db.add_external_function(cloned);
+        db.with_execution_state(|st| st.call_external_func(ephemeral_id, args))
+    }
+
     // -- typed value handles ------------------------------------------------
 
     fn base_value_pool(&self) -> &dyn BaseValuePool {

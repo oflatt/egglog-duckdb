@@ -171,3 +171,32 @@ fn run1_vs_run3_bounded_and_matches_reference() {
     );
     assert!(fel_run3.contains(&(1, 4)), "run(3) must reach 3-hop pair");
 }
+
+/// Milestone 4: the transitive-closure rule's body join must run on the DBSP
+/// dataflow engine, NOT on the host interpreter fallback. We run the program on
+/// a concrete Feldera `EGraph`, then read `dbsp_join_stats()`: the multi-atom
+/// join `path(x,y), edge(y,z)` is DBSP-eligible, so every rule firing must be
+/// counted on the DBSP path and zero on the host path.
+#[test]
+fn transitive_closure_join_runs_on_dbsp() {
+    let mut feldera = egglog_bridge_feldera::EGraph::new();
+    {
+        let b: &mut dyn Backend = &mut feldera;
+        let (edge, path) = add_relations(b);
+        seed(b, edge, path, &[(1, 2), (2, 3), (3, 4)]);
+        let rule = add_join_rule(b, edge, path);
+        for _ in 0..3 {
+            b.run_rules(&[rule]).unwrap();
+            b.flush_updates();
+        }
+    }
+    let (dbsp_runs, host_runs) = feldera.dbsp_join_stats();
+    assert_eq!(
+        host_runs, 0,
+        "the 2-atom join must NOT fall back to the host interpreter"
+    );
+    assert!(
+        dbsp_runs >= 3,
+        "expected the join to fire on DBSP each round (got {dbsp_runs})"
+    );
+}

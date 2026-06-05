@@ -1671,6 +1671,7 @@ version = "2.0.0"
 dependencies = [
  "anyhow",
  "duckdb",
+ "dyn-clone",
  "egglog-backend-trait",
  "egglog-core-relations",
  "egglog-numeric-id",

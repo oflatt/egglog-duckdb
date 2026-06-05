@@ -15,6 +15,7 @@ egglog-numeric-id = { workspace = true }
 log = { workspace = true }
 num = { workspace = true }
 ordered-float = { workspace = true }
+dyn-clone = { workspace = true }
 
 [[example]]
 name = "transitive_closure"

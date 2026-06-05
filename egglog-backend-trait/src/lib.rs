@@ -450,6 +450,31 @@ pub trait Backend: Send + Sync {
     /// Wraps `egglog_bridge::EGraph::new_panic`.
     fn new_panic(&mut self, message: String) -> ExternalFunctionId;
 
+    /// Evaluate a registered primitive on the given (already-interned) argument
+    /// `Value`s, returning its result, or `None` if the primitive fails
+    /// (e.g. `!=` of equal arguments, or a guard that does not hold).
+    ///
+    /// This is the **backend-agnostic primitive entry point**. It lets a
+    /// backend evaluate a primitive *inline* (e.g. inside a DBSP map/filter
+    /// operator, or a host-side join loop) without owning or borrowing a
+    /// `core_relations::ExecutionState`, which is the type
+    /// [`ExternalFunction::invoke`] requires.
+    ///
+    /// ## Contract
+    ///
+    /// - `args` are interned `Value`s in the backend's value space (same
+    ///   representation `for_each` / `lookup_id` use).
+    /// - The result, if any, is an interned `Value` in that same space.
+    /// - For backends that evaluate primitives against an execution state
+    ///   (reference, feldera), this is `with_execution_state(|st|
+    ///   st.call_external_func(id, args))`.
+    /// - Pure primitives (comparisons, arithmetic, string ops) do not touch
+    ///   the database, so they evaluate identically regardless of which
+    ///   backend hosts them. Primitives that reenter table state are only
+    ///   well-defined on backends whose
+    ///   [`Backend::supports_inline_table_lookups`] is `true`.
+    fn eval_prim(&self, id: ExternalFunctionId, args: &[Value]) -> Option<Value>;
+
     // -- typed value handles (sub-traits) -----------------------------------
 
     /// Access the backend's [`BaseValuePool`] for typed base-value queries.
