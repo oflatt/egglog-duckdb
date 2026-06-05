@@ -56,6 +56,43 @@ python3 eval/bench_backends.py tests/web-demo --runs 3 --warmup 1
 python3 eval/bench_backends.py --justserve
 ```
 
+## Timing mode: paper vs. fast-coverage (IMPORTANT)
+
+By default cells run **sequentially**, one subprocess at a time. Two flags
+change the scheduling *across* cells (the per-cell warmup + timed runs are
+identical in every mode — only which cells run at the same time changes):
+
+- **`--paper`** — **PAPER MODE.** Forces strictly sequential execution
+  (parallelism OFF) so each cell runs uncontended and its wall-clock time is
+  accurate. **All numbers reported in the paper must be produced with
+  `--paper`.** It overrides `--parallel`/`--jobs` (sequential wins) and bumps
+  `--warmup` to at least 1.
+- **`--parallel` / `--jobs N`** — **FAST COVERAGE only.** Runs benchmark cells
+  **concurrently** across a `ProcessPoolExecutor`. `--jobs N` implies
+  `--parallel`; bare `--parallel` defaults to `min(8, cpu_count-1)` workers.
+  This is for quickly seeing *which cells run vs. error* over a large corpus.
+  Concurrent egglog/duckdb/feldera/flowlog processes contend for CPU, so the
+  recorded per-cell wall-times are **inflated and NOT paper-quality** — never
+  cite them as timings.
+
+```bash
+# fast coverage sweep over a big corpus (timings inflated, don't cite):
+python3 eval/bench_backends.py tests/ --parallel            # min(8, cpu-1) jobs
+python3 eval/bench_backends.py tests/ --jobs 4              # explicit job count
+
+# accurate, paper-quality timing (run on a QUIET machine):
+python3 eval/bench_backends.py tests/ --paper --runs 5 --timeout 600
+```
+
+`results.json` records a top-level **`"timing_mode"`** field
+(`"paper-sequential"`, `"parallel-Njobs"`, or `"sequential"`) so the graphs/CDF
+never silently mix paper-quality and contended timings.
+
+**Memory / OOM caveat:** each worker spawns a full egglog/duckdb/feldera/flowlog
+subprocess, so `--parallel` runs N benchmark engines at once and can OOM on
+memory-heavy benchmarks (duckdb especially). The `min(8, cpu-1)` default cap
+helps; lower `--jobs` if you see workers killed.
+
 The default corpus is now **`tests/`** (the paper-benchmarks corpus mostly
 doesn't run standalone — see `BLOCKERS.md`). Some benchmarks (e.g. `rectangle`)
 legitimately exceed `--timeout`; that is data, not a harness failure — the cell
@@ -63,7 +100,8 @@ is recorded as a timeout error and simply never reaches "completed" in the
 completion-CDF graph.
 
 Useful flags: `--runs N`, `--warmup N`, `--timeout SECONDS`, `--debug` (use the
-debug build), `--output PATH`, `--port N`.
+debug build), `--output PATH`, `--port N`, `--paper` (accurate sequential
+timing), `--parallel` / `--jobs N` (fast contended coverage; see above).
 
 A cell that errors or times out is recorded in the `errors` table instead of
 `timings`. Results stream to `eval/results.json` after each benchmark, so you

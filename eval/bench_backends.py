@@ -23,14 +23,24 @@ Usage:
     python3 eval/bench_backends.py --serve          # also open the eval-live viewer
     python3 eval/bench_backends.py path/to/dir      # benchmark every .egg under a dir
     python3 eval/bench_backends.py tests/ --runs 5 --warmup 1 --timeout 600
+    python3 eval/bench_backends.py tests/ --paper    # accurate sequential timing (paper)
+    python3 eval/bench_backends.py tests/ --parallel # fast contended coverage sweep
     python3 eval/bench_backends.py --justserve      # skip benchmarking, view existing results
+
+Scheduling: by default cells run sequentially. `--paper` forces strictly
+sequential, uncontended execution for accurate paper-quality timings (and
+overrides --parallel/--jobs). `--parallel`/`--jobs N` run cells concurrently
+across a process pool for FAST COVERAGE only -- contended wall-times are
+inflated and must not be cited. results.json records the `timing_mode`.
 """
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 WORKSPACE = Path(__file__).resolve().parents[1]
@@ -83,9 +93,12 @@ class BenchDB:
     """Minimal results database, serialized to the JSON shape eval-live reads:
     {"timings": [...], "errors": [...]}."""
 
-    def __init__(self):
+    def __init__(self, timing_mode="unknown"):
         self.timings = []
         self.errors = []
+        # Provenance: "paper-sequential" (accurate, uncontended) vs
+        # "parallel-Njobs" (fast coverage, contended -> inflated wall-times).
+        self.timing_mode = timing_mode
 
     def add_timing(self, benchmark, backend, mode, condition, timing_list):
         self.timings.append({
@@ -106,7 +119,8 @@ class BenchDB:
         })
 
     def to_dict(self):
-        return {"timings": self.timings, "errors": self.errors}
+        return {"timing_mode": self.timing_mode,
+                "timings": self.timings, "errors": self.errors}
 
     def save_json(self, path):
         Path(path).write_text(json.dumps(self.to_dict(), indent=2))
@@ -162,23 +176,48 @@ def run_once(binary: Path, flags: list[str], bench: Path, timeout: float):
     return elapsed, None
 
 
-def bench_one(binary, bench, rel, condition, backend, mode, flags, args, db):
+def bench_cell(binary, bench, rel, condition, backend, mode, flags, warmup, runs, timeout):
+    """Run one (benchmark, backend, encoding) cell: `warmup` discarded runs
+    followed by `runs` timed runs. Returns a result dict that the main process
+    folds into the DB. Pure (no shared state) so it is safe to run in a worker
+    process; a failing cell returns an error result rather than raising, so one
+    cell's failure never kills the pool."""
     # Warm-up runs (discarded): pay one-time costs (page cache, etc.).
-    for _ in range(args.warmup):
-        run_once(binary, flags, bench, args.timeout)
+    for _ in range(warmup):
+        run_once(binary, flags, bench, timeout)
 
     timings = []
-    for _ in range(args.runs):
-        elapsed, err = run_once(binary, flags, bench, args.timeout)
+    for _ in range(runs):
+        elapsed, err = run_once(binary, flags, bench, timeout)
         if err is not None:
-            db.add_error(rel, backend, mode, condition, err)
-            print(f"    {condition:24} ERROR: {err}", flush=True)
-            return
+            return {"benchmark": rel, "backend": backend, "mode": mode,
+                    "condition": condition, "error": err}
         timings.append(round(elapsed, 6))
 
+    return {"benchmark": rel, "backend": backend, "mode": mode,
+            "condition": condition, "timing_list": timings}
+
+
+def _bench_cell_worker(task):
+    """Picklable entry point for ProcessPoolExecutor workers. `task` is the
+    tuple of positional args for `bench_cell`."""
+    return bench_cell(*task)
+
+
+def apply_cell_result(result, db):
+    """Fold a cell result (from `bench_cell`) into the DB and log it."""
+    rel = result["benchmark"]
+    backend = result["backend"]
+    mode = result["mode"]
+    condition = result["condition"]
+    if "error" in result:
+        db.add_error(rel, backend, mode, condition, result["error"])
+        print(f"    {rel}: {condition:24} ERROR: {result['error']}", flush=True)
+        return
+    timings = result["timing_list"]
     db.add_timing(rel, backend, mode, condition, timings)
     mean = sum(timings) / len(timings)
-    print(f"    {condition:24} mean {mean:8.3f}s  (runs: {timings})", flush=True)
+    print(f"    {rel}: {condition:24} mean {mean:8.3f}s  (runs: {timings})", flush=True)
 
 
 def serve_results(results_path: Path, port: int):
@@ -250,6 +289,22 @@ def main():
                         help="results JSON path")
     parser.add_argument("--debug", action="store_true",
                         help="use the debug build instead of release")
+    parser.add_argument("--parallel", action="store_true",
+                        help="run benchmark cells CONCURRENTLY via a process pool. "
+                             "FAST COVERAGE only (which cells run vs error) -- "
+                             "concurrent processes contend for CPU so per-cell "
+                             "wall-times are INFLATED and NOT paper-quality. "
+                             "Ignored when --paper is given.")
+    parser.add_argument("--jobs", type=int, default=None,
+                        help="number of concurrent worker processes (implies "
+                             "--parallel). Default when --parallel is given: "
+                             "min(8, cpu_count-1). Keep modest -- concurrent "
+                             "egglog/duckdb/feldera/flowlog processes can OOM.")
+    parser.add_argument("--paper", action="store_true",
+                        help="PAPER MODE: force strictly SEQUENTIAL execution "
+                             "(parallelism OFF) for accurate, uncontended "
+                             "timings. Overrides --parallel/--jobs and ensures "
+                             "warmup>=1. Paper numbers must use this mode.")
     parser.add_argument("--serve", action="store_true", help="open the eval-live viewer after running")
     parser.add_argument("--justserve", action="store_true", help="skip benchmarking; just serve results")
     parser.add_argument("--port", type=int, default=8080)
@@ -258,6 +313,25 @@ def main():
     if args.justserve:
         serve_results(Path(args.output), args.port)
         return
+
+    # Resolve scheduling mode. --paper forces strictly sequential (accurate,
+    # uncontended timing) and overrides --parallel/--jobs. Otherwise --jobs
+    # implies --parallel; --parallel with no --jobs uses a sensible cap.
+    if args.paper:
+        jobs = 1
+        timing_mode = "paper-sequential"
+        # Paper mode wants at least one warm-up to absorb one-time costs.
+        if args.warmup < 1:
+            args.warmup = 1
+    elif args.parallel or args.jobs is not None:
+        if args.jobs is not None:
+            jobs = max(1, args.jobs)
+        else:
+            jobs = max(1, min(8, (os.cpu_count() or 1) - 1))
+        timing_mode = f"parallel-{jobs}jobs" if jobs > 1 else "sequential"
+    else:
+        jobs = 1
+        timing_mode = "sequential"
 
     binary = build_egglog(release=not args.debug)
 
@@ -271,18 +345,60 @@ def main():
         benchmarks = benchmarks[:args.limit]
 
     conds = list(conditions())
+    sched = "PAPER (sequential)" if args.paper else (
+        f"parallel ({jobs} jobs)" if jobs > 1 else "sequential")
     print(f"\n{len(benchmarks)} benchmark(s) x {len(conds)} condition(s), "
-          f"{args.runs} run(s) each (warmup {args.warmup}, timeout {args.timeout}s)\n")
+          f"{args.runs} run(s) each (warmup {args.warmup}, timeout {args.timeout}s)\n"
+          f"timing mode: {timing_mode}  [{sched}]\n")
 
-    db = BenchDB()
-    for i, bench in enumerate(benchmarks, 1):
-        rel = str(bench.relative_to(WORKSPACE)) if str(bench).startswith(str(WORKSPACE)) else str(bench)
-        print(f"[{i}/{len(benchmarks)}] {rel}", flush=True)
+    db = BenchDB(timing_mode=timing_mode)
+
+    def rel_of(bench):
+        return (str(bench.relative_to(WORKSPACE))
+                if str(bench).startswith(str(WORKSPACE)) else str(bench))
+
+    # Build the full task list: one task per (benchmark, condition) cell. Each
+    # task is fully self-contained so it can run in a worker process.
+    tasks = []
+    for bench in benchmarks:
+        rel = rel_of(bench)
         for condition, backend, mode, flags in conds:
-            bench_one(binary, bench, rel, condition, backend, mode, flags, args, db)
-        db.save_json(args.output)  # incremental: write after each benchmark
+            tasks.append((binary, bench, rel, condition, backend, mode, flags,
+                          args.warmup, args.runs, args.timeout))
 
-    print(f"\nResults written to {args.output}")
+    if jobs > 1:
+        # FAST COVERAGE: schedule all cells across a process pool. Per-cell
+        # logic (warmup + timed runs) is unchanged; only cross-cell scheduling
+        # differs. Results are collected as they complete and folded into the
+        # DB in the main process, so a failing cell can't kill the pool.
+        done = 0
+        total = len(tasks)
+        with ProcessPoolExecutor(max_workers=jobs) as pool:
+            futures = {pool.submit(_bench_cell_worker, t): t for t in tasks}
+            for fut in as_completed(futures):
+                done += 1
+                try:
+                    result = fut.result()
+                except Exception as exc:  # noqa: BLE001 - keep the pool alive
+                    t = futures[fut]
+                    result = {"benchmark": t[2], "backend": t[4], "mode": t[5],
+                              "condition": t[3], "error": f"worker crashed: {exc}"}
+                print(f"[{done}/{total}]", flush=True)
+                apply_cell_result(result, db)
+                db.save_json(args.output)  # incremental
+    else:
+        # SEQUENTIAL: one process at a time (paper-quality / default).
+        last_rel = None
+        for i, t in enumerate(tasks, 1):
+            rel = t[2]
+            if rel != last_rel:
+                print(f"[{i}/{len(tasks)}] {rel}", flush=True)
+                last_rel = rel
+            result = bench_cell(*t)
+            apply_cell_result(result, db)
+            db.save_json(args.output)  # incremental: write after each cell
+
+    print(f"\nResults written to {args.output}  (timing_mode: {timing_mode})")
     if args.serve:
         serve_results(Path(args.output), args.port)
 
