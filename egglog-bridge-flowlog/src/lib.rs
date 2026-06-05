@@ -617,6 +617,15 @@ impl Backend for EGraph {
         id
     }
 
+    fn eval_prim(&self, id: ExternalFunctionId, args: &[Value]) -> Option<Value> {
+        // Delegate to the inherent stopgap (`eval_prim_internal`) that the host
+        // interpreter and the DD-join path already use, so primitive evaluation
+        // stays bit-for-bit identical to the reference backend. The merged
+        // `Backend` trait (from the Feldera milestones) now requires this entry
+        // point; flowlog satisfies it without changing its internal posture.
+        self.eval_prim_internal(id, args)
+    }
+
     // -- typed value handles ------------------------------------------------
 
     fn base_value_pool(&self) -> &dyn BaseValuePool {

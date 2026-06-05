@@ -88,6 +88,18 @@ struct Args {
     /// `--duckdb` only; off by default.
     #[clap(long = "duck-native-uf")]
     duck_native_uf: bool,
+    /// Run the program on the experimental Feldera/DBSP backend.
+    /// Like `--duckdb`, this bypasses the default `egglog-bridge`
+    /// execution path and is term-encoding only. Mutually exclusive
+    /// with `--duckdb` and `--flowlog`.
+    #[clap(long = "feldera")]
+    feldera_backend: bool,
+    /// Run the program on the experimental FlowLog/Differential-Dataflow
+    /// backend. Like `--duckdb`, this bypasses the default
+    /// `egglog-bridge` execution path and is term-encoding only.
+    /// Mutually exclusive with `--duckdb` and `--feldera`.
+    #[clap(long = "flowlog")]
+    flowlog_backend: bool,
 }
 
 /// Start a command-line interface for the E-graph.
@@ -103,6 +115,14 @@ pub fn cli(mut egraph: EGraph) {
         .init();
 
     let args = Args::parse();
+
+    // The experimental backends are mutually exclusive: each swaps in a
+    // different `Backend` impl for the run, so at most one may be selected.
+    if (args.duckdb_backend as u8) + (args.feldera_backend as u8) + (args.flowlog_backend as u8) > 1
+    {
+        log::error!("at most one of --duckdb, --feldera, --flowlog may be passed");
+        std::process::exit(1);
+    }
 
     if args.term_encoding {
         egraph = egraph.with_term_encoding_enabled();
@@ -235,6 +255,33 @@ pub fn cli(mut egraph: EGraph) {
                 duck_eg.ensure_no_reserved_symbols(false);
                 if let Err(err) =
                     duck_eg.parse_and_run_program(Some(input.to_str().unwrap().into()), &program)
+                {
+                    log::error!("{err}");
+                    std::process::exit(1);
+                }
+                continue;
+            }
+
+            // Feldera / FlowLog backends: same idea as the duckdb path but
+            // simpler — these constructors take no config and enable term
+            // encoding internally, and there are no table-dump/perf env
+            // hooks to replicate. Build a fresh egraph with the requested
+            // backend and route the program through the shared frontend.
+            if args.feldera_backend || args.flowlog_backend {
+                let mut backend_eg = if args.feldera_backend {
+                    egglog::EGraph::with_feldera_backend()
+                } else {
+                    egglog::EGraph::with_flowlog_backend()
+                }
+                .unwrap_or_else(|err| {
+                    log::error!("failed to start experimental backend: {err}");
+                    std::process::exit(1);
+                });
+                backend_eg.parser = std::mem::take(&mut egraph.parser);
+                backend_eg.fact_directory.clone_from(&args.fact_directory);
+                backend_eg.ensure_no_reserved_symbols(false);
+                if let Err(err) =
+                    backend_eg.parse_and_run_program(Some(input.to_str().unwrap().into()), &program)
                 {
                     log::error!("{err}");
                     std::process::exit(1);
