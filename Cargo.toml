@@ -8,6 +8,7 @@ members = [
   "egglog-backend-trait",
   "egglog-bridge",
   "egglog-bridge-duckdb",
+  "egglog-bridge-feldera",
   "egglog-experimental",
   "numeric-id",
   "union-find",

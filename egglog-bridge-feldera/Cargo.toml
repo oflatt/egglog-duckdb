@@ -1,0 +1,29 @@
+[package]
+name = "egglog-bridge-feldera"
+version.workspace = true
+# dbsp 0.150.0 is an edition-2021 crate and the proven spike pinned it; keep
+# this member on 2021 to match the spike's working configuration.
+edition = "2021"
+description = "Feldera/DBSP-backed executor for egglog's resolved IR (milestone 1: per-iteration stepping behind the Backend trait; see ../PLAN.md)"
+license.workspace = true
+publish = false
+
+[dependencies]
+# Pinned to match the Phase-0 spike: 0.150.0 declares rust-version 1.87.0 and
+# builds on the installed 1.91.0 toolchain. The newest dbsp (0.3xx) requires
+# rustc >= 1.93.1, which is not installed. The public API used here
+# (add_input_zset / ZSetHandle::push, RootCircuit::build, join/map_index/plus,
+# integrate, transaction, OutputHandle::consolidate) is identical across
+# 0.150 and 0.3xx, so a later toolchain bump can re-pin without code churn.
+dbsp = "=0.150.0"
+anyhow = "1"
+egglog-backend-trait = { workspace = true }
+egglog-core-relations = { workspace = true }
+egglog-numeric-id = { workspace = true }
+hashbrown = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+# The reference backend, used by the milestone-1 proof test to confirm the
+# Feldera backend matches it round-for-round on the same program.
+egglog-bridge = { workspace = true }

@@ -1,0 +1,26 @@
+# Standalone spike crate. The empty [workspace] table below DETACHES this
+# project from the parent egglog workspace at /tmp/egglog-feldera so that
+# `cargo build` here does NOT build the egglog workspace and this crate is
+# NOT a member of it.
+[workspace]
+
+[package]
+name = "spike-dbsp"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Latest published dbsp is 0.305.0 (checked against crates.io API 2026-06-04),
+# but dbsp >= 0.270.0 requires rustc >= 1.91.1 and the newest toolchain
+# available in this spike environment is 1.91.0 / 1.87.0. dbsp 0.150.0 exposes
+# the IDENTICAL public API used here (add_input_zset / ZSetHandle::push,
+# RootCircuit::build, recursive, delta0, join/map_index/plus, integrate,
+# step, OutputHandle::consolidate) and builds on rustc 1.87.0, so we pin it
+# to actually RUN the spike. The code is API-compatible with 0.305.0.
+dbsp = "=0.150.0"
+anyhow = "1"
+
+[[bin]]
+name = "spike"
+path = "src/main.rs"
