@@ -1,0 +1,26 @@
+[package]
+name = "spike-flowlog"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# IMPORTANT: this is a STANDALONE spike crate. It is intentionally NOT a member
+# of the egglog workspace. Do not add it to any workspace `members` list.
+[workspace]
+
+[dependencies]
+# flowlog-runtime is linked into the generated code (interning, txn state, the
+# differential-dataflow / timely re-exports the generated engine relies on).
+#
+# Resolve ONE of these depending on what `git clone` / crates.io actually
+# provides (see SPIKE_RESULTS.md "How to actually build this"):
+#
+#   path  :  flowlog-runtime = { path = "/tmp/flowlog/crates/flowlog-runtime" }
+#   git   :  flowlog-runtime = { git = "https://github.com/flowlog-rs/flowlog" }
+#   crate :  flowlog-runtime = "0.0"
+flowlog-runtime = { path = "/tmp/flowlog-main/crates/flowlog-runtime" }
+
+[build-dependencies]
+# flowlog-build compiles path.dl -> a Rust module at build time. We include!
+# that module from main.rs. Same path/git/crate choice as above.
+flowlog-build = { path = "/tmp/flowlog-main/crates/flowlog-build" }

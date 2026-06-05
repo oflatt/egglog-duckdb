@@ -1,0 +1,35 @@
+// Milestone-1 build-time-FIXED FlowLog program: ONE transitive-closure hop.
+//
+// This `.dl` is deliberately NON-RECURSIVE. egglog's `(run N)` applies a
+// ruleset N times *with bounded extension per round* — a transitive-closure
+// rule must extend N hops, NOT saturate to the full closure in one step. So we
+// compile a single non-recursive join:
+//
+//     hop(x, z) :- path(x, y), edge(y, z).
+//
+// Both `path` and `edge` are runtime-staged command inputs (IO="command", the
+// attribute that gives the generated incremental engine its `insert_<rel>` /
+// `remove_<rel>` staging methods). `hop` is the output relation: its per-epoch
+// deltas come back in `IncrementalResults.hop`.
+//
+// The host backend (lib.rs `run_rules`) realizes egglog's bounded N-round loop:
+// one `run_rules` call = one `commit()` = one hop. Each round it feeds the
+// PREVIOUS round's newly-derived `path` rows as an `insert_path` delta; the
+// single non-recursive join then produces exactly the next hop's `hop` deltas,
+// which the host folds back into the `path` mirror. N calls = N hops, bounded
+// (NOT closure). This mirrors the proven Feldera M1 host-feedback model, but on
+// real flowlog-rs differential dataflow.
+//
+// Relation names are lowercase so the generated public API idents are
+// predictable (insert_path / insert_edge / IncrementalResults.hop) — flowlog
+// normalizes relation names to lowercase for the lib API (SPIKE_RESULTS.md).
+
+.decl edge(src: int32, dst: int32)
+.input edge(IO="command", delimiter=",")
+
+.decl path(src: int32, dst: int32)
+.input path(IO="command", delimiter=",")
+
+.decl hop(src: int32, dst: int32)
+hop(x, z) :- path(x, y), edge(y, z).
+.output hop

@@ -536,6 +536,34 @@ impl EGraph {
         eg.proof_state.original_typechecking = Some(Box::new(typechecker));
         Ok(eg)
     }
+
+    /// Construct an `EGraph` whose backend is the FlowLog/Differential-Dataflow
+    /// -backed [`egglog_bridge_flowlog::EGraph`] driven through the
+    /// [`egglog_backend_trait::Backend`] trait.
+    ///
+    /// This is the Milestone-3 entry point exercised by `tests/files.rs`'s
+    /// `flowlog` treatment (gated behind `EGGLOG_TEST_FLOWLOG=1`): real `.egg`
+    /// files run parse → desugar → typecheck → term-encode → FlowLog and are
+    /// checked against the shared snapshot (including per-function tuple counts
+    /// via the appended `(print-size)`).
+    ///
+    /// Like the DuckDB/Feldera backends, FlowLog is **term-encoding only**: the
+    /// encoder lowers eq-sorts to view-table congruence + the `@uf` / `@uff`
+    /// rebuild rulesets, which the FlowLog host interpreter runs faithfully; the
+    /// DD-eligible table-atom joins run on the Differential-Dataflow engine (a
+    /// subprocess compiled from the rule's `.dl`) when DD routing is enabled
+    /// (`EGGLOG_FLOWLOG_DD=1`). Proof mode is not wired.
+    pub fn with_flowlog_backend() -> anyhow::Result<Self> {
+        let backend: Box<dyn egglog_backend_trait::Backend> =
+            Box::new(egglog_bridge_flowlog::EGraph::new_interpret());
+        let mut eg = Self::with_backend(backend);
+
+        // Term encoding requires a separate bridge-backed typechecker EGraph for
+        // re-typechecking after the encoder runs. Mirror the DuckDB/Feldera setup.
+        let typechecker = EGraph::default().with_term_encoding_enabled();
+        eg.proof_state.original_typechecking = Some(Box::new(typechecker));
+        Ok(eg)
+    }
 }
 
 struct ResolvedNCommands {
@@ -606,6 +634,13 @@ impl EGraph {
             // The Feldera backend exposes its `BaseValues` (which live in its
             // embedded core-relations Database) through the trait method.
             return self.backend.base_values();
+        }
+        if let Some(flow) = self
+            .backend
+            .as_any()
+            .downcast_ref::<egglog_bridge_flowlog::EGraph>()
+        {
+            return flow.base_values_inner();
         }
         panic!("EGraph::base_values: unknown backend type")
     }
@@ -1698,10 +1733,16 @@ impl EGraph {
                         .as_any()
                         .downcast_ref::<egglog_bridge_feldera::EGraph>()
                         .is_some()
+                    || self
+                        .backend
+                        .as_any()
+                        .downcast_ref::<egglog_bridge_flowlog::EGraph>()
+                        .is_some()
                 {
-                    // The Feldera backend, like duckdb, has no extraction
-                    // pipeline yet; the shared snapshot drops `(extract …)`
-                    // output, so skipping keeps every treatment comparable.
+                    // The Feldera and FlowLog backends, like duckdb, have no
+                    // extraction pipeline yet; the shared snapshot drops
+                    // `(extract …)` output, so skipping keeps every treatment
+                    // comparable.
                     return Ok(vec![]);
                 }
                 let sort = expr.output_type();

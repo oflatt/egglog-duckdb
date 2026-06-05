@@ -25,6 +25,12 @@ struct Run {
     /// snapshot every other treatment targets (including per-function
     /// tuple counts via the appended `(print-size)`).
     feldera: bool,
+    /// Run the program through the FlowLog/Differential-Dataflow-backed
+    /// executor (Milestone 3). Like `duckdb`/`feldera` this always uses term
+    /// encoding internally; output is diffed against the same shared snapshot
+    /// (including per-function tuple counts). Gated behind
+    /// `EGGLOG_TEST_FLOWLOG=1` so it never perturbs the default test run.
+    flowlog: bool,
     threads: usize,
 }
 
@@ -94,6 +100,7 @@ impl Run {
                 proof_testing: false,
                 duckdb: false,
                 feldera: false,
+                flowlog: false,
                 threads: self.threads,
             };
             let proof_check_prog = if self.proof_testing {
@@ -197,6 +204,37 @@ impl Run {
                 Err(err) => {
                     if !self.should_fail() {
                         panic!("{message} (feldera): {err}");
+                    }
+                    Err(err.to_string())
+                }
+            };
+        }
+
+        // flowlog mode (Milestone 3): route the program through the
+        // FlowLog/Differential-Dataflow backend (term-encoding only,
+        // like duckdb/feldera) and diff against the same shared
+        // snapshot — including per-function tuple counts via the
+        // appended `(print-size)`.
+        if self.flowlog {
+            let mut egraph = EGraph::with_flowlog_backend()
+                .unwrap_or_else(|e| panic!("EGraph::with_flowlog_backend init failed: {e}"));
+            egraph.ensure_no_reserved_symbols(false);
+            return match egraph.parse_and_run_program(filename, &program) {
+                Ok(msgs) => {
+                    if self.should_fail() {
+                        panic!(
+                            "Program should have failed under flowlog! Outputs:\n{}",
+                            msgs.iter()
+                                .map(|m| m.to_string())
+                                .collect::<Vec<_>>()
+                                .join("")
+                        );
+                    }
+                    Ok(msgs)
+                }
+                Err(err) => {
+                    if !self.should_fail() {
+                        panic!("{message} (flowlog): {err}");
                     }
                     Err(err.to_string())
                 }
@@ -385,6 +423,9 @@ impl Run {
                 if self.0.feldera {
                     write!(f, "_feldera")?;
                 }
+                if self.0.flowlog {
+                    write!(f, "_flowlog")?;
+                }
 
                 if self.0.threads > 1 {
                     write!(f, "_{}threads", self.0.threads)?;
@@ -451,6 +492,7 @@ fn generate_tests(glob: &str) -> Vec<Trial> {
             proof_testing: false,
             duckdb: false,
             feldera: false,
+            flowlog: false,
             threads: 1,
         };
         let should_fail = run.should_fail();
@@ -534,6 +576,17 @@ fn generate_tests(glob: &str) -> Vec<Trial> {
         if duckdb_supported && std::env::var("EGGLOG_TEST_FELDERA").is_ok() {
             push_trial(Run {
                 feldera: true,
+                ..run.clone()
+            });
+        }
+
+        // flowlog mode (Milestone 3): same supportability gate as the
+        // plain-duckdb treatment (term-encoding only, no push/pop, must
+        // support proofs/term-encoding). Gated behind
+        // `EGGLOG_TEST_FLOWLOG=1` so it never perturbs the default run.
+        if duckdb_supported && std::env::var("EGGLOG_TEST_FLOWLOG").is_ok() {
+            push_trial(Run {
+                flowlog: true,
                 ..run.clone()
             });
         }

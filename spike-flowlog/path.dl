@@ -1,0 +1,15 @@
+// Transitive closure / reachability.
+// EDB: Edge(int32, int32). IDB: Path(int32, int32).
+// In the embedded incremental engine, facts are fed via the generated
+// `insert_edge(...)` / `remove_edge(...)` API and Path deltas come back in
+// IncrementalResults at each `commit()`. The `IO="command"` attribute marks
+// Edge as a runtime-staged input (vs. file-loaded); it is what gives us the
+// insert_/remove_ staging methods in lib incremental mode.
+
+.decl Edge(src: int32, dst: int32)
+.input Edge(IO="command", delimiter=",")
+
+.decl Path(src: int32, dst: int32)
+Path(s, d) :- Edge(s, d).
+Path(s, d) :- Path(s, m), Edge(m, d).
+.output Path

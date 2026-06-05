@@ -9,6 +9,7 @@ members = [
   "egglog-bridge",
   "egglog-bridge-duckdb",
   "egglog-bridge-feldera",
+  "egglog-bridge-flowlog",
   "egglog-experimental",
   "numeric-id",
   "union-find",
@@ -81,6 +82,7 @@ egglog-backend-trait = { path = "egglog-backend-trait", version = "2.0.0" }
 egglog-bridge = { path = "egglog-bridge", version = "2.0.0" }
 egglog-bridge-duckdb = { path = "egglog-bridge-duckdb", version = "2.0.0" }
 egglog-bridge-feldera = { path = "egglog-bridge-feldera", version = "2.0.0" }
+egglog-bridge-flowlog = { path = "egglog-bridge-flowlog", version = "2.0.0" }
 egglog-concurrency = { path = "concurrency", version = "2.0.0" }
 egglog-numeric-id = { path = "numeric-id", version = "2.0.0" }
 egglog-union-find = { path = "union-find", version = "2.0.0" }
@@ -162,6 +164,7 @@ egglog-backend-trait = { workspace = true }
 egglog-bridge = { workspace = true }
 egglog-bridge-duckdb = { workspace = true }
 egglog-bridge-feldera = { workspace = true }
+egglog-bridge-flowlog = { workspace = true }
 egglog-numeric-id = { workspace = true }
 anyhow = { workspace = true }
 egglog-add-primitive = { workspace = true }
