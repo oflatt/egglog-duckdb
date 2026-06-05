@@ -24,3 +24,11 @@ anyhow = "1"
 [[bin]]
 name = "spike"
 path = "src/main.rs"
+
+[[bin]]
+name = "rebuild"
+path = "src/rebuild.rs"
+
+[[bin]]
+name = "persist_probe"
+path = "src/persist_probe.rs"

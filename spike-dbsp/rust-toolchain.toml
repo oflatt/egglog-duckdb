@@ -1,3 +1,4 @@
-# dbsp 0.150.0 builds on rustc 1.87.0, which is installed in this environment.
+# dbsp 0.150.0 builds on rustc 1.87+; the workspace toolchain is 1.91.0, which
+# is the one installed here, so pin to it (some transitive deps now need >=1.88).
 [toolchain]
-channel = "1.87.0"
+channel = "1.91.0"
