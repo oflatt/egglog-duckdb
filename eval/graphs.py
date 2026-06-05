@@ -79,6 +79,55 @@ def geomean_by_condition(data):
     return fig
 
 
+def completion_cdf(data):
+    """Performance profile / CDF: x = wall-clock time T (log scale), y = number
+    of benchmarks each treatment COMPLETED within time T. One right-continuous
+    step curve per condition (backend, encoding).
+
+    A treatment that completes more benchmarks faster sits up-and-to-the-left.
+    Errored / timed-out cells never produce a timing, so they never reach
+    "completed" and simply don't contribute to that treatment's curve. Curves
+    can therefore plateau at different heights (different completed-counts),
+    which is the point of a performance profile.
+    """
+    import matplotlib.pyplot as plt
+
+    conds = _all_conditions(data)
+    # Per condition, the per-benchmark completion time (mean of its timings).
+    times_by_cond = {c: [] for c in conds}
+    for row in data.get("timings", []):
+        tl = row.get("timing_list", [])
+        if tl:
+            times_by_cond[row["condition"]].append(_mean(tl))
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for cond in conds:
+        ts = sorted(times_by_cond[cond])
+        if not ts:
+            continue
+        # Step curve: at each completion time T the count of benchmarks done by
+        # T jumps by one. Right-continuous: draw [t_k, t_{k+1}) at height k+1.
+        xs = [ts[0]]
+        ys = [0]
+        for k, t in enumerate(ts):
+            xs.extend([t, t])
+            ys.extend([k, k + 1])
+        # Extend the final plateau to the right so the curve's height is visible.
+        xs.append(ts[-1] * 1.05)
+        ys.append(len(ts))
+        style = "--" if cond.endswith("-proofs") else "-"
+        ax.step(xs, ys, where="post", label=f"{cond} ({len(ts)})", linestyle=style)
+
+    ax.set_xscale("log")
+    ax.set_xlabel("wall-clock time T (s, log scale)")
+    ax.set_ylabel("benchmarks completed within T")
+    ax.set_title("Completion CDF / performance profile by condition")
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend(fontsize=8, title="condition (n completed)")
+    plt.tight_layout()
+    return fig
+
+
 def mean_time_table(data):
     """Pivot: one row per benchmark, a column per condition (mean seconds)."""
     by_bench = _by_bench_cond(data)
@@ -126,6 +175,7 @@ def speedup_vs_bridge_normal(data):
 reg = eval_live.Registry()
 reg.graph("Mean time per benchmark", mean_time_grouped)
 reg.graph("Geomean by condition", geomean_by_condition)
+reg.graph("Completion CDF (performance profile)", completion_cdf)
 reg.table("Mean time (s) per condition", mean_time_table, filter_source=mean_time_filter)
 reg.table("Slowdown vs bridge-normal", speedup_vs_bridge_normal)
 eval_live.registry = reg

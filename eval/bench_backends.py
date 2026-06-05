@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
-"""Benchmark egglog across the cross product of {backend} x {mode}.
+"""Benchmark egglog across the cross product of {backend} x {encoding}.
 
-Backends:  bridge (default in-memory) and duckdb (`--duckdb`).
-Modes:     normal, term-encoding (`--term-encoding`), proofs (`--proofs`).
+Backends:  bridge (default in-memory), duckdb (`--duckdb`),
+           feldera (`--feldera`), flowlog (`--flowlog`).
+Encodings: normal, term-encoding (`--term-encoding`), proofs (`--proofs`).
 
-For every (benchmark file, backend, mode) cell we run the egglog CLI as a
+For every (benchmark file, backend, encoding) cell we run the egglog CLI as a
 subprocess `--runs` times (after `--warmup` discarded runs) and record the
 wall-clock timings. Cells that error (non-zero exit, timeout) are recorded in
 an `errors` table instead. Results are written to a JSON database that
 `eval-live` renders interactively (`--serve`).
 
-Note: duckdb is term-encoding-only, so `duckdb-normal` and
-`duckdb-term-encoding` exercise the same engine and should report similar
-numbers; both are kept so the grid is a true cross product.
+bridge is the only backend with a meaningful "normal" (non-term-encoded) mode;
+it is kept as a baseline. duckdb, feldera, and flowlog are term-encoding-only:
+their backend flag already implies the term encoding, so for them we run two
+cells, term-encoding and proofs (proofs = proof-instrumented term encoding).
+The degenerate "normal" cell for those backends is the same engine as
+term-encoding and is therefore skipped (not double-run).
 
 Usage:
-    python3 eval/bench_backends.py                 # default benchmarks, build + run + save
+    python3 eval/bench_backends.py tests/           # benchmark every .egg under tests/
     python3 eval/bench_backends.py --serve          # also open the eval-live viewer
     python3 eval/bench_backends.py path/to/dir      # benchmark every .egg under a dir
-    python3 eval/bench_backends.py --runs 5 --warmup 1 --timeout 600
+    python3 eval/bench_backends.py tests/ --runs 5 --warmup 1 --timeout 600
     python3 eval/bench_backends.py --justserve      # skip benchmarking, view existing results
 """
 
@@ -31,12 +35,17 @@ from pathlib import Path
 
 WORKSPACE = Path(__file__).resolve().parents[1]
 
-# (name, extra CLI flags) for each axis of the cross product.
+# (name, backend-selecting CLI flags, term-encoding-only?) for each backend.
+# bridge has a real "normal" (non-term) mode; the others are term-only: their
+# backend flag already implies the term encoding.
 BACKENDS = [
-    ("bridge", []),
-    ("duckdb", ["--duckdb"]),
+    ("bridge", [], False),
+    ("duckdb", ["--duckdb"], True),
+    ("feldera", ["--feldera"], True),
+    ("flowlog", ["--flowlog"], True),
 ]
-MODES = [
+# (name, extra CLI flags) per encoding axis.
+ENCODINGS = [
     ("normal", []),
     ("term-encoding", ["--term-encoding"]),
     ("proofs", ["--proofs"]),
@@ -44,19 +53,30 @@ MODES = [
 
 
 def conditions():
-    """The cross product backends x modes, as (name, flags) pairs."""
-    for backend, bflags in BACKENDS:
-        for mode, mflags in MODES:
-            # duckdb is term-encoding-only: `--duckdb` already implies term
-            # encoding, and passing `--term-encoding` on top of it panics the
-            # backend. So for duckdb the "term-encoding" cell adds no extra
-            # flag (it equals duckdb-normal); the grid stays a true cross
-            # product without the broken/redundant combination.
-            if backend == "duckdb" and mode == "term-encoding":
+    """The cross product backends x encodings, as
+    (condition, backend, encoding, flags) tuples, with degenerate cells
+    skipped:
+
+    * bridge      -> normal, term-encoding, proofs  (full baseline)
+    * term-only   -> term-encoding, proofs
+
+    For a term-only backend the "normal" cell is identical to its
+    "term-encoding" cell (the backend flag already implies term encoding), so
+    we skip "normal" rather than double-run it. Its "term-encoding" cell needs
+    no `--term-encoding` flag (that would be redundant / can panic the
+    backend); "proofs" adds `--proofs` for proof-instrumented term encoding.
+    """
+    for backend, bflags, term_only in BACKENDS:
+        for encoding, eflags in ENCODINGS:
+            if term_only and encoding == "normal":
+                # Degenerate: same engine as this backend's term-encoding cell.
+                continue
+            if term_only and encoding == "term-encoding":
+                # Backend flag already implies term encoding; don't re-pass it.
                 flags = list(bflags)
             else:
-                flags = bflags + mflags
-            yield (f"{backend}-{mode}", backend, mode, flags)
+                flags = bflags + eflags
+            yield (f"{backend}-{encoding}", backend, encoding, flags)
 
 
 class BenchDB:
@@ -219,7 +239,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("path", nargs="?", default=None,
-                        help="benchmark file or directory (default: paper-benchmarks)")
+                        help="benchmark file or directory (default: tests/)")
     parser.add_argument("--runs", type=int, default=3, help="timed runs per cell (default 3)")
     parser.add_argument("--warmup", type=int, default=1, help="discarded warm-up runs (default 1)")
     parser.add_argument("--timeout", type=float, default=300.0,
@@ -241,7 +261,7 @@ def main():
 
     binary = build_egglog(release=not args.debug)
 
-    bench_path = Path(args.path) if args.path else (WORKSPACE / "paper-benchmarks")
+    bench_path = Path(args.path) if args.path else (WORKSPACE / "tests")
     if not bench_path.is_absolute():
         bench_path = (WORKSPACE / bench_path)
     benchmarks = find_benchmarks(bench_path)
