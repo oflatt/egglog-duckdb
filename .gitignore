@@ -27,3 +27,6 @@ lcov.info
 
 # eval: extracted benchmark corpora (e.g. Herbie dumps)
 *.extracted/
+
+# Python virtualenv (local eval/eval-live tooling)
+venv/

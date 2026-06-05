@@ -588,9 +588,9 @@ pub trait Backend: Send + Sync {
     ///
     /// Implementations are expected to be one-liners: `fn as_any(&self) ->
     /// &dyn Any { self }`. The trait can't supply a default body because
-    /// `dyn Backend` is not `Sized` and `&dyn Any` requires `Self: 'static
-    /// + Sized` — but every concrete backend type satisfies both, so each
-    /// impl trivially provides the body.
+    /// `dyn Backend` is not `Sized` and `&dyn Any` requires
+    /// `Self: 'static + Sized` — but every concrete backend type satisfies
+    /// both, so each impl trivially provides the body.
     fn as_any(&self) -> &dyn Any;
 
     /// Mutable counterpart of [`Backend::as_any`]. Implementations are
@@ -672,7 +672,7 @@ pub type PanicMsg = Box<dyn FnOnce() -> String + Send>;
 ///
 /// ## Unsupported on DuckDB
 ///
-/// - [`RuleBuilderOps::subsume`]: error.
+/// - [`RuleBuilderOps::subsume`][]: error.
 /// - Complex `MergeFn::Function` / `MergeFn::Primitive` referenced via
 ///   `query_prim`: error at `build()` time when the rule references such a
 ///   merge.
