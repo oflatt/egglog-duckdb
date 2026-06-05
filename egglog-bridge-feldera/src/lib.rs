@@ -141,7 +141,13 @@ pub struct EGraph {
     /// distinct rulesets in sequence, and rows produced by an earlier ruleset
     /// must count as *new* to a later ruleset's rules (which have never matched
     /// them). A global `seen` would starve a freshly-scheduled rule of its delta.
-    pub(crate) seen: HashMap<usize, HashMap<FunctionId, HashSet<Row>>>,
+    ///
+    /// The snapshot is stored as a shared `Rc<HashSet<Row>>`: within one
+    /// `run_rules` call every rule advances its `seen[r][f]` to the SAME
+    /// start-of-iteration view of `f`, so we build that view once and share it by
+    /// refcount instead of cloning the full (growing) relation per rule — turning
+    /// an O(rules · state) per-iteration cost into O(state) once.
+    pub(crate) seen: HashMap<usize, HashMap<FunctionId, std::rc::Rc<HashSet<Row>>>>,
     /// A core-relations [`Database`] used purely as the **base-value /
     /// primitive engine**. It owns the [`egglog_core_relations::BaseValues`]
     /// registry (so `Value`s are bit-for-bit identical to the reference

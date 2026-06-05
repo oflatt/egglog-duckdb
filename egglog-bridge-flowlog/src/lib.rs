@@ -190,7 +190,12 @@ pub struct EGraph {
     /// re-fires (the rebuild/retraction trap). Keyed by RULE (not globally):
     /// rows produced by an earlier-scheduled ruleset must count as fresh to a
     /// later ruleset's rules, which have never matched them.
-    pub(crate) seen: HashMap<usize, HashMap<FunctionId, HashSet<Row>>>,
+    ///
+    /// Stored as a shared `Rc<HashSet<Row>>`: within one `run_rules` call every
+    /// rule advances its `seen[r][f]` to the SAME start-of-iteration view of
+    /// `f`, so the view is built once and shared by refcount instead of cloning
+    /// the full (growing) relation per rule.
+    pub(crate) seen: HashMap<usize, HashMap<FunctionId, std::rc::Rc<HashSet<Row>>>>,
 }
 
 impl Default for EGraph {

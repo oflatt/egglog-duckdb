@@ -76,6 +76,10 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
 
     let mut writes: Vec<Write> = Vec::new();
     let mut touched: HashSet<FunctionId> = HashSet::new();
+    // Iteration-scoped `key -> output` index for `lookup_or_create` (eq-sort
+    // constructor hash-cons). Built lazily per function so repeated lookups in
+    // one iteration are O(1) instead of rescanning the growing mirror each time.
+    let mut lookup_index: HashMap<FunctionId, HashMap<Box<[u32]>, u32>> = HashMap::new();
 
     // Collect each rule's index + IR up front (clone to avoid borrow conflicts
     // while we also mutate the db / mirror via lookups). The index keys the
@@ -85,6 +89,9 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
         .filter_map(|&i| eg.rules.get(i).and_then(|r| r.clone()).map(|r| (i, r)))
         .collect();
 
+    // Shared start-of-iteration snapshots, built lazily once per function and
+    // reused (by refcount) for every rule's `seen` advance this call.
+    let mut shared_snapshot: HashMap<FunctionId, std::rc::Rc<HashSet<Row>>> = HashMap::new();
     for (idx, rule) in &rules {
         // The table relations this rule's body reads, and the seminaive delta of
         // each (rows present now that this rule has not yet matched against).
@@ -116,32 +123,70 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
         let bindings = seminaive_bindings(eg, &read, &delta, rule)?;
 
         for mut env in bindings {
-            apply_head(eg, &rule.head, &mut env, &mut writes, &mut touched)?;
+            apply_head(
+                eg,
+                &rule.head,
+                &mut env,
+                &mut writes,
+                &mut touched,
+                &mut lookup_index,
+            )?;
         }
 
         // Advance this rule's seen snapshot to the START-OF-ITERATION read view
         // (NOT the post-write mirror): the rule has now matched everything
         // currently present. A row deleted+readded later reappears in the delta.
+        // Build each touched function's snapshot once (shared by Rc across all
+        // rules in this call), then bump the refcount into this rule's seen.
+        for &f in &body_funcs {
+            if !shared_snapshot.contains_key(&f) {
+                let cur: HashSet<Row> = read
+                    .get(&f)
+                    .map(|v| v.iter().cloned().collect())
+                    .unwrap_or_default();
+                shared_snapshot.insert(f, std::rc::Rc::new(cur));
+            }
+        }
         let entry = eg.seen.entry(*idx).or_default();
         for &f in &body_funcs {
-            let cur = read.get(&f).cloned().unwrap_or_default();
-            entry.insert(f, cur.into_iter().collect());
+            entry.insert(f, std::rc::Rc::clone(&shared_snapshot[&f]));
         }
     }
 
     // Apply collected writes to the mirror.
+    //
+    // Removes are BATCHED per function: applying each `Write::Remove` with its
+    // own `set.retain` scan is O(|removes| · |state|) — quadratic, and the
+    // dominant per-iteration cost during rebuild (which retracts many rows at
+    // once). We collect all retraction keys per function into a hash set, then
+    // do a SINGLE `retain` pass per touched function: O(|state|) total. Removes
+    // are applied FIRST (batched), then Sets — preserving the term encoder's
+    // `(@uf)` "delete old leader, set new leader" delete-then-set ordering.
+    let mut removes_by_func: HashMap<FunctionId, (usize, HashSet<Box<[u32]>>)> = HashMap::new();
+    let mut sets: Vec<(FunctionId, Row)> = Vec::new();
     for w in writes {
         match w {
             Write::Set(f, row) => {
-                eg.mirror.entry(f).or_default().insert(row);
+                sets.push((f, row));
             }
             Write::Remove(f, key) => {
-                let keylen = key.len();
-                if let Some(set) = eg.mirror.get_mut(&f) {
-                    set.retain(|row| (0..keylen).any(|i| row_col(row, i) != key[i]));
-                }
+                let entry = removes_by_func
+                    .entry(f)
+                    .or_insert_with(|| (key.len(), HashSet::new()));
+                entry.1.insert(key.into_boxed_slice());
             }
         }
+    }
+    for (f, (keylen, keys)) in removes_by_func {
+        if let Some(set) = eg.mirror.get_mut(&f) {
+            set.retain(|row| {
+                let k: Box<[u32]> = (0..keylen).map(|i| row_col(row, i)).collect();
+                !keys.contains(&k)
+            });
+        }
+    }
+    for (f, row) in sets {
+        eg.mirror.entry(f).or_default().insert(row);
     }
 
     // Resolve FD conflicts on every function a head action wrote to (a `set`
@@ -450,6 +495,7 @@ fn apply_head(
     env: &mut Env,
     writes: &mut Vec<Write>,
     touched: &mut HashSet<FunctionId>,
+    lookup_index: &mut HashMap<FunctionId, HashMap<Box<[u32]>, u32>>,
 ) -> Result<()> {
     for op in head {
         match op {
@@ -477,7 +523,7 @@ fn apply_head(
                     .iter()
                     .map(|s| resolve(s, env).map(Value::new))
                     .collect::<Result<_>>()?;
-                let val = lookup_or_create(eg, *func, &key);
+                let val = lookup_or_create(eg, *func, &key, lookup_index);
                 env.insert(*ret, val.rep());
             }
             HeadOp::Call { id, args, ret } => {
@@ -524,17 +570,32 @@ fn resolve(s: &Slot, env: &Env) -> Result<u32> {
 /// a fresh id (eq-sort constructor semantics — mirrors `add_term`). The created
 /// row is written directly into the mirror so subsequent lookups in the same
 /// iteration see it (hash-cons).
-fn lookup_or_create(eg: &mut EGraph, func: FunctionId, key: &[Value]) -> Value {
+fn lookup_or_create(
+    eg: &mut EGraph,
+    func: FunctionId,
+    key: &[Value],
+    index: &mut HashMap<FunctionId, HashMap<Box<[u32]>, u32>>,
+) -> Value {
     let info = eg.info(func);
     let inputs_len = info.arity.saturating_sub(1);
-    if let Some(set) = eg.mirror.get(&func) {
-        for row in set.iter() {
-            if (0..inputs_len).all(|i| row_col(row, i) == key[i].rep()) {
-                return Value::new(row_col(row, inputs_len));
+    // Lazily build the key->output index for this function from the mirror so
+    // repeated lookups within one iteration are O(1) instead of O(state) scans.
+    let idx = index.entry(func).or_insert_with(|| {
+        let mut m: HashMap<Box<[u32]>, u32> = HashMap::new();
+        if let Some(set) = eg.mirror.get(&func) {
+            for row in set.iter() {
+                let k: Box<[u32]> = (0..inputs_len).map(|i| row_col(row, i)).collect();
+                m.insert(k, row_col(row, inputs_len));
             }
         }
+        m
+    });
+    let k: Box<[u32]> = key.iter().map(|v| v.rep()).collect();
+    if let Some(&out) = idx.get(&k) {
+        return Value::new(out);
     }
     let id = eg.fresh_id_internal();
+    idx.insert(k, id);
     let mut full: Vec<u32> = key.iter().map(|v| v.rep()).collect();
     full.push(id);
     eg.mirror
