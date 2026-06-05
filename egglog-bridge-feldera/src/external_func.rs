@@ -20,10 +20,14 @@ enum Slot {
 
 /// A grow-only registry of external functions, indexed by
 /// [`ExternalFunctionId`]. Freed slots are tombstoned (not reused) so ids stay
-/// stable for the lifetime of the egraph.
+/// stable for the lifetime of the egraph. Names are tracked (via the trait's
+/// `rename_prim`) so the rule builder can recognize built-in predicates like
+/// `!=` and lower them to circuit filters — mirroring how the DuckDB backend
+/// recognizes primitives by name (`external_func_name`).
 #[derive(Default)]
 pub struct ExternalFuncRegistry {
     slots: Vec<Slot>,
+    names: Vec<Option<String>>,
 }
 
 impl ExternalFuncRegistry {
@@ -31,6 +35,7 @@ impl ExternalFuncRegistry {
     pub fn add_func(&mut self, func: Box<dyn ExternalFunction + 'static>) -> ExternalFunctionId {
         let id = ExternalFunctionId::new(self.slots.len() as u32);
         self.slots.push(Slot::Func(func));
+        self.names.push(None);
         id
     }
 
@@ -38,7 +43,21 @@ impl ExternalFuncRegistry {
     pub fn add_panic(&mut self, message: String) -> ExternalFunctionId {
         let id = ExternalFunctionId::new(self.slots.len() as u32);
         self.slots.push(Slot::Panic(message));
+        self.names.push(None);
         id
+    }
+
+    /// Record a primitive's display name (the term encoder / frontend calls
+    /// this via `Backend`/`RuleBuilderOps::rename_prim`).
+    pub fn set_name(&mut self, id: ExternalFunctionId, name: String) {
+        if let Some(slot) = self.names.get_mut(id.rep() as usize) {
+            *slot = Some(name);
+        }
+    }
+
+    /// The display name of a primitive, if recorded.
+    pub fn name(&self, id: ExternalFunctionId) -> Option<&str> {
+        self.names.get(id.rep() as usize).and_then(|n| n.as_deref())
     }
 
     /// Tombstone a slot. Idempotent.

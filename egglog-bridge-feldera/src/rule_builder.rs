@@ -21,7 +21,7 @@ use egglog_backend_trait::{
 };
 use egglog_numeric_id::NumericId;
 
-use crate::compile::{BodyAtom, HeadAction, RuleIr};
+use crate::compile::{BodyAtom, Filter, HeadAction, RuleIr, Slot};
 use crate::EGraph;
 
 /// Accumulates a rule's body atoms and head actions, then registers them.
@@ -41,6 +41,7 @@ impl<'a> FelderaRuleBuilder<'a> {
             ir: RuleIr {
                 name: desc.to_string(),
                 body: Vec::new(),
+                filters: Vec::new(),
                 head: Vec::new(),
             },
             next_var: 1 << 20, // keep builder-synthesized vars away from caller ids
@@ -91,13 +92,36 @@ impl<'a> RuleBuilderOps for FelderaRuleBuilder<'a> {
 
     fn query_prim(
         &mut self,
-        _func: ExternalFunctionId,
-        _entries: &[QueryEntry],
+        func: ExternalFunctionId,
+        entries: &[QueryEntry],
         _ret_ty: ColumnTy,
     ) -> Result<()> {
-        Err(anyhow!(
-            "Feldera backend (milestone 1): primitive body atoms are not supported"
-        ))
+        // The only body primitive the term encoder's rebuild rulesets use is the
+        // inequality guard `(!= b c)`. We recognize it by name (the frontend
+        // registers primitive names via `rename_prim`) and lower it to a
+        // circuit [`Filter::Ne`]. The trait's `query_prim` threads the expected
+        // return value as the last entry; for a `!=` predicate the meaningful
+        // operands are the first two entries.
+        let name = self.egraph.external_funcs.name(func).map(str::to_string);
+        match name.as_deref() {
+            Some("!=") | Some("bool-!=") | Some("value-!=") => {
+                if entries.len() < 2 {
+                    return Err(anyhow!(
+                        "Feldera backend: `!=` primitive needs two operands (got {})",
+                        entries.len()
+                    ));
+                }
+                let l = Slot::from_entry(&entries[0]);
+                let r = Slot::from_entry(&entries[1]);
+                self.ir.filters.push(Filter::Ne(l, r));
+                Ok(())
+            }
+            other => Err(anyhow!(
+                "Feldera backend: primitive body atom `{}` is not supported (only `!=` \
+                 guards are lowered, which covers the term encoder's rebuild rulesets)",
+                other.unwrap_or("<unnamed>")
+            )),
+        }
     }
 
     fn call_external_func(
@@ -141,14 +165,21 @@ impl<'a> RuleBuilderOps for FelderaRuleBuilder<'a> {
 
     fn set(&mut self, func: FunctionId, entries: &[QueryEntry]) {
         // `set f(k..) = v` and a relation `insert f(..)` both land here as a
-        // full-row write; milestone 1 stores the full row uniformly.
-        self.ir.head.push(HeadAction::from_entries(func, entries));
+        // full-row write; we store the full row uniformly.
+        self.ir
+            .head
+            .push(HeadAction::from_entries(func, entries, false));
     }
 
-    fn remove(&mut self, _func: FunctionId, _entries: &[QueryEntry]) {
-        self.defer(anyhow!(
-            "Feldera backend (milestone 1): remove is not supported"
-        ));
+    fn remove(&mut self, func: FunctionId, entries: &[QueryEntry]) {
+        // `(delete f(k..))` — rebuild's retraction half. The term encoder's
+        // path_compress / single_parent rulesets delete the stale `@uf` edge
+        // before inserting the compressed one. `remove` takes only the key
+        // columns; for a plain relation the whole row is the key, so the
+        // entries already address the row to retract.
+        self.ir
+            .head
+            .push(HeadAction::from_entries(func, entries, true));
     }
 
     fn union(&mut self, _l: QueryEntry, _r: QueryEntry) {
@@ -161,6 +192,12 @@ impl<'a> RuleBuilderOps for FelderaRuleBuilder<'a> {
         self.defer(anyhow!(
             "Feldera backend (milestone 1): panic action: {message}"
         ));
+    }
+
+    fn rename_prim(&mut self, id: ExternalFunctionId, name: String) {
+        // Record the primitive's display name so `query_prim` can recognize
+        // built-in predicates (`!=`) and lower them to circuit filters.
+        self.egraph.external_funcs.set_name(id, name);
     }
 
     fn build(self: Box<Self>) -> Result<RuleId> {

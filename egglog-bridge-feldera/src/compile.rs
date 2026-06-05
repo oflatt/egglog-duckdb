@@ -1,4 +1,4 @@
-//! Rule IR and DBSP circuit assembly for the Feldera backend (milestone 1).
+//! Rule IR and DBSP circuit assembly for the Feldera backend.
 //!
 //! ## The load-bearing design choice (per the milestone brief)
 //!
@@ -14,23 +14,22 @@
 //! `(run N)` by calling `run_rules` N times — and because the circuit does one
 //! hop per call, `(run 1)` and `(run 3)` produce different, bounded results.
 //!
+//! ## Milestone 2: ruleset-scoped execution + retraction-rebuild
+//!
+//! Each `run_rules(&[RuleId])` call runs a **subset** of rules. A DBSP circuit
+//! is a static monolithic graph, so we build a *per-subset* circuit keyed by the
+//! sorted rule-id list (cached). The host pushes the current mirror as the
+//! circuit's input, runs one transaction, and reads back two diff streams per
+//! relation: an **insert** stream and a **delete** stream. The host then folds
+//! `(old ∪ inserts) \ deletes` into the mirror and resolves FD conflicts via the
+//! relation's merge mode. Deletes are the term encoder's `(delete ...)` actions
+//! (rebuild's retraction half); inserts are `(set ...)`.
+//!
 //! ## Row representation
 //!
 //! Every relation uses a single uniform row type [`Row`] = `Tup8<u32,…>` (eight
-//! `u32` slots, which is `DBData` in dbsp). egglog values are `u32`
-//! ([`Value`] reps); columns beyond a relation's arity are padded with 0.
-//! Using one monomorphic row type lets a *dynamically assembled* circuit wire
-//! `OrdZSet<Row>` streams together without per-relation generics. (Arity is
-//! capped at 8 for milestone 1; larger relations are a later-milestone concern
-//! and are rejected at registration time.)
-//!
-//! ## Per-relation handles
-//!
-//! Each relation gets an input `ZSetHandle<Row>` (the host pushes the round's
-//! starting facts as a delta) and an integrated output `OutputHandle` (the host
-//! reads the accumulated relation back, exactly like the spike's
-//! `integrate().output()` mirror). The Rust-side mirror in `lib.rs` folds the
-//! consolidated output into a `HashSet<Row>` after each transaction.
+//! `u32` slots). egglog values are `u32` ([`Value`] reps); columns beyond a
+//! relation's arity are padded with 0.
 
 use anyhow::{anyhow, Result};
 use dbsp::{OrdZSet, OutputHandle, RootCircuit, Stream, ZSetHandle};
@@ -38,12 +37,29 @@ use egglog_backend_trait::{FunctionId, QueryEntry, Value};
 use egglog_numeric_id::NumericId;
 use hashbrown::HashMap;
 
-/// Max number of columns a relation may have in milestone 1.
+/// Max number of columns a relation may have.
 pub const MAX_ARITY: usize = 8;
 
 /// Uniform row type for every relation. Eight `u32` slots; egglog `Value`s are
 /// `u32`. Columns past a relation's arity are 0-padded.
 pub type Row = dbsp::utils::Tup8<u32, u32, u32, u32, u32, u32, u32, u32>;
+
+/// How a function resolves a functional-dependency conflict (two rows sharing
+/// the same key columns with different output columns). Recognized from the
+/// trait `MergeFn` / the term encoder's `:merge` clause (see `lib.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeMode {
+    /// Plain relation: the whole row is the key, no output column to resolve.
+    Relation,
+    /// `:merge old` / `AssertEq`: keep the existing value on conflict.
+    Old,
+    /// `:merge new`: keep the new value on conflict.
+    New,
+    /// `:merge (ordering-min old new)`: keep the numerically smallest value.
+    /// This is the term encoder's `@uff` (uf-index) merge — load-bearing for
+    /// rebuild: the function must hold the *minimum* representative per child.
+    Min,
+}
 
 /// Pack a slice of `Value`s into a [`Row`] (0-padded).
 pub fn pack_row(vals: &[Value]) -> Row {
@@ -91,7 +107,7 @@ pub enum Slot {
 }
 
 impl Slot {
-    fn from_entry(e: &QueryEntry) -> Self {
+    pub fn from_entry(e: &QueryEntry) -> Self {
         match e {
             QueryEntry::Var(v) => Slot::Var(v.id.rep()),
             QueryEntry::Const { val, .. } => Slot::Const(val.rep()),
@@ -106,45 +122,56 @@ pub struct BodyAtom {
     pub slots: Vec<Slot>,
 }
 
-/// A head action: write a row into `func` built from these slots.
+/// A body filter: a comparison between two slots that must hold for the rule to
+/// fire. Milestone 2 supports `!=` (the only filter the term encoder's rebuild
+/// rulesets use: `(!= b c)`).
+#[derive(Clone, Debug)]
+pub enum Filter {
+    Ne(Slot, Slot),
+}
+
+/// A head action: write (`Set`) or retract (`Delete`) a row in `func` built from
+/// these slots.
 #[derive(Clone, Debug)]
 pub struct HeadAction {
     pub func: FunctionId,
     pub slots: Vec<Slot>,
+    pub delete: bool,
 }
 
 /// The compiled IR for one egglog rule.
 ///
-/// Milestone 1 supports rules whose body is **1 or 2 table atoms** (no
-/// primitives, no negation) and whose head is **one or more `set`/`insert`
-/// actions**. This is enough for a single-join derivation, which is the
-/// milestone's proof target.
+/// Supports rules whose body is **1 or 2 table atoms** plus optional `!=`
+/// filters, and whose head is one or more `set`/`delete` actions. This covers a
+/// single-join derivation AND the term encoder's union-find maintenance
+/// rulesets (path_compress / single_parent / uf_index).
 #[derive(Clone, Debug, Default)]
 pub struct RuleIr {
     pub name: String,
     pub body: Vec<BodyAtom>,
+    pub filters: Vec<Filter>,
     pub head: Vec<HeadAction>,
 }
 
 /// Per-relation circuit handles produced by [`build_circuit`].
+///
+/// Two output streams: `inserts` (rows the rules `set`) and `deletes` (rows the
+/// rules `delete`). Both are integrated so the host reads the *accumulated*
+/// diff for this transaction's input. The host applies them against the mirror.
 pub struct RelationHandles {
     pub input: ZSetHandle<Row>,
-    pub output: OutputHandle<OrdZSet<Row>>,
+    pub inserts: OutputHandle<OrdZSet<Row>>,
+    pub deletes: OutputHandle<OrdZSet<Row>>,
 }
 
 /// Build a NON-recursive DBSP circuit for one egglog iteration over the given
-/// relations and rules.
+/// relations and the given rule subset.
 ///
-/// For each relation `r`:
-///   `r_out = r_in  ∪  ⋃ over rules whose head targets r ( body-join → head )`
-/// then `r_out.integrate().output()` so the host reads the accumulated set.
-///
-/// Crucially there is **no recursive scope**: `r_out` is a function of the
-/// *current* inputs only, so one `transaction()` is one hop. The host feeds the
-/// previous round's derived rows back as input deltas to take the next hop —
-/// that Rust-side feedback loop is what realizes egglog's bounded `(run N)`.
-///
-/// `arities[&f]` gives the column count of relation `f`.
+/// For each relation `r` and each rule whose head targets `r`, the body
+/// join/filter produces rows; `set` actions feed `r`'s insert stream and
+/// `delete` actions feed `r`'s delete stream. The host folds both into the
+/// mirror after the transaction. There is **no recursive scope**: one
+/// `transaction()` is one hop.
 pub fn build_circuit(
     root: &mut RootCircuit,
     relations: &[FunctionId],
@@ -158,60 +185,80 @@ pub fn build_circuit(
         inputs.insert(f, root.add_input_zset::<Row>());
     }
 
-    // 2. For each relation, accumulate the head-action contributions of every
-    //    rule that targets it, unioned with the relation's own input stream.
-    let mut head_streams: HashMap<FunctionId, Stream<RootCircuit, OrdZSet<Row>>> = HashMap::new();
+    // 2. Accumulate per-relation insert and delete contributions. We start each
+    //    relation's *insert* stream empty (the mirror already holds existing
+    //    rows; the insert stream carries only NEW rows derived this round) and
+    //    its *delete* stream empty.
+    let empty_insert = |root: &mut RootCircuit| -> Stream<RootCircuit, OrdZSet<Row>> {
+        // An always-empty input stream: a zset input we never push to.
+        let (s, _h) = root.add_input_zset::<Row>();
+        s
+    };
+    let mut insert_streams: HashMap<FunctionId, Stream<RootCircuit, OrdZSet<Row>>> = HashMap::new();
+    let mut delete_streams: HashMap<FunctionId, Stream<RootCircuit, OrdZSet<Row>>> = HashMap::new();
     for &f in relations {
-        head_streams.insert(f, inputs[&f].0.clone());
+        insert_streams.insert(f, empty_insert(root));
+        delete_streams.insert(f, empty_insert(root));
     }
 
     for rule in rules {
         let derived = compile_rule_body(rule, &inputs, arities)?;
-        for (head_func, stream) in derived {
-            let acc = head_streams
+        for (head_func, delete, stream) in derived {
+            let map = if delete {
+                &mut delete_streams
+            } else {
+                &mut insert_streams
+            };
+            let acc = map
                 .get(&head_func)
                 .ok_or_else(|| anyhow!("rule `{}` writes unknown relation", rule.name))?
                 .plus(&stream);
-            head_streams.insert(head_func, acc);
+            map.insert(head_func, acc);
         }
     }
 
-    // 3. Integrate + output each relation so the host reads the accumulated set.
+    // 3. Integrate + output the insert and delete diff streams per relation.
     let mut out = HashMap::new();
     for &f in relations {
         let (_, input) = inputs.remove(&f).unwrap();
-        let stream = head_streams.remove(&f).unwrap();
+        let ins = insert_streams.remove(&f).unwrap();
+        let del = delete_streams.remove(&f).unwrap();
         out.insert(
             f,
             RelationHandles {
                 input,
-                output: stream.integrate().output(),
+                inserts: ins.integrate().output(),
+                deletes: del.integrate().output(),
             },
         );
     }
     Ok(out)
 }
 
-/// Compile a single rule's body+head into a list of `(head_func, Row stream)`
-/// contributions. Returns one entry per head action.
+/// Compile a single rule's body+filters+head into a list of
+/// `(head_func, is_delete, Row stream)` contributions, one per head action.
 fn compile_rule_body(
     rule: &RuleIr,
     inputs: &HashMap<FunctionId, (Stream<RootCircuit, OrdZSet<Row>>, ZSetHandle<Row>)>,
     arities: &HashMap<FunctionId, usize>,
-) -> Result<Vec<(FunctionId, Stream<RootCircuit, OrdZSet<Row>>)>> {
-    // A "binding environment" maps a variable id -> the join key/value column it
-    // is currently materialized in. We compile the body left-to-right. After
-    // processing the body, each head action projects bound variables/constants
-    // into a Row.
-    //
-    // Milestone 1 supports 1 or 2 body atoms.
+) -> Result<Vec<(FunctionId, bool, Stream<RootCircuit, OrdZSet<Row>>)>> {
     match rule.body.len() {
         1 => {
             let atom = &rule.body[0];
             let stream = atom_stream(atom, inputs)?;
-            // Bindings: var id -> column index within this atom's row.
             let env = atom_bindings(atom);
-            // Each head action: map over the single body stream.
+            let filters = rule.filters.clone();
+            let env_f = env.clone();
+            // Apply filters to the single body stream.
+            let stream = if filters.is_empty() {
+                stream
+            } else {
+                stream.filter(move |r: &Row| {
+                    eval_filters(&filters, &|vid| {
+                        row_col(r, *env_f.get(&vid).expect("filter var unbound"))
+                    })
+                })
+            };
             let mut out = Vec::new();
             for head in &rule.head {
                 let head_arity = *arities
@@ -225,14 +272,13 @@ fn compile_rule_body(
                         row_col(r, col)
                     })
                 });
-                out.push((head.func, mapped));
+                out.push((head.func, head.delete, mapped));
             }
             Ok(out)
         }
         2 => {
             let a = &rule.body[0];
             let b = &rule.body[1];
-            // Determine join variables: variables that appear in BOTH atoms.
             let env_a = atom_bindings(a);
             let env_b = atom_bindings(b);
             let mut join_vars: Vec<u32> = env_a
@@ -244,22 +290,17 @@ fn compile_rule_body(
             if join_vars.is_empty() {
                 return Err(anyhow!(
                     "rule `{}`: 2-atom body with no shared variable (cartesian \
-                     products are not supported in milestone 1)",
+                     products are not supported)",
                     rule.name
                 ));
             }
-            // Key both atoms by the tuple of shared-variable columns (packed into
-            // a single u64 for a 1- or 2-key join; milestone 1 supports up to two
-            // join columns).
             let stream_a = atom_stream(a, inputs)?;
             let stream_b = atom_stream(b, inputs)?;
             let key_cols_a: Vec<usize> = join_vars.iter().map(|v| env_a[v]).collect();
             let key_cols_b: Vec<usize> = join_vars.iter().map(|v| env_b[v]).collect();
-
-            let kca = key_cols_a.clone();
-            let indexed_a = stream_a.map_index(move |r: &Row| (join_key(r, &kca), *r));
-            let kcb = key_cols_b.clone();
-            let indexed_b = stream_b.map_index(move |r: &Row| (join_key(r, &kcb), *r));
+            // `stream_a`/`stream_b` are re-indexed per head action below (each
+            // head action gets its own `map_index`); the join itself is shared
+            // structurally but DBSP dedups identical operators.
 
             let mut out = Vec::new();
             for head in &rule.head {
@@ -267,29 +308,61 @@ fn compile_rule_body(
                     .get(&head.func)
                     .ok_or_else(|| anyhow!("rule `{}`: head relation arity unknown", rule.name))?;
                 let slots = head.slots.clone();
+                let filters = rule.filters.clone();
                 let env_a = env_a.clone();
                 let env_b = env_b.clone();
-                // The join callback sees (key, row_a, row_b); resolve each head
-                // var from whichever atom binds it (prefer a, fall back to b).
-                let joined = indexed_a.join(&indexed_b, move |_key, ra: &Row, rb: &Row| {
-                    project_head(&slots, head_arity, &|vid| {
-                        if let Some(c) = env_a.get(&vid) {
-                            row_col(ra, *c)
-                        } else if let Some(c) = env_b.get(&vid) {
-                            row_col(rb, *c)
-                        } else {
-                            panic!("unbound head var {vid}")
-                        }
+                let kca = key_cols_a.clone();
+                let kcb = key_cols_b.clone();
+                let ia = stream_a.map_index(move |r: &Row| (join_key(r, &kca), *r));
+                let ib = stream_b.map_index(move |r: &Row| (join_key(r, &kcb), *r));
+                // The join produces `Tup2(filter_ok, head_row)`; we drop pairs
+                // whose filter failed, then project to the head row. Filters
+                // reference *body* variables (resolved through ra/rb), so they
+                // must be evaluated inside the join, not on the projected head.
+                // `u8` (1=keep, 0=drop) is `DBData`; a raw `bool`/tuple is not
+                // guaranteed to be, so we use `Tup2<u8, Row>` as the carrier.
+                use dbsp::utils::Tup2;
+                let joined = ia
+                    .join(&ib, move |_key, ra: &Row, rb: &Row| {
+                        let resolve = |vid: u32| -> u32 {
+                            if let Some(c) = env_a.get(&vid) {
+                                row_col(ra, *c)
+                            } else if let Some(c) = env_b.get(&vid) {
+                                row_col(rb, *c)
+                            } else {
+                                panic!("unbound var {vid}")
+                            }
+                        };
+                        let ok = u8::from(eval_filters(&filters, &resolve));
+                        let row = project_head(&slots, head_arity, &resolve);
+                        Tup2(ok, row)
                     })
-                });
-                out.push((head.func, joined));
+                    .filter(|Tup2(ok, _row): &Tup2<u8, Row>| *ok == 1)
+                    .map(|Tup2(_ok, row): &Tup2<u8, Row>| *row);
+                out.push((head.func, head.delete, joined));
             }
             Ok(out)
         }
         n => Err(anyhow!(
-            "rule `{}`: body has {n} atoms; milestone 1 supports 1 or 2",
+            "rule `{}`: body has {n} atoms; supported: 1 or 2",
             rule.name
         )),
+    }
+}
+
+/// Evaluate the rule's filters against a variable resolver. All filters must
+/// hold (conjunction).
+fn eval_filters(filters: &[Filter], resolve: &dyn Fn(u32) -> u32) -> bool {
+    filters.iter().all(|f| match f {
+        Filter::Ne(l, r) => slot_val(l, resolve) != slot_val(r, resolve),
+    })
+}
+
+#[inline]
+fn slot_val(s: &Slot, resolve: &dyn Fn(u32) -> u32) -> u32 {
+    match s {
+        Slot::Var(v) => resolve(*v),
+        Slot::Const(c) => *c,
     }
 }
 
@@ -304,11 +377,7 @@ fn atom_stream(
         .ok_or_else(|| anyhow!("body atom references unregistered relation"))
 }
 
-/// Map var id -> column index for the (last) occurrence of each variable in an
-/// atom. Milestone-1 atoms are linear (no repeated variable within one atom),
-/// which is the common Datalog body shape; a repeated variable would silently
-/// take the last column here (an equality constraint within an atom is a later-
-/// milestone feature).
+/// Map var id -> column index for each variable in an atom.
 fn atom_bindings(atom: &BodyAtom) -> HashMap<u32, usize> {
     let mut env = HashMap::new();
     for (i, s) in atom.slots.iter().enumerate() {
@@ -319,19 +388,17 @@ fn atom_bindings(atom: &BodyAtom) -> HashMap<u32, usize> {
     env
 }
 
-/// Pack the shared-variable columns of a row into a `u64` join key (supports up
-/// to two 32-bit key columns, which covers single- and double-equality joins).
+/// Pack the shared-variable columns of a row into a `u64` join key.
 #[inline]
 fn join_key(r: &Row, cols: &[usize]) -> u64 {
     match cols.len() {
         1 => row_col(r, cols[0]) as u64,
         2 => ((row_col(r, cols[0]) as u64) << 32) | (row_col(r, cols[1]) as u64),
-        _ => panic!("milestone 1 supports at most 2 join columns"),
+        _ => panic!("supported: at most 2 join columns"),
     }
 }
 
-/// Project a head action's slots into a [`Row`], resolving each variable slot
-/// through `resolve_var`.
+/// Project a head action's slots into a [`Row`].
 fn project_head(slots: &[Slot], arity: usize, resolve_var: &dyn Fn(u32) -> u32) -> Row {
     debug_assert_eq!(slots.len(), arity, "head action arity mismatch");
     let mut a = [0u32; MAX_ARITY];
@@ -344,7 +411,6 @@ fn project_head(slots: &[Slot], arity: usize, resolve_var: &dyn Fn(u32) -> u32) 
     dbsp::utils::Tup8(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7])
 }
 
-// Re-export so callers can build `RuleIr` from trait `QueryEntry`s.
 impl BodyAtom {
     pub fn from_entries(func: FunctionId, entries: &[QueryEntry]) -> Self {
         BodyAtom {
@@ -355,10 +421,11 @@ impl BodyAtom {
 }
 
 impl HeadAction {
-    pub fn from_entries(func: FunctionId, entries: &[QueryEntry]) -> Self {
+    pub fn from_entries(func: FunctionId, entries: &[QueryEntry], delete: bool) -> Self {
         HeadAction {
             func,
             slots: entries.iter().map(Slot::from_entry).collect(),
+            delete,
         }
     }
 }

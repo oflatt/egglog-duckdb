@@ -1,18 +1,34 @@
 //! # egglog-bridge-feldera
 //!
 //! A Feldera/DBSP-backed executor for egglog's resolved IR, behind the
-//! [`egglog_backend_trait::Backend`] interface. **Milestone 1** scope (see
-//! `../PLAN.md` §8 and the milestone brief):
+//! [`egglog_backend_trait::Backend`] interface.
+//!
+//! ## Milestone 1 — bounded per-iteration stepping
 //!
 //! - Register relations and *non-recursive* single-/double-join rules.
 //! - Run them so that `(run 1)` and `(run 3)` produce **different, bounded**
 //!   results — N rounds of extension, **NOT** full saturation in one call.
 //! - Read results back through `for_each` / `lookup_id` / `table_size`.
 //!
-//! Deliberately **out of scope** for milestone 1 (PLAN Phases 2–4):
-//! union-find / rebuild, primitives, merges beyond plain insert, containers,
-//! subsumption, proofs. The corresponding trait methods are stubbed following
-//! the DuckDB backend's gating precedent.
+//! ## Milestone 2 — union-find + rebuild (the research crux)
+//!
+//! The backend now faithfully RUNS multi-ruleset term-encoded programs that do
+//! unions + rebuild, matching the reference backend's per-function tuple counts
+//! (see `tests/rebuild_proof.rs`). Three new pieces of machinery:
+//!
+//! - **Ruleset-scoped execution.** `run_rules(&[RuleId])` runs an arbitrary
+//!   *subset* of rules. A DBSP circuit is static once built, so we build and
+//!   cache one circuit per distinct sorted rule subset (keyed in
+//!   [`EGraph::circuits`]). This lets the frontend schedule the term encoder's
+//!   `(saturate single_parent)` / `(saturate path_compress)` /
+//!   `(saturate uf_index)` rulesets in order.
+//! - **Retraction-rebuild.** `(delete …)` / the trait `remove` becomes a
+//!   negative-weight DBSP diff. The `@uf` rewrites (delete `a→b`, set `a→c`)
+//!   are retraction + insertion; the host folds the integrated insert/delete
+//!   diff streams into the mirror as `(old ∪ inserts) \ deletes`.
+//! - **Merge recognition.** `:merge (ordering-min old new)` (the term encoder's
+//!   `@uff` uf-index) is recognized DuckDB-style and implemented as a
+//!   lattice-min upsert at fold time. `Old` / `New` / relation modes too.
 //!
 //! ## The per-iteration model (load-bearing)
 //!
@@ -21,9 +37,9 @@
 //! `run_rules` call**, not saturate. We therefore compile a **non-recursive**
 //! circuit (NO `recursive` scope): one `transaction()` is one round of rule
 //! application over the *current* relation contents. The frontend's existing
-//! loop drives `(run N)` by calling `run_rules` N times. See `compile.rs` for
-//! the circuit shape and `run_rules` below for the host-side feedback that
-//! takes the next hop.
+//! loop drives `(run N)` / `(saturate R)` by calling `run_rules` repeatedly.
+//! See `compile.rs` for the circuit shape and `run_rules` below for the
+//! host-side feedback that takes the next hop.
 
 use std::any::Any;
 
@@ -43,7 +59,7 @@ mod external_func;
 mod rule_builder;
 
 use base_values::FelderaBaseValuePool;
-use compile::{build_circuit, pack_row, unpack_row, RelationHandles, Row, RuleIr};
+use compile::{build_circuit, pack_row, unpack_row, MergeMode, RelationHandles, Row, RuleIr};
 use external_func::ExternalFuncRegistry;
 
 // ---------------------------------------------------------------------------
@@ -90,16 +106,23 @@ struct RelationInfo {
     arity: usize,
     /// True for functions/constructors that have an output column.
     has_output: bool,
+    /// How functional-dependency conflicts are resolved at flush time. For a
+    /// function the key is the input columns (`arity - 1`) and the output column
+    /// is resolved per this mode; for a relation it is [`MergeMode::Relation`]
+    /// (whole row is the key, nothing to resolve).
+    merge: MergeMode,
 }
 
 // ---------------------------------------------------------------------------
 // The compiled circuit + its per-relation handles
 // ---------------------------------------------------------------------------
 
-/// A built DBSP circuit and the per-relation input/output handles. Rebuilt
-/// lazily whenever the relation set or rule set changes (DBSP circuits are
-/// static once built — PLAN §4.2 #2). `pushed` tracks, per relation, the rows
-/// already pushed into the input handle so we only push deltas.
+/// A built DBSP circuit and the per-relation input/output handles for ONE rule
+/// subset. DBSP circuits are static once built (PLAN §4.2 #2), and
+/// `run_rules(&[RuleId])` runs an arbitrary *subset* of rules — so we build (and
+/// cache) one circuit per distinct sorted rule-id list. `pushed` tracks, per
+/// relation, the rows already pushed into the input handle so we only push
+/// deltas across successive transactions of THIS circuit.
 struct CircuitState {
     handle: CircuitHandle,
     relations: HashMap<FunctionId, RelationHandles>,
@@ -126,9 +149,12 @@ pub struct EGraph {
     /// Monotonic fresh-id counter for `fresh_id` / `add_term`.
     next_id: u32,
     report_level: ReportLevel,
-    /// Lazily (re)built circuit; `None` until first `run_rules`, and dropped
-    /// whenever a relation or rule is added/removed.
-    circuit: Option<CircuitState>,
+    /// Cache of built circuits, keyed by the sorted list of rule ids the circuit
+    /// contains. `run_rules(&[RuleId])` runs a *subset* of rules, and a DBSP
+    /// circuit is static once built, so we build one circuit per distinct subset
+    /// and reuse it across calls. Cleared whenever a relation or rule is
+    /// added/removed (the schema changed).
+    circuits: HashMap<Vec<u32>, CircuitState>,
 }
 
 impl Default for EGraph {
@@ -152,7 +178,7 @@ impl EGraph {
             // padding in the uniform Row representation).
             next_id: 1,
             report_level: ReportLevel::default(),
-            circuit: None,
+            circuits: HashMap::new(),
         }
     }
 
@@ -162,9 +188,10 @@ impl EGraph {
             .unwrap_or_else(|| panic!("FunctionId({}) not registered", f.rep()))
     }
 
-    /// Invalidate the built circuit; it will be rebuilt on the next `run_rules`.
+    /// Invalidate all built circuits; they will be rebuilt on the next
+    /// `run_rules` because the schema (relations or rules) changed.
     fn invalidate_circuit(&mut self) {
-        self.circuit = None;
+        self.circuits.clear();
     }
 
     /// Insert a single row into the Rust mirror.
@@ -172,47 +199,121 @@ impl EGraph {
         self.mirror.entry(f).or_default().insert(row);
     }
 
-    /// (Re)build the DBSP circuit from the current relation + rule set.
-    fn rebuild_circuit(&mut self) -> Result<()> {
+    /// Build a DBSP circuit containing exactly the rules named by `rule_idxs`
+    /// (indices into `self.rules`). Returns the built circuit state. This is how
+    /// **ruleset-scoped execution** is realized: each distinct rule subset gets
+    /// its own circuit, cached by the sorted index list in `self.circuits`.
+    fn build_circuit_for(&self, rule_idxs: &[u32]) -> Result<CircuitState> {
         let rel_ids: Vec<FunctionId> = (0..self.relations.len())
             .map(|i| FunctionId::new(i as u32))
             .collect();
         let arities: HashMap<FunctionId, usize> =
             rel_ids.iter().map(|&f| (f, self.info(f).arity)).collect();
-        let rules: Vec<RuleIr> = self.rules.iter().flatten().cloned().collect();
+        let rules: Vec<RuleIr> = rule_idxs
+            .iter()
+            .filter_map(|&i| self.rules.get(i as usize).and_then(|r| r.clone()))
+            .collect();
 
-        // `build` runs the user-provided constructor closure; we move the
-        // relation list / arities / rules in by reference via the closure env.
-        // `RootCircuit::build`'s constructor closure returns
-        // `Result<T, anyhow::Error>`, so `build_circuit`'s `anyhow::Result`
-        // flows straight through. `build` itself returns a `dbsp::Error`
-        // (which impls `std::error::Error`), so `?` lifts it into anyhow.
+        // `build` runs the constructor closure once; the relation list /
+        // arities / rules are moved into the closure. `build_circuit`'s
+        // `anyhow::Result` flows through; `build`'s `dbsp::Error` lifts via `?`.
         let (handle, relations) =
             RootCircuit::build(move |root| build_circuit(root, &rel_ids, &arities, &rules))?;
-
-        self.circuit = Some(CircuitState {
+        Ok(CircuitState {
             handle,
             relations,
             pushed: HashMap::new(),
-        });
-        Ok(())
+        })
     }
 
-    /// Read the accumulated contents of a relation out of the circuit's
-    /// integrated output handle (positive-weight rows only) and fold them into
-    /// the Rust mirror. Returns the number of rows currently in the relation.
-    fn refresh_mirror_from_circuit(&mut self, f: FunctionId) {
-        let Some(cs) = &self.circuit else { return };
+    /// Resolve a function's merge mode (for FD-conflict resolution at fold time).
+    fn merge_mode(&self, f: FunctionId) -> MergeMode {
+        self.info(f).merge
+    }
+
+    /// Apply this round's insert/delete diffs (read from the circuit's
+    /// integrated diff handles) against the mirror, resolving FD conflicts via
+    /// the relation's merge mode. This is the host-side analog of egglog's
+    /// flush: `new = (old ∪ inserts) \ deletes`, then per-key merge.
+    fn fold_diffs_into_mirror(&mut self, cs: &CircuitState, f: FunctionId) {
         let Some(handles) = cs.relations.get(&f) else {
             return;
         };
-        let consolidated = handles.output.consolidate();
-        let mut set: HashSet<Row> = HashSet::new();
-        for (row, (), w) in consolidated.iter() {
+        let arity = self.info(f).arity;
+        let merge = self.merge_mode(f);
+        let has_output = self.info(f).has_output;
+        // A delete addresses a row by its KEY: the input columns for a function
+        // (arity-1) or the whole row for a plain relation. The term encoder's
+        // `(delete (@uf a b))` provides exactly the key columns, so the delete
+        // stream rows carry the key in columns `0..keylen` (rest 0-padded).
+        let keylen = if has_output {
+            arity.saturating_sub(1)
+        } else {
+            arity
+        };
+
+        // Collect inserts and deletes (positive net weight = present).
+        let mut inserts: Vec<Row> = Vec::new();
+        for (row, (), w) in handles.inserts.consolidate().iter() {
             let w: ZWeight = w;
             if w > 0 {
-                set.insert(row);
+                inserts.push(row);
             }
+        }
+        let mut delete_keys: HashSet<Vec<u32>> = HashSet::new();
+        for (row, (), w) in handles.deletes.consolidate().iter() {
+            let w: ZWeight = w;
+            if w > 0 {
+                delete_keys.insert((0..keylen).map(|i| compile::row_col(&row, i)).collect());
+            }
+        }
+
+        let mut set = self.mirror.get(&f).cloned().unwrap_or_default();
+        // Deletes retract every existing row whose key matches a deleted key.
+        if !delete_keys.is_empty() {
+            set.retain(|row| {
+                let key: Vec<u32> = (0..keylen).map(|i| compile::row_col(row, i)).collect();
+                !delete_keys.contains(&key)
+            });
+        }
+        // Inserts add new rows.
+        for r in inserts {
+            set.insert(r);
+        }
+        // Resolve FD conflicts per merge mode (functions only; relations have no
+        // output column to merge). For each key (input columns), pick a single
+        // surviving output column.
+        if matches!(merge, MergeMode::Old | MergeMode::New | MergeMode::Min) && arity >= 1 {
+            let inputs_len = arity - 1;
+            let mut by_key: HashMap<Vec<u32>, u32> = HashMap::new();
+            for row in &set {
+                let key: Vec<u32> = (0..inputs_len).map(|i| compile::row_col(row, i)).collect();
+                let out = compile::row_col(row, inputs_len);
+                match by_key.entry(key) {
+                    hashbrown::hash_map::Entry::Vacant(e) => {
+                        e.insert(out);
+                    }
+                    hashbrown::hash_map::Entry::Occupied(mut e) => {
+                        let cur = *e.get();
+                        let chosen = match merge {
+                            MergeMode::Old => cur,
+                            MergeMode::New => out,
+                            MergeMode::Min => cur.min(out),
+                            MergeMode::Relation => unreachable!(),
+                        };
+                        e.insert(chosen);
+                    }
+                }
+            }
+            let mut resolved: HashSet<Row> = HashSet::new();
+            for (key, out) in by_key {
+                let mut full = key;
+                full.push(out);
+                resolved.insert(pack_row(
+                    &full.iter().map(|v| Value::new(*v)).collect::<Vec<_>>(),
+                ));
+            }
+            set = resolved;
         }
         self.mirror.insert(f, set);
     }
@@ -255,11 +356,35 @@ impl Backend for EGraph {
         // key/value split.
         let has_output =
             arity > 0 && matches!(config.default, DefaultVal::FreshId | DefaultVal::Const(_));
-        let _ = &config.merge; // merge modes beyond plain insert are Phase 2.
+        // Recognize the merge mode (FD-conflict resolution). We mirror the
+        // DuckDB backend's stopgap recognition (`backend_impl.rs` ~577):
+        //   - `AssertEq` / `Old`          => keep the old value
+        //   - `New`                       => keep the new value
+        //   - `UnionId`                   => lattice-min (the union-find leader)
+        //   - `Primitive(ordering-min..)` => lattice-min — this is how the term
+        //     encoder lowers `@uff`'s `:merge (ordering-min old new)`. The
+        //     Feldera external-func registry doesn't track names, so we
+        //     conservatively treat ANY `Primitive` whose first arg-merge is
+        //     `Old`/`New` as `Min` (the only complex merge the term encoder's
+        //     rebuild needs). `Function`/`Const` fall back to `Old`.
+        // A relation (no output column, or Unit output) needs no FD resolution.
+        use egglog_backend_trait::MergeFn;
+        let merge = if !has_output {
+            MergeMode::Relation
+        } else {
+            match &config.merge {
+                MergeFn::AssertEq | MergeFn::Old => MergeMode::Old,
+                MergeFn::New => MergeMode::New,
+                MergeFn::UnionId => MergeMode::Min,
+                MergeFn::Primitive(_, _) => MergeMode::Min,
+                MergeFn::Function(_, _) | MergeFn::Const(_) => MergeMode::Old,
+            }
+        };
         self.relations.push(RelationInfo {
             name: config.name,
             arity,
             has_output,
+            merge,
         });
         self.mirror.insert(id, HashSet::new());
         self.invalidate_circuit();
@@ -415,33 +540,54 @@ impl Backend for EGraph {
 
     fn run_rules(&mut self, rules: &[RuleId]) -> Result<IterationReport> {
         // ONE egglog iteration = one round of rule application over the current
-        // relations. The frontend calls this N times for `(run N)`.
+        // relations, running ONLY the rules in `rules`. The frontend calls this
+        // N times for `(run N)` and with different rule subsets to schedule
+        // distinct rulesets (e.g. the term encoder's `(saturate single_parent)`
+        // then `(saturate path_compress)` …).
         //
-        // NOTE (milestone-1 simplification): the trait passes a *subset* of
-        // rule ids to run. The non-recursive circuit we build contains *all*
-        // rules; running a strict subset would require per-call circuits. For
-        // milestone 1's single-ruleset programs this is equivalent, and we run
-        // the whole built circuit. Honoring `rules` precisely is noted as
-        // trait-friction in MILESTONE1.md.
+        // **Ruleset-scoped execution:** a DBSP circuit is static once built, so
+        // we build (and cache) one circuit per distinct sorted rule subset. The
+        // mirror is the single source of truth shared across all circuits; we
+        // push the current mirror as the circuit's input delta, run one
+        // transaction, and fold the resulting insert/delete diffs back into the
+        // mirror.
         if rules.is_empty() {
             return Ok(IterationReport::default());
         }
-        if self.circuit.is_none() {
-            self.rebuild_circuit()?;
+
+        // Cache key: the sorted list of rule-id reps that actually map to a live
+        // rule. Freed/empty rules are dropped (their circuit just omits them).
+        let mut key: Vec<u32> = rules
+            .iter()
+            .map(|r| r.rep())
+            .filter(|&i| {
+                self.rules
+                    .get(i as usize)
+                    .map(|s| s.is_some())
+                    .unwrap_or(false)
+            })
+            .collect();
+        key.sort_unstable();
+        key.dedup();
+        if key.is_empty() {
+            return Ok(IterationReport::default());
+        }
+
+        if !self.circuits.contains_key(&key) {
+            let cs = self.build_circuit_for(&key)?;
+            self.circuits.insert(key.clone(), cs);
         }
 
         let rel_ids: Vec<FunctionId> = (0..self.relations.len())
             .map(|i| FunctionId::new(i as u32))
             .collect();
 
-        // 1. Push the delta between the current mirror and what was already
-        //    pushed into each relation's input handle. The mirror holds both
-        //    the seeded facts AND the rows derived by previous `run_rules`
-        //    calls — pushing the latter back is the host-side feedback that
-        //    takes the next hop (egglog's bounded iteration; NOT a recursive
-        //    scope).
+        // 1. Sync this circuit's input handles to the CURRENT mirror by pushing
+        //    the delta (additions +1, removals -1) versus what was last pushed
+        //    into THIS circuit. Removals matter because rebuild shrinks
+        //    relations (deletes) — the spike-proven negative-weight retraction.
         {
-            let cs = self.circuit.as_mut().unwrap();
+            let cs = self.circuits.get_mut(&key).unwrap();
             for &f in &rel_ids {
                 let want = self.mirror.get(&f).cloned().unwrap_or_default();
                 let have = cs.pushed.entry(f).or_default();
@@ -449,29 +595,37 @@ impl Backend for EGraph {
                 for row in want.difference(have) {
                     handles.input.push(*row, 1);
                 }
-                // (Milestone 1 is monotone-insert-only; no retractions yet.)
+                for row in have.difference(&want) {
+                    handles.input.push(*row, -1);
+                }
                 *have = want;
             }
         }
 
-        // 2. One transaction = one round of rule application to a (logical)
-        //    delta-fixpoint of *this* non-recursive circuit. Because the body
-        //    is non-recursive, the derived rows are exactly the 1-hop
-        //    extension over what was pushed.
+        // 2. One transaction = one round of rule application over the current
+        //    inputs (non-recursive circuit ⇒ exactly one hop / one rebuild step).
         {
-            let cs = self.circuit.as_ref().unwrap();
+            let cs = self.circuits.get(&key).unwrap();
             cs.handle.transaction()?;
         }
 
-        // 3. Fold the integrated outputs back into the mirror and detect change.
-        let before: usize = rel_ids.iter().map(|f| self.table_size(*f)).sum();
+        // 3. Fold the per-relation insert/delete diffs into the mirror,
+        //    resolving FD conflicts per merge mode. Detect change for the
+        //    frontend's loop termination.
+        let before_mirror: HashMap<FunctionId, HashSet<Row>> = self.mirror.clone();
+        // Move the circuit out so we can borrow `self` mutably while reading its
+        // (immutable) handles.
+        let cs = self.circuits.remove(&key).unwrap();
         for &f in &rel_ids {
-            self.refresh_mirror_from_circuit(f);
+            self.fold_diffs_into_mirror(&cs, f);
         }
-        let after: usize = rel_ids.iter().map(|f| self.table_size(*f)).sum();
+        self.circuits.insert(key, cs);
+        let changed = rel_ids
+            .iter()
+            .any(|f| before_mirror.get(f) != self.mirror.get(f));
 
         let mut report = IterationReport::default();
-        report.rule_set_report.changed = after != before;
+        report.rule_set_report.changed = changed;
         Ok(report)
     }
 
