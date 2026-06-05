@@ -54,10 +54,12 @@ use egglog_numeric_id::NumericId;
 use hashbrown::{HashMap, HashSet};
 
 mod base_values;
+pub mod circuit_rebuild;
 pub mod compile;
 pub mod dbsp_join;
 mod external_func;
 mod interpret;
+pub mod rebuild_circuit;
 mod rule_builder;
 
 use base_values::base_values_as_pool_mut;
@@ -105,7 +107,7 @@ impl ContainerPool for FelderaContainerPool {
 struct RelationInfo {
     name: String,
     /// Number of columns (including the output column for functions).
-    arity: usize,
+    pub(crate) arity: usize,
     /// True for functions/constructors that have an output column.
     has_output: bool,
     /// How functional-dependency conflicts are resolved at flush time. For a
@@ -123,11 +125,11 @@ struct RelationInfo {
 pub struct EGraph {
     relations: Vec<RelationInfo>,
     /// Rule slots; `None` = freed.
-    rules: Vec<Option<RuleIr>>,
+    pub(crate) rules: Vec<Option<RuleIr>>,
     /// Rust-side materialized mirror: the accumulated contents of each
     /// relation, kept in sync with the circuit's integrated output after each
     /// transaction. This is what `for_each` / `lookup_id` / `table_size` read.
-    mirror: HashMap<FunctionId, HashSet<Row>>,
+    pub(crate) mirror: HashMap<FunctionId, HashSet<Row>>,
     /// Seminaive bookkeeping (Milestone 5), keyed by **rule index**: for each
     /// rule, the per-relation contents that rule has **already matched against**.
     /// The seminaive *delta* fed into a firing of rule `r` is
@@ -169,6 +171,19 @@ pub struct EGraph {
     /// characterize the frontier honestly (see `dbsp_join_stats`).
     pub(crate) dbsp_rule_runs: u64,
     pub(crate) host_rule_runs: u64,
+    /// Stage-3 (migration) flag: when set (env `FELDERA_CIRCUIT_REBUILD=1`),
+    /// rebuild rulesets are routed onto the persistent congruence-shuttle
+    /// circuit (`rebuild_circuit`) instead of the host interpreter. Off by
+    /// default — the interpreter stays the oracle.
+    pub(crate) circuit_rebuild: bool,
+    /// Diagnostics: number of `run_rules` calls served by the circuit-rebuild
+    /// path vs. the interpreter, when the flag is on.
+    pub(crate) circuit_rebuild_runs: u64,
+    /// Persistent rebuild-circuit cache (Stage 1 persistence for Stage 3): the
+    /// congruence-shuttle circuit is built ONCE and fed only per-call DELTAS of
+    /// the raw view rows / union edges across `run_rules` calls, so rebuild cost
+    /// is O(delta) not O(state). `None` until the first circuit-rebuild call.
+    pub(crate) rebuild_cache: Option<circuit_rebuild::RebuildCache>,
 }
 
 impl Default for EGraph {
@@ -195,6 +210,9 @@ impl EGraph {
             report_level: ReportLevel::default(),
             dbsp_rule_runs: 0,
             host_rule_runs: 0,
+            circuit_rebuild: std::env::var("FELDERA_CIRCUIT_REBUILD").is_ok(),
+            circuit_rebuild_runs: 0,
+            rebuild_cache: None,
         }
     }
 
@@ -206,7 +224,14 @@ impl EGraph {
         (self.dbsp_rule_runs, self.host_rule_runs)
     }
 
-    fn info(&self, f: FunctionId) -> &RelationInfo {
+    /// Diagnostics: number of `run_rules` calls served by the Stage-3
+    /// persistent rebuild circuit (`FELDERA_CIRCUIT_REBUILD=1`) rather than the
+    /// host interpreter. Zero when the flag is off or no rebuild ruleset ran.
+    pub fn circuit_rebuild_runs(&self) -> u64 {
+        self.circuit_rebuild_runs
+    }
+
+    pub(crate) fn info(&self, f: FunctionId) -> &RelationInfo {
         self.relations
             .get(f.rep() as usize)
             .unwrap_or_else(|| panic!("FunctionId({}) not registered", f.rep()))
@@ -554,6 +579,21 @@ impl Backend for EGraph {
             .collect();
         if live.is_empty() {
             return Ok(IterationReport::default());
+        }
+
+        // Stage-3: when `FELDERA_CIRCUIT_REBUILD=1` and this call is a pure
+        // rebuild ruleset, run the whole rebuild fixpoint on the persistent
+        // congruence-shuttle circuit instead of the interpreter. Recognition is
+        // conservative — anything unrecognized falls back to the interpreter, so
+        // this can never regress a program, only accelerate rebuild.
+        if self.circuit_rebuild {
+            if let Some(roles) = circuit_rebuild::recognize(self, &live) {
+                self.circuit_rebuild_runs += 1;
+                let changed = circuit_rebuild::run_rebuild(self, &roles)?;
+                let mut report = IterationReport::default();
+                report.rule_set_report.changed = changed;
+                return Ok(report);
+            }
         }
 
         let changed = interpret::run_iteration(self, &live)?;
