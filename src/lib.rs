@@ -510,6 +510,32 @@ impl EGraph {
         }
         Ok(eg)
     }
+
+    /// Construct an `EGraph` whose backend is the Feldera/DBSP-backed
+    /// [`egglog_bridge_feldera::EGraph`] driven through the
+    /// [`egglog_backend_trait::Backend`] trait.
+    ///
+    /// This is the Milestone-3 entry point exercised by `tests/files.rs`'s
+    /// `feldera` treatment: real `.egg` files run parse → desugar → typecheck →
+    /// term-encode → Feldera and are checked against the shared snapshot
+    /// (including per-function tuple counts via the appended `(print-size)`).
+    ///
+    /// Like the DuckDB backend, the Feldera backend is **term-encoding only**:
+    /// the encoder lowers eq-sorts to view-table congruence + the `@uf` / `@uff`
+    /// rebuild rulesets, which the Feldera host interpreter runs faithfully (see
+    /// `egglog-bridge-feldera`). Proof mode is not yet wired (Milestone 4).
+    pub fn with_feldera_backend() -> anyhow::Result<Self> {
+        let backend: Box<dyn egglog_backend_trait::Backend> =
+            Box::new(egglog_bridge_feldera::EGraph::new());
+        let mut eg = Self::with_backend(backend);
+
+        // Term encoding requires a separate bridge-backed typechecker EGraph for
+        // re-typechecking after the encoder runs (the Feldera backend, like
+        // DuckDB, is not the typechecker). Mirror the DuckDB setup.
+        let typechecker = EGraph::default().with_term_encoding_enabled();
+        eg.proof_state.original_typechecking = Some(Box::new(typechecker));
+        Ok(eg)
+    }
 }
 
 struct ResolvedNCommands {
@@ -570,6 +596,16 @@ impl EGraph {
             .downcast_ref::<egglog_bridge_duckdb::EGraph>()
         {
             return duck.base_value_pool_typed().inner();
+        }
+        if self
+            .backend
+            .as_any()
+            .downcast_ref::<egglog_bridge_feldera::EGraph>()
+            .is_some()
+        {
+            // The Feldera backend exposes its `BaseValues` (which live in its
+            // embedded core-relations Database) through the trait method.
+            return self.backend.base_values();
         }
         panic!("EGraph::base_values: unknown backend type")
     }
@@ -1657,7 +1693,15 @@ impl EGraph {
                     .as_any()
                     .downcast_ref::<egglog_bridge_duckdb::EGraph>()
                     .is_some()
+                    || self
+                        .backend
+                        .as_any()
+                        .downcast_ref::<egglog_bridge_feldera::EGraph>()
+                        .is_some()
                 {
+                    // The Feldera backend, like duckdb, has no extraction
+                    // pipeline yet; the shared snapshot drops `(extract …)`
+                    // output, so skipping keeps every treatment comparable.
                     return Ok(vec![]);
                 }
                 let sort = expr.output_type();

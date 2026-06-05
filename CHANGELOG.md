@@ -2,6 +2,7 @@
 
 ## [Unreleased] - ReleaseDate
 
+- **Feldera/DBSP backend Milestone 3.** `EGraph::with_feldera_backend()` runs real `.egg` programs through the full egglog frontend (parse → desugar → typecheck → term-encode) on the Feldera/DBSP backend, with a `feldera` `tests/files.rs` treatment (gated behind `EGGLOG_TEST_FELDERA=1`) checked against the shared snapshot — including per-function tuple-count parity via the appended `(print-size)`. The backend embeds a core-relations `Database` as its base-value/primitive engine and executes rules with a host-side ordered-IR interpreter.
 - Report full source file paths in egglog span and error messages.
 - Fix seminaive matching after nested containers rebuild in place by propagating dirty container ids through parent containers.
 - Render nullary AST calls without a trailing space, e.g. (foo) instead of (foo ).

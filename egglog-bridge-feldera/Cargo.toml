@@ -22,6 +22,7 @@ egglog-core-relations = { workspace = true }
 egglog-numeric-id = { workspace = true }
 hashbrown = { workspace = true }
 log = { workspace = true }
+dyn-clone = { workspace = true }
 
 [dev-dependencies]
 # The reference backend, used by the milestone-1 proof test to confirm the

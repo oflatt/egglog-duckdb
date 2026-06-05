@@ -19,6 +19,12 @@ struct Run {
     /// the flag. Output is captured and diffed against the same
     /// shared snapshot every other mode targets.
     duckdb: bool,
+    /// Run the program through the Feldera/DBSP-backed executor (the
+    /// `feldera` treatment). Like `duckdb`, this always uses term
+    /// encoding internally and is checked against the same shared
+    /// snapshot every other treatment targets (including per-function
+    /// tuple counts via the appended `(print-size)`).
+    feldera: bool,
     threads: usize,
 }
 
@@ -87,6 +93,7 @@ impl Run {
                 proofs: false,
                 proof_testing: false,
                 duckdb: false,
+                feldera: false,
                 threads: self.threads,
             };
             let proof_check_prog = if self.proof_testing {
@@ -164,6 +171,37 @@ impl Run {
     ) -> Result<Vec<CommandOutput>, String> {
         // Append print-size to every test file to ensure it works.
         let program = format!("{program}\n(print-size)");
+
+        // feldera mode: route the program through the Feldera/DBSP
+        // backend (term-encoding only, like duckdb) and diff against
+        // the same shared snapshot — including per-function tuple
+        // counts via the appended `(print-size)`. This is Milestone 3's
+        // end-to-end check.
+        if self.feldera {
+            let mut egraph = EGraph::with_feldera_backend()
+                .unwrap_or_else(|e| panic!("EGraph::with_feldera_backend init failed: {e}"));
+            egraph.ensure_no_reserved_symbols(false);
+            return match egraph.parse_and_run_program(filename, &program) {
+                Ok(msgs) => {
+                    if self.should_fail() {
+                        panic!(
+                            "Program should have failed under feldera! Outputs:\n{}",
+                            msgs.iter()
+                                .map(|m| m.to_string())
+                                .collect::<Vec<_>>()
+                                .join("")
+                        );
+                    }
+                    Ok(msgs)
+                }
+                Err(err) => {
+                    if !self.should_fail() {
+                        panic!("{message} (feldera): {err}");
+                    }
+                    Err(err.to_string())
+                }
+            };
+        }
 
         // --duckdb mode reuses everything: the same snapshot, the
         // same should_fail handling, the same `(print-size)`
@@ -344,6 +382,9 @@ impl Run {
                 if self.0.duckdb {
                     write!(f, "_duckdb")?;
                 }
+                if self.0.feldera {
+                    write!(f, "_feldera")?;
+                }
 
                 if self.0.threads > 1 {
                     write!(f, "_{}threads", self.0.threads)?;
@@ -409,6 +450,7 @@ fn generate_tests(glob: &str) -> Vec<Trial> {
             proofs: false,
             proof_testing: false,
             duckdb: false,
+            feldera: false,
             threads: 1,
         };
         let should_fail = run.should_fail();
@@ -478,6 +520,20 @@ fn generate_tests(glob: &str) -> Vec<Trial> {
         if duckdb_supported {
             push_trial(Run {
                 duckdb: true,
+                ..run.clone()
+            });
+        }
+
+        // feldera mode (Milestone 3): same supportability gate as the
+        // plain-duckdb treatment (term-encoding only, no push/pop, must
+        // support proofs since the encoder runs). Each file is an
+        // independent trial, so the failure frontier is characterized
+        // per-file rather than aborting the suite. Gated behind
+        // `EGGLOG_TEST_FELDERA=1` so it does not perturb the default
+        // CI run while the backend's frontier is still advancing.
+        if duckdb_supported && std::env::var("EGGLOG_TEST_FELDERA").is_ok() {
+            push_trial(Run {
+                feldera: true,
                 ..run.clone()
             });
         }

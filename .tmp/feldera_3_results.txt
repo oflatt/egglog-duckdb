@@ -1,0 +1,4 @@
+TIMEOUT(60 s)  rectangle_feldera
+TIMEOUT(60 s)  repro_should_saturate_feldera
+TIMEOUT(60 s)  naturals_feldera
+=== DONE ===

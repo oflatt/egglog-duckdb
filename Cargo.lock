@@ -1588,6 +1588,7 @@ dependencies = [
  "egglog-backend-trait",
  "egglog-bridge",
  "egglog-bridge-duckdb",
+ "egglog-bridge-feldera",
  "egglog-core-relations",
  "egglog-numeric-id",
  "egglog-reports",
@@ -1684,6 +1685,7 @@ version = "2.0.0"
 dependencies = [
  "anyhow",
  "dbsp",
+ "dyn-clone",
  "egglog-backend-trait",
  "egglog-bridge",
  "egglog-core-relations",

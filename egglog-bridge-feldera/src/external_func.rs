@@ -1,29 +1,34 @@
 //! External-function (primitive) registry for the Feldera/DBSP backend.
 //!
-//! Milestone 1 is "Datalog only, primitive-light" (PLAN §8): no rule references
-//! primitives yet. This module therefore provides only a *storage* registry so
-//! that `register_external_func` / `new_panic` return stable ids and
-//! `free_external_func` works. Actually invoking a primitive inside a rule is
-//! deferred to the merges+primitives milestone (PLAN Phase 2), where primitives
-//! become plain Rust closures inside `map`/`filter` (no UDF/ABI dance, unlike
-//! DuckDB — PLAN §3.4).
+//! ## Milestone 3 — primitives actually evaluate
+//!
+//! The canonical home of every registered primitive is the embedded
+//! [`egglog_core_relations::Database`] (see `lib.rs`), which is what gets
+//! *invoked* via `Database::with_execution_state`. This module is a thin
+//! side-table indexed by the **same** [`ExternalFunctionId`] the Database
+//! assigns, used for two things the Database doesn't surface conveniently:
+//!
+//! - **Names.** The rule builder recognizes built-in predicates (`!=`) by name
+//!   to lower them to circuit filters; the frontend records names via
+//!   `rename_prim`.
+//! - **Panic sentinels.** `Backend::new_panic` registers a `PanicFunc` in the
+//!   Database (so it is invokable) and mirrors the message here.
 
-use egglog_backend_trait::{ExternalFunction, ExternalFunctionId};
+use egglog_backend_trait::{ExecutionState, ExternalFunction, ExternalFunctionId, Value};
 use egglog_numeric_id::NumericId;
 
-/// Either a real registered primitive or a deferred-panic sentinel.
+/// Either a real registered primitive, a panic sentinel, or a freed slot.
 enum Slot {
-    Func(#[allow(dead_code)] Box<dyn ExternalFunction + 'static>),
+    Func,
     Panic(#[allow(dead_code)] String),
     Free,
 }
 
-/// A grow-only registry of external functions, indexed by
-/// [`ExternalFunctionId`]. Freed slots are tombstoned (not reused) so ids stay
-/// stable for the lifetime of the egraph. Names are tracked (via the trait's
-/// `rename_prim`) so the rule builder can recognize built-in predicates like
-/// `!=` and lower them to circuit filters — mirroring how the DuckDB backend
-/// recognizes primitives by name (`external_func_name`).
+/// A side-table of external-function metadata, indexed by the
+/// [`ExternalFunctionId`] the embedded `Database` assigned. `add_*_at` keeps
+/// this `Vec` aligned with the Database's `DenseIdMapWithReuse` (ids advance in
+/// lockstep). Names are tracked so the rule builder can recognize built-in
+/// predicates like `!=`.
 #[derive(Default)]
 pub struct ExternalFuncRegistry {
     slots: Vec<Slot>,
@@ -31,31 +36,42 @@ pub struct ExternalFuncRegistry {
 }
 
 impl ExternalFuncRegistry {
-    /// Register a primitive, returning its fresh id.
-    pub fn add_func(&mut self, func: Box<dyn ExternalFunction + 'static>) -> ExternalFunctionId {
-        let id = ExternalFunctionId::new(self.slots.len() as u32);
-        self.slots.push(Slot::Func(func));
-        self.names.push(None);
-        id
-    }
-
-    /// Register a deferred-panic sentinel, returning its fresh id.
-    pub fn add_panic(&mut self, message: String) -> ExternalFunctionId {
-        let id = ExternalFunctionId::new(self.slots.len() as u32);
-        self.slots.push(Slot::Panic(message));
-        self.names.push(None);
-        id
-    }
-
-    /// Record a primitive's display name (the term encoder / frontend calls
-    /// this via `Backend`/`RuleBuilderOps::rename_prim`).
-    pub fn set_name(&mut self, id: ExternalFunctionId, name: String) {
-        if let Some(slot) = self.names.get_mut(id.rep() as usize) {
-            *slot = Some(name);
+    fn ensure_len(&mut self, idx: usize) {
+        while self.slots.len() <= idx {
+            self.slots.push(Slot::Free);
+            self.names.push(None);
         }
     }
 
+    /// Record a primitive at the id the Database assigned.
+    pub fn add_func_at(
+        &mut self,
+        id: ExternalFunctionId,
+        _func: Box<dyn ExternalFunction + 'static>,
+    ) {
+        let idx = id.rep() as usize;
+        self.ensure_len(idx);
+        self.slots[idx] = Slot::Func;
+        // (the func itself lives in the Database; we keep only metadata)
+    }
+
+    /// Record a panic sentinel at the id the Database assigned.
+    pub fn add_panic_at(&mut self, id: ExternalFunctionId, message: String) {
+        let idx = id.rep() as usize;
+        self.ensure_len(idx);
+        self.slots[idx] = Slot::Panic(message);
+    }
+
+    /// Record a primitive's display name (the frontend calls this via
+    /// `Backend`/`RuleBuilderOps::rename_prim`).
+    pub fn set_name(&mut self, id: ExternalFunctionId, name: String) {
+        let idx = id.rep() as usize;
+        self.ensure_len(idx);
+        self.names[idx] = Some(name);
+    }
+
     /// The display name of a primitive, if recorded.
+    #[allow(dead_code)]
     pub fn name(&self, id: ExternalFunctionId) -> Option<&str> {
         self.names.get(id.rep() as usize).and_then(|n| n.as_deref())
     }
@@ -67,13 +83,32 @@ impl ExternalFuncRegistry {
         }
     }
 
-    /// The panic message for a deferred-panic id, if any. Used by tests and by
-    /// a later milestone's rule lowering of `panic` actions.
+    /// The panic message for a deferred-panic id, if any.
     #[allow(dead_code)]
     pub fn panic_message(&self, id: ExternalFunctionId) -> Option<&str> {
         match self.slots.get(id.rep() as usize) {
             Some(Slot::Panic(m)) => Some(m.as_str()),
             _ => None,
         }
+    }
+}
+
+/// A real, invokable panic sentinel registered into the Database by
+/// `Backend::new_panic`. Invoking it panics with the recorded message — the
+/// same observable behavior as the reference backend's `Action::Panic`.
+#[derive(Clone)]
+pub struct PanicFunc {
+    message: String,
+}
+
+impl PanicFunc {
+    pub fn new(message: String) -> Self {
+        PanicFunc { message }
+    }
+}
+
+impl ExternalFunction for PanicFunc {
+    fn invoke(&self, _state: &mut ExecutionState, _args: &[Value]) -> Option<Value> {
+        panic!("{}", self.message);
     }
 }

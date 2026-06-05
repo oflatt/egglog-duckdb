@@ -1,30 +1,28 @@
-//! `impl RuleBuilderOps` for the Feldera backend (milestone 1).
+//! `impl RuleBuilderOps` for the Feldera backend.
 //!
 //! Like the DuckDB backend's rule builder, this is an **accumulator**: each
 //! `RuleBuilderOps` call appends to an in-progress [`RuleIr`] (defined in
-//! `compile.rs`); `build()` registers it on the egraph and invalidates the
-//! cached circuit so the next `run_rules` rebuilds with the new rule wired in.
+//! `compile.rs`) in emission order; `build()` registers it on the egraph.
 //!
-//! Milestone-1 support (PLAN §8):
-//! - `new_var` / `new_var_named`: allocate body/head variables.
-//! - `query_table`: 1 or 2 table body atoms (single-join).
-//! - `set` / `insert`: head actions that write a row.
-//!
-//! Errored / unsupported (deferred to later milestones, mirroring DuckDB's
-//! gating): `query_prim`, `call_external_func`, `lookup`, `subsume`, `remove`,
-//! `union`. Their presence in a rule surfaces an error at `build()` time.
+//! Milestone 3 records the **fully general ordered IR** — table atoms,
+//! primitive body atoms (guards and bindings), and head actions (`set` /
+//! `delete` / `subsume` / RHS `lookup` / RHS `call_external_func` / `union` /
+//! `panic`). The host interpreter (`lib.rs`) executes it as a nested-loop join
+//! over the relation mirror, invoking primitives through the embedded
+//! `Database`. This is what lets *real* `.egg` programs run on the Feldera
+//! backend through the egglog frontend.
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use egglog_backend_trait::{
-    ColumnTy, ExternalFunctionId, FunctionId, PanicMsg, QueryEntry, RuleBuilderOps, RuleId, Value,
+    ColumnTy, ExternalFunctionId, FunctionId, PanicMsg, QueryEntry, RuleBuilderOps, RuleId,
     Variable, VariableId,
 };
 use egglog_numeric_id::NumericId;
 
-use crate::compile::{BodyAtom, Filter, HeadAction, RuleIr, Slot};
+use crate::compile::{BodyAtom, BodyOp, HeadOp, RuleIr, Slot};
 use crate::EGraph;
 
-/// Accumulates a rule's body atoms and head actions, then registers them.
+/// Accumulates a rule's body ops and head ops, then registers them.
 pub struct FelderaRuleBuilder<'a> {
     egraph: &'a mut EGraph,
     ir: RuleIr,
@@ -41,10 +39,9 @@ impl<'a> FelderaRuleBuilder<'a> {
             ir: RuleIr {
                 name: desc.to_string(),
                 body: Vec::new(),
-                filters: Vec::new(),
                 head: Vec::new(),
             },
-            next_var: 1 << 20, // keep builder-synthesized vars away from caller ids
+            next_var: 1 << 24, // keep builder-synthesized vars away from caller ids
             deferred_err: None,
         }
     }
@@ -58,6 +55,7 @@ impl<'a> FelderaRuleBuilder<'a> {
         })
     }
 
+    #[allow(dead_code)]
     fn defer(&mut self, e: anyhow::Error) {
         if self.deferred_err.is_none() {
             self.deferred_err = Some(e);
@@ -78,15 +76,14 @@ impl<'a> RuleBuilderOps for FelderaRuleBuilder<'a> {
         &mut self,
         func: FunctionId,
         entries: &[QueryEntry],
-        is_subsumed: Option<bool>,
+        _is_subsumed: Option<bool>,
     ) -> Result<()> {
-        if is_subsumed.is_some() {
-            return Err(anyhow!(
-                "Feldera backend (milestone 1): subsumption filters on body atoms \
-                 are not supported"
-            ));
-        }
-        self.ir.body.push(BodyAtom::from_entries(func, entries));
+        // Subsumption filters on body atoms are ignored (the backend does not
+        // track subsumption yet; `supports_subsumption()` is false so the
+        // frontend passes `Some(false)` — "non-subsumed only" — which is the
+        // only state we ever hold anyway).
+        let atom = BodyAtom::from_entries(func, entries);
+        self.ir.body.push(BodyOp::Atom(atom));
         Ok(())
     }
 
@@ -96,107 +93,102 @@ impl<'a> RuleBuilderOps for FelderaRuleBuilder<'a> {
         entries: &[QueryEntry],
         _ret_ty: ColumnTy,
     ) -> Result<()> {
-        // The only body primitive the term encoder's rebuild rulesets use is the
-        // inequality guard `(!= b c)`. We recognize it by name (the frontend
-        // registers primitive names via `rename_prim`) and lower it to a
-        // circuit [`Filter::Ne`]. The trait's `query_prim` threads the expected
-        // return value as the last entry; for a `!=` predicate the meaningful
-        // operands are the first two entries.
-        let name = self.egraph.external_funcs.name(func).map(str::to_string);
-        match name.as_deref() {
-            Some("!=") | Some("bool-!=") | Some("value-!=") => {
-                if entries.len() < 2 {
-                    return Err(anyhow!(
-                        "Feldera backend: `!=` primitive needs two operands (got {})",
-                        entries.len()
-                    ));
-                }
-                let l = Slot::from_entry(&entries[0]);
-                let r = Slot::from_entry(&entries[1]);
-                self.ir.filters.push(Filter::Ne(l, r));
-                Ok(())
-            }
-            other => Err(anyhow!(
-                "Feldera backend: primitive body atom `{}` is not supported (only `!=` \
-                 guards are lowered, which covers the term encoder's rebuild rulesets)",
-                other.unwrap_or("<unnamed>")
-            )),
+        // The last entry is the primitive's return slot (see the bridge's
+        // `query_prim`): if it is an as-yet-unbound variable it BINDS the
+        // result; otherwise it is an equality guard. We record the op verbatim
+        // and let the interpreter evaluate it through the embedded Database.
+        if entries.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Feldera backend: query_prim with no entries"
+            ));
         }
+        let args: Vec<Slot> = entries[..entries.len() - 1]
+            .iter()
+            .map(Slot::from_entry)
+            .collect();
+        let ret = Slot::from_entry(entries.last().unwrap());
+        self.ir.body.push(BodyOp::Prim {
+            id: func,
+            args,
+            ret,
+        });
+        Ok(())
     }
 
     fn call_external_func(
         &mut self,
-        _func: ExternalFunctionId,
-        _args: &[QueryEntry],
-        ret_ty: ColumnTy,
+        func: ExternalFunctionId,
+        args: &[QueryEntry],
+        _ret_ty: ColumnTy,
         _panic_msg: PanicMsg,
     ) -> QueryEntry {
-        // Infallible signature: defer the error to build() and return a dummy.
-        self.defer(anyhow!(
-            "Feldera backend (milestone 1): external-function calls in rule heads \
-             are not supported"
-        ));
-        QueryEntry::Const {
-            val: Value::new(0),
-            ty: ret_ty,
-        }
+        // RHS primitive call binding a fresh result variable. We allocate a
+        // synthetic result var, record a `HeadOp::Call`, and return the var so
+        // later head actions can reference the result.
+        let ret = self.fresh_var(None);
+        let QueryEntry::Var(Variable { id, .. }) = &ret else {
+            unreachable!()
+        };
+        let rid = id.rep();
+        let slots: Vec<Slot> = args.iter().map(Slot::from_entry).collect();
+        self.ir.head.push(HeadOp::Call {
+            id: func,
+            args: slots,
+            ret: rid,
+        });
+        ret
     }
 
     fn lookup(
         &mut self,
-        _func: FunctionId,
-        _entries: &[QueryEntry],
+        func: FunctionId,
+        entries: &[QueryEntry],
         _panic_msg: PanicMsg,
     ) -> QueryEntry {
-        self.defer(anyhow!(
-            "Feldera backend (milestone 1): RHS function lookups are not supported"
-        ));
-        QueryEntry::Const {
-            val: Value::new(0),
-            ty: ColumnTy::Id,
-        }
+        // RHS function lookup binding a fresh result variable (eq-sort
+        // constructor: create the row with a fresh id if absent).
+        let ret = self.fresh_var(None);
+        let QueryEntry::Var(Variable { id, .. }) = &ret else {
+            unreachable!()
+        };
+        let rid = id.rep();
+        let args: Vec<Slot> = entries.iter().map(Slot::from_entry).collect();
+        self.ir.head.push(HeadOp::Lookup {
+            func,
+            args,
+            ret: rid,
+        });
+        ret
     }
 
-    fn subsume(&mut self, _func: FunctionId, _entries: &[QueryEntry]) -> Result<()> {
-        Err(anyhow!(
-            "Feldera backend (milestone 1): subsume is not supported"
-        ))
+    fn subsume(&mut self, func: FunctionId, entries: &[QueryEntry]) -> Result<()> {
+        let slots: Vec<Slot> = entries.iter().map(Slot::from_entry).collect();
+        self.ir.head.push(HeadOp::Subsume { func, slots });
+        Ok(())
     }
 
     fn set(&mut self, func: FunctionId, entries: &[QueryEntry]) {
-        // `set f(k..) = v` and a relation `insert f(..)` both land here as a
-        // full-row write; we store the full row uniformly.
-        self.ir
-            .head
-            .push(HeadAction::from_entries(func, entries, false));
+        let slots: Vec<Slot> = entries.iter().map(Slot::from_entry).collect();
+        self.ir.head.push(HeadOp::Set { func, slots });
     }
 
     fn remove(&mut self, func: FunctionId, entries: &[QueryEntry]) {
-        // `(delete f(k..))` — rebuild's retraction half. The term encoder's
-        // path_compress / single_parent rulesets delete the stale `@uf` edge
-        // before inserting the compressed one. `remove` takes only the key
-        // columns; for a plain relation the whole row is the key, so the
-        // entries already address the row to retract.
-        self.ir
-            .head
-            .push(HeadAction::from_entries(func, entries, true));
+        let slots: Vec<Slot> = entries.iter().map(Slot::from_entry).collect();
+        self.ir.head.push(HeadOp::Remove { func, slots });
     }
 
-    fn union(&mut self, _l: QueryEntry, _r: QueryEntry) {
-        self.defer(anyhow!(
-            "Feldera backend (milestone 1): union is not supported (no union-find yet)"
-        ));
+    fn union(&mut self, l: QueryEntry, r: QueryEntry) {
+        self.ir.head.push(HeadOp::Union {
+            l: Slot::from_entry(&l),
+            r: Slot::from_entry(&r),
+        });
     }
 
     fn panic(&mut self, message: String) {
-        self.defer(anyhow!(
-            "Feldera backend (milestone 1): panic action: {message}"
-        ));
+        self.ir.head.push(HeadOp::Panic(message));
     }
 
     fn rename_prim(&mut self, id: ExternalFunctionId, name: String) {
-        // Record the primitive's display name so `query_prim` can recognize
-        // built-in predicates (`!=`) and lower them to circuit filters.
         self.egraph.external_funcs.set_name(id, name);
     }
 
