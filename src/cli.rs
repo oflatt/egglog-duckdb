@@ -280,11 +280,22 @@ pub fn cli(mut egraph: EGraph) {
                 backend_eg.parser = std::mem::take(&mut egraph.parser);
                 backend_eg.fact_directory.clone_from(&args.fact_directory);
                 backend_eg.ensure_no_reserved_symbols(false);
-                if let Err(err) =
-                    backend_eg.parse_and_run_program(Some(input.to_str().unwrap().into()), &program)
+                match backend_eg
+                    .parse_and_run_program(Some(input.to_str().unwrap().into()), &program)
                 {
-                    log::error!("{err}");
-                    std::process::exit(1);
+                    Ok(msgs) => {
+                        if args.mode != RunMode::NoMessages {
+                            use std::io::Write;
+                            let mut out = io::stdout();
+                            for msg in msgs {
+                                let _ = write!(out, "{msg}");
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        log::error!("{err}");
+                        std::process::exit(1);
+                    }
                 }
                 continue;
             }

@@ -2,6 +2,8 @@
 source: tests/files.rs
 expression: snapshot_content_across_treatments
 ---
+extracted cost: 11
+extracted cost: 11
 ((Add 2)
  (Mul 2)
  (Num 2)

@@ -56,6 +56,17 @@ impl Run {
     /// Extraction results may differ slightly due to the proof encoding when multiple
     /// solutions have the same cost. Snapshot only the extracted cost so shared
     /// snapshots still verify that normal and proof modes find equally good solutions.
+    ///
+    /// The reference, proof, term-encoding, feldera, and flowlog treatments all run
+    /// the real extractor, so they contribute a deterministic `extracted cost: N`
+    /// line for each `(extract …)` — every such treatment must therefore agree on
+    /// the lowest cost found. The `--duckdb` treatment has no extraction pipeline
+    /// and silently drops `(extract …)`, so for duckdb runs we omit the cost lines
+    /// (and `should_skip_snapshot` excludes duckdb from the shared snapshot whenever
+    /// a program uses extraction) — see `should_skip_snapshot`.
+    ///
+    /// We snapshot the cost (an integer) rather than the extracted *term* because
+    /// tied-cost solutions can legitimately differ between treatments.
     fn outputs_to_snapshot_preserved_across_treatments(&self, outputs: &[CommandOutput]) -> String {
         outputs
             .iter()
@@ -64,11 +75,17 @@ impl Run {
                 CommandOutput::OverallStatistics(_) => None,
                 // Skipping PrintFunction for now due to egglog nondeterminism bug: https://github.com/egraphs-good/egglog/issues/793
                 CommandOutput::PrintFunction(..) => None,
-                // Skip extraction outputs. --duckdb mode silently
-                // ignores `(extract …)` commands (no extraction
-                // pipeline yet), so this keeps the shared snapshot
-                // comparable across all backends.
-                CommandOutput::ExtractBest(..) => None,
+                // Snapshot the extracted COST (deterministic) instead of the
+                // full term: every treatment that can extract must agree on
+                // the lowest cost. --duckdb produces no ExtractBest at all
+                // (extraction is a no-op there); it is excluded from the
+                // shared snapshot for extraction programs via
+                // `should_skip_snapshot`.
+                CommandOutput::ExtractBest(_termdag, cost, _term) => {
+                    Some(format!("extracted cost: {cost}\n"))
+                }
+                // Variant extraction can return tied-cost terms in a
+                // treatment-dependent order, so it stays dropped.
                 CommandOutput::ExtractVariants(..) => None,
                 // All other variants use normal Display formatting
                 other => Some(other.to_string()),
@@ -444,8 +461,21 @@ impl Run {
     fn should_skip_snapshot(&self) -> bool {
         if self.threads > 1 {
             // Skip snapshots for parallel tests due to non-deterministic output ordering
-            true
-        } else {
+            return true;
+        }
+        // The --duckdb treatment has no extraction pipeline: it drops
+        // `(extract …)` silently. Since the shared snapshot now records the
+        // extracted cost (which every other treatment produces), a duckdb run
+        // of an extraction program would diverge by exactly those cost lines.
+        // Exclude duckdb from the shared snapshot for such programs; the
+        // non-extraction treatments still cross-check the cost.
+        if self.duckdb
+            && let Ok(src) = std::fs::read_to_string(&self.path)
+            && src.contains("(extract")
+        {
+            return true;
+        }
+        {
             // Skip tests with known non-deterministic output
             let filename = self.path.file_stem().unwrap().to_string_lossy();
             const SKIP_PATTERNS: [&str; 6] = [

@@ -2,6 +2,9 @@
 source: tests/files.rs
 expression: snapshot_content_across_treatments
 ---
+extracted cost: 1
+extracted cost: 1
+extracted cost: 1
 ((Add 8)
  (Cons 22)
  (EditDist 110)

@@ -2,4 +2,6 @@
 source: tests/files.rs
 expression: snapshot_content_across_treatments
 ---
+extracted cost: 5
+extracted cost: 4
 ()

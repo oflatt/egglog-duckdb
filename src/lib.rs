@@ -1716,40 +1716,27 @@ impl EGraph {
                 }
             },
             ResolvedNCommand::Extract(span, expr, variants) => {
-                // Extraction relies on bridge-specific facilities
-                // (`Extractor::compute_costs_from_rootsorts` walks the
-                // bridge's typed tables). The duck backend silently
-                // skips extract commands — matches the legacy
-                // duck pipeline's behavior (see
-                // `backend_duckdb.rs::dispatch`, where
-                // `GenericNCommand::Extract` is a no-op).
+                // The duck backend silently skips extract commands — it has no
+                // extraction pipeline yet (see `backend_duckdb.rs::dispatch`,
+                // where `GenericNCommand::Extract` is a no-op). The Feldera and
+                // FlowLog backends DO support extraction: the shared
+                // `Extractor` reads e-graph contents through the backend trait
+                // (`for_each` over the Rust-side materialized mirror,
+                // `base_values()`), so the path below runs against them
+                // unchanged.
                 if self
                     .backend
                     .as_any()
                     .downcast_ref::<egglog_bridge_duckdb::EGraph>()
                     .is_some()
-                    || self
-                        .backend
-                        .as_any()
-                        .downcast_ref::<egglog_bridge_feldera::EGraph>()
-                        .is_some()
-                    || self
-                        .backend
-                        .as_any()
-                        .downcast_ref::<egglog_bridge_flowlog::EGraph>()
-                        .is_some()
                 {
-                    // The Feldera and FlowLog backends, like duckdb, have no
-                    // extraction pipeline yet; the shared snapshot drops
-                    // `(extract …)` output, so skipping keeps every treatment
-                    // comparable.
                     return Ok(vec![]);
                 }
                 let sort = expr.output_type();
 
                 let x = self.eval_resolved_expr(span.clone(), &expr)?;
                 let n = self.eval_resolved_expr(span, &variants)?;
-                let n: i64 = self.bridge().base_values().unwrap(n);
+                let n: i64 = self.base_values().unwrap(n);
 
                 let mut termdag = TermDag::default();
 
