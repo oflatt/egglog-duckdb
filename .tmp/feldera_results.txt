@@ -31,7 +31,7 @@ PASS     repro_primitive_query_feldera
 PASS     repro_querybug_feldera
 PASS     repro_querybug2_feldera
 PASS     repro_querybug4_feldera
-TIMEOUT  repro_should_saturate_feldera
+PASS     repro_should_saturate_feldera
 PASS     repro_silly_panic_feldera
 PASS     repro_small_rebuild_fail_term_encoding_feldera
 PASS     repro_typecheck_term_encoding_feldera
@@ -49,7 +49,7 @@ PASS     combinators_feldera
 PASS     eqsat_basic_feldera
 PASS     eqsolve_feldera
 PASS     matrix_feldera
-TIMEOUT  naturals_feldera
+PASS     naturals_feldera
 PASS     path_union_feldera
 PASS     path_feldera
 PASS     pathproof_feldera
@@ -61,6 +61,6 @@ PASS     typecheck_feldera
 PASS     unification_points_to_feldera
 PASS     unify_feldera
 === SUMMARY ===
-PASS:    59
+PASS:    61
 FAIL:    0
-TIMEOUT: 3
+TIMEOUT: 1

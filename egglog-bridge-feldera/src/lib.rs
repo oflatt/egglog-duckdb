@@ -128,6 +128,20 @@ pub struct EGraph {
     /// relation, kept in sync with the circuit's integrated output after each
     /// transaction. This is what `for_each` / `lookup_id` / `table_size` read.
     mirror: HashMap<FunctionId, HashSet<Row>>,
+    /// Seminaive bookkeeping (Milestone 5), keyed by **rule index**: for each
+    /// rule, the per-relation contents that rule has **already matched against**.
+    /// The seminaive *delta* fed into a firing of rule `r` is
+    /// `mirror[f] \ seen[r][f]` — the rows of `f` that became present since rule
+    /// `r` last looked. After `r` fires, `seen[r][f]` is set to the
+    /// *start-of-iteration* snapshot (NOT the post-write mirror), so a
+    /// deleted-then-readded row reappears in `r`'s delta and retraction-driven
+    /// rebuild re-fires correctly.
+    ///
+    /// Keying by rule (not globally) is load-bearing: the frontend schedules
+    /// distinct rulesets in sequence, and rows produced by an earlier ruleset
+    /// must count as *new* to a later ruleset's rules (which have never matched
+    /// them). A global `seen` would starve a freshly-scheduled rule of its delta.
+    pub(crate) seen: HashMap<usize, HashMap<FunctionId, HashSet<Row>>>,
     /// A core-relations [`Database`] used purely as the **base-value /
     /// primitive engine**. It owns the [`egglog_core_relations::BaseValues`]
     /// registry (so `Value`s are bit-for-bit identical to the reference
@@ -164,6 +178,7 @@ impl EGraph {
             relations: Vec::new(),
             rules: Vec::new(),
             mirror: HashMap::new(),
+            seen: HashMap::new(),
             db: Database::new(),
             container_pool: FelderaContainerPool,
             external_funcs: ExternalFuncRegistry::default(),
@@ -469,6 +484,11 @@ impl Backend for EGraph {
         if let Some(set) = self.mirror.get_mut(&func) {
             set.clear();
         }
+        // Forget what every rule had matched in this table: a re-populated table
+        // must present its rows as fresh deltas to the seminaive driver.
+        for per_rel in self.seen.values_mut() {
+            per_rel.remove(&func);
+        }
         self.invalidate_circuit();
     }
 
@@ -499,6 +519,7 @@ impl Backend for EGraph {
     fn free_rule(&mut self, id: RuleId) {
         if let Some(slot) = self.rules.get_mut(id.rep() as usize) {
             *slot = None;
+            self.seen.remove(&(id.rep() as usize));
             self.invalidate_circuit();
         }
     }

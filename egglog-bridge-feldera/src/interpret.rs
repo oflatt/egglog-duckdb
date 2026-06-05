@@ -1,14 +1,14 @@
-//! Host-side rule interpreter for the Feldera backend (Milestone 3).
+//! Host-side rule interpreter for the Feldera backend (Milestones 3–5).
 //!
 //! One `run_rules` call = **one bounded egglog iteration**. The interpreter:
 //!
 //! 1. snapshots the relation mirror (the read view for this iteration — all
 //!    rules see the same pre-iteration state, matching egglog's semi-naive
 //!    "match against the old database, then apply" model for a single hop);
-//! 2. for each rule, runs a **nested-loop join** over the body's table atoms,
-//!    threading a variable→value binding environment, evaluating primitive body
-//!    atoms (`BodyOp::Prim`) against the embedded `Database` (guards prune,
-//!    bindings extend);
+//! 2. for each rule, runs a **seminaive join** over the body's table atoms (see
+//!    "Seminaive incrementality" below), threading a variable→value binding
+//!    environment, evaluating primitive body atoms (`BodyOp::Prim`) against the
+//!    embedded `Database` (guards prune, bindings extend);
 //! 3. for every surviving binding, executes the head ops in order — `set` /
 //!    `delete` / `subsume` writes, RHS `lookup` (eq-sort constructor: create on
 //!    miss), RHS primitive `call` (with side effects + result binding),
@@ -19,6 +19,32 @@
 //! Primitives are invoked through `Database::with_execution_state`, so they see
 //! the same interned base `Value`s the frontend created — giving the Feldera
 //! backend bit-for-bit value parity with the reference backend.
+//!
+//! ## Seminaive incrementality (Milestone 5 — the headline result)
+//!
+//! Each iteration fires a rule only on bindings that involve **at least one
+//! newly-derived fact** (the *delta*), exactly mirroring egglog's seminaive
+//! evaluation — and exactly the incremental view maintenance DBSP exists for. A
+//! rule that already fired on the existing facts does NOT re-fire, so a fixpoint
+//! (`changed == false`) is actually reached instead of oscillating forever
+//! against a cleanup rule.
+//!
+//! The delta of rule `r` over relation `f` is `read[f] \ seen[r][f]`, where
+//! `seen[r][f]` is the snapshot `r` has already matched (per-rule, see
+//! `EGraph::seen`). The body join is run as the standard seminaive union over
+//! atom positions:
+//!
+//! ```text
+//! Δbindings(r) = ⋃_j  A_1(full) ⋈ … ⋈ A_j(delta) ⋈ … ⋈ A_k(full)
+//! ```
+//!
+//! i.e. for each table-atom position `j`, atom `j` ranges over only the delta
+//! rows while the others range over the full relation; the union over `j` is the
+//! set of all bindings touching ≥1 new fact. After `r` has generated its
+//! bindings, `seen[r][f]` is advanced to the *start-of-iteration* snapshot
+//! (`read[f]`) — never the post-write mirror — so a row that is deleted and
+//! later re-added reappears in `r`'s delta and re-fires (load-bearing for
+//! rebuild's rule-driven retraction).
 
 use anyhow::{anyhow, Result};
 use egglog_backend_trait::{FunctionId, Value};
@@ -54,60 +80,55 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
     let mut writes: Vec<Write> = Vec::new();
     let mut touched: HashSet<FunctionId> = HashSet::new();
 
-    // Collect each rule's IR up front (clone to avoid borrow conflicts while we
-    // also mutate the db / mirror via lookups).
-    let rules: Vec<RuleIr> = rule_idxs
+    // Collect each rule's index + IR up front (clone to avoid borrow conflicts
+    // while we also mutate the db / mirror via lookups). The index lets us
+    // advance the per-rule seminaive `seen` snapshot after the rule fires.
+    let rules: Vec<(usize, RuleIr)> = rule_idxs
         .iter()
-        .filter_map(|&i| eg.rules.get(i).and_then(|r| r.clone()))
+        .filter_map(|&i| eg.rules.get(i).and_then(|r| r.clone()).map(|r| (i, r)))
         .collect();
 
-    for rule in &rules {
-        // --- DBSP-join path (Milestone 4) -------------------------------
-        // If the rule's body join is DBSP-eligible, run the relational join on
-        // DBSP's dataflow engine and evaluate only value-computing primitives +
-        // head actions on the host. Otherwise fall back to the host nested-loop
-        // interpreter (the oracle).
-        if let Some(plan) = dbsp_join::plan_join(eg, rule) {
-            let bindings = dbsp_join::run_join(eg, &plan)?;
-            eg.dbsp_rule_runs += 1;
-            let var_order = plan.var_order().to_vec();
-            for bind in bindings {
-                // Seed the env from the join's canonical binding row.
-                let mut env: Env = Env::new();
-                for (i, &v) in var_order.iter().enumerate() {
-                    env.insert(v, bind[i]);
-                }
-                // Re-run body primitives host-side over the join binding. Table
-                // atoms and `!=` guards were already handled by the DBSP join;
-                // value-computing prims (which bind fresh vars) and any other
-                // guards are evaluated here. Re-evaluating `!=` is harmless
-                // (it re-filters identically).
-                let mut envs: Vec<Env> = vec![env];
-                for op in &rule.body {
-                    if let BodyOp::Prim { .. } = op {
-                        envs = step_body(eg, &read, op, envs)?;
-                    }
-                }
-                for mut env in envs {
-                    apply_head(eg, &rule.head, &mut env, &mut writes, &mut touched)?;
-                }
-            }
-            continue;
+    for (idx, rule) in &rules {
+        // The relations this rule's body reads, and the seminaive delta of each
+        // (rows present now that this rule has not yet matched against).
+        let body_funcs: Vec<FunctionId> = rule
+            .body
+            .iter()
+            .filter_map(|op| match op {
+                BodyOp::Atom(a) => Some(a.func),
+                BodyOp::Prim { .. } => None,
+            })
+            .collect();
+        let delta: HashMap<FunctionId, HashSet<Row>> = body_funcs
+            .iter()
+            .map(|&f| {
+                let cur = read.get(&f).map(|v| v.as_slice()).unwrap_or(&[]);
+                let seen = eg.seen.get(idx).and_then(|m| m.get(&f));
+                let d: HashSet<Row> = cur
+                    .iter()
+                    .filter(|r| seen.map(|s| !s.contains(*r)).unwrap_or(true))
+                    .cloned()
+                    .collect();
+                (f, d)
+            })
+            .collect();
+
+        // The seminaive binding set: union over table-atom positions of the join
+        // with exactly that atom restricted to the delta. Each variant is run
+        // through the DBSP engine (if eligible) or the host nested-loop fallback.
+        let bindings = seminaive_bindings(eg, &read, &delta, rule)?;
+
+        for mut env in bindings {
+            apply_head(eg, &rule.head, &mut env, &mut writes, &mut touched)?;
         }
 
-        // --- Host interpreter fallback ----------------------------------
-        eg.host_rule_runs += 1;
-        // Enumerate all body matches as a list of binding environments.
-        let mut envs: Vec<Env> = vec![Env::new()];
-        for op in &rule.body {
-            envs = step_body(eg, &read, op, envs)?;
-            if envs.is_empty() {
-                break;
-            }
-        }
-        // Apply the head for each surviving binding.
-        for mut env in envs {
-            apply_head(eg, &rule.head, &mut env, &mut writes, &mut touched)?;
+        // Advance this rule's seen snapshot to the start-of-iteration read view
+        // (NOT the post-write mirror): the rule has now matched everything
+        // currently present. A row deleted+readded later reappears in the delta.
+        let entry = eg.seen.entry(*idx).or_default();
+        for &f in &body_funcs {
+            let cur = read.get(&f).cloned().unwrap_or_default();
+            entry.insert(f, cur.into_iter().collect());
         }
     }
 
@@ -173,60 +194,7 @@ fn step_body(
     match op {
         BodyOp::Atom(atom) => {
             let rows = read.get(&atom.func).map(|v| v.as_slice()).unwrap_or(&[]);
-            // Determine the JOIN KEY: columns whose slot is a variable that is
-            // already bound in the incoming envs (so the same var must agree
-            // between the env and the row). If non-empty, hash-join on it
-            // instead of a full cartesian scan. (Const-slot columns are
-            // constraints, applied during `match_atom` regardless.)
-            let bound_in_env = |v: u32| envs.first().map(|e| e.contains_key(&v)).unwrap_or(false);
-            let key_cols: Vec<usize> = atom
-                .slots
-                .iter()
-                .enumerate()
-                .filter_map(|(i, s)| match s {
-                    Slot::Var(v) if bound_in_env(*v) => Some(i),
-                    _ => None,
-                })
-                .collect();
-            // Which env var supplies each key column.
-            let key_vars: Vec<u32> = key_cols
-                .iter()
-                .map(|&i| match &atom.slots[i] {
-                    Slot::Var(v) => *v,
-                    _ => unreachable!(),
-                })
-                .collect();
-
-            let mut out = Vec::new();
-            if key_cols.is_empty() {
-                // No shared bound variable: cartesian (correct for the first
-                // atom / a fresh body).
-                for env in &envs {
-                    for row in rows {
-                        if let Some(next) = match_atom(&atom.slots, row, env) {
-                            out.push(next);
-                        }
-                    }
-                }
-            } else {
-                // Index rows by the key columns, then probe per env.
-                let mut index: HashMap<Vec<u32>, Vec<&Row>> = HashMap::new();
-                for row in rows {
-                    let key: Vec<u32> = key_cols.iter().map(|&i| row[i]).collect();
-                    index.entry(key).or_default().push(row);
-                }
-                for env in &envs {
-                    let key: Vec<u32> = key_vars.iter().map(|v| env[v]).collect();
-                    if let Some(cands) = index.get(&key) {
-                        for row in cands {
-                            if let Some(next) = match_atom(&atom.slots, row, env) {
-                                out.push(next);
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(out)
+            Ok(step_atom(&atom.slots, rows, envs))
         }
         BodyOp::Prim { id, args, ret } => {
             let mut out = Vec::new();
@@ -265,6 +233,200 @@ fn step_body(
             Ok(out)
         }
     }
+}
+
+/// Join a table atom (given by its `slots`) against an explicit `rows` set,
+/// extending each incoming env. Hash-joins on already-bound shared columns when
+/// possible, otherwise scans. This is the core of both the full-relation match
+/// (`step_body`) and the seminaive delta match (`seminaive_bindings`).
+fn step_atom(slots: &[Slot], rows: &[Row], envs: Vec<Env>) -> Vec<Env> {
+    // JOIN KEY: columns whose slot is a variable already bound in the incoming
+    // envs. If non-empty, hash-join on it instead of a full cartesian scan.
+    let bound_in_env = |v: u32| envs.first().map(|e| e.contains_key(&v)).unwrap_or(false);
+    let key_cols: Vec<usize> = slots
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| match s {
+            Slot::Var(v) if bound_in_env(*v) => Some(i),
+            _ => None,
+        })
+        .collect();
+    let key_vars: Vec<u32> = key_cols
+        .iter()
+        .map(|&i| match &slots[i] {
+            Slot::Var(v) => *v,
+            _ => unreachable!(),
+        })
+        .collect();
+
+    let mut out = Vec::new();
+    if key_cols.is_empty() {
+        // No shared bound variable: cartesian (correct for the first atom).
+        for env in &envs {
+            for row in rows {
+                if let Some(next) = match_atom(slots, row, env) {
+                    out.push(next);
+                }
+            }
+        }
+    } else {
+        // Index rows by the key columns, then probe per env.
+        let mut index: HashMap<Vec<u32>, Vec<&Row>> = HashMap::new();
+        for row in rows {
+            let key: Vec<u32> = key_cols.iter().map(|&i| row[i]).collect();
+            index.entry(key).or_default().push(row);
+        }
+        for env in &envs {
+            let key: Vec<u32> = key_vars.iter().map(|v| env[v]).collect();
+            if let Some(cands) = index.get(&key) {
+                for row in cands {
+                    if let Some(next) = match_atom(slots, row, env) {
+                        out.push(next);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Compute the **seminaive** binding set for one rule: the union, over each
+/// table-atom position `j`, of the body join with atom `j` restricted to its
+/// relation's *delta* (rows new to this rule) and every other atom ranging over
+/// the full relation. The union is exactly the set of bindings touching at
+/// least one newly-derived fact — egglog's seminaive semantics, and DBSP's
+/// incremental view maintenance.
+///
+/// Each delta-atom variant is run through the DBSP dataflow engine when the
+/// rule is DBSP-eligible (`dbsp_join`), otherwise through the host nested-loop
+/// fallback (the oracle). Body primitives (`!=` guards, value-computing prims)
+/// are applied host-side over the produced bindings. Bindings are deduplicated
+/// across the `j`-variants (a binding with new facts in two positions appears
+/// in two variants).
+fn seminaive_bindings(
+    eg: &mut EGraph,
+    read: &HashMap<FunctionId, Vec<Row>>,
+    delta: &HashMap<FunctionId, HashSet<Row>>,
+    rule: &RuleIr,
+) -> Result<Vec<Env>> {
+    // Positions of the table atoms within the body op list.
+    let atom_positions: Vec<usize> = rule
+        .body
+        .iter()
+        .enumerate()
+        .filter_map(|(i, op)| matches!(op, BodyOp::Atom(_)).then_some(i))
+        .collect();
+
+    if atom_positions.is_empty() {
+        // Prim-only / constant body: no table atoms to delta over. There is no
+        // notion of "new fact" here; evaluate it once (it is bounded and
+        // idempotent — these bodies are rare and not on the saturation hot path).
+        let mut envs: Vec<Env> = vec![Env::new()];
+        for op in &rule.body {
+            envs = step_body(eg, read, op, envs)?;
+            if envs.is_empty() {
+                break;
+            }
+        }
+        return Ok(envs);
+    }
+
+    // If NO body relation has any delta rows, the rule cannot produce a new
+    // binding this iteration — skip it entirely (the seminaive win).
+    let any_delta = atom_positions.iter().any(|&p| {
+        if let BodyOp::Atom(a) = &rule.body[p] {
+            delta.get(&a.func).map(|d| !d.is_empty()).unwrap_or(false)
+        } else {
+            false
+        }
+    });
+    if !any_delta {
+        return Ok(Vec::new());
+    }
+
+    // Try the DBSP-eligible whole-body join once per delta-atom variant.
+    let plan = dbsp_join::plan_join(eg, rule);
+
+    let mut seen_bindings: HashSet<Vec<(u32, u32)>> = HashSet::new();
+    let mut out: Vec<Env> = Vec::new();
+
+    for (atom_ord, &delta_pos) in atom_positions.iter().enumerate() {
+        // Skip a variant whose delta atom has no new rows (it contributes
+        // nothing and would just rescan the full relation pointlessly).
+        let delta_func = match &rule.body[delta_pos] {
+            BodyOp::Atom(a) => a.func,
+            _ => unreachable!(),
+        };
+        if delta.get(&delta_func).map(|d| d.is_empty()).unwrap_or(true) {
+            continue;
+        }
+
+        let variant_envs = if let Some(plan) = &plan {
+            // DBSP path: run the relational join with this atom occurrence fed
+            // the delta rows and the others the full relation. `atom_ord` is the
+            // occurrence's index within the plan's atom list (plan atoms are in
+            // body order, matching `atom_positions`).
+            eg.dbsp_rule_runs += 1;
+            let bindings = dbsp_join::run_join_seminaive(eg, plan, atom_ord, delta)?;
+            let var_order = plan.var_order().to_vec();
+            let mut envs: Vec<Env> = Vec::new();
+            for bind in bindings {
+                let mut env: Env = Env::new();
+                for (i, &v) in var_order.iter().enumerate() {
+                    env.insert(v, bind[i]);
+                }
+                // Re-run body primitives host-side (value-computing prims bind
+                // fresh vars; `!=` re-filters identically). Table atoms / `!=`
+                // were already handled inside the DBSP join.
+                let mut es: Vec<Env> = vec![env];
+                for op in &rule.body {
+                    if let BodyOp::Prim { .. } = op {
+                        es = step_body(eg, read, op, es)?;
+                    }
+                }
+                envs.extend(es);
+            }
+            envs
+        } else {
+            // Host fallback: nested-loop body scan where the atom at
+            // `delta_pos` ranges over the delta rows, all others over `read`.
+            eg.host_rule_runs += 1;
+            let mut envs: Vec<Env> = vec![Env::new()];
+            for (pos, op) in rule.body.iter().enumerate() {
+                match op {
+                    BodyOp::Atom(atom) => {
+                        let rows: Vec<Row> = if pos == delta_pos {
+                            delta
+                                .get(&atom.func)
+                                .map(|d| d.iter().cloned().collect())
+                                .unwrap_or_default()
+                        } else {
+                            read.get(&atom.func).cloned().unwrap_or_default()
+                        };
+                        envs = step_atom(&atom.slots, &rows, envs);
+                    }
+                    BodyOp::Prim { .. } => {
+                        envs = step_body(eg, read, op, envs)?;
+                    }
+                }
+                if envs.is_empty() {
+                    break;
+                }
+            }
+            envs
+        };
+
+        // Deduplicate across the delta-position variants.
+        for env in variant_envs {
+            let mut key: Vec<(u32, u32)> = env.iter().map(|(&k, &v)| (k, v)).collect();
+            key.sort_unstable();
+            if seen_bindings.insert(key) {
+                out.push(env);
+            }
+        }
+    }
+
+    Ok(out)
 }
 
 /// Try to unify `slots` with `row` under `env`. Returns the extended env on

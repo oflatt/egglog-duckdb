@@ -213,46 +213,60 @@ struct RelHandles {
     input: ZSetHandle<RelRow>,
 }
 
-/// Run the body join of `plan` on DBSP over the current mirror, returning one
-/// binding row per satisfying assignment. Each returned `Vec<u32>` has length
-/// `plan.n_vars()` and is indexed by the canonical variable order.
-///
-/// This builds a fresh non-recursive circuit, pushes the current mirror as the
-/// circuit input, runs exactly one `transaction()` (one round), reads the
-/// consolidated join output, and drops the circuit. Building per call keeps the
-/// DBSP join a pure function of the current relation contents (the
-/// per-iteration model) without per-subset circuit-cache bookkeeping.
+/// Run the body join of `plan` on DBSP over the current mirror (full relations
+/// in every atom occurrence), returning one binding row per satisfying
+/// assignment. Retained for the M4 non-incremental proof; the seminaive driver
+/// uses [`run_join_seminaive`].
 pub fn run_join(eg: &EGraph, plan: &JoinPlan) -> Result<Vec<Vec<u32>>> {
-    // The set of distinct relations referenced by the body atoms.
-    let rel_ids: Vec<FunctionId> = {
-        let mut seen = HashSet::new();
-        let mut v = Vec::new();
-        for a in &plan.atoms {
-            if seen.insert(a.func) {
-                v.push(a.func);
-            }
-        }
-        v
-    };
+    // No delta atom: every occurrence reads the full mirror.
+    run_join_with(eg, plan, None)
+}
 
-    // Snapshot each relation's rows (fixed-width, 0-padded) up front; the
-    // circuit-builder closure captures them by move.
-    let mut snapshot: HashMap<FunctionId, Vec<RelRow>> = HashMap::new();
-    for &f in &rel_ids {
-        let rows: Vec<RelRow> = eg
-            .mirror
-            .get(&f)
-            .map(|set| set.iter().map(|row| pack8(row)).collect())
-            .unwrap_or_default();
-        snapshot.insert(f, rows);
+/// Run the body join with **one atom occurrence restricted to its relation's
+/// delta** and every other occurrence over the full relation — one term of the
+/// seminaive union (see `interpret::seminaive_bindings`). `delta_atom_ord` is
+/// the occurrence's index within `plan.atoms` (plan atoms are in body order).
+pub fn run_join_seminaive(
+    eg: &EGraph,
+    plan: &JoinPlan,
+    delta_atom_ord: usize,
+    delta: &HashMap<FunctionId, HashSet<crate::compile::Row>>,
+) -> Result<Vec<Vec<u32>>> {
+    run_join_with(eg, plan, Some((delta_atom_ord, delta)))
+}
+
+/// Core join runner. Builds a fresh non-recursive circuit with **one input
+/// stream per atom occurrence** (so the same relation appearing in multiple
+/// atoms can be fed different row sets — full vs. delta — for seminaive), pushes
+/// each occurrence's rows, runs one `transaction()`, and reads the consolidated
+/// binding rows. When `delta` is `Some((ord, d))`, occurrence `ord` is fed
+/// `d[func]` (its delta) and all others the full mirror.
+fn run_join_with(
+    eg: &EGraph,
+    plan: &JoinPlan,
+    delta: Option<(usize, &HashMap<FunctionId, HashSet<crate::compile::Row>>)>,
+) -> Result<Vec<Vec<u32>>> {
+    let n_atoms = plan.atoms.len();
+
+    // Snapshot the rows feeding each atom occurrence (fixed-width, 0-padded).
+    let mut snapshot: Vec<Vec<RelRow>> = Vec::with_capacity(n_atoms);
+    for (ord, a) in plan.atoms.iter().enumerate() {
+        let rows: Vec<RelRow> = match delta {
+            Some((delta_ord, d)) if delta_ord == ord => d
+                .get(&a.func)
+                .map(|set| set.iter().map(|row| pack8(row)).collect())
+                .unwrap_or_default(),
+            _ => eg
+                .mirror
+                .get(&a.func)
+                .map(|set| set.iter().map(|row| pack8(row)).collect())
+                .unwrap_or_default(),
+        };
+        snapshot.push(rows);
     }
 
     // Clone the plan pieces the circuit closure needs (it must be `'static`).
-    let atoms: Vec<(FunctionId, Vec<Slot>)> = plan
-        .atoms
-        .iter()
-        .map(|a| (a.func, a.slots.clone()))
-        .collect();
+    let atoms: Vec<Vec<Slot>> = plan.atoms.iter().map(|a| a.slots.clone()).collect();
     let var_col = plan.var_col.clone();
     let neq = plan
         .neq
@@ -260,26 +274,24 @@ pub fn run_join(eg: &EGraph, plan: &JoinPlan) -> Result<Vec<Vec<u32>>> {
         .map(|g| (g.a.clone(), g.b.clone()))
         .collect::<Vec<_>>();
     let n_vars = plan.var_order.len();
-    let rel_ids_c = rel_ids.clone();
 
-    let (handle, (mut inputs, output)) = RootCircuit::build(move |root| {
-        let mut inputs: HashMap<FunctionId, RelHandles> = HashMap::new();
-        let mut streams: HashMap<FunctionId, Stream<RootCircuit, OrdZSet<RelRow>>> = HashMap::new();
-        for &f in &rel_ids_c {
+    let (handle, (inputs, output)) = RootCircuit::build(move |root| {
+        let mut inputs: Vec<RelHandles> = Vec::with_capacity(n_atoms);
+        let mut streams: Vec<Stream<RootCircuit, OrdZSet<RelRow>>> = Vec::with_capacity(n_atoms);
+        for _ in 0..n_atoms {
             let (stream, input) = root.add_input_zset::<RelRow>();
-            inputs.insert(f, RelHandles { input });
-            streams.insert(f, stream);
+            inputs.push(RelHandles { input });
+            streams.push(stream);
         }
 
         let out = build_join_stream(&streams, &atoms, &var_col, &neq, n_vars)?;
         Ok((inputs, out.output()))
     })?;
 
-    // Push each relation's snapshot as the circuit input delta (all +1).
-    for &f in &rel_ids {
-        let h = inputs.get_mut(&f).expect("relation handle");
-        for row in &snapshot[&f] {
-            h.input.push(*row, 1);
+    // Push each occurrence's snapshot as the circuit input delta (all +1).
+    for (ord, rows) in snapshot.iter().enumerate() {
+        for row in rows {
+            inputs[ord].input.push(*row, 1);
         }
     }
 
@@ -305,8 +317,8 @@ pub fn run_join(eg: &EGraph, plan: &JoinPlan) -> Result<Vec<Vec<u32>>> {
 /// binding row carries all canonical variables bound so far (others 0). `!=`
 /// guards are applied as `filter`s as soon as both operands are bound.
 fn build_join_stream(
-    streams: &HashMap<FunctionId, Stream<RootCircuit, OrdZSet<RelRow>>>,
-    atoms: &[(FunctionId, Vec<Slot>)],
+    streams: &[Stream<RootCircuit, OrdZSet<RelRow>>],
+    atoms: &[Vec<Slot>],
     var_col: &HashMap<u32, usize>,
     neq: &[(Slot, Slot)],
     n_vars: usize,
@@ -315,10 +327,10 @@ fn build_join_stream(
     let mut bound: Vec<bool> = vec![false; n_vars];
 
     // Initialize from the first atom: map each row to a binding row.
-    let (f0, slots0) = &atoms[0];
+    let slots0 = &atoms[0];
     let s0 = streams
-        .get(f0)
-        .ok_or_else(|| anyhow!("join atom references unregistered relation"))?
+        .first()
+        .ok_or_else(|| anyhow!("join has no atoms"))?
         .clone();
     let vc0 = var_col.clone();
     let slots0c = slots0.clone();
@@ -333,11 +345,8 @@ fn build_join_stream(
     cur = apply_neq(cur, neq, var_col, &bound);
 
     // Join successive atoms.
-    for (f, slots) in &atoms[1..] {
-        let s = streams
-            .get(f)
-            .ok_or_else(|| anyhow!("join atom references unregistered relation"))?
-            .clone();
+    for (i, slots) in atoms.iter().enumerate().skip(1) {
+        let s = streams[i].clone();
 
         // Shared variables = atom variables already bound.
         let shared: Vec<u32> = atom_vars(slots)
