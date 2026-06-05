@@ -986,6 +986,7 @@ dependencies = [
  "egglog-backend-trait",
  "egglog-bridge",
  "egglog-bridge-duckdb",
+ "egglog-bridge-flowlog",
  "egglog-core-relations",
  "egglog-numeric-id",
  "egglog-reports",

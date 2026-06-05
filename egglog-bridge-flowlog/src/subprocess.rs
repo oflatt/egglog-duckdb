@@ -138,8 +138,55 @@ impl DriverHandle {
         })
     }
 
+    /// Build the driver for a generalized join: a `.dl` and a matching driver
+    /// `main.rs` are supplied directly (the dd-join path's flexible-arity,
+    /// multi-relation protocol), keyed by the hash of `dl ++ main_rs` so each
+    /// distinct join shape compiles once and is reused.
+    pub fn build_or_cached_with(dl: &str, main_rs: &str) -> Result<Self> {
+        let root = cache_root();
+        std::fs::create_dir_all(&root)
+            .with_context(|| format!("creating cache root {}", root.display()))?;
+
+        let combined = format!("{dl}\n//---main---\n{main_rs}");
+        let hash = hash_dl(&combined);
+        let crate_dir = root.join(&hash);
+        let binary = crate_dir.join("target").join("release").join("driver");
+
+        if binary.exists() {
+            let _ = std::fs::write(crate_dir.join(".touch"), hash.as_bytes());
+            prune_cache(&root, &crate_dir);
+            return Ok(DriverHandle {
+                binary,
+                child: None,
+                stdin: None,
+                stdout: None,
+            });
+        }
+
+        Self::materialize_crate_with(&crate_dir, dl, main_rs)?;
+        Self::cargo_build(&crate_dir)?;
+        if !binary.exists() {
+            return Err(anyhow!(
+                "driver build reported success but binary {} is missing",
+                binary.display()
+            ));
+        }
+        prune_cache(&root, &crate_dir);
+        Ok(DriverHandle {
+            binary,
+            child: None,
+            stdin: None,
+            stdout: None,
+        })
+    }
+
     /// Write the driver crate's files to `crate_dir`.
     fn materialize_crate(crate_dir: &Path, dl: &str) -> Result<()> {
+        Self::materialize_crate_with(crate_dir, dl, &codegen::emit_main_rs())
+    }
+
+    /// Write the driver crate's files with an explicit `main.rs`.
+    fn materialize_crate_with(crate_dir: &Path, dl: &str, main_rs: &str) -> Result<()> {
         let src = crate_dir.join("src");
         std::fs::create_dir_all(&src).with_context(|| format!("creating {}", src.display()))?;
         std::fs::write(
@@ -148,7 +195,7 @@ impl DriverHandle {
         )?;
         std::fs::write(crate_dir.join("build.rs"), codegen::emit_build_rs())?;
         std::fs::write(crate_dir.join("program.dl"), dl)?;
-        std::fs::write(src.join("main.rs"), codegen::emit_main_rs())?;
+        std::fs::write(src.join("main.rs"), main_rs)?;
         Ok(())
     }
 
@@ -215,6 +262,78 @@ impl DriverHandle {
     #[allow(dead_code)]
     pub fn remove(&mut self, rel: &str, a: i32, b: i32) -> Result<()> {
         self.send(&format!("remove {rel} {a} {b}"))
+    }
+
+    /// Send `clear` and wait for the `ok` reply: reset the dd-join engine's
+    /// staged relations to empty before re-staging the next iteration's read
+    /// view (the non-recursive join is recomputed from scratch each call).
+    pub fn send_clear(&mut self) -> Result<()> {
+        self.send("clear")?;
+        let stdout = self
+            .stdout
+            .as_mut()
+            .ok_or_else(|| anyhow!("driver not spawned"))?;
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            let n = stdout.read_line(&mut buf)?;
+            if n == 0 {
+                return Err(anyhow!("driver closed pipe before `ok` (clear)"));
+            }
+            let line = buf.trim();
+            if line == "ok" {
+                break;
+            }
+            if let Some(err) = line.strip_prefix("err ") {
+                return Err(anyhow!("driver error: {err}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Stage an `ins <rel_idx> <c0> <c1> ...` delta for the generalized
+    /// dd-join protocol (arbitrary-arity row into relation `rel_idx`).
+    pub fn insert_row(&mut self, rel_idx: usize, cols: &[i32]) -> Result<()> {
+        let mut line = format!("ins {rel_idx}");
+        for c in cols {
+            line.push(' ');
+            line.push_str(&c.to_string());
+        }
+        self.send(&line)
+    }
+
+    /// `commit` one epoch for the generalized dd-join protocol; read back
+    /// `row <c0> <c1> ...` lines (one per join binding) until the terminating
+    /// `ok`. Returns the binding rows as `Vec<Vec<i32>>`.
+    pub fn commit_rows(&mut self) -> Result<Vec<Vec<i32>>> {
+        self.send("commit")?;
+        let stdout = self
+            .stdout
+            .as_mut()
+            .ok_or_else(|| anyhow!("driver not spawned"))?;
+        let mut rows = Vec::new();
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            let n = stdout.read_line(&mut buf)?;
+            if n == 0 {
+                return Err(anyhow!("driver closed pipe before `ok`"));
+            }
+            let line = buf.trim();
+            if line == "ok" {
+                break;
+            }
+            if let Some(rest) = line.strip_prefix("row ") {
+                let cols: Vec<i32> = rest
+                    .split_whitespace()
+                    .filter_map(|t| t.parse::<i32>().ok())
+                    .collect();
+                rows.push(cols);
+            } else if let Some(err) = line.strip_prefix("err ") {
+                return Err(anyhow!("driver error: {err}"));
+            }
+        }
+        Ok(rows)
     }
 
     /// `commit` one epoch; read back `delta <rel> <x> <z> <diff>` lines until

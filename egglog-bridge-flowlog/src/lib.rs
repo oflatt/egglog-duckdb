@@ -40,7 +40,7 @@ use std::any::Any;
 
 use anyhow::Result;
 use egglog_backend_trait::{
-    Backend, BaseValueId, BaseValuePool, ColumnTy, ContainerPool, DefaultVal, ExternalFunction,
+    Backend, BaseValueId, BaseValuePool, ColumnTy, ContainerPool, ExternalFunction,
     ExternalFunctionId, FunctionConfig, FunctionId, FunctionRow, IterationReport, MergeFn,
     QueryEntry, ReportLevel, RuleBuilderOps, RuleId, Value,
 };
@@ -51,14 +51,17 @@ use hashbrown::{HashMap, HashSet};
 mod base_values;
 pub mod codegen;
 pub mod compile;
+pub mod dd_join;
 mod engine;
 mod external_func;
+pub mod interpret;
 mod rule_builder;
 pub mod subprocess;
 
 use base_values::base_values_as_pool_mut;
 use compile::{pack_row, row_col, unpack_row, BodyOp, HeadOp, MergeMode, Row, RuleIr, Slot};
 use external_func::ExternalFuncRegistry;
+use subprocess::DriverHandle;
 
 // ---------------------------------------------------------------------------
 // Container pool stub (milestone 1 has no containers; mirror DuckDB/Feldera)
@@ -98,16 +101,16 @@ impl ContainerPool for FlowlogContainerPool {
 // ---------------------------------------------------------------------------
 
 /// What we remember about each registered relation/function.
-struct RelationInfo {
+pub(crate) struct RelationInfo {
     #[allow(dead_code)]
     name: String,
     /// Number of columns (including the output column for functions).
-    arity: usize,
+    pub(crate) arity: usize,
     /// True for functions/constructors that have an output column.
-    has_output: bool,
-    /// How functional-dependency conflicts are resolved (M2+; recognized now).
     #[allow(dead_code)]
-    merge: MergeMode,
+    has_output: bool,
+    /// How functional-dependency conflicts are resolved.
+    pub(crate) merge: MergeMode,
 }
 
 // ---------------------------------------------------------------------------
@@ -117,22 +120,29 @@ struct RelationInfo {
 /// How `run_rules` executes the recognized step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecMode {
-    /// M1: drive a build-time-fixed in-process flowlog engine.
+    /// M1: drive a build-time-fixed in-process flowlog engine (recognized
+    /// transitive-closure step only; used by `run_n_proof`).
     InProcess,
-    /// M2: translate the runtime rule to `.dl`, compile a driver crate
-    /// (cached by rule-set hash), and drive it as a subprocess over a pipe.
+    /// M2: translate the recognized step to `.dl`, compile a driver crate
+    /// (cached by rule-set hash), and drive it as a subprocess over a pipe
+    /// (used by `run_n_shellout_proof`).
     ShellOut,
+    /// M3 (the frontend default): the host-side ordered-IR interpreter runs
+    /// general multi-atom bodies + primitives + head actions, and routes
+    /// DD-eligible table-atom joins onto the Differential-Dataflow engine (the
+    /// subprocess) when `dd_enabled`. This is what real `.egg` files run on.
+    Interpret,
 }
 
 /// The FlowLog-backed egraph.
 pub struct EGraph {
     relations: Vec<RelationInfo>,
     /// Rule slots; `None` = freed.
-    rules: Vec<Option<RuleIr>>,
+    pub(crate) rules: Vec<Option<RuleIr>>,
     /// Rust-side materialized mirror: the accumulated contents of each
     /// relation, kept in sync with the flowlog engine's per-epoch `commit()`
     /// deltas. This is what `for_each` / `lookup_id` / `table_size` read.
-    mirror: HashMap<FunctionId, HashSet<Row>>,
+    pub(crate) mirror: HashMap<FunctionId, HashSet<Row>>,
     /// The live, in-process flowlog-rs `DatalogIncrementalEngine`, wrapped so
     /// the trait code stays free of the generated-symbol details. `None` until
     /// the first transitive-closure-step `run_rules`, which is where we know
@@ -155,8 +165,32 @@ pub struct EGraph {
     container_pool: FlowlogContainerPool,
     pub(crate) external_funcs: ExternalFuncRegistry,
     /// Monotonic fresh-id counter for `fresh_id` / `add_term`.
-    next_id: u32,
+    pub(crate) next_id: u32,
     report_level: ReportLevel,
+    /// Whether the relational table-atom join runs on the Differential-Dataflow
+    /// engine (`interpret`'s DD branch). Default `false`: the host interpreter
+    /// (the oracle) runs the join, which is fast and disk-free across the whole
+    /// `.egg` survey. Set via [`EGraph::enable_dd_join`] (or `EGGLOG_FLOWLOG_DD=1`)
+    /// to route eligible joins onto DD — the milestone's "joins on DD" mandate,
+    /// proven in `tests/dd_join_proof.rs`.
+    pub(crate) dd_enabled: bool,
+    /// Warm dd-join driver subprocesses, keyed by the join `.dl` text (one per
+    /// distinct join shape, reused across iterations).
+    pub(crate) dd_drivers: HashMap<String, DriverHandle>,
+    /// Diagnostics: rule firings whose join ran on the DD engine.
+    pub(crate) dd_rule_runs: u64,
+    /// Diagnostics: rule firings that fell back to the host interpreter.
+    pub(crate) host_rule_runs: u64,
+    /// Per-rule seminaive state (Milestone 3 / mirrors Feldera M5): for each
+    /// rule index, the rows of each body relation that rule has ALREADY matched
+    /// against. The seminaive delta of rule `r` over relation `f` is
+    /// `mirror[f] \ seen[r][f]`; after `r` fires, `seen[r][f]` is advanced to
+    /// the START-OF-ITERATION snapshot (not the post-write mirror) so a
+    /// deleted-then-readded row reappears in the delta and the consuming rule
+    /// re-fires (the rebuild/retraction trap). Keyed by RULE (not globally):
+    /// rows produced by an earlier-scheduled ruleset must count as fresh to a
+    /// later ruleset's rules, which have never matched them.
+    pub(crate) seen: HashMap<usize, HashMap<FunctionId, HashSet<Row>>>,
 }
 
 impl Default for EGraph {
@@ -177,6 +211,15 @@ impl EGraph {
         Self::with_mode(ExecMode::ShellOut)
     }
 
+    /// Construct a fresh FlowLog-backed egraph driven by the M3 host-side
+    /// interpreter (general bodies + primitives + head actions; DD-eligible
+    /// table joins routed onto the Differential-Dataflow engine when
+    /// `dd_enabled`). This is the constructor the egglog frontend uses
+    /// (`EGraph::with_flowlog_backend`).
+    pub fn new_interpret() -> Self {
+        Self::with_mode(ExecMode::Interpret)
+    }
+
     /// Construct with an explicit execution mode.
     pub fn with_mode(mode: ExecMode) -> Self {
         EGraph {
@@ -193,10 +236,15 @@ impl EGraph {
             // Start at 1 so id 0 stays a "null"/padding sentinel.
             next_id: 1,
             report_level: ReportLevel::default(),
+            dd_enabled: std::env::var_os("EGGLOG_FLOWLOG_DD").is_some(),
+            dd_drivers: HashMap::new(),
+            dd_rule_runs: 0,
+            host_rule_runs: 0,
+            seen: HashMap::new(),
         }
     }
 
-    fn info(&self, f: FunctionId) -> &RelationInfo {
+    pub(crate) fn info(&self, f: FunctionId) -> &RelationInfo {
         self.relations
             .get(f.rep() as usize)
             .unwrap_or_else(|| panic!("FunctionId({}) not registered", f.rep()))
@@ -205,6 +253,101 @@ impl EGraph {
     /// Insert a single row into the Rust mirror.
     fn mirror_insert(&mut self, f: FunctionId, row: Row) {
         self.mirror.entry(f).or_default().insert(row);
+    }
+
+    /// Inherent accessor for the embedded [`BaseValues`] registry (the frontend
+    /// extraction path threads `&BaseValues` through `reconstruct_termdag_base`).
+    pub fn base_values_inner(&self) -> &egglog_core_relations::BaseValues {
+        self.db.base_values()
+    }
+
+    /// Enable routing of DD-eligible table-atom joins onto the
+    /// Differential-Dataflow engine (the subprocess shell-out). Off by default;
+    /// the host interpreter (the oracle) otherwise runs the join.
+    pub fn enable_dd_join(&mut self) {
+        self.dd_enabled = true;
+    }
+
+    /// Diagnostics: `(dd_rule_runs, host_rule_runs)` — the number of rule
+    /// firings whose table-atom join ran on the DD engine vs. fell back to the
+    /// host interpreter. Mirrors Feldera's `dbsp_join_stats`; lets a test assert
+    /// which fraction of joins genuinely ran on DD.
+    pub fn flowlog_join_stats(&self) -> (u64, u64) {
+        (self.dd_rule_runs, self.host_rule_runs)
+    }
+
+    /// The functional-dependency merge mode of a function (from `add_table`).
+    pub(crate) fn merge_mode(&self, f: FunctionId) -> MergeMode {
+        self.info(f).merge
+    }
+
+    /// Evaluate a primitive through the embedded `Database` (the base-value /
+    /// primitive engine). Both the host interpreter and the DD-join path's
+    /// host-side primitive tail call this, so `Value`s are bit-for-bit
+    /// identical to the reference backend. This is the inherent counterpart of
+    /// Feldera M4's `eval_prim` trait method — flowlog keeps it inherent to
+    /// preserve its zero-trait-change posture (no `egglog-backend-trait` edit).
+    pub(crate) fn eval_prim_internal(
+        &self,
+        id: ExternalFunctionId,
+        args: &[Value],
+    ) -> Option<Value> {
+        self.db
+            .with_execution_state(|st| st.call_external_func(id, args))
+    }
+
+    /// Allocate a fresh id (the interpreter's eq-sort constructor hash-cons uses
+    /// the same counter the trait's `fresh_id` advances).
+    pub(crate) fn fresh_id_internal(&mut self) -> u32 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    /// Resolve functional-dependency conflicts in a function's mirror set: for
+    /// each key (input columns) keep a single output column chosen by the merge
+    /// mode. Relations (whole-row key) are left untouched. Rows are folded in a
+    /// DETERMINISTIC (sorted) order so `Old`/`New` conflicts that arrive in the
+    /// SAME iteration resolve stably (otherwise `(saturate …)` could hang).
+    pub(crate) fn resolve_merge(&mut self, f: FunctionId) {
+        let arity = self.info(f).arity;
+        let merge = self.merge_mode(f);
+        if !matches!(merge, MergeMode::Old | MergeMode::New | MergeMode::Min) || arity == 0 {
+            return;
+        }
+        let Some(set) = self.mirror.get(&f) else {
+            return;
+        };
+        let inputs_len = arity - 1;
+        let mut rows: Vec<&Row> = set.iter().collect();
+        rows.sort();
+        let mut by_key: HashMap<Vec<u32>, u32> = HashMap::new();
+        for row in rows {
+            let key: Vec<u32> = (0..inputs_len).map(|i| row_col(row, i)).collect();
+            let out = row_col(row, inputs_len);
+            match by_key.entry(key) {
+                hashbrown::hash_map::Entry::Vacant(e) => {
+                    e.insert(out);
+                }
+                hashbrown::hash_map::Entry::Occupied(mut e) => {
+                    let cur = *e.get();
+                    let chosen = match merge {
+                        MergeMode::Old => cur,
+                        MergeMode::New => out,
+                        MergeMode::Min => cur.min(out),
+                        MergeMode::Relation => unreachable!(),
+                    };
+                    e.insert(chosen);
+                }
+            }
+        }
+        let mut resolved: HashSet<Row> = HashSet::new();
+        for (key, out) in by_key {
+            let mut full: Vec<u32> = key;
+            full.push(out);
+            resolved.insert(full.into_boxed_slice());
+        }
+        self.mirror.insert(f, resolved);
     }
 }
 
@@ -236,8 +379,24 @@ impl Backend for EGraph {
             arity,
             config.name
         );
-        let has_output =
-            arity > 0 && matches!(config.default, DefaultVal::FreshId | DefaultVal::Const(_));
+        // Relation vs function: a table is a **relation** (whole row is the key,
+        // no output column to merge) iff it is nullary OR its last column is
+        // `Unit` — the term encoder's view-table pattern
+        // `(function @XView (...) Unit :merge old)` AND ordinary relations.
+        // Otherwise the last column is a function OUTPUT, resolved by the merge
+        // mode. This mirrors the DuckDB/Feldera backends' Unit-detection — NOT
+        // `DefaultVal`, which is `Fail` for every custom function regardless of
+        // whether it has a real output column. (This is the fix that took the
+        // Feldera survey from 38 to 59 passing files.)
+        let output_is_unit = config.schema.last().is_some_and(|t| match t {
+            ColumnTy::Base(bv) => {
+                let bvs = self.db.base_values();
+                bvs.has_ty_by_id(std::any::TypeId::of::<()>())
+                    && *bv == bvs.get_ty_by_id(std::any::TypeId::of::<()>())
+            }
+            _ => false,
+        });
+        let has_output = arity > 0 && !output_is_unit;
         let merge = if !has_output {
             MergeMode::Relation
         } else {
@@ -366,6 +525,11 @@ impl Backend for EGraph {
         if let Some(set) = self.mirror.get_mut(&func) {
             set.clear();
         }
+        // Forget what every rule had matched in this table: a re-populated table
+        // must present its rows as fresh seminaive deltas.
+        for per_rel in self.seen.values_mut() {
+            per_rel.remove(&func);
+        }
     }
 
     fn base_values(&self) -> &egglog_core_relations::BaseValues {
@@ -394,6 +558,7 @@ impl Backend for EGraph {
     fn free_rule(&mut self, id: RuleId) {
         if let Some(slot) = self.rules.get_mut(id.rep() as usize) {
             *slot = None;
+            self.seen.remove(&(id.rep() as usize));
         }
     }
 
@@ -412,7 +577,10 @@ impl Backend for EGraph {
             return Ok(IterationReport::default());
         }
 
-        let changed = self.run_one_hop(&live)?;
+        let changed = match self.mode {
+            ExecMode::Interpret => interpret::run_iteration(self, &live)?,
+            ExecMode::InProcess | ExecMode::ShellOut => self.run_one_hop(&live)?,
+        };
 
         let mut report = IterationReport::default();
         report.rule_set_report.changed = changed;
@@ -576,6 +744,9 @@ impl EGraph {
         match self.mode {
             ExecMode::InProcess => self.run_one_hop_inprocess(live),
             ExecMode::ShellOut => self.run_one_hop_shellout(live),
+            ExecMode::Interpret => {
+                unreachable!("Interpret mode routes through interpret::run_iteration")
+            }
         }
     }
 

@@ -79,6 +79,16 @@ pub enum Slot {
     Const(u32),
 }
 
+/// Resolve a [`Slot`] to a concrete `u32` value: a constant resolves to itself,
+/// a variable resolves through `get` (the current binding env), or `None` if the
+/// variable is unbound.
+pub fn slot_lookup(s: &Slot, get: &dyn Fn(u32) -> Option<u32>) -> Option<u32> {
+    match s {
+        Slot::Var(v) => get(*v),
+        Slot::Const(c) => Some(*c),
+    }
+}
+
 impl Slot {
     pub fn from_entry(e: &QueryEntry) -> Self {
         use egglog_numeric_id::NumericId;
