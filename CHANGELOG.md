@@ -2,6 +2,7 @@
 
 ## [Unreleased] - ReleaseDate
 
+- **New experimental `egglog-bridge-flowlog` backend (Milestone 1).** A FlowLog (Differential-Dataflow / flowlog-rs)-backed executor behind the `egglog-backend-trait` `Backend` interface, proving bounded per-iteration `(run N)` stepping: one `run_rules` call drives one flowlog `commit()` (one transitive-closure hop) over a build-time-fixed non-recursive `.dl`, with a Rust-side materialized mirror folded from `commit()`'s per-epoch deltas. `(run 1)` vs `(run 3)` produce different bounded results matching the reference backend. Runtime `.dl`-rule installation (the FlowLog crux) is investigated and deferred to M2 — see `MILESTONE1.md`.
 - Report full source file paths in egglog span and error messages.
 - Fix seminaive matching after nested containers rebuild in place by propagating dirty container ids through parent containers.
 - Render nullary AST calls without a trailing space, e.g. (foo) instead of (foo ).

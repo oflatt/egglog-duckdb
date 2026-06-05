@@ -1,0 +1,36 @@
+[package]
+name = "egglog-bridge-flowlog"
+version.workspace = true
+# The flowlog-rs generated engine + its differential-dataflow / timely
+# dependencies are edition-2021 crates; the spike proved the embedding on 2021.
+# Keep this member on 2021 to match the proven spike configuration.
+edition = "2021"
+description = "FlowLog (Differential-Dataflow)-backed executor for egglog's resolved IR (milestone 1: bounded per-iteration (run N) stepping behind the Backend trait via flowlog-rs commit(); see ../PLAN.md, ../SPIKE_RESULTS.md)"
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1"
+egglog-backend-trait = { workspace = true }
+egglog-core-relations = { workspace = true }
+egglog-numeric-id = { workspace = true }
+hashbrown = { workspace = true }
+log = { workspace = true }
+dyn-clone = { workspace = true }
+# flowlog-runtime is linked into the build-time-generated incremental engine
+# (string interning, txn state, the differential-dataflow / timely re-exports
+# the generated `DatalogIncrementalEngine` relies on). Path-pinned to the local
+# flowlog-rs clone (workspace v0.4.0; runtime 0.2.2). See SPIKE_RESULTS.md.
+flowlog-runtime = { path = "/tmp/flowlog-main/crates/flowlog-runtime" }
+
+[build-dependencies]
+# flowlog-build compiles the bundled, build-time-FIXED `transitive_step.dl`
+# into a Rust module (incremental mode -> `DatalogIncrementalEngine`) that
+# `lib.rs` include!s. Milestone 1 uses a fixed `.dl`; runtime rule installation
+# (the FlowLog crux) is investigated in ../MILESTONE1.md and deferred to M2.
+flowlog-build = { path = "/tmp/flowlog-main/crates/flowlog-build" }
+
+[dev-dependencies]
+# The reference backend, used by the milestone-1 proof test to confirm the
+# FlowLog backend matches it round-for-round on the same program.
+egglog-bridge = { workspace = true }
