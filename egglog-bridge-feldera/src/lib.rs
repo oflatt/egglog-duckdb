@@ -108,6 +108,12 @@ struct RelationInfo {
     name: String,
     /// Number of columns (including the output column for functions).
     pub(crate) arity: usize,
+    /// The column types (one per column), used by `dbsp_join::plan_join` to
+    /// type-gate prim inlining: rep-arithmetic (`ordering-min/max`, `<`) is only
+    /// valid on `ColumnTy::Id` columns (rep IS the union-find id) and on bool
+    /// columns; on other base values the rep is an intern handle whose order
+    /// differs from the logical value.
+    pub(crate) schema: Vec<ColumnTy>,
     /// True for functions/constructors that have an output column.
     has_output: bool,
     /// How functional-dependency conflicts are resolved at flush time. For a
@@ -295,6 +301,24 @@ impl EGraph {
         self.relations
             .get(f.rep() as usize)
             .unwrap_or_else(|| panic!("FunctionId({}) not registered", f.rep()))
+    }
+
+    /// The type of column `col` of function `f`, if known. Used by
+    /// `dbsp_join::plan_join` to type-gate prim inlining (rep-arithmetic is only
+    /// valid on `Id` and bool columns).
+    pub(crate) fn col_ty(&self, f: FunctionId, col: usize) -> Option<ColumnTy> {
+        self.relations
+            .get(f.rep() as usize)
+            .and_then(|r| r.schema.get(col).copied())
+    }
+
+    /// The [`BaseValueId`] of the `bool` base type, if it has been registered.
+    /// Lets `dbsp_join::plan_join` recognize bool-typed columns (whose distinct
+    /// reps make equality / `bool-!=` / `or` rep-arithmetic valid).
+    pub(crate) fn bool_bvid(&self) -> Option<BaseValueId> {
+        let bvs = self.db.base_values();
+        bvs.has_ty_by_id(std::any::TypeId::of::<bool>())
+            .then(|| bvs.get_ty_by_id(std::any::TypeId::of::<bool>()))
     }
 
     /// Schema changed (relation/rule added/removed). No cached state to clear in
@@ -509,6 +533,7 @@ impl Backend for EGraph {
         self.relations.push(RelationInfo {
             name: config.name,
             arity,
+            schema: config.schema.clone(),
             has_output,
             merge,
         });

@@ -34,11 +34,14 @@
 //!   - its body has at least one table atom;
 //!   - every table atom has arity <= [`JOIN_WIDTH`];
 //!   - the rule's body uses <= [`JOIN_WIDTH`] distinct variables (binding row);
-//!   - its only body *primitives* are `!=` guards (recognized by name), which
-//!     lower to a pure-`u32`-inequality DBSP filter — every other body prim
-//!     (value-computing, ordering guards on typed base values) forces the
-//!     host fallback, because evaluating it needs the primitive engine the
-//!     DBSP closure cannot hold.
+//!   - its only body *primitives* are a recognized set of PURE prims (`!=`,
+//!     `bool-!=`, `or`, `guard`, `ordering-min/max`, recognized by name) whose
+//!     operands sit on rep-comparable columns (`Id` / bool). These are inlined
+//!     into the join — value prims as symbolic expressions, guards as DBSP
+//!     `filter`s — so the `@congruence` / `@rebuild_cleanup` rules run their
+//!     body join on-circuit. Any other body prim, or an inlinable prim touching
+//!     a non-rep-comparable base value (i64/f64/string intern handles), forces
+//!     the host fallback.
 //!
 //! Rules that are not eligible fall back to the host interpreter; `run_rules`
 //! reports the split so the milestone can characterize the frontier honestly.
@@ -46,7 +49,7 @@
 use anyhow::{anyhow, Result};
 use dbsp::utils::Tup10;
 use dbsp::{CircuitHandle, OrdZSet, OutputHandle, RootCircuit, Stream, ZSetHandle, ZWeight};
-use egglog_backend_trait::FunctionId;
+use egglog_backend_trait::{ColumnTy, FunctionId};
 use hashbrown::{HashMap, HashSet};
 
 use crate::compile::{BodyOp, RuleIr, Slot};
@@ -58,10 +61,7 @@ use crate::EGraph;
 /// distributivity rewrites peak at 9 distinct body variables) with one column of
 /// margin, at zero extra dependency cost (a wider custom row would need to pull
 /// in dbsp's full DBData derive stack — paste/rkyv/size_of/serde/derive_more —
-/// and re-pin them to dbsp 0.150). The rebuild/congruence/`@uf` rules are *not*
-/// rejected by this cap (they carry value-computing body prims — `ordering-max`,
-/// `next_ts`, `bool-!=`, ordering guards — and are rejected by the prim check in
-/// [`plan_join`]); widening the row does not make them DBSP-eligible.
+/// and re-pin them to dbsp 0.150).
 pub const JOIN_WIDTH: usize = 10;
 
 /// A fixed-width binding row flowing through the DBSP circuit: `bind[i]` is the
@@ -107,17 +107,94 @@ fn get_col(r: &BindRow, i: usize) -> u32 {
     }
 }
 
-/// The name the frontend records for the `!=` predicate (via `rename_prim`).
+// Names of the PURE prims that `plan_join` inlines into the persistent DBSP
+// join (Stage B). Recognition is by name only (no `@uf`/rebuild rule-name
+// recognition). See `set_external_func_name` for where these are registered.
+/// `!=` guard (pure `u32` inequality on the interned rep).
 const NEQ_NAME: &str = "!=";
+/// `bool-!=` value prim: produces the bool `a != b`.
+const BOOL_NE_NAME: &str = "bool-!=";
+/// `or` value prim: produces the disjunction of its bool operands.
+const OR_NAME: &str = "or";
+/// `guard` prim: prunes the match unless its bool operand is true.
+const GUARD_NAME: &str = "guard";
+/// `ordering-min` value prim: min of two reps.
+const ORD_MIN_NAME: &str = "ordering-min";
+/// `ordering-max` value prim: max of two reps.
+const ORD_MAX_NAME: &str = "ordering-max";
 
-/// A `!=` guard recognized in a rule body: the two operand slots.
-struct NeqGuard {
-    a: Slot,
-    b: Slot,
+/// A pure VALUE expression over a binding row, built from inlined value prims.
+/// Evaluates to a `u32` (an interned rep). Only constructed when every leaf is
+/// a binding-row column whose type makes rep-arithmetic provably correct (an
+/// `Id`/union-find column, or — for equality only — a bool column).
+#[derive(Clone, Debug)]
+enum PureExpr {
+    /// A binding-row column (an atom-bound variable).
+    Col(usize),
+    /// A literal rep.
+    Const(u32),
+    /// `ordering-min(a, b)` = numeric min of the two reps.
+    Min(Box<PureExpr>, Box<PureExpr>),
+    /// `ordering-max(a, b)` = numeric max of the two reps.
+    Max(Box<PureExpr>, Box<PureExpr>),
+}
+
+/// A pure BOOLEAN condition over a binding row, built from inlined guard/bool
+/// prims. Lowered to a DBSP `filter` once all its leaf columns are bound.
+#[derive(Clone, Debug)]
+enum Cond {
+    /// `a != b` on reps (from `!=` and `bool-!=`).
+    Ne(PureExpr, PureExpr),
+    /// `a == b` on reps (from an `(= (ordering-* a b) c)` assert).
+    Eq(PureExpr, PureExpr),
+    /// Disjunction (from `or`).
+    Or(Vec<Cond>),
+}
+
+impl PureExpr {
+    /// Evaluate against a binding row.
+    fn eval(&self, row: &BindRow) -> u32 {
+        match self {
+            PureExpr::Col(c) => get_col(row, *c),
+            PureExpr::Const(v) => *v,
+            PureExpr::Min(a, b) => a.eval(row).min(b.eval(row)),
+            PureExpr::Max(a, b) => a.eval(row).max(b.eval(row)),
+        }
+    }
+    /// Binding-row columns this expression reads.
+    fn cols(&self, out: &mut Vec<usize>) {
+        match self {
+            PureExpr::Col(c) => out.push(*c),
+            PureExpr::Const(_) => {}
+            PureExpr::Min(a, b) | PureExpr::Max(a, b) => {
+                a.cols(out);
+                b.cols(out);
+            }
+        }
+    }
+}
+
+impl Cond {
+    fn eval(&self, row: &BindRow) -> bool {
+        match self {
+            Cond::Ne(a, b) => a.eval(row) != b.eval(row),
+            Cond::Eq(a, b) => a.eval(row) == b.eval(row),
+            Cond::Or(cs) => cs.iter().any(|c| c.eval(row)),
+        }
+    }
+    fn cols(&self, out: &mut Vec<usize>) {
+        match self {
+            Cond::Ne(a, b) | Cond::Eq(a, b) => {
+                a.cols(out);
+                b.cols(out);
+            }
+            Cond::Or(cs) => cs.iter().for_each(|c| c.cols(out)),
+        }
+    }
 }
 
 /// The analysis of a DBSP-eligible rule body: canonical variable order, the
-/// table atoms, and the `!=` guards.
+/// table atoms, and the boolean guards inlined from pure body prims.
 pub struct JoinPlan {
     /// Canonical body-variable order: `var_order[i]` is the variable id placed
     /// at binding-row column `i`.
@@ -126,8 +203,9 @@ pub struct JoinPlan {
     var_col: HashMap<u32, usize>,
     /// The body table atoms (in emission order).
     atoms: Vec<AtomPlan>,
-    /// `!=` guards to apply as DBSP filters once both operands are bound.
-    neq: Vec<NeqGuard>,
+    /// Boolean guards inlined from the body's pure prims, applied as DBSP
+    /// `filter`s once every binding-row column they read is bound.
+    guards: Vec<Cond>,
 }
 
 /// One table atom in the plan.
@@ -153,24 +231,86 @@ impl JoinPlan {
 /// [`JoinPlan`]. Returns `None` (host fallback) when any eligibility condition
 /// fails.
 ///
-/// `allow_neq` controls whether a body `!=` guard keeps the rule eligible. The
-/// **persistent** circuit (`persistent_bindings`) drives the transaction
-/// lifecycle manually and is bit-exact for `!=`-guarded rules, so it passes
-/// `true`. The non-persistent seminaive path (`seminaive_bindings`,
-/// `run_join_seminaive`) is *not* bit-exact for `!=`-guarded rules (the UF /
-/// congruence guard rules then diverge from the host nested-loop), so it passes
-/// `false` and those rules stay on the correct host path. Rules whose bodies
-/// have no `!=` guard are unaffected either way.
-pub fn plan_join(eg: &EGraph, rule: &RuleIr, allow_neq: bool) -> Option<JoinPlan> {
+/// `allow_prims` controls whether a body PURE prim (`!=`, `bool-!=`, `or`,
+/// `guard`, `ordering-min/max`) keeps the rule eligible by being inlined into
+/// the join (Stage B). The **persistent** circuit (`persistent_bindings`)
+/// drives the transaction lifecycle manually and is bit-exact for these inlined
+/// prims, so it passes `true`; this is what makes the `@congruence` /
+/// `@rebuild_cleanup` rules DBSP-eligible. The non-persistent seminaive path
+/// (`seminaive_bindings`, `run_join_seminaive`) is *not* bit-exact for them, so
+/// it passes `false` and those rules stay on the correct host path. Rules whose
+/// bodies have no prims are unaffected either way.
+///
+/// ## Correctness gating (rep-arithmetic validity)
+///
+/// Inlined prim closures operate on the INTERNED `u32` rep, not the logical
+/// value. `ordering-min/max` and `<`/`==`/`!=` on the rep are only valid when
+/// the rep order/equality matches the logical one:
+///   - `ColumnTy::Id` columns: the rep IS the union-find id, so min/max = the
+///     leader choice and equality is identity — VALID.
+///   - bool columns: distinct logical values get distinct interned reps, so
+///     equality / `!=` are VALID (but ordering is meaningless — we never inline
+///     ordering on bool).
+///   - other base values (i64/f64/string): the rep is an intern HANDLE whose
+///     order ≠ value order — INVALID. Any prim instance touching such a column
+///     leaves the whole rule on the host (graceful fallback).
+pub fn plan_join(eg: &EGraph, rule: &RuleIr, allow_prims: bool) -> Option<JoinPlan> {
     let mut atoms: Vec<AtomPlan> = Vec::new();
-    let mut neq: Vec<NeqGuard> = Vec::new();
+    let mut guards: Vec<Cond> = Vec::new();
     let mut var_order: Vec<u32> = Vec::new();
     let mut var_col: HashMap<u32, usize> = HashMap::new();
+    // Whether each atom-bound variable's column supports rep-arithmetic for
+    // ordering/comparison (`Id` columns) and for equality (`Id` or bool). We
+    // only ever inline equality on bool, never ordering, so a single "is this
+    // rep-comparable" predicate per use site suffices; the prim handlers below
+    // check the exact operation.
+    // `var_kind[v]`: Some(true) = Id column (ordering+eq valid), Some(false) =
+    // bool column (eq valid, ordering not), None = some other base value.
+    let mut var_kind: HashMap<u32, bool> = HashMap::new();
+    // Symbolic definitions for prim-produced (not atom-bound) variables.
+    let mut pure_vals: HashMap<u32, PureExpr> = HashMap::new();
+    let mut pure_conds: HashMap<u32, Cond> = HashMap::new();
 
     let see_var = |v: u32, var_order: &mut Vec<u32>, var_col: &mut HashMap<u32, usize>| {
         if !var_col.contains_key(&v) {
             var_col.insert(v, var_order.len());
             var_order.push(v);
+        }
+    };
+
+    let bool_bvid = eg.bool_bvid();
+    // Classify a function column's type into the rep-arithmetic kind.
+    let col_kind = |f: FunctionId, col: usize| -> Option<bool> {
+        match eg.col_ty(f, col) {
+            Some(ColumnTy::Id) => Some(true),
+            Some(ColumnTy::Base(bv)) if Some(bv) == bool_bvid => Some(false),
+            _ => None,
+        }
+    };
+
+    // Resolve a prim-operand slot to a `PureExpr` value, or `None` if it cannot
+    // be safely inlined (unbound var, or a non-rep-comparable base value).
+    let val_of = |s: &Slot,
+                  pure_vals: &HashMap<u32, PureExpr>,
+                  var_col: &HashMap<u32, usize>,
+                  var_kind: &HashMap<u32, bool>,
+                  need_ordering: bool|
+     -> Option<PureExpr> {
+        match s {
+            Slot::Const(c) => Some(PureExpr::Const(*c)),
+            Slot::Var(v) => {
+                if let Some(e) = pure_vals.get(v) {
+                    return Some(e.clone());
+                }
+                let &col = var_col.get(v)?;
+                match var_kind.get(v) {
+                    // Id column: ordering + equality both valid.
+                    Some(true) => Some(PureExpr::Col(col)),
+                    // bool column: equality only (ordering meaningless).
+                    Some(false) if !need_ordering => Some(PureExpr::Col(col)),
+                    _ => None,
+                }
+            }
         }
     };
 
@@ -180,9 +320,15 @@ pub fn plan_join(eg: &EGraph, rule: &RuleIr, allow_neq: bool) -> Option<JoinPlan
                 if atom.slots.len() > JOIN_WIDTH {
                     return None; // atom too wide for the fixed row
                 }
-                for s in &atom.slots {
+                for (col, s) in atom.slots.iter().enumerate() {
                     if let Slot::Var(v) = s {
                         see_var(*v, &mut var_order, &mut var_col);
+                        // Record the column's rep-arithmetic kind. (If a var is
+                        // bound by several atoms, any Id occurrence wins — they
+                        // must agree by the type system anyway.)
+                        if let Some(k) = col_kind(atom.func, col) {
+                            var_kind.entry(*v).and_modify(|e| *e = *e || k).or_insert(k);
+                        }
                     }
                 }
                 atoms.push(AtomPlan {
@@ -191,34 +337,113 @@ pub fn plan_join(eg: &EGraph, rule: &RuleIr, allow_neq: bool) -> Option<JoinPlan
                 });
             }
             BodyOp::Prim { id, args, ret } => {
-                // Only `!=` guards are DBSP-eligible (pure u32 inequality). Any
-                // other body primitive needs the primitive engine inside the
-                // join, which a `Send + 'static` DBSP closure cannot hold.
-                if !allow_neq || eg.external_funcs.name(*id) != Some(NEQ_NAME) {
+                if !allow_prims {
                     return None;
                 }
-                // `!=` is encoded as `query_prim([a, b, ret_unit])`: two
-                // operands and a unit return slot. The operands must be
-                // variables already bound by a preceding atom, or constants.
-                if args.len() != 2 {
-                    return None;
-                }
-                // The return slot of `!=` is unit; it neither binds nor guards.
-                let _ = ret;
-                for s in args {
-                    if let Slot::Var(v) = s {
-                        // A `!=` over a variable not bound by any table atom is
-                        // not something the join can evaluate.
-                        if !var_col.contains_key(v) {
+                let name = eg.external_funcs.name(*id);
+                match name {
+                    Some(NEQ_NAME) | Some(BOOL_NE_NAME) => {
+                        // `a != b` on reps. `!=` returns unit (a guard); `bool-!=`
+                        // returns a bool the `or`/`guard` chain consumes.
+                        if args.len() != 2 {
+                            return None;
+                        }
+                        let a = val_of(&args[0], &pure_vals, &var_col, &var_kind, false)?;
+                        let b = val_of(&args[1], &pure_vals, &var_col, &var_kind, false)?;
+                        let cond = Cond::Ne(a, b);
+                        if name == Some(NEQ_NAME) {
+                            // Unit guard: prune unless a != b.
+                            guards.push(cond);
+                        } else if let Slot::Var(rv) = ret {
+                            // Bind the bool result symbolically for `or`/`guard`.
+                            pure_conds.insert(*rv, cond);
+                        } else {
                             return None;
                         }
                     }
+                    Some(OR_NAME) => {
+                        // Disjunction of bool operands (each a prior `bool-!=`).
+                        let mut cs = Vec::with_capacity(args.len());
+                        for s in args {
+                            match s {
+                                Slot::Var(v) => cs.push(pure_conds.get(v)?.clone()),
+                                Slot::Const(_) => return None,
+                            }
+                        }
+                        if let Slot::Var(rv) = ret {
+                            pure_conds.insert(*rv, Cond::Or(cs));
+                        } else {
+                            return None;
+                        }
+                    }
+                    Some(GUARD_NAME) => {
+                        // Prune unless the bool operand is true.
+                        if args.len() != 1 {
+                            return None;
+                        }
+                        match &args[0] {
+                            Slot::Var(v) => guards.push(pure_conds.get(v)?.clone()),
+                            Slot::Const(_) => return None,
+                        }
+                    }
+                    Some(ORD_MIN_NAME) | Some(ORD_MAX_NAME) => {
+                        // Value-producing ordering prim on reps — ONLY valid on
+                        // Id columns (rep order = id order = leader choice).
+                        if args.len() != 2 {
+                            return None;
+                        }
+                        let a = val_of(&args[0], &pure_vals, &var_col, &var_kind, true)?;
+                        let b = val_of(&args[1], &pure_vals, &var_col, &var_kind, true)?;
+                        let expr = if name == Some(ORD_MIN_NAME) {
+                            PureExpr::Min(Box::new(a), Box::new(b))
+                        } else {
+                            PureExpr::Max(Box::new(a), Box::new(b))
+                        };
+                        match ret {
+                            // `ret` already bound by an atom (or another prim
+                            // value): an equality assert `expr == ret`.
+                            Slot::Var(rv) if var_col.contains_key(rv) => {
+                                let rexpr =
+                                    val_of(ret, &pure_vals, &var_col, &var_kind, true)?;
+                                guards.push(Cond::Eq(expr, rexpr));
+                            }
+                            Slot::Var(rv) if pure_vals.contains_key(rv) => {
+                                let rexpr = pure_vals.get(rv).unwrap().clone();
+                                guards.push(Cond::Eq(expr, rexpr));
+                            }
+                            // `ret` is a fresh var: bind it symbolically so later
+                            // prims can read it. (If it were needed by an atom or
+                            // the head we'd have to materialize it into the row;
+                            // none of the recognized rules do this, and an atom
+                            // binding a value-prim output is not produced by the
+                            // term encoder.)
+                            Slot::Var(rv) => {
+                                pure_vals.insert(*rv, expr);
+                            }
+                            Slot::Const(c) => {
+                                guards.push(Cond::Eq(expr, PureExpr::Const(*c)));
+                            }
+                        }
+                    }
+                    _ => {
+                        // An unrecognized / non-inlinable body prim: leave the
+                        // whole rule on the host nested-loop join.
+                        return None;
+                    }
                 }
-                neq.push(NeqGuard {
-                    a: args[0].clone(),
-                    b: args[1].clone(),
-                });
             }
+        }
+    }
+
+    // A prim-produced var must not escape to the head as a materialized value
+    // (we keep such vars symbolic, never in the binding row). The recognized
+    // rules only use prim outputs inside the body prim chain, so verify the head
+    // never reads one — if it does, fall back to the host to stay correct.
+    for hv in head_vars(rule) {
+        if (pure_vals.contains_key(&hv) || pure_conds.contains_key(&hv))
+            && !var_col.contains_key(&hv)
+        {
+            return None;
         }
     }
 
@@ -233,8 +458,49 @@ pub fn plan_join(eg: &EGraph, rule: &RuleIr, allow_neq: bool) -> Option<JoinPlan
         var_order,
         var_col,
         atoms,
-        neq,
+        guards,
     })
+}
+
+/// Variables read by a rule's head actions (so we can verify no symbolic
+/// prim-output var escapes the body).
+fn head_vars(rule: &RuleIr) -> Vec<u32> {
+    use crate::compile::HeadOp;
+    let mut out = Vec::new();
+    let push_slot = |s: &Slot, out: &mut Vec<u32>| {
+        if let Slot::Var(v) = s {
+            out.push(*v);
+        }
+    };
+    for op in &rule.head {
+        match op {
+            HeadOp::Set { slots, .. }
+            | HeadOp::Remove { slots, .. }
+            | HeadOp::Subsume { slots, .. } => {
+                for s in slots {
+                    push_slot(s, &mut out);
+                }
+            }
+            HeadOp::Lookup { args, ret, .. } => {
+                for s in args {
+                    push_slot(s, &mut out);
+                }
+                out.push(*ret);
+            }
+            HeadOp::Call { args, ret, .. } => {
+                for s in args {
+                    push_slot(s, &mut out);
+                }
+                out.push(*ret);
+            }
+            HeadOp::Union { l, r } => {
+                push_slot(l, &mut out);
+                push_slot(r, &mut out);
+            }
+            HeadOp::Panic(_) => {}
+        }
+    }
+    out
 }
 
 /// Per-relation input handle for the join circuit.
@@ -297,11 +563,7 @@ fn run_join_with(
     // Clone the plan pieces the circuit closure needs (it must be `'static`).
     let atoms: Vec<Vec<Slot>> = plan.atoms.iter().map(|a| a.slots.clone()).collect();
     let var_col = plan.var_col.clone();
-    let neq = plan
-        .neq
-        .iter()
-        .map(|g| (g.a.clone(), g.b.clone()))
-        .collect::<Vec<_>>();
+    let guards = plan.guards.clone();
     let n_vars = plan.var_order.len();
 
     let (handle, (inputs, output)) = RootCircuit::build(move |root| {
@@ -313,7 +575,7 @@ fn run_join_with(
             streams.push(stream);
         }
 
-        let out = build_join_stream(&streams, &atoms, &var_col, &neq, n_vars)?;
+        let out = build_join_stream(&streams, &atoms, &var_col, &guards, n_vars)?;
         Ok((inputs, out.output()))
     })?;
 
@@ -349,11 +611,14 @@ fn build_join_stream(
     streams: &[Stream<RootCircuit, OrdZSet<RelRow>>],
     atoms: &[Vec<Slot>],
     var_col: &HashMap<u32, usize>,
-    neq: &[(Slot, Slot)],
+    guards: &[Cond],
     n_vars: usize,
 ) -> Result<Stream<RootCircuit, OrdZSet<BindRow>>> {
     // `bound`: which canonical variable columns are filled after each atom.
     let mut bound: Vec<bool> = vec![false; n_vars];
+    // Track which guards have already been applied (each is applied once, as
+    // soon as every binding-row column it reads is bound).
+    let mut applied: Vec<bool> = vec![false; guards.len()];
 
     // Initialize from the first atom: map each row to a binding row.
     let slots0 = &atoms[0];
@@ -370,8 +635,8 @@ fn build_join_stream(
         None => vec![],
     });
     mark_bound(slots0, var_col, &mut bound);
-    // Apply any `!=` guards now satisfiable.
-    cur = apply_neq(cur, neq, var_col, &bound);
+    // Apply any guards now satisfiable.
+    cur = apply_guards(cur, guards, &bound, &mut applied);
 
     // Join successive atoms.
     for (i, slots) in atoms.iter().enumerate().skip(1) {
@@ -434,7 +699,7 @@ fn build_join_stream(
         }
 
         mark_bound(slots, var_col, &mut bound);
-        cur = apply_neq(cur, neq, var_col, &bound);
+        cur = apply_guards(cur, guards, &bound, &mut applied);
     }
 
     Ok(cur)
@@ -567,49 +832,31 @@ fn set_col(mut r: BindRow, i: usize, v: u32) -> BindRow {
     r
 }
 
-/// Apply every `!=` guard whose operands are both resolvable (bound vars or
-/// constants) as a `filter` on the binding stream.
-fn apply_neq(
+/// Apply every not-yet-applied guard whose binding-row columns are all bound,
+/// as a `filter` on the binding stream. Each guard is applied exactly once (the
+/// `applied` flags persist across atoms).
+fn apply_guards(
     stream: Stream<RootCircuit, OrdZSet<BindRow>>,
-    neq: &[(Slot, Slot)],
-    var_col: &HashMap<u32, usize>,
+    guards: &[Cond],
     bound: &[bool],
+    applied: &mut [bool],
 ) -> Stream<RootCircuit, OrdZSet<BindRow>> {
     let mut cur = stream;
-    for (a, b) in neq {
-        // Only apply once both operands are available.
-        let ra = resolvable(a, var_col, bound);
-        let rb = resolvable(b, var_col, bound);
-        if !(ra && rb) {
+    for (i, g) in guards.iter().enumerate() {
+        if applied[i] {
             continue;
         }
-        let a = a.clone();
-        let b = b.clone();
-        let vc = var_col.clone();
-        cur = cur.filter(move |row: &BindRow| {
-            let av = slot_val(&a, row, &vc);
-            let bv = slot_val(&b, row, &vc);
-            av != bv
-        });
+        let mut cols = Vec::new();
+        g.cols(&mut cols);
+        // Only apply once every column the guard reads is bound.
+        if !cols.iter().all(|&c| bound[c]) {
+            continue;
+        }
+        applied[i] = true;
+        let g = g.clone();
+        cur = cur.filter(move |row: &BindRow| g.eval(row));
     }
     cur
-}
-
-/// Whether a slot's value is available in the binding row (bound var) or is a
-/// constant.
-fn resolvable(s: &Slot, var_col: &HashMap<u32, usize>, bound: &[bool]) -> bool {
-    match s {
-        Slot::Const(_) => true,
-        Slot::Var(v) => var_col.get(v).map(|&c| bound[c]).unwrap_or(false),
-    }
-}
-
-/// Read a slot's value out of a binding row.
-fn slot_val(s: &Slot, row: &BindRow, var_col: &HashMap<u32, usize>) -> u32 {
-    match s {
-        Slot::Const(c) => *c,
-        Slot::Var(v) => get_col(row, var_col[v]),
-    }
 }
 
 // ===========================================================================
@@ -657,11 +904,7 @@ impl PersistentJoin {
         let n_atoms = plan.atoms.len();
         let atoms: Vec<Vec<Slot>> = plan.atoms.iter().map(|a| a.slots.clone()).collect();
         let var_col = plan.var_col.clone();
-        let neq = plan
-            .neq
-            .iter()
-            .map(|g| (g.a.clone(), g.b.clone()))
-            .collect::<Vec<_>>();
+        let guards = plan.guards.clone();
         let n_vars = plan.var_order.len();
 
         let (handle, (inputs, output)) = RootCircuit::build(move |root| {
@@ -675,7 +918,7 @@ impl PersistentJoin {
                 // matching egglog relations.
                 streams.push(stream.distinct());
             }
-            let out = build_join_stream(&streams, &atoms, &var_col, &neq, n_vars)?;
+            let out = build_join_stream(&streams, &atoms, &var_col, &guards, n_vars)?;
             // Non-integrated, distinct binding stream: each `step()` yields this
             // tick's binding DELTA directly. (We drive the circuit with `step()`,
             // not `transaction()`: a transaction is a *sequence* of steps for one
@@ -773,7 +1016,7 @@ mod persistent_tests {
                     slots: vec![Slot::Var(1), Slot::Var(2)], // R(y, z)
                 },
             ],
-            neq: vec![],
+            guards: vec![],
         }
     }
 

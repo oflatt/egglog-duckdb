@@ -460,9 +460,10 @@ fn seminaive_bindings(
     }
 
     // Try the DBSP-eligible whole-body join once per delta-atom variant.
-    // Non-persistent seminaive path: `!=`-guarded rules are not bit-exact on
-    // `run_join_seminaive`, so keep them on the host nested-loop (`allow_neq =
-    // false`). Only the persistent circuit (`persistent_bindings`) runs them.
+    // Non-persistent seminaive path: prim-carrying rules are not bit-exact on
+    // `run_join_seminaive`, so keep them on the host nested-loop
+    // (`allow_prims = false`). Only the persistent circuit
+    // (`persistent_bindings`) inlines the pure prims (Stage B).
     let plan = dbsp_join::plan_join(eg, rule, false);
 
     let mut seen_bindings: HashSet<Vec<(u32, u32)>> = HashSet::new();
@@ -657,8 +658,9 @@ fn persistent_bindings(
         eg.prof_circuit_step += t_step.elapsed();
     }
 
-    // Eligible rules have only `!=` body prims (already applied in-circuit) and
-    // no value-computing prims, so the env is fully determined by `var_order`.
+    // Eligible rules carry only inlined pure prims (guards applied in-circuit,
+    // value prims kept symbolic and never escaping to the head — verified by
+    // `plan_join`), so the env is fully determined by `var_order`.
     let mut envs: Vec<Env> = Vec::new();
     let mut neg_count = 0usize;
     for (bind, w) in &bindings {

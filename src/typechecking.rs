@@ -419,17 +419,23 @@ impl EGraph {
                 {
                     duck.set_external_func_name(id, name.clone());
                 }
-                // Feldera side-channel: record only the generic `!=` guard's
-                // name so `dbsp_join::plan_join` recognizes it and makes the
-                // `!=`-guarded rules (`@uf_update`, congruence guards) eligible
-                // to run their body join on the persistent DBSP circuit instead
-                // of the host nested-loop. The non-persistent path keeps them on
-                // the host (see `plan_join`'s `allow_neq`).
-                if name == "!="
-                    && let Some(feld) = self
-                        .backend
-                        .as_any_mut()
-                        .downcast_mut::<egglog_bridge_feldera::EGraph>()
+                // Feldera side-channel: record the names of the generic PURE
+                // value/guard prims that `dbsp_join::plan_join` can inline into
+                // the persistent DBSP circuit (Stage B), so the `@congruence` /
+                // `@rebuild_cleanup` rules become DBSP-eligible instead of
+                // falling back to the host nested-loop. Recognition is by name
+                // only (no `@uf`/rebuild rule-name recognition); the persistent
+                // path inlines them when the operand column types make
+                // rep-arithmetic provably correct (see `plan_join`'s gating).
+                // The non-persistent path keeps these rules on the host (see
+                // `plan_join`'s `allow_prims`).
+                if matches!(
+                    name.as_str(),
+                    "!=" | "bool-!=" | "or" | "guard" | "ordering-min" | "ordering-max"
+                ) && let Some(feld) = self
+                    .backend
+                    .as_any_mut()
+                    .downcast_mut::<egglog_bridge_feldera::EGraph>()
                 {
                     feld.set_external_func_name(id, name.clone());
                 }
