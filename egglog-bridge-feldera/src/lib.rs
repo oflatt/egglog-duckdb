@@ -129,7 +129,15 @@ pub struct EGraph {
     /// Rust-side materialized mirror: the accumulated contents of each
     /// relation, kept in sync with the circuit's integrated output after each
     /// transaction. This is what `for_each` / `lookup_id` / `table_size` read.
-    pub(crate) mirror: HashMap<FunctionId, HashSet<Row>>,
+    ///
+    /// Each function's row set is held behind an [`std::rc::Rc`] so that the
+    /// per-iteration start-of-call *read snapshot* (`interpret::run_iteration`)
+    /// can be taken in O(#functions) by cloning the `Rc` handles instead of
+    /// deep-cloning every row. Mutations go through `Rc::make_mut`, which
+    /// copy-on-writes only the (few) functions actually changed this call while
+    /// the snapshot is alive — turning the old O(state) per-call read clone into
+    /// O(changed-state).
+    pub(crate) mirror: HashMap<FunctionId, std::rc::Rc<HashSet<Row>>>,
     /// Seminaive bookkeeping (Milestone 5), keyed by **rule index**: for each
     /// rule, the per-relation contents that rule has **already matched against**.
     /// The seminaive *delta* fed into a firing of rule `r` is
@@ -184,6 +192,36 @@ pub struct EGraph {
     /// the raw view rows / union edges across `run_rules` calls, so rebuild cost
     /// is O(delta) not O(state). `None` until the first circuit-rebuild call.
     pub(crate) rebuild_cache: Option<circuit_rebuild::RebuildCache>,
+    /// Stage-A (interpreter-deprecation, #23): when set (env
+    /// `FELDERA_PERSISTENT=1`), DBSP-eligible rules run their body join on a
+    /// PERSISTENT per-rule circuit ([`dbsp_join::PersistentJoin`]) fed signed
+    /// deltas, instead of the fresh-circuit join + host `seen`. The circuit's
+    /// integral does the seminaive bookkeeping and handles retraction natively
+    /// (signed weights), uniformly for user AND `@uf` rules — no recognition.
+    /// Off by default; the interpreter stays the oracle. Ineligible rules (value
+    /// prims in the body) still fall back to the host nested-loop + `seen`.
+    pub(crate) persistent_mode: bool,
+    /// Per-rule persistent join circuits, built lazily for eligible rules.
+    pub(crate) persistent: HashMap<usize, dbsp_join::PersistentJoin>,
+    /// Rule indices proven DBSP-ineligible (cached so we don't re-plan + so the
+    /// host fallback path is taken consistently).
+    pub(crate) persistent_ineligible: HashSet<usize>,
+    /// Per-rule, per-body-relation last-fed row set: each `run_rules` pushes only
+    /// the `+/-` diff vs the start-of-call read view into that rule's persistent
+    /// circuit, keeping its integral equal to the read view.
+    ///
+    /// Stored as the start-of-call `Rc` snapshot handle, so the per-rule fed-diff
+    /// can `Rc::ptr_eq` the new read view against it: an unchanged function shares
+    /// the same `Rc` and is skipped in O(1) instead of an O(state) set diff.
+    pub(crate) fed: HashMap<usize, HashMap<FunctionId, std::rc::Rc<HashSet<Row>>>>,
+    /// Temporary profiling accumulators (gated by env `FELDERA_PROFILE`).
+    pub(crate) prof_read_clone: std::time::Duration,
+    pub(crate) prof_read_rows: u64,
+    pub(crate) prof_fed_diff: std::time::Duration,
+    pub(crate) prof_circuit_step: std::time::Duration,
+    pub(crate) prof_apply: std::time::Duration,
+    pub(crate) prof_merge: std::time::Duration,
+    pub(crate) prof_change: std::time::Duration,
 }
 
 impl Default for EGraph {
@@ -213,6 +251,17 @@ impl EGraph {
             circuit_rebuild: std::env::var("FELDERA_CIRCUIT_REBUILD").is_ok(),
             circuit_rebuild_runs: 0,
             rebuild_cache: None,
+            persistent_mode: std::env::var("FELDERA_PERSISTENT").is_ok(),
+            persistent: HashMap::new(),
+            persistent_ineligible: HashSet::new(),
+            fed: HashMap::new(),
+            prof_read_clone: std::time::Duration::ZERO,
+            prof_read_rows: 0,
+            prof_fed_diff: std::time::Duration::ZERO,
+            prof_circuit_step: std::time::Duration::ZERO,
+            prof_apply: std::time::Duration::ZERO,
+            prof_merge: std::time::Duration::ZERO,
+            prof_change: std::time::Duration::ZERO,
         }
     }
 
@@ -244,7 +293,7 @@ impl EGraph {
 
     /// Insert a single row into the Rust mirror.
     fn mirror_insert(&mut self, f: FunctionId, row: Row) {
-        self.mirror.entry(f).or_default().insert(row);
+        std::rc::Rc::make_mut(self.mirror.entry(f).or_default()).insert(row);
     }
 
     /// Resolve a function's merge mode (for FD-conflict resolution).
@@ -275,51 +324,79 @@ impl EGraph {
 
     /// Resolve functional-dependency conflicts in a relation's mirror set: for
     /// each key (input columns) keep a single output column chosen by the merge
-    /// mode. Relations (whole-row key) are left untouched.
-    fn resolve_merge(&mut self, f: FunctionId) {
+    /// mode. Relations (whole-row key) are left untouched. Returns whether any
+    /// row was actually changed/collapsed.
+    ///
+    /// INCREMENTAL: the pre-call mirror is already FD-resolved (this runs every
+    /// `run_rules` call), so only the keys whose rows were `set` this call (in
+    /// `keys`) can newly conflict. We re-resolve just those keys instead of
+    /// rebuilding the whole function — O(touched-keys), not O(state). The
+    /// deterministic fold order (sort) is preserved PER KEY, which gives the same
+    /// chosen output as the old whole-set sort+fold (the fold is independent
+    /// across distinct keys).
+    fn resolve_merge(&mut self, f: FunctionId, keys: &HashSet<Vec<u32>>) -> bool {
         let arity = self.info(f).arity;
         let merge = self.merge_mode(f);
-        if !matches!(merge, MergeMode::Old | MergeMode::New | MergeMode::Min) || arity == 0 {
-            return;
+        if !matches!(merge, MergeMode::Old | MergeMode::New | MergeMode::Min)
+            || arity == 0
+            || keys.is_empty()
+        {
+            return false;
         }
         let Some(set) = self.mirror.get(&f) else {
-            return;
+            return false;
         };
         let inputs_len = arity - 1;
-        // Fold rows in a DETERMINISTIC order (mirror is a HashSet with arbitrary
-        // iteration order). Without this, `Old`/`New` conflict resolution over
-        // two distinct values that arrive in the SAME iteration (e.g. a rule
-        // doing `(set f 1)(set f 2)`) would pick nondeterministically and never
-        // reach a stable fixpoint, hanging `(saturate …)`.
-        let mut rows: Vec<&Row> = set.iter().collect();
-        rows.sort();
-        let mut by_key: HashMap<Vec<u32>, u32> = HashMap::new();
-        for row in rows {
+        // Gather the candidate rows for the touched keys only.
+        let mut by_key: HashMap<&[u32], Vec<&Row>> = HashMap::new();
+        for row in set.iter() {
             let key: Vec<u32> = (0..inputs_len).map(|i| row_col(row, i)).collect();
-            let out = row_col(row, inputs_len);
-            match by_key.entry(key) {
-                hashbrown::hash_map::Entry::Vacant(e) => {
-                    e.insert(out);
-                }
-                hashbrown::hash_map::Entry::Occupied(mut e) => {
-                    let cur = *e.get();
-                    let chosen = match merge {
-                        MergeMode::Old => cur,
-                        MergeMode::New => out,
-                        MergeMode::Min => cur.min(out),
-                        MergeMode::Relation => unreachable!(),
-                    };
-                    e.insert(chosen);
-                }
+            if keys.contains(&key) {
+                by_key.entry(&row[..inputs_len]).or_default().push(row);
             }
         }
-        let mut resolved: HashSet<Row> = HashSet::new();
-        for (key, out) in by_key {
-            let mut full: Vec<u32> = key;
-            full.push(out);
-            resolved.insert(full.into_boxed_slice());
+        // Resolve each touched key; collect the rows to remove and the winner to
+        // insert. Only keys with >1 candidate row can change.
+        let mut new_rows: Vec<Row> = Vec::new();
+        let mut drop_rows: HashSet<Row> = HashSet::new();
+        for (_key, mut cands) in by_key {
+            if cands.len() < 2 {
+                continue;
+            }
+            // Deterministic fold order (mirror is a HashSet — arbitrary order).
+            cands.sort();
+            let mut chosen = row_col(cands[0], inputs_len);
+            for row in &cands[1..] {
+                let out = row_col(row, inputs_len);
+                chosen = match merge {
+                    MergeMode::Old => chosen,
+                    MergeMode::New => out,
+                    MergeMode::Min => chosen.min(out),
+                    MergeMode::Relation => unreachable!(),
+                };
+            }
+            // The winning row.
+            let mut winner: Vec<u32> = cands[0][..inputs_len].to_vec();
+            winner.push(chosen);
+            let winner: Row = winner.into_boxed_slice();
+            for row in cands {
+                if **row != *winner {
+                    drop_rows.insert((*row).clone());
+                }
+            }
+            new_rows.push(winner);
         }
-        self.mirror.insert(f, resolved);
+        if drop_rows.is_empty() {
+            return false;
+        }
+        let set = std::rc::Rc::make_mut(self.mirror.get_mut(&f).unwrap());
+        for r in &drop_rows {
+            set.remove(r);
+        }
+        for r in new_rows {
+            set.insert(r);
+        }
+        true
     }
 }
 
@@ -334,6 +411,33 @@ impl EGraph {
 // supported configuration.
 unsafe impl Send for EGraph {}
 unsafe impl Sync for EGraph {}
+
+impl Drop for EGraph {
+    // The `FELDERA_PROFILE` breakdown is a temporary stderr diagnostic gated
+    // behind an env var (never on in normal runs); `eprintln!` is intentional.
+    #[allow(clippy::disallowed_macros)]
+    fn drop(&mut self) {
+        if std::env::var("FELDERA_PROFILE").is_ok() {
+            eprintln!(
+                "[PROF] read_clone={:.2}s (rows_total={}) fed_diff={:.2}s circuit_step={:.2}s",
+                self.prof_read_clone.as_secs_f64(),
+                self.prof_read_rows,
+                self.prof_fed_diff.as_secs_f64(),
+                self.prof_circuit_step.as_secs_f64(),
+            );
+            eprintln!(
+                "[PROF] apply_writes={:.2}s resolve_merge={:.2}s change_detect={:.2}s (folded into apply/merge)",
+                self.prof_apply.as_secs_f64(),
+                self.prof_merge.as_secs_f64(),
+                self.prof_change.as_secs_f64(),
+            );
+            eprintln!(
+                "[PROF] dbsp_runs={} host_runs={} (host rebuild/congruence join is the residual bottleneck)",
+                self.dbsp_rule_runs, self.host_rule_runs,
+            );
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // impl Backend
@@ -397,7 +501,7 @@ impl Backend for EGraph {
             has_output,
             merge,
         });
-        self.mirror.insert(id, HashSet::new());
+        self.mirror.insert(id, std::rc::Rc::new(HashSet::new()));
         self.invalidate_circuit();
         id
     }
@@ -513,7 +617,7 @@ impl Backend for EGraph {
 
     fn clear_table(&mut self, func: FunctionId) {
         if let Some(set) = self.mirror.get_mut(&func) {
-            set.clear();
+            std::rc::Rc::make_mut(set).clear();
         }
         // Forget what every rule had matched in this table: a re-populated table
         // must present its rows as fresh deltas to the seminaive driver.

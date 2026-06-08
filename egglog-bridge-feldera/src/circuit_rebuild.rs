@@ -209,7 +209,7 @@ pub fn run_rebuild(eg: &mut EGraph, roles: &RebuildRoles) -> anyhow::Result<bool
         .filter(|(f, _)| {
             roles.uf.contains(*f) || roles.uff.contains(*f) || roles.views.contains(*f)
         })
-        .map(|(f, s)| (*f, s.clone()))
+        .map(|(f, s)| (*f, (**s).clone()))
         .collect();
 
     // Assign stable per-table tags (sorted for determinism) and lazily build the
@@ -252,7 +252,7 @@ pub fn run_rebuild(eg: &mut EGraph, roles: &RebuildRoles) -> anyhow::Result<bool
         let nargs = arity - 1;
         let tag = eg.rebuild_cache.as_ref().unwrap().tag_of[&view];
         if let Some(set) = eg.mirror.get(&view) {
-            for row in set {
+            for row in set.iter() {
                 let arg0 = row_col(row, 0) as u64;
                 let arg1 = if nargs >= 2 {
                     row_col(row, 1) as u64
@@ -267,7 +267,7 @@ pub fn run_rebuild(eg: &mut EGraph, roles: &RebuildRoles) -> anyhow::Result<bool
     let mut cur_uf_seed: std::collections::BTreeSet<(u64, u64)> = std::collections::BTreeSet::new();
     for &uf in &roles.uf {
         if let Some(set) = eg.mirror.get(&uf) {
-            for row in set {
+            for row in set.iter() {
                 let child = row_col(row, UF_CHILD) as u64;
                 let parent = row_col(row, UF_PARENT) as u64;
                 cur_uf_seed.insert((child.min(parent), child.max(parent)));
@@ -315,7 +315,7 @@ pub fn run_rebuild(eg: &mut EGraph, roles: &RebuildRoles) -> anyhow::Result<bool
         for (&x, &l) in &leaders {
             resolved.insert(vec![x as u32, l as u32].into_boxed_slice());
         }
-        eg.mirror.insert(uff, resolved);
+        eg.mirror.insert(uff, std::rc::Rc::new(resolved));
     }
 
     // Synthesize canonical @UF: child->leader edge for each non-leader child.
@@ -334,7 +334,7 @@ pub fn run_rebuild(eg: &mut EGraph, roles: &RebuildRoles) -> anyhow::Result<bool
                 resolved.insert(row.into_boxed_slice());
             }
         }
-        eg.mirror.insert(uf, resolved);
+        eg.mirror.insert(uf, std::rc::Rc::new(resolved));
     }
 
     // Rewrite each view table to the circuit's canonical rows (args + output
@@ -361,7 +361,7 @@ pub fn run_rebuild(eg: &mut EGraph, roles: &RebuildRoles) -> anyhow::Result<bool
                 resolved.insert(full.into_boxed_slice());
             }
         }
-        eg.mirror.insert(view, resolved);
+        eg.mirror.insert(view, std::rc::Rc::new(resolved));
     }
 
     // Forget per-rule seen snapshots for touched relations so later rulesets see

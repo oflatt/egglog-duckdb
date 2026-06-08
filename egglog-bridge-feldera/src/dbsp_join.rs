@@ -45,7 +45,7 @@
 
 use anyhow::{anyhow, Result};
 use dbsp::utils::Tup8;
-use dbsp::{OrdZSet, RootCircuit, Stream, ZSetHandle, ZWeight};
+use dbsp::{CircuitHandle, OrdZSet, OutputHandle, RootCircuit, Stream, ZSetHandle, ZWeight};
 use egglog_backend_trait::FunctionId;
 use hashbrown::{HashMap, HashSet};
 
@@ -582,5 +582,212 @@ fn slot_val(s: &Slot, row: &BindRow, var_col: &HashMap<u32, usize>) -> u32 {
     match s {
         Slot::Const(c) => *c,
         Slot::Var(v) => col8(row, var_col[v]),
+    }
+}
+
+// ===========================================================================
+// PersistentJoin — the persistent, delta-fed body join (Stage A of #23)
+// ===========================================================================
+//
+// Unlike [`run_join_with`] (which builds a fresh circuit and pushes the FULL
+// relations every call — O(state)), `PersistentJoin` builds the circuit ONCE
+// and is fed only per-transaction RELATION DELTAS. DBSP's `join` is incremental
+// and maintains the integrals of its inputs internally, so feeding `δR` across
+// transactions yields the full seminaive join (`δR⋈S + R⋈δS + δR⋈δS`)
+// automatically — no manual per-delta-atom loop, and no host `seen` set. The
+// circuit's integrals ARE the seminaive bookkeeping.
+//
+// The output is read WITHOUT `integrate()`, so each `step` returns exactly the
+// *binding delta* produced by that transaction: positive-weight rows are new
+// satisfying assignments, negative-weight rows are assignments retracted because
+// a body row was retracted (deletion at the transaction boundary — handled
+// natively by DBSP's signed weights).
+
+/// A persistent, delta-fed body join for one rule. Built once via
+/// [`PersistentJoin::build`]; driven across iterations via [`PersistentJoin::step`].
+pub struct PersistentJoin {
+    handle: CircuitHandle,
+    /// One input handle per atom occurrence (in `plan.atoms` order).
+    inputs: Vec<ZSetHandle<RelRow>>,
+    /// The INTEGRATED (accumulated) distinct binding set. We read the full
+    /// accumulated set each step and diff it against [`PersistentJoin::prev`]
+    /// in Rust to get the new matches. Reading non-integrated per-transaction
+    /// deltas under-reports on large single-transaction batches (a DBSP
+    /// delta-read quirk), so we mirror the proven `rebuild_circuit` pattern of
+    /// reading the integral and diffing host-side.
+    output: OutputHandle<OrdZSet<BindRow>>,
+    /// `func` → the atom-occurrence indices that read it, so a relation's delta
+    /// is fanned out to every occurrence (correct for self-joins).
+    occ_of_func: HashMap<FunctionId, Vec<usize>>,
+    /// Number of canonical body variables (binding-row width in use).
+    n_vars: usize,
+}
+
+impl PersistentJoin {
+    /// Build the persistent circuit for `plan` ONCE. The circuit retains the
+    /// integral of every body relation across transactions.
+    pub fn build(plan: &JoinPlan) -> Result<PersistentJoin> {
+        let n_atoms = plan.atoms.len();
+        let atoms: Vec<Vec<Slot>> = plan.atoms.iter().map(|a| a.slots.clone()).collect();
+        let var_col = plan.var_col.clone();
+        let neq = plan
+            .neq
+            .iter()
+            .map(|g| (g.a.clone(), g.b.clone()))
+            .collect::<Vec<_>>();
+        let n_vars = plan.var_order.len();
+
+        let (handle, (inputs, output)) = RootCircuit::build(move |root| {
+            let mut inputs: Vec<ZSetHandle<RelRow>> = Vec::with_capacity(n_atoms);
+            let mut streams: Vec<Stream<RootCircuit, OrdZSet<RelRow>>> =
+                Vec::with_capacity(n_atoms);
+            for _ in 0..n_atoms {
+                let (stream, input) = root.add_input_zset::<RelRow>();
+                inputs.push(input);
+                // `.distinct()` makes each input set-semantic (weights 0/1),
+                // matching egglog relations.
+                streams.push(stream.distinct());
+            }
+            let out = build_join_stream(&streams, &atoms, &var_col, &neq, n_vars)?;
+            // Non-integrated, distinct binding stream: each `step()` yields this
+            // tick's binding DELTA directly. (We drive the circuit with `step()`,
+            // not `transaction()`: a transaction is a *sequence* of steps for one
+            // logical tick, and the non-integrated output handle only reflects the
+            // last internal step — which silently truncates large batches.)
+            Ok((inputs, out.distinct().output()))
+        })?;
+
+        let mut occ_of_func: HashMap<FunctionId, Vec<usize>> = HashMap::new();
+        for (ord, a) in plan.atoms.iter().enumerate() {
+            occ_of_func.entry(a.func).or_default().push(ord);
+        }
+
+        Ok(PersistentJoin {
+            handle,
+            inputs,
+            output,
+            occ_of_func,
+            n_vars,
+        })
+    }
+
+    /// Feed one round of relation deltas and run a single transaction, returning
+    /// the resulting binding delta as `(binding_row, weight)` pairs. `deltas`
+    /// maps a body relation to its `±`-weighted changed rows since the previous
+    /// `step`. Relations not in this rule's body are ignored; a relation read by
+    /// several atoms has its delta fanned out to each occurrence.
+    pub fn step(
+        &mut self,
+        deltas: &HashMap<FunctionId, Vec<(Vec<u32>, ZWeight)>>,
+    ) -> Result<Vec<(Vec<u32>, ZWeight)>> {
+        let mut pushed_any = false;
+        for (func, rows) in deltas {
+            if let Some(occs) = self.occ_of_func.get(func) {
+                for &ord in occs {
+                    for (row, w) in rows {
+                        self.inputs[ord].push(pack8(row), *w);
+                        pushed_any = true;
+                    }
+                }
+            }
+        }
+        // No input change ⇒ no new bindings; skip the transaction entirely. This
+        // short-circuits the many no-op rebuild-saturation re-runs.
+        if !pushed_any {
+            return Ok(Vec::new());
+        }
+
+        // Drive the transaction lifecycle manually and ACCUMULATE the
+        // non-integrated output across all commit steps. A `transaction()`
+        // processes a batch over several internal steps and the non-integrated
+        // handle only retains the *last* step's delta — silently truncating
+        // large batches (the `@uf` rebuild bug). Summing per-step deltas recovers
+        // the complete tick delta at O(delta) cost (no full-integral re-read).
+        self.handle.start_transaction()?;
+        self.handle.start_commit_transaction()?;
+        let mut acc: HashMap<Vec<u32>, ZWeight> = HashMap::new();
+        while !self.handle.is_commit_complete() {
+            self.handle.step()?;
+            for (row, (), w) in self.output.consolidate().iter() {
+                let w: ZWeight = w;
+                if w != 0 {
+                    let key: Vec<u32> = (0..self.n_vars).map(|i| col8(&row, i)).collect();
+                    *acc.entry(key).or_insert(0) += w;
+                }
+            }
+        }
+        Ok(acc.into_iter().filter(|(_, w)| *w != 0).collect())
+    }
+}
+
+#[cfg(test)]
+mod persistent_tests {
+    use super::*;
+    use egglog_numeric_id::NumericId;
+
+    /// Build a 2-atom self-join plan `R(x,y), R(y,z)` (transitive-closure hop)
+    /// over a single relation, without going through `plan_join` (which needs a
+    /// full `RuleIr`). Same-module access to the private `JoinPlan` fields.
+    fn tc_plan(func: FunctionId) -> JoinPlan {
+        let mut var_col = HashMap::new();
+        var_col.insert(0u32, 0usize); // x
+        var_col.insert(1u32, 1usize); // y
+        var_col.insert(2u32, 2usize); // z
+        JoinPlan {
+            var_order: vec![0, 1, 2],
+            var_col,
+            atoms: vec![
+                AtomPlan {
+                    func,
+                    slots: vec![Slot::Var(0), Slot::Var(1)], // R(x, y)
+                },
+                AtomPlan {
+                    func,
+                    slots: vec![Slot::Var(1), Slot::Var(2)], // R(y, z)
+                },
+            ],
+            neq: vec![],
+        }
+    }
+
+    fn delta(
+        func: FunctionId,
+        rows: &[(&[u32], ZWeight)],
+    ) -> HashMap<FunctionId, Vec<(Vec<u32>, ZWeight)>> {
+        let mut m = HashMap::new();
+        m.insert(func, rows.iter().map(|(r, w)| (r.to_vec(), *w)).collect());
+        m
+    }
+
+    /// The load-bearing property: after seeding the relation, a SECOND step fed
+    /// only the new edge produces ONLY the new bindings — i.e. the join is
+    /// incremental/seminaive (O(delta)), not a full re-evaluation.
+    #[test]
+    fn persistent_join_is_incremental() {
+        let f = FunctionId::new(0);
+        let plan = tc_plan(f);
+        let mut pj = PersistentJoin::build(&plan).expect("build persistent join");
+
+        // Step 1: seed edges (1,2) and (2,3). The only TC hop is x=1,y=2,z=3.
+        let out1 = pj
+            .step(&delta(f, &[(&[1, 2], 1), (&[2, 3], 1)]))
+            .expect("step 1");
+        assert_eq!(out1, vec![(vec![1, 2, 3], 1)], "first hop");
+
+        // Step 2: add only the NEW edge (3,4). The incremental join must emit
+        // ONLY the new binding x=2,y=3,z=4 — not re-derive (1,2,3).
+        let out2 = pj.step(&delta(f, &[(&[3, 4], 1)])).expect("step 2");
+        assert_eq!(out2, vec![(vec![2, 3, 4], 1)], "only the new hop");
+
+        // Step 3: retract edge (2,3). The binding (1,2,3) used it as R(y,z) and
+        // (2,3,4) used it as R(x,y); both retract (negative weight) — deletion at
+        // the transaction boundary, handled by signed weights.
+        let mut out3 = pj.step(&delta(f, &[(&[2, 3], -1)])).expect("step 3");
+        out3.sort();
+        assert_eq!(
+            out3,
+            vec![(vec![1, 2, 3], -1), (vec![2, 3, 4], -1)],
+            "retraction propagates"
+        );
     }
 }
