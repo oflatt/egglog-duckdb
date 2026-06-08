@@ -152,7 +152,16 @@ impl JoinPlan {
 /// Decide whether `rule` can run its body join on DBSP, and if so return the
 /// [`JoinPlan`]. Returns `None` (host fallback) when any eligibility condition
 /// fails.
-pub fn plan_join(eg: &EGraph, rule: &RuleIr) -> Option<JoinPlan> {
+///
+/// `allow_neq` controls whether a body `!=` guard keeps the rule eligible. The
+/// **persistent** circuit (`persistent_bindings`) drives the transaction
+/// lifecycle manually and is bit-exact for `!=`-guarded rules, so it passes
+/// `true`. The non-persistent seminaive path (`seminaive_bindings`,
+/// `run_join_seminaive`) is *not* bit-exact for `!=`-guarded rules (the UF /
+/// congruence guard rules then diverge from the host nested-loop), so it passes
+/// `false` and those rules stay on the correct host path. Rules whose bodies
+/// have no `!=` guard are unaffected either way.
+pub fn plan_join(eg: &EGraph, rule: &RuleIr, allow_neq: bool) -> Option<JoinPlan> {
     let mut atoms: Vec<AtomPlan> = Vec::new();
     let mut neq: Vec<NeqGuard> = Vec::new();
     let mut var_order: Vec<u32> = Vec::new();
@@ -185,7 +194,7 @@ pub fn plan_join(eg: &EGraph, rule: &RuleIr) -> Option<JoinPlan> {
                 // Only `!=` guards are DBSP-eligible (pure u32 inequality). Any
                 // other body primitive needs the primitive engine inside the
                 // join, which a `Send + 'static` DBSP closure cannot hold.
-                if eg.external_funcs.name(*id) != Some(NEQ_NAME) {
+                if !allow_neq || eg.external_funcs.name(*id) != Some(NEQ_NAME) {
                     return None;
                 }
                 // `!=` is encoded as `query_prim([a, b, ret_unit])`: two

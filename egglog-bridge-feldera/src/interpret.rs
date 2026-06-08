@@ -460,7 +460,10 @@ fn seminaive_bindings(
     }
 
     // Try the DBSP-eligible whole-body join once per delta-atom variant.
-    let plan = dbsp_join::plan_join(eg, rule);
+    // Non-persistent seminaive path: `!=`-guarded rules are not bit-exact on
+    // `run_join_seminaive`, so keep them on the host nested-loop (`allow_neq =
+    // false`). Only the persistent circuit (`persistent_bindings`) runs them.
+    let plan = dbsp_join::plan_join(eg, rule, false);
 
     let mut seen_bindings: HashSet<Vec<(u32, u32)>> = HashSet::new();
     let mut out: Vec<Env> = Vec::new();
@@ -568,7 +571,7 @@ fn persistent_bindings(
 ) -> Result<Option<Vec<Env>>> {
     // Plan the body join; ineligible rules (non-`!=` body prims, arity/var caps)
     // return None and the caller uses the host path.
-    let plan = match dbsp_join::plan_join(eg, rule) {
+    let plan = match dbsp_join::plan_join(eg, rule, true) {
         Some(p) => p,
         None => return Ok(None),
     };

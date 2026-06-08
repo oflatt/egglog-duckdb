@@ -419,6 +419,20 @@ impl EGraph {
                 {
                     duck.set_external_func_name(id, name.clone());
                 }
+                // Feldera side-channel: record only the generic `!=` guard's
+                // name so `dbsp_join::plan_join` recognizes it and makes the
+                // `!=`-guarded rules (`@uf_update`, congruence guards) eligible
+                // to run their body join on the persistent DBSP circuit instead
+                // of the host nested-loop. The non-persistent path keeps them on
+                // the host (see `plan_join`'s `allow_neq`).
+                if name == "!="
+                    && let Some(feld) = self
+                        .backend
+                        .as_any_mut()
+                        .downcast_mut::<egglog_bridge_feldera::EGraph>()
+                {
+                    feld.set_external_func_name(id, name.clone());
+                }
                 id
             })
         });

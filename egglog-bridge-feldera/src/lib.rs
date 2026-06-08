@@ -273,6 +273,17 @@ impl EGraph {
         (self.dbsp_rule_runs, self.host_rule_runs)
     }
 
+    /// Record a primitive's user-visible egglog name. Mirrors the duckdb
+    /// `set_external_func_name` side-channel: the frontend's typechecker calls
+    /// this after `register_external_func` so `dbsp_join::plan_join` can
+    /// recognize the generic `!=` guard by name and make the surrounding rule
+    /// (congruence / rebuild / `@uf_update`) DBSP-eligible. Unlike the duckdb
+    /// path this is purely informational — feldera never renames prims for
+    /// evaluation; it only consults the name to decide join eligibility.
+    pub fn set_external_func_name(&mut self, id: ExternalFunctionId, name: String) {
+        self.external_funcs.set_name(id, name);
+    }
+
     /// Diagnostics: number of `run_rules` calls served by the Stage-3
     /// persistent rebuild circuit (`FELDERA_CIRCUIT_REBUILD=1`) rather than the
     /// host interpreter. Zero when the flag is off or no rebuild ruleset ran.
