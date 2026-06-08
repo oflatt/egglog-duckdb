@@ -134,7 +134,7 @@ pub fn plan_join(_eg: &EGraph, rule: &RuleIr) -> Option<JoinPlan> {
 pub fn run_join(
     eg: &mut EGraph,
     plan: &JoinPlan,
-    read: &HashMap<FunctionId, Vec<Row>>,
+    read: &HashMap<FunctionId, std::rc::Rc<HashSet<Row>>>,
 ) -> Result<Vec<Vec<u32>>> {
     // Full×…×full: every atom occurrence ranges over its relation's full read
     // view. (Retained for the M3 `dd_join_proof`; the seminaive driver uses
@@ -160,10 +160,10 @@ pub fn run_join_seminaive(
     eg: &mut EGraph,
     plan: &JoinPlan,
     delta_ord: usize,
-    read: &HashMap<FunctionId, Vec<Row>>,
+    read: &HashMap<FunctionId, std::rc::Rc<HashSet<Row>>>,
     delta: &HashMap<FunctionId, HashSet<Row>>,
 ) -> Result<Vec<Vec<u32>>> {
-    let empty_full: Vec<Row> = Vec::new();
+    let empty_full: HashSet<Row> = HashSet::new();
     let empty_delta: HashSet<Row> = HashSet::new();
     let atom_rows: Vec<Vec<&Row>> = plan
         .atoms
@@ -177,7 +177,11 @@ pub fn run_join_seminaive(
                     .iter()
                     .collect()
             } else {
-                read.get(&atom.func).unwrap_or(&empty_full).iter().collect()
+                read.get(&atom.func)
+                    .map(|v| &**v)
+                    .unwrap_or(&empty_full)
+                    .iter()
+                    .collect()
             }
         })
         .collect();

@@ -68,11 +68,23 @@ enum Write {
 /// delta per atom-occurrence); the primitive tail + head actions are host-side.
 pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
     // Snapshot the read view: rules match against the pre-iteration mirror.
-    let read: HashMap<FunctionId, Vec<Row>> = eg
+    //
+    // The snapshot shares each function's row set by `Rc` rather than
+    // deep-cloning every row: this is O(#functions), not O(state). Mutations to
+    // the mirror this call (head writes, hash-cons in `lookup_or_create`, merge
+    // resolution) go through `Rc::make_mut`, which copy-on-writes only the
+    // functions actually changed while this snapshot is alive — so `read` keeps
+    // the start-of-call contents and rules all match the pre-iteration state,
+    // exactly as before, but without paying for a full-mirror clone every call.
+    let read: HashMap<FunctionId, std::rc::Rc<HashSet<Row>>> = eg
         .mirror
         .iter()
-        .map(|(f, set)| (*f, set.iter().cloned().collect()))
+        .map(|(f, set)| (*f, std::rc::Rc::clone(set)))
         .collect();
+
+    // Snapshot the fresh-id counter: any hash-cons (`lookup_or_create`) this
+    // call advances it, the O(1) signal that a new term row was created.
+    let next_id_at_start = eg.next_id;
 
     let mut writes: Vec<Write> = Vec::new();
     let mut touched: HashSet<FunctionId> = HashSet::new();
@@ -106,8 +118,17 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
         let delta: HashMap<FunctionId, HashSet<Row>> = body_funcs
             .iter()
             .map(|&f| {
-                let cur = read.get(&f).map(|v| v.as_slice()).unwrap_or(&[]);
+                let empty: HashSet<Row> = HashSet::new();
+                let cur = read.get(&f).map(|v| &**v).unwrap_or(&empty);
                 let seen = eg.seen.get(idx).and_then(|m| m.get(&f));
+                // Fast path: if this rule's `seen[f]` snapshot is the SAME `Rc`
+                // as the current read view, `f` is unchanged since the rule last
+                // ran ⇒ empty delta, no O(state) scan (the proven fed-diff trick).
+                if let (Some(cur_rc), Some(seen_rc)) = (read.get(&f), seen) {
+                    if std::rc::Rc::ptr_eq(cur_rc, seen_rc) {
+                        return (f, HashSet::new());
+                    }
+                }
                 let d: HashSet<Row> = cur
                     .iter()
                     .filter(|r| seen.map(|s| !s.contains(*r)).unwrap_or(true))
@@ -140,11 +161,15 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
         // rules in this call), then bump the refcount into this rule's seen.
         for &f in &body_funcs {
             if !shared_snapshot.contains_key(&f) {
-                let cur: HashSet<Row> = read
+                // `read[f]` is already the start-of-call `Rc<HashSet<Row>>`;
+                // reuse its handle directly as this rule's seen snapshot (no
+                // rebuild). This also makes the next-iteration `Rc::ptr_eq`
+                // delta short-circuit fire when `f` is untouched.
+                let cur = read
                     .get(&f)
-                    .map(|v| v.iter().cloned().collect())
-                    .unwrap_or_default();
-                shared_snapshot.insert(f, std::rc::Rc::new(cur));
+                    .map(std::rc::Rc::clone)
+                    .unwrap_or_else(|| std::rc::Rc::new(HashSet::new()));
+                shared_snapshot.insert(f, cur);
             }
         }
         let entry = eg.seen.entry(*idx).or_default();
@@ -162,6 +187,12 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
     // do a SINGLE `retain` pass per touched function: O(|state|) total. Removes
     // are applied FIRST (batched), then Sets — preserving the term encoder's
     // `(@uf)` "delete old leader, set new leader" delete-then-set ordering.
+    //
+    // `changed` is computed INCREMENTALLY as writes land (O(delta)), not via a
+    // full before/after content compare of every function (O(state)). A
+    // hash-cons in `lookup_or_create` always allocates a fresh id, so any term
+    // created this call advances `next_id` — that alone is a real mirror change.
+    let mut changed = eg.next_id != next_id_at_start;
     let mut removes_by_func: HashMap<FunctionId, (usize, HashSet<Box<[u32]>>)> = HashMap::new();
     let mut sets: Vec<(FunctionId, Row)> = Vec::new();
     for w in writes {
@@ -179,46 +210,41 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
     }
     for (f, (keylen, keys)) in removes_by_func {
         if let Some(set) = eg.mirror.get_mut(&f) {
-            set.retain(|row| {
+            let before_len = set.len();
+            std::rc::Rc::make_mut(set).retain(|row| {
                 let k: Box<[u32]> = (0..keylen).map(|i| row_col(row, i)).collect();
                 !keys.contains(&k)
             });
+            // A retraction that actually removed a row is a real change.
+            changed |= set.len() != before_len;
         }
     }
+    // Per-function set of input keys touched by a `set` this call — the only
+    // keys that can newly conflict and need merge resolution.
+    let mut touched_keys: HashMap<FunctionId, HashSet<Vec<u32>>> = HashMap::new();
     for (f, row) in sets {
-        eg.mirror.entry(f).or_default().insert(row);
+        let inputs_len = eg.info(f).arity.saturating_sub(1);
+        let key: Vec<u32> = (0..inputs_len).map(|i| row_col(&row, i)).collect();
+        // `insert` returns true iff the row was genuinely new (set a row that
+        // already exists ⇒ no content change, so don't flag `changed`).
+        let inserted = std::rc::Rc::make_mut(eg.mirror.entry(f).or_default()).insert(row);
+        changed |= inserted;
+        touched_keys.entry(f).or_default().insert(key);
     }
 
     // Resolve FD conflicts on every function a head action wrote to (a `set`
     // can introduce two rows sharing a key that must merge per the merge mode).
+    // Resolution is INCREMENTAL — only the keys whose rows were touched this
+    // call can newly conflict, and `resolve_merge` reports whether it actually
+    // collapsed/changed any row (another real change source for the loop).
+    let empty_keys: HashSet<Vec<u32>> = HashSet::new();
     for &f in &touched {
-        eg.resolve_merge(f);
+        let keys = touched_keys.get(&f).unwrap_or(&empty_keys);
+        changed |= eg.resolve_merge(f, keys);
     }
 
-    // Detect change for the frontend's saturation loop: any content delta on
-    // ANY function vs the pre-iteration read view (covers head writes, merges
-    // that collapse rows, AND eq-sort constructor rows created by
-    // `lookup_or_create`, which write the mirror directly outside `touched`).
-    let mut changed = false;
-    let all_funcs: HashSet<FunctionId> = read
-        .keys()
-        .copied()
-        .chain(eg.mirror.keys().copied())
-        .collect();
-    for f in all_funcs {
-        let after = eg.mirror.get(&f);
-        let before = read.get(&f);
-        let same = match (before, after) {
-            (Some(b), Some(a)) => b.len() == a.len() && b.iter().all(|r| a.contains(r)),
-            (None, Some(a)) => a.is_empty(),
-            (Some(b), None) => b.is_empty(),
-            (None, None) => true,
-        };
-        if !same {
-            changed = true;
-            break;
-        }
-    }
+    // `change_detect` is now folded incrementally into apply/merge (O(delta));
+    // there is no separate full before/after compare.
     Ok(changed)
 }
 
@@ -226,13 +252,14 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
 /// or evaluating it (primitive). Returns the new list of envs.
 pub(crate) fn step_body(
     eg: &mut EGraph,
-    read: &HashMap<FunctionId, Vec<Row>>,
+    read: &HashMap<FunctionId, std::rc::Rc<HashSet<Row>>>,
     op: &BodyOp,
     envs: Vec<Env>,
 ) -> Result<Vec<Env>> {
     match op {
         BodyOp::Atom(atom) => {
-            let rows = read.get(&atom.func).map(|v| v.as_slice()).unwrap_or(&[]);
+            let empty: HashSet<Row> = HashSet::new();
+            let rows = read.get(&atom.func).map(|v| &**v).unwrap_or(&empty);
             Ok(step_atom(&atom.slots, rows, envs))
         }
         BodyOp::Prim { id, args, ret } => {
@@ -276,7 +303,7 @@ pub(crate) fn step_body(
 /// (`step_body`) and the seminaive delta match (`seminaive_bindings`): when
 /// `rows` is a relation's delta slice, this performs the delta-restricted join
 /// of that atom occurrence.
-pub(crate) fn step_atom(slots: &[Slot], rows: &[Row], envs: Vec<Env>) -> Vec<Env> {
+pub(crate) fn step_atom(slots: &[Slot], rows: &HashSet<Row>, envs: Vec<Env>) -> Vec<Env> {
     // JOIN KEY: columns whose slot is a variable already bound in the incoming
     // envs (the same var must agree between env and row). If non-empty,
     // hash-join on it instead of a full cartesian scan.
@@ -339,7 +366,7 @@ pub(crate) fn step_atom(slots: &[Slot], rows: &[Row], envs: Vec<Env>) -> Vec<Env
 /// across the `j`-variants (a binding new in two positions appears twice).
 fn seminaive_bindings(
     eg: &mut EGraph,
-    read: &HashMap<FunctionId, Vec<Row>>,
+    read: &HashMap<FunctionId, std::rc::Rc<HashSet<Row>>>,
     delta: &HashMap<FunctionId, HashSet<Row>>,
     rule: &RuleIr,
 ) -> Result<Vec<Env>> {
@@ -427,19 +454,20 @@ fn seminaive_bindings(
             // Host fallback: nested-loop body scan where the atom at `delta_pos`
             // ranges over the delta rows, all others over the full read view.
             eg.host_rule_runs += 1;
+            let empty: HashSet<Row> = HashSet::new();
             let mut envs: Vec<Env> = vec![Env::new()];
             for (pos, op) in rule.body.iter().enumerate() {
                 match op {
                     BodyOp::Atom(atom) => {
-                        let rows: Vec<Row> = if pos == delta_pos {
-                            delta
-                                .get(&atom.func)
-                                .map(|d| d.iter().cloned().collect())
-                                .unwrap_or_default()
+                        // Borrow the row set directly (no per-call clone): the
+                        // delta atom ranges over its delta set, the rest over
+                        // `read[f]`.
+                        let rows: &HashSet<Row> = if pos == delta_pos {
+                            delta.get(&atom.func).unwrap_or(&empty)
                         } else {
-                            read.get(&atom.func).cloned().unwrap_or_default()
+                            read.get(&atom.func).map(|v| &**v).unwrap_or(&empty)
                         };
-                        envs = step_atom(&atom.slots, &rows, envs);
+                        envs = step_atom(&atom.slots, rows, envs);
                     }
                     BodyOp::Prim { .. } => {
                         envs = step_body(eg, read, op, envs)?;
@@ -598,9 +626,6 @@ fn lookup_or_create(
     idx.insert(k, id);
     let mut full: Vec<u32> = key.iter().map(|v| v.rep()).collect();
     full.push(id);
-    eg.mirror
-        .entry(func)
-        .or_default()
-        .insert(full.into_boxed_slice());
+    std::rc::Rc::make_mut(eg.mirror.entry(func).or_default()).insert(full.into_boxed_slice());
     Value::new(id)
 }
