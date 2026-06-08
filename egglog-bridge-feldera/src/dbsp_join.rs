@@ -36,12 +36,16 @@
 //!   - the rule's body uses <= [`JOIN_WIDTH`] distinct variables (binding row);
 //!   - its only body *primitives* are a recognized set of PURE prims (`!=`,
 //!     `bool-!=`, `or`, `guard`, `ordering-min/max`, recognized by name) whose
-//!     operands sit on rep-comparable columns (`Id` / bool). These are inlined
-//!     into the join — value prims as symbolic expressions, guards as DBSP
-//!     `filter`s — so the `@congruence` / `@rebuild_cleanup` rules run their
-//!     body join on-circuit. Any other body prim, or an inlinable prim touching
-//!     a non-rep-comparable base value (i64/f64/string intern handles), forces
-//!     the host fallback.
+//!     operands sit on columns supporting the relevant rep-arithmetic: ORDERING
+//!     prims (`ordering-min/max`) require `Id` columns; EQUALITY prims (`!=` /
+//!     `bool-!=` / `or` / `guard`) also accept the injectively-interned base
+//!     types `bool` / `i64` / `string` (rep-equality ⇔ value-equality). These
+//!     are inlined into the join — value prims as symbolic expressions, guards
+//!     as DBSP `filter`s — so the `@congruence` / `@rebuild_cleanup` /
+//!     base-value `@merge` rules run their body join on-circuit. Any other body
+//!     prim, an ordering prim on a non-`Id` column, or any prim touching `f64`
+//!     (NaN breaks rep-equality ⇔ value-`!=`) or another unvetted base value,
+//!     forces the host fallback.
 //!
 //! Rules that are not eligible fall back to the host interpreter; `run_rules`
 //! reports the split so the milestone can characterize the frontier honestly.
@@ -122,6 +126,19 @@ const GUARD_NAME: &str = "guard";
 const ORD_MIN_NAME: &str = "ordering-min";
 /// `ordering-max` value prim: max of two reps.
 const ORD_MAX_NAME: &str = "ordering-max";
+
+/// Rep-arithmetic kind of an atom-bound column, gating which inlined prim
+/// operations are correct on its interned `u32` rep. See `plan_join`'s
+/// "Correctness gating" docs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RepKind {
+    /// `Id` (union-find) column: rep order = id order, so ordering AND equality
+    /// are both valid.
+    Ordering,
+    /// bool / i64 / string column: injective interning makes equality / `!=`
+    /// valid, but rep order ≠ value order so ordering is NOT inlinable.
+    Equality,
+}
 
 /// A pure VALUE expression over a binding row, built from inlined value prims.
 /// Evaluates to a `u32` (an interned rep). Only constructed when every leaf is
@@ -251,22 +268,45 @@ impl JoinPlan {
 ///   - bool columns: distinct logical values get distinct interned reps, so
 ///     equality / `!=` are VALID (but ordering is meaningless — we never inline
 ///     ordering on bool).
-///   - other base values (i64/f64/string): the rep is an intern HANDLE whose
-///     order ≠ value order — INVALID. Any prim instance touching such a column
-///     leaves the whole rule on the host (graceful fallback).
+///   - i64 / string columns: interning is injective (distinct values get
+///     distinct reps, and `intern(a) == intern(b)` iff `a == b`), so equality /
+///     `!=` are VALID. Ordering is NOT — the rep is a handle whose order ≠ value
+///     order — so we never inline `<`/`ordering-min/max` on them.
+///   - f64 columns: an interned `NaN` rep equals itself, but IEEE says
+///     `NaN != NaN`, so rep-equality does NOT match value-`!=`. f64 is therefore
+///     EXCLUDED from equality inlining and stays on the host.
+///   - any other base value (BigInt/BigRat/…): conservatively INVALID. Any prim
+///     instance touching such a column leaves the whole rule on the host
+///     (graceful fallback).
 pub fn plan_join(eg: &EGraph, rule: &RuleIr, allow_prims: bool) -> Option<JoinPlan> {
+    // DIAGNOSTIC ONLY (gated `FELDERA_DBG_PLAN`): name the rejected rule and the
+    // blocking reason so a suite-wide survey can aggregate host-fallback causes.
+    // Purely env-gated; never affects default behavior. Only logs the
+    // prim-allowing (persistent) call so each rejection is reported once.
+    macro_rules! reject {
+        ($($reason:tt)*) => {{
+            if allow_prims && std::env::var("FELDERA_DBG_PLAN").is_ok() {
+                #[allow(clippy::disallowed_macros)]
+                {
+                    eprintln!("[DBG_PLAN] reject rule={:?} reason={}", rule.name, format!($($reason)*));
+                }
+            }
+            return None;
+        }};
+    }
+
     let mut atoms: Vec<AtomPlan> = Vec::new();
     let mut guards: Vec<Cond> = Vec::new();
     let mut var_order: Vec<u32> = Vec::new();
     let mut var_col: HashMap<u32, usize> = HashMap::new();
-    // Whether each atom-bound variable's column supports rep-arithmetic for
-    // ordering/comparison (`Id` columns) and for equality (`Id` or bool). We
-    // only ever inline equality on bool, never ordering, so a single "is this
-    // rep-comparable" predicate per use site suffices; the prim handlers below
-    // check the exact operation.
-    // `var_kind[v]`: Some(true) = Id column (ordering+eq valid), Some(false) =
-    // bool column (eq valid, ordering not), None = some other base value.
-    let mut var_kind: HashMap<u32, bool> = HashMap::new();
+    // Each atom-bound variable's column rep-arithmetic kind:
+    //   `Ordering` (Id columns): rep order = id order, so ordering AND equality
+    //     are both valid.
+    //   `Equality` (bool / i64 / string): interning is injective so equality /
+    //     `!=` are valid, but rep order ≠ value order so ordering is NOT inlined.
+    //   absent (`None`): f64 (NaN breaks rep-equality ↔ value-`!=`) or any other
+    //     base value — never inlinable; any prim use leaves the rule on host.
+    let mut var_kind: HashMap<u32, RepKind> = HashMap::new();
     // Symbolic definitions for prim-produced (not atom-bound) variables.
     let mut pure_vals: HashMap<u32, PureExpr> = HashMap::new();
     let mut pure_conds: HashMap<u32, Cond> = HashMap::new();
@@ -279,21 +319,33 @@ pub fn plan_join(eg: &EGraph, rule: &RuleIr, allow_prims: bool) -> Option<JoinPl
     };
 
     let bool_bvid = eg.bool_bvid();
-    // Classify a function column's type into the rep-arithmetic kind.
-    let col_kind = |f: FunctionId, col: usize| -> Option<bool> {
+    let i64_bvid = eg.i64_bvid();
+    let string_bvid = eg.string_bvid();
+    // Classify a function column's type into the rep-arithmetic kind, or `None`
+    // if it cannot be inlined at all (f64 / other base values). NOTE: matching
+    // i64/string POSITIVELY (rather than excluding f64) is deliberately
+    // conservative — any base type we have not vetted as injective-with-matching
+    // equality (BigInt, BigRat, future types) falls through to `None` and the
+    // rule stays on the host.
+    let col_kind = |f: FunctionId, col: usize| -> Option<RepKind> {
         match eg.col_ty(f, col) {
-            Some(ColumnTy::Id) => Some(true),
-            Some(ColumnTy::Base(bv)) if Some(bv) == bool_bvid => Some(false),
+            Some(ColumnTy::Id) => Some(RepKind::Ordering),
+            Some(ColumnTy::Base(bv))
+                if Some(bv) == bool_bvid || Some(bv) == i64_bvid || Some(bv) == string_bvid =>
+            {
+                Some(RepKind::Equality)
+            }
             _ => None,
         }
     };
 
     // Resolve a prim-operand slot to a `PureExpr` value, or `None` if it cannot
-    // be safely inlined (unbound var, or a non-rep-comparable base value).
+    // be safely inlined (unbound var, or a column whose rep-arithmetic kind does
+    // not support the requested operation).
     let val_of = |s: &Slot,
                   pure_vals: &HashMap<u32, PureExpr>,
                   var_col: &HashMap<u32, usize>,
-                  var_kind: &HashMap<u32, bool>,
+                  var_kind: &HashMap<u32, RepKind>,
                   need_ordering: bool|
      -> Option<PureExpr> {
         match s {
@@ -305,9 +357,10 @@ pub fn plan_join(eg: &EGraph, rule: &RuleIr, allow_prims: bool) -> Option<JoinPl
                 let &col = var_col.get(v)?;
                 match var_kind.get(v) {
                     // Id column: ordering + equality both valid.
-                    Some(true) => Some(PureExpr::Col(col)),
-                    // bool column: equality only (ordering meaningless).
-                    Some(false) if !need_ordering => Some(PureExpr::Col(col)),
+                    Some(RepKind::Ordering) => Some(PureExpr::Col(col)),
+                    // bool / i64 / string column: equality only (rep order is
+                    // meaningless / handle-order, so never inline ordering).
+                    Some(RepKind::Equality) if !need_ordering => Some(PureExpr::Col(col)),
                     _ => None,
                 }
             }
@@ -318,16 +371,27 @@ pub fn plan_join(eg: &EGraph, rule: &RuleIr, allow_prims: bool) -> Option<JoinPl
         match op {
             BodyOp::Atom(atom) => {
                 if atom.slots.len() > JOIN_WIDTH {
-                    return None; // atom too wide for the fixed row
+                    reject!(
+                        "atom arity {} > JOIN_WIDTH {}",
+                        atom.slots.len(),
+                        JOIN_WIDTH
+                    );
                 }
                 for (col, s) in atom.slots.iter().enumerate() {
                     if let Slot::Var(v) = s {
                         see_var(*v, &mut var_order, &mut var_col);
                         // Record the column's rep-arithmetic kind. (If a var is
-                        // bound by several atoms, any Id occurrence wins — they
-                        // must agree by the type system anyway.)
+                        // bound by several atoms, any `Ordering` occurrence wins
+                        // — they must agree by the type system anyway.)
                         if let Some(k) = col_kind(atom.func, col) {
-                            var_kind.entry(*v).and_modify(|e| *e = *e || k).or_insert(k);
+                            var_kind
+                                .entry(*v)
+                                .and_modify(|e| {
+                                    if k == RepKind::Ordering {
+                                        *e = RepKind::Ordering;
+                                    }
+                                })
+                                .or_insert(k);
                         }
                     }
                 }
@@ -346,10 +410,20 @@ pub fn plan_join(eg: &EGraph, rule: &RuleIr, allow_prims: bool) -> Option<JoinPl
                         // `a != b` on reps. `!=` returns unit (a guard); `bool-!=`
                         // returns a bool the `or`/`guard` chain consumes.
                         if args.len() != 2 {
-                            return None;
+                            reject!("prim {} bad-arity {}", name.unwrap_or("?"), args.len());
                         }
-                        let a = val_of(&args[0], &pure_vals, &var_col, &var_kind, false)?;
-                        let b = val_of(&args[1], &pure_vals, &var_col, &var_kind, false)?;
+                        let a = match val_of(&args[0], &pure_vals, &var_col, &var_kind, false) {
+                            Some(e) => e,
+                            None => {
+                                reject!("prim {} operand0 not-rep-comparable", name.unwrap_or("?"))
+                            }
+                        };
+                        let b = match val_of(&args[1], &pure_vals, &var_col, &var_kind, false) {
+                            Some(e) => e,
+                            None => {
+                                reject!("prim {} operand1 not-rep-comparable", name.unwrap_or("?"))
+                            }
+                        };
                         let cond = Cond::Ne(a, b);
                         if name == Some(NEQ_NAME) {
                             // Unit guard: prune unless a != b.
@@ -358,7 +432,7 @@ pub fn plan_join(eg: &EGraph, rule: &RuleIr, allow_prims: bool) -> Option<JoinPl
                             // Bind the bool result symbolically for `or`/`guard`.
                             pure_conds.insert(*rv, cond);
                         } else {
-                            return None;
+                            reject!("prim bool-!= ret not a var");
                         }
                     }
                     Some(OR_NAME) => {
@@ -366,34 +440,50 @@ pub fn plan_join(eg: &EGraph, rule: &RuleIr, allow_prims: bool) -> Option<JoinPl
                         let mut cs = Vec::with_capacity(args.len());
                         for s in args {
                             match s {
-                                Slot::Var(v) => cs.push(pure_conds.get(v)?.clone()),
-                                Slot::Const(_) => return None,
+                                Slot::Var(v) => match pure_conds.get(v) {
+                                    Some(c) => cs.push(c.clone()),
+                                    None => reject!("prim or operand not a bound bool-cond"),
+                                },
+                                Slot::Const(_) => reject!("prim or const operand"),
                             }
                         }
                         if let Slot::Var(rv) = ret {
                             pure_conds.insert(*rv, Cond::Or(cs));
                         } else {
-                            return None;
+                            reject!("prim or ret not a var");
                         }
                     }
                     Some(GUARD_NAME) => {
                         // Prune unless the bool operand is true.
                         if args.len() != 1 {
-                            return None;
+                            reject!("prim guard bad-arity {}", args.len());
                         }
                         match &args[0] {
-                            Slot::Var(v) => guards.push(pure_conds.get(v)?.clone()),
-                            Slot::Const(_) => return None,
+                            Slot::Var(v) => match pure_conds.get(v) {
+                                Some(c) => guards.push(c.clone()),
+                                None => reject!("prim guard operand not a bound bool-cond"),
+                            },
+                            Slot::Const(_) => reject!("prim guard const operand"),
                         }
                     }
                     Some(ORD_MIN_NAME) | Some(ORD_MAX_NAME) => {
                         // Value-producing ordering prim on reps — ONLY valid on
                         // Id columns (rep order = id order = leader choice).
                         if args.len() != 2 {
-                            return None;
+                            reject!("prim {} bad-arity {}", name.unwrap_or("?"), args.len());
                         }
-                        let a = val_of(&args[0], &pure_vals, &var_col, &var_kind, true)?;
-                        let b = val_of(&args[1], &pure_vals, &var_col, &var_kind, true)?;
+                        let a = match val_of(&args[0], &pure_vals, &var_col, &var_kind, true) {
+                            Some(e) => e,
+                            None => {
+                                reject!("prim {} operand0 not-Id-ordering", name.unwrap_or("?"))
+                            }
+                        };
+                        let b = match val_of(&args[1], &pure_vals, &var_col, &var_kind, true) {
+                            Some(e) => e,
+                            None => {
+                                reject!("prim {} operand1 not-Id-ordering", name.unwrap_or("?"))
+                            }
+                        };
                         let expr = if name == Some(ORD_MIN_NAME) {
                             PureExpr::Min(Box::new(a), Box::new(b))
                         } else {
@@ -403,8 +493,13 @@ pub fn plan_join(eg: &EGraph, rule: &RuleIr, allow_prims: bool) -> Option<JoinPl
                             // `ret` already bound by an atom (or another prim
                             // value): an equality assert `expr == ret`.
                             Slot::Var(rv) if var_col.contains_key(rv) => {
-                                let rexpr =
-                                    val_of(ret, &pure_vals, &var_col, &var_kind, true)?;
+                                let rexpr = match val_of(ret, &pure_vals, &var_col, &var_kind, true)
+                                {
+                                    Some(e) => e,
+                                    None => {
+                                        reject!("prim {} ret not-Id-ordering", name.unwrap_or("?"))
+                                    }
+                                };
                                 guards.push(Cond::Eq(expr, rexpr));
                             }
                             Slot::Var(rv) if pure_vals.contains_key(rv) => {
@@ -425,10 +520,10 @@ pub fn plan_join(eg: &EGraph, rule: &RuleIr, allow_prims: bool) -> Option<JoinPl
                             }
                         }
                     }
-                    _ => {
+                    other => {
                         // An unrecognized / non-inlinable body prim: leave the
                         // whole rule on the host nested-loop join.
-                        return None;
+                        reject!("unrecognized-prim {}", other.unwrap_or("<unnamed>"));
                     }
                 }
             }
@@ -443,15 +538,19 @@ pub fn plan_join(eg: &EGraph, rule: &RuleIr, allow_prims: bool) -> Option<JoinPl
         if (pure_vals.contains_key(&hv) || pure_conds.contains_key(&hv))
             && !var_col.contains_key(&hv)
         {
-            return None;
+            reject!("prim-output var escapes to head");
         }
     }
 
     if atoms.is_empty() {
-        return None; // nothing to join (constant-only / prim-only body)
+        reject!("no body atoms (constant-only / prim-only body)");
     }
     if var_order.len() > JOIN_WIDTH {
-        return None; // too many distinct body variables for the fixed row
+        reject!(
+            "too many vars {} > JOIN_WIDTH {}",
+            var_order.len(),
+            JOIN_WIDTH
+        );
     }
 
     Some(JoinPlan {

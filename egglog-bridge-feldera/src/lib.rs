@@ -316,9 +316,29 @@ impl EGraph {
     /// Lets `dbsp_join::plan_join` recognize bool-typed columns (whose distinct
     /// reps make equality / `bool-!=` / `or` rep-arithmetic valid).
     pub(crate) fn bool_bvid(&self) -> Option<BaseValueId> {
+        self.bvid_of::<bool>()
+    }
+
+    /// The [`BaseValueId`] of the `i64` base type, if it has been registered.
+    /// `i64` interning is injective, so rep-equality matches value equality:
+    /// `dbsp_join::plan_join` may inline `=`/`!=` (but never ordering) on these
+    /// columns. (See the `f64` exception in `plan_join`'s docs.)
+    pub(crate) fn i64_bvid(&self) -> Option<BaseValueId> {
+        self.bvid_of::<i64>()
+    }
+
+    /// The [`BaseValueId`] of the `String` base type, if it has been registered.
+    /// Like `i64`, string interning is injective so rep-equality matches value
+    /// equality and `=`/`!=` may be inlined.
+    pub(crate) fn string_bvid(&self) -> Option<BaseValueId> {
+        self.bvid_of::<String>()
+    }
+
+    /// The [`BaseValueId`] of base type `T`, if it has been registered.
+    fn bvid_of<T: 'static>(&self) -> Option<BaseValueId> {
         let bvs = self.db.base_values();
-        bvs.has_ty_by_id(std::any::TypeId::of::<bool>())
-            .then(|| bvs.get_ty_by_id(std::any::TypeId::of::<bool>()))
+        let id = std::any::TypeId::of::<T>();
+        bvs.has_ty_by_id(id).then(|| bvs.get_ty_by_id(id))
     }
 
     /// Schema changed (relation/rule added/removed). No cached state to clear in
@@ -452,6 +472,15 @@ impl Drop for EGraph {
     // behind an env var (never on in normal runs); `eprintln!` is intentional.
     #[allow(clippy::disallowed_macros)]
     fn drop(&mut self) {
+        // DIAGNOSTIC ONLY (gated `FELDERA_STATS`): final cumulative split of
+        // rule firings (body join on DBSP vs host nested-loop fallback). Used by
+        // suite-wide surveys; never on in normal runs.
+        if std::env::var("FELDERA_STATS").is_ok() {
+            eprintln!(
+                "[FELDERA_STATS] dbsp_runs={} host_runs={}",
+                self.dbsp_rule_runs, self.host_rule_runs,
+            );
+        }
         if std::env::var("FELDERA_PROFILE").is_ok() {
             eprintln!(
                 "[PROF] read_clone={:.2}s (rows_total={}) fed_diff={:.2}s circuit_step={:.2}s",
