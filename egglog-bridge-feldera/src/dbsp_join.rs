@@ -13,8 +13,8 @@
 //! operators *inside* the dataflow. One `transaction()` performs exactly one
 //! round of the join over the current relation contents (the per-iteration
 //! model M1/M2 proved). The circuit's output is a z-set of **binding rows**:
-//! one [`Tup8`] per satisfying assignment, holding the rule's body variables
-//! in a fixed canonical order.
+//! one fixed-width binding row ([`BindRow`], a dbsp [`Tup10`]) per satisfying
+//! assignment, holding the rule's body variables in a fixed canonical order.
 //!
 //! ## What stays on the host (the frontier)
 //!
@@ -27,13 +27,13 @@
 //! primitive *value computation* and head writes remain host-side. The join
 //! itself — the expensive, paper-relevant part — runs on DBSP.
 //!
-//! ## Eligibility / the Tup8 cap
+//! ## Eligibility / the row-width cap
 //!
-//! DBSP rows must be fixed-arity `DBData` (rkyv-archivable); we use the same
-//! uniform [`Tup8`] the M1/M2 circuits used. A rule is DBSP-eligible iff:
+//! DBSP rows must be fixed-arity `DBData` (rkyv-archivable); we use a uniform
+//! [`Tup10`] (see [`JOIN_WIDTH`]). A rule is DBSP-eligible iff:
 //!   - its body has at least one table atom;
-//!   - every table atom has arity <= 8;
-//!   - the rule's body uses <= 8 distinct variables (canonical binding row);
+//!   - every table atom has arity <= [`JOIN_WIDTH`];
+//!   - the rule's body uses <= [`JOIN_WIDTH`] distinct variables (binding row);
 //!   - its only body *primitives* are `!=` guards (recognized by name), which
 //!     lower to a pure-`u32`-inequality DBSP filter — every other body prim
 //!     (value-computing, ordering guards on typed base values) forces the
@@ -44,7 +44,7 @@
 //! reports the split so the milestone can characterize the frontier honestly.
 
 use anyhow::{anyhow, Result};
-use dbsp::utils::Tup8;
+use dbsp::utils::Tup10;
 use dbsp::{CircuitHandle, OrdZSet, OutputHandle, RootCircuit, Stream, ZSetHandle, ZWeight};
 use egglog_backend_trait::FunctionId;
 use hashbrown::{HashMap, HashSet};
@@ -53,27 +53,45 @@ use crate::compile::{BodyOp, RuleIr, Slot};
 use crate::EGraph;
 
 /// Max distinct body variables / atom columns the DBSP join supports (the
-/// fixed-arity `DBData` row width).
-pub const JOIN_WIDTH: usize = 8;
+/// fixed-arity `DBData` row width). Width 10 uses dbsp's stock [`Tup10`]: it
+/// covers every var-rejected rule observed (the math-microbenchmark
+/// distributivity rewrites peak at 9 distinct body variables) with one column of
+/// margin, at zero extra dependency cost (a wider custom row would need to pull
+/// in dbsp's full DBData derive stack — paste/rkyv/size_of/serde/derive_more —
+/// and re-pin them to dbsp 0.150). The rebuild/congruence/`@uf` rules are *not*
+/// rejected by this cap (they carry value-computing body prims — `ordering-max`,
+/// `next_ts`, `bool-!=`, ordering guards — and are rejected by the prim check in
+/// [`plan_join`]); widening the row does not make them DBSP-eligible.
+pub const JOIN_WIDTH: usize = 10;
 
 /// A fixed-width binding row flowing through the DBSP circuit: `bind[i]` is the
 /// value of the rule's `i`-th canonical body variable (0 if not yet bound).
-type BindRow = Tup8<u32, u32, u32, u32, u32, u32, u32, u32>;
+type BindRow = Tup10<u32, u32, u32, u32, u32, u32, u32, u32, u32, u32>;
 
 /// A fixed-width relation row pushed into the circuit's input z-sets.
-type RelRow = Tup8<u32, u32, u32, u32, u32, u32, u32, u32>;
+type RelRow = Tup10<u32, u32, u32, u32, u32, u32, u32, u32, u32, u32>;
 
-fn pack8(vals: &[u32]) -> Tup8<u32, u32, u32, u32, u32, u32, u32, u32> {
+/// Build a fixed-width row from a slice of column values (0-padded to
+/// [`JOIN_WIDTH`]). Slices longer than [`JOIN_WIDTH`] are rejected upstream by
+/// [`plan_join`].
+fn pack_row(vals: &[u32]) -> BindRow {
     let mut a = [0u32; JOIN_WIDTH];
     for (i, v) in vals.iter().enumerate() {
         a[i] = *v;
     }
-    Tup8(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7])
+    arr_to_row(a)
 }
 
+/// Pack a fixed `[u32; JOIN_WIDTH]` array into the row tuple.
 #[inline]
-fn col8(r: &Tup8<u32, u32, u32, u32, u32, u32, u32, u32>, i: usize) -> u32 {
-    let Tup8(a0, a1, a2, a3, a4, a5, a6, a7) = r;
+fn arr_to_row(a: [u32; JOIN_WIDTH]) -> BindRow {
+    Tup10(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9])
+}
+
+/// Read column `i` of a fixed-width row.
+#[inline]
+fn get_col(r: &BindRow, i: usize) -> u32 {
+    let Tup10(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9) = r;
     match i {
         0 => *a0,
         1 => *a1,
@@ -83,7 +101,9 @@ fn col8(r: &Tup8<u32, u32, u32, u32, u32, u32, u32, u32>, i: usize) -> u32 {
         5 => *a5,
         6 => *a6,
         7 => *a7,
-        _ => panic!("col8 index {i} out of range"),
+        8 => *a8,
+        9 => *a9,
+        _ => panic!("col index {i} out of range"),
     }
 }
 
@@ -254,12 +274,12 @@ fn run_join_with(
         let rows: Vec<RelRow> = match delta {
             Some((delta_ord, d)) if delta_ord == ord => d
                 .get(&a.func)
-                .map(|set| set.iter().map(|row| pack8(row)).collect())
+                .map(|set| set.iter().map(|row| pack_row(row)).collect())
                 .unwrap_or_default(),
             _ => eg
                 .mirror
                 .get(&a.func)
-                .map(|set| set.iter().map(|row| pack8(row)).collect())
+                .map(|set| set.iter().map(|row| pack_row(row)).collect())
                 .unwrap_or_default(),
         };
         snapshot.push(rows);
@@ -304,7 +324,7 @@ fn run_join_with(
     for (row, (), w) in consolidated.iter() {
         let w: ZWeight = w;
         if w > 0 {
-            bindings.push((0..n_vars).map(|i| col8(&row, i)).collect());
+            bindings.push((0..n_vars).map(|i| get_col(&row, i)).collect());
         }
     }
     Ok(bindings)
@@ -376,7 +396,7 @@ fn build_join_stream(
             // Hash-join on the shared variable columns.
             let shared_cols_left: Vec<usize> = shared.iter().map(|v| var_col[v]).collect();
             let scl = shared_cols_left.clone();
-            let left = cur.map_index(move |b: &BindRow| (join_key(b, &scl, col8), *b));
+            let left = cur.map_index(move |b: &BindRow| (join_key(b, &scl, get_col), *b));
 
             // For the right side, the key is read from the row's columns that
             // correspond to the shared variables (the atom's slot positions).
@@ -390,7 +410,7 @@ fn build_join_stream(
                 })
                 .collect();
             let sac = shared_atom_cols.clone();
-            let right = s.map_index(move |r: &RelRow| (join_key(r, &sac, col8), *r));
+            let right = s.map_index(move |r: &RelRow| (join_key(r, &sac, get_col), *r));
 
             let bound_now = bound.clone();
             let vc2 = vc.clone();
@@ -435,17 +455,15 @@ fn mark_bound(slots: &[Slot], var_col: &HashMap<u32, usize>, bound: &mut [bool])
     }
 }
 
-/// Build a `u64`/`u128`-free join key from selected columns (packed into a
-/// `Vec<u32>` for arbitrary arity — DBSP requires the key be `DBData`, and
-/// `Vec<u32>` is not, so we pack up to 4 columns into a `Tup4`-style tuple via
-/// a fixed `[u32; 8]`-backed `Tup8`). For simplicity and to stay within
-/// `DBData`, the key is a `Tup8` with the selected columns in the low slots.
+/// Build a `u64`/`u128`-free join key from selected columns. DBSP requires the
+/// key be `DBData` (`Vec<u32>` is not), so the key reuses the fixed-width row
+/// tuple with the selected columns packed into the low slots (others 0).
 fn join_key<R>(r: &R, cols: &[usize], get: fn(&R, usize) -> u32) -> BindRow {
     let mut a = [0u32; JOIN_WIDTH];
     for (i, &c) in cols.iter().enumerate() {
         a[i] = get(r, c);
     }
-    Tup8(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7])
+    arr_to_row(a)
 }
 
 /// Match the first atom's row against its slots and produce the initial binding
@@ -456,28 +474,26 @@ fn bind_atom(r: &RelRow, slots: &[Slot], var_col: &HashMap<u32, usize>) -> Optio
     // repeated-variable equality.
     let mut local: HashMap<u32, u32> = HashMap::new();
     for (i, s) in slots.iter().enumerate() {
-        let col = col8(r, i);
+        let val = get_col(r, i);
         match s {
             Slot::Const(c) => {
-                if *c != col {
+                if *c != val {
                     return None;
                 }
             }
             Slot::Var(v) => {
                 if let Some(&prev) = local.get(v) {
-                    if prev != col {
+                    if prev != val {
                         return None;
                     }
                 } else {
-                    local.insert(*v, col);
-                    out[var_col[v]] = col;
+                    local.insert(*v, val);
+                    out[var_col[v]] = val;
                 }
             }
         }
     }
-    Some(Tup8(
-        out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7],
-    ))
+    Some(arr_to_row(out))
 }
 
 /// Merge atom row `r` into binding `b` (already-bound columns must agree with
@@ -493,30 +509,30 @@ fn merge_atom_into(
     let mut out = *b;
     let mut local: HashMap<u32, u32> = HashMap::new();
     for (i, s) in slots.iter().enumerate() {
-        let col = col8(r, i);
+        let val = get_col(r, i);
         match s {
             Slot::Const(c) => {
-                if *c != col {
+                if *c != val {
                     return None;
                 }
             }
             Slot::Var(v) => {
                 // Repeated variable within this atom must agree.
                 if let Some(&prev) = local.get(v) {
-                    if prev != col {
+                    if prev != val {
                         return None;
                     }
                     continue;
                 }
-                local.insert(*v, col);
+                local.insert(*v, val);
                 let c = var_col[v];
                 if bound[c] {
                     // Already bound by a previous atom: must agree.
-                    if col8(&out, c) != col {
+                    if get_col(&out, c) != val {
                         return None;
                     }
                 } else {
-                    out = set_col8(out, c, col);
+                    out = set_col(out, c, val);
                 }
             }
         }
@@ -525,7 +541,7 @@ fn merge_atom_into(
 }
 
 #[inline]
-fn set_col8(mut r: BindRow, i: usize, v: u32) -> BindRow {
+fn set_col(mut r: BindRow, i: usize, v: u32) -> BindRow {
     match i {
         0 => r.0 = v,
         1 => r.1 = v,
@@ -535,7 +551,9 @@ fn set_col8(mut r: BindRow, i: usize, v: u32) -> BindRow {
         5 => r.5 = v,
         6 => r.6 = v,
         7 => r.7 = v,
-        _ => panic!("set_col8 index {i} out of range"),
+        8 => r.8 = v,
+        9 => r.9 = v,
+        _ => panic!("set_col index {i} out of range"),
     }
     r
 }
@@ -581,7 +599,7 @@ fn resolvable(s: &Slot, var_col: &HashMap<u32, usize>, bound: &[bool]) -> bool {
 fn slot_val(s: &Slot, row: &BindRow, var_col: &HashMap<u32, usize>) -> u32 {
     match s {
         Slot::Const(c) => *c,
-        Slot::Var(v) => col8(row, var_col[v]),
+        Slot::Var(v) => get_col(row, var_col[v]),
     }
 }
 
@@ -685,7 +703,7 @@ impl PersistentJoin {
             if let Some(occs) = self.occ_of_func.get(func) {
                 for &ord in occs {
                     for (row, w) in rows {
-                        self.inputs[ord].push(pack8(row), *w);
+                        self.inputs[ord].push(pack_row(row), *w);
                         pushed_any = true;
                     }
                 }
@@ -711,7 +729,7 @@ impl PersistentJoin {
             for (row, (), w) in self.output.consolidate().iter() {
                 let w: ZWeight = w;
                 if w != 0 {
-                    let key: Vec<u32> = (0..self.n_vars).map(|i| col8(&row, i)).collect();
+                    let key: Vec<u32> = (0..self.n_vars).map(|i| get_col(&row, i)).collect();
                     *acc.entry(key).or_insert(0) += w;
                 }
             }
