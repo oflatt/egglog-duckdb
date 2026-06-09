@@ -196,26 +196,6 @@ pub struct EGraph {
     /// the snapshot is alive — turning the old O(state) per-call read clone into
     /// O(changed-state).
     pub(crate) mirror: HashMap<FunctionId, std::rc::Rc<HashSet<Row>>>,
-    /// Seminaive bookkeeping (Milestone 5), keyed by **rule index**: for each
-    /// rule, the per-relation contents that rule has **already matched against**.
-    /// The seminaive *delta* fed into a firing of rule `r` is
-    /// `mirror[f] \ seen[r][f]` — the rows of `f` that became present since rule
-    /// `r` last looked. After `r` fires, `seen[r][f]` is set to the
-    /// *start-of-iteration* snapshot (NOT the post-write mirror), so a
-    /// deleted-then-readded row reappears in `r`'s delta and retraction-driven
-    /// rebuild re-fires correctly.
-    ///
-    /// Keying by rule (not globally) is load-bearing: the frontend schedules
-    /// distinct rulesets in sequence, and rows produced by an earlier ruleset
-    /// must count as *new* to a later ruleset's rules (which have never matched
-    /// them). A global `seen` would starve a freshly-scheduled rule of its delta.
-    ///
-    /// The snapshot is stored as a shared `Rc<HashSet<Row>>`: within one
-    /// `run_rules` call every rule advances its `seen[r][f]` to the SAME
-    /// start-of-iteration view of `f`, so we build that view once and share it by
-    /// refcount instead of cloning the full (growing) relation per rule — turning
-    /// an O(rules · state) per-iteration cost into O(state) once.
-    pub(crate) seen: HashMap<usize, HashMap<FunctionId, std::rc::Rc<HashSet<Row>>>>,
     /// A core-relations [`Database`] used purely as the **base-value /
     /// primitive engine**. It owns the [`egglog_core_relations::BaseValues`]
     /// registry (so `Value`s are bit-for-bit identical to the reference
@@ -263,20 +243,21 @@ pub struct EGraph {
     /// the raw view rows / union edges across `run_rules` calls, so rebuild cost
     /// is O(delta) not O(state). `None` until the first circuit-rebuild call.
     pub(crate) rebuild_cache: Option<circuit_rebuild::RebuildCache>,
-    /// Stage-A (interpreter-deprecation, #23): when set (env
-    /// `FELDERA_PERSISTENT=1`), DBSP-eligible rules run their body join on a
-    /// PERSISTENT per-rule circuit ([`dbsp_join::PersistentJoin`]) fed signed
-    /// deltas, instead of the fresh-circuit join + host `seen`. The circuit's
-    /// integral does the seminaive bookkeeping and handles retraction natively
-    /// (signed weights), uniformly for user AND `@uf` rules — no recognition.
-    /// Off by default; the interpreter stays the oracle. Ineligible rules (value
-    /// prims in the body) still fall back to the host nested-loop + `seen`.
-    pub(crate) persistent_mode: bool,
-    /// Per-rule persistent join circuits, built lazily for eligible rules.
+    /// The persistent per-rule DBSP join circuit ([`dbsp_join::PersistentJoin`]),
+    /// built lazily per rule. This is the ONLY body-join path (#23 Stage C
+    /// complete): every atom-bearing rule runs its join on its persistent circuit
+    /// fed signed deltas; the circuit's integral does the seminaive bookkeeping
+    /// and handles retraction natively (signed weights), uniformly for user AND
+    /// `@uf` rules — no recognition. The host nested-loop + `seen` fallback was
+    /// retired; a genuinely-ineligible (impure) rule panics.
     pub(crate) persistent: HashMap<usize, dbsp_join::PersistentJoin>,
-    /// Rule indices proven DBSP-ineligible (cached so we don't re-plan + so the
-    /// host fallback path is taken consistently).
-    pub(crate) persistent_ineligible: HashSet<usize>,
+    /// Rule indices for ATOM-LESS rules (`(rule () …)` / `eval_actions` /
+    /// `eval_resolved_expr`) that have already fired their single unconditional
+    /// binding. An atom-less rule has no body relation to drive a join, so its
+    /// (trivially-satisfied) empty binding fires exactly once — tracked here so it
+    /// never re-fires on subsequent iterations (the seminaive "seen" for the lone
+    /// empty binding). Handled on the persistent path WITHOUT a nested-loop.
+    pub(crate) atomless_fired: HashSet<usize>,
     /// Per-rule, per-body-relation last-fed row set: each `run_rules` pushes only
     /// the `+/-` diff vs the start-of-call read view into that rule's persistent
     /// circuit, keeping its integral equal to the read view.
@@ -308,7 +289,6 @@ impl EGraph {
             relations: Vec::new(),
             rules: Vec::new(),
             mirror: HashMap::new(),
-            seen: HashMap::new(),
             db: Database::new(),
             prim_engine: None,
             pure_prim_names: HashMap::new(),
@@ -324,9 +304,8 @@ impl EGraph {
             circuit_rebuild: std::env::var("FELDERA_CIRCUIT_REBUILD").is_ok(),
             circuit_rebuild_runs: 0,
             rebuild_cache: None,
-            persistent_mode: std::env::var("FELDERA_PERSISTENT").is_ok(),
             persistent: HashMap::new(),
-            persistent_ineligible: HashSet::new(),
+            atomless_fired: HashSet::new(),
             fed: HashMap::new(),
             prof_read_clone: std::time::Duration::ZERO,
             prof_read_rows: 0,
@@ -779,11 +758,11 @@ impl Backend for EGraph {
         if let Some(set) = self.mirror.get_mut(&func) {
             std::rc::Rc::make_mut(set).clear();
         }
-        // Forget what every rule had matched in this table: a re-populated table
-        // must present its rows as fresh deltas to the seminaive driver.
-        for per_rel in self.seen.values_mut() {
-            per_rel.remove(&func);
-        }
+        // No per-rule `seen` to forget: each persistent rule's circuit will
+        // diff the now-cleared mirror against its last-fed view at the next
+        // `run_rules`, naturally retracting the dropped rows from its integral
+        // (and re-adding them if the table is repopulated). The `fed` snapshot is
+        // intentionally left in place so that diff is computed correctly.
         self.invalidate_circuit();
     }
 
@@ -814,7 +793,14 @@ impl Backend for EGraph {
     fn free_rule(&mut self, id: RuleId) {
         if let Some(slot) = self.rules.get_mut(id.rep() as usize) {
             *slot = None;
-            self.seen.remove(&(id.rep() as usize));
+            let i = id.rep() as usize;
+            // Drop all per-rule persistent state so a reused rule index (egglog's
+            // `eval_actions` builds + frees a fresh rule every command) starts
+            // clean — otherwise a stale `atomless_fired` / circuit would suppress
+            // the new rule's firing.
+            self.persistent.remove(&i);
+            self.fed.remove(&i);
+            self.atomless_fired.remove(&i);
             self.invalidate_circuit();
         }
     }

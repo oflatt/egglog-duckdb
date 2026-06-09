@@ -364,19 +364,12 @@ pub fn run_rebuild(eg: &mut EGraph, roles: &RebuildRoles) -> anyhow::Result<bool
         eg.mirror.insert(view, std::rc::Rc::new(resolved));
     }
 
-    // Forget per-rule seen snapshots for touched relations so later rulesets see
-    // the canonicalized rows as fresh deltas (mirror the interpreter / clear).
-    for per_rel in eg.seen.values_mut() {
-        for &uf in &roles.uf {
-            per_rel.remove(&uf);
-        }
-        for &uff in &roles.uff {
-            per_rel.remove(&uff);
-        }
-        for &view in &view_list {
-            per_rel.remove(&view);
-        }
-    }
+    // No per-rule `seen` to forget: the persistent rules' circuits diff the
+    // (now canonicalized) mirror against their last-fed view at the next
+    // `run_rules`, so the rebuild's rewrites of the uf / uff / view relations are
+    // picked up as proper signed deltas against each circuit's actual integral.
+    // (Forgetting the fed view would double-count, since the integral still holds
+    // the pre-rebuild rows.)
 
     // Change check: did any touched relation's contents differ?
     let mut changed = false;

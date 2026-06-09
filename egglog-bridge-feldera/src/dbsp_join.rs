@@ -1,61 +1,54 @@
-//! DBSP-backed body join for the Feldera backend (Milestone 4).
+//! DBSP-backed body join for the Feldera backend (#23 Stage C complete).
 //!
-//! This module runs a rule's **relational body join on DBSP's dataflow
-//! engine** — the paper's core technical contribution — rather than on the
-//! host-side nested-loop interpreter (`interpret.rs`, retained as the
-//! correctness oracle / fallback).
+//! This module runs a rule's **relational body join on DBSP's dataflow engine**
+//! — the paper's core technical contribution. The persistent per-rule circuit
+//! ([`PersistentJoin`]) is the ONLY join path: there is no host nested-loop
+//! fallback. A genuinely-ineligible rule PANICS (see [`plan_join`]).
 //!
 //! ## What runs on DBSP
 //!
-//! For a DBSP-eligible rule (see [`plan_join`]), [`run_join`] builds a
-//! **non-recursive** DBSP circuit that computes the join of the body's table
-//! atoms (multi-atom, left-deep), with `!=` guards applied as DBSP `filter`
-//! operators *inside* the dataflow. One `transaction()` performs exactly one
-//! round of the join over the current relation contents (the per-iteration
-//! model M1/M2 proved). The circuit's output is a z-set of **binding rows**:
-//! one fixed-width binding row ([`BindRow`], a 32-wide [`TupRow`]) per
-//! satisfying assignment, holding the rule's body variables in a fixed
-//! canonical order (see [`JOIN_WIDTH`]).
+//! [`PersistentJoin`] builds a **non-recursive** DBSP circuit ONCE per rule that
+//! computes the join of the body's table atoms (multi-atom, left-deep), with
+//! `!=` guards applied as DBSP `filter` operators *inside* the dataflow. It is
+//! fed only the per-relation signed DELTA each iteration; the incremental join +
+//! integral do the seminaive bookkeeping and retraction natively. The circuit's
+//! output is a z-set of **binding rows** ([`BindRow`], a [`JOIN_WIDTH`]-wide
+//! [`TupRow`]) holding the rule's body variables in a fixed canonical order.
 //!
-//! ## What stays on the host (the frontier)
+//! ## Pure body prims run ON-CIRCUIT
 //!
-//! The join *output* (binding rows) is read back and handed to the existing
-//! head-application machinery (`interpret::run_iteration`), which evaluates
-//! value-computing primitives (via the backend-agnostic
-//! [`crate::EGraph::eval_prim_internal`]) and applies `set` / `delete` /
-//! `lookup` / `union` head actions + FD-merge resolution. DBSP map/filter
-//! closures are `Send + 'static` and cannot borrow the primitive engine, so
-//! primitive *value computation* and head writes remain host-side. The join
-//! itself — the expensive, paper-relevant part — runs on DBSP.
+//! Value-computing body prims are evaluated on-circuit through the shared
+//! [`crate::PrimEngine`] (an `Arc<Mutex<Database>>` captured into the circuit
+//! closures), so the whole body join — guards AND value prims — runs on DBSP.
+//! Recognized rep-comparison prims are inlined without a lock; everything else
+//! is evaluated by re-running the REAL prim under the engine lock (the call-prim
+//! path). Only head application (`set`/`delete`/`lookup`/`union` + FD-merge)
+//! stays host-side (`interpret::run_iteration` / `apply_head`).
 //!
 //! ## Eligibility / the row-width cap
 //!
 //! DBSP rows must be fixed-arity `DBData` (rkyv-archivable); we use a uniform
-//! 32-wide [`TupRow`] (see [`JOIN_WIDTH`]). A rule is DBSP-eligible iff:
-//!   - its body has at least one table atom;
+//! [`JOIN_WIDTH`]-wide [`TupRow`]. A rule is eligible (does not panic) iff:
+//!   - it has at least one table atom (atom-less rules are fired once by the
+//!     caller, not planned here);
 //!   - every table atom has arity <= [`JOIN_WIDTH`];
 //!   - the rule's body uses <= [`JOIN_WIDTH`] distinct variables (binding row);
-//!   - its only body *primitives* are a recognized set of PURE prims (`!=`,
-//!     `bool-!=`, `or`, `guard`, `ordering-min/max`, recognized by name) whose
-//!     operands sit on columns supporting the relevant rep-arithmetic: ORDERING
-//!     prims (`ordering-min/max`) require `Id` columns; EQUALITY prims (`!=` /
-//!     `bool-!=` / `or` / `guard`) also accept the injectively-interned base
-//!     types `bool` / `i64` / `string` (rep-equality ⇔ value-equality). These
-//!     are inlined into the join — value prims as symbolic expressions, guards
-//!     as DBSP `filter`s — so the `@congruence` / `@rebuild_cleanup` /
-//!     base-value `@merge` rules run their body join on-circuit. Any other body
-//!     prim, an ordering prim on a non-`Id` column, or any prim touching `f64`
-//!     (NaN breaks rep-equality ⇔ value-`!=`) or another unvetted base value,
-//!     forces the host fallback.
-//!
-//! Rules that are not eligible fall back to the host interpreter; `run_rules`
-//! reports the split so the milestone can characterize the frontier honestly.
+//!   - every body primitive is PURE. A recognized rep-comparison prim (`!=`,
+//!     `bool-!=`, `or`, `guard`, `ordering-min/max`) is inlined when its operand
+//!     columns support the relevant rep-arithmetic (ORDERING prims require `Id`
+//!     columns; EQUALITY prims also accept the injectively-interned base types
+//!     `bool`/`i64`/`string`). A pure prim that is NOT rep-inlinable
+//!     (base-value `ordering-min/max`, f64 `!=`, or any unrecognized value prim
+//!     like `+`/`int-div`/`string-concat`) is NOT rejected — it ROUTES to the
+//!     on-circuit call-prim engine, which evaluates the real prim semantics on
+//!     actual values. Only an IMPURE prim (or a shape above the row-width cap)
+//!     makes the rule ineligible — and that PANICS.
 
 use anyhow::{anyhow, Result};
 use dbsp::{CircuitHandle, OrdZSet, OutputHandle, RootCircuit, Stream, ZSetHandle, ZWeight};
 use egglog_backend_trait::{ColumnTy, ExternalFunctionId, FunctionId, Value};
 use egglog_numeric_id::NumericId;
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashMap;
 
 use crate::compile::{BodyOp, RuleIr, Slot};
 use crate::{EGraph, PrimEngine};
@@ -66,11 +59,17 @@ use crate::{EGraph, PrimEngine};
 /// Stage C widens this from 10 (dbsp's stock [`dbsp::utils::Tup10`]) to 32 via a
 /// custom [`TupRow`] declared with dbsp's `declare_tuples!` macro, because the
 /// persistent circuit is now the ONLY join path: it must cover the WIDEST
-/// feldera-supported rule. A suite-wide survey put the peak at ~23 distinct body
-/// variables (e.g. `cykjson` `check_facts`, the `const-prop` value rules — the
-/// latter also materialize on-circuit prim outputs into binding columns), so 32
-/// gives headroom. Cost: a binding row is `32 * 4 = 128` bytes (vs 40 at width
-/// 10); rows flow through the join z-sets, so this trades memory for coverage.
+/// feldera-supported rule. A suite-wide survey put the peak among PASSING
+/// programs at ~23 distinct body variables (`cykjson` `check_facts`, the
+/// `const-prop` value rules — the latter also materialize on-circuit prim
+/// outputs into binding columns), so 32 gives headroom. A rule wider than this
+/// PANICS as ineligible (`plan_join`'s "too many vars" reject); the only suite
+/// program that trips it is `luminal-llama`'s `@rebuild_rule34` (35 vars), which
+/// is independently unsupported (it fails the frontend with an unbound-global
+/// error regardless of the backend). Widening to cover it (48) regressed the
+/// `math-microbenchmark` N=11 run to OOM (50% larger rows through the saturation
+/// z-sets), so 32 is the chosen ceiling: it covers every program that actually
+/// completes. Cost: a binding row is `32 * 4 = 128` bytes (vs 40 at width 10).
 /// Pulling in dbsp's DBData derive stack (paste/rkyv/size_of/serde/derive_more)
 /// is the one-time dependency price for a row wider than `Tup10`.
 pub const JOIN_WIDTH: usize = 32;
@@ -107,8 +106,38 @@ macro_rules! with_row_fields {
     // Destructure a `&TupRow` `$r` into a `[u32; 32]` array.
     (read $r:expr) => {{
         let TupRow(
-            a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18,
-            a19, a20, a21, a22, a23, a24, a25, a26, a27, a28, a29, a30, a31,
+            a0,
+            a1,
+            a2,
+            a3,
+            a4,
+            a5,
+            a6,
+            a7,
+            a8,
+            a9,
+            a10,
+            a11,
+            a12,
+            a13,
+            a14,
+            a15,
+            a16,
+            a17,
+            a18,
+            a19,
+            a20,
+            a21,
+            a22,
+            a23,
+            a24,
+            a25,
+            a26,
+            a27,
+            a28,
+            a29,
+            a30,
+            a31,
         ) = $r;
         [
             *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13, *a14, *a15,
@@ -121,8 +150,38 @@ macro_rules! with_row_fields {
 /// A fixed-width binding row flowing through the DBSP circuit: `bind[i]` is the
 /// value of the rule's `i`-th canonical body variable (0 if not yet bound).
 type BindRow = TupRow<
-    u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32,
-    u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
 >;
 
 /// A fixed-width relation row pushed into the circuit's input z-sets.
@@ -331,19 +390,17 @@ impl JoinPlan {
     }
 }
 
-/// Decide whether `rule` can run its body join on DBSP, and if so return the
-/// [`JoinPlan`]. Returns `None` (host fallback) when any eligibility condition
-/// fails.
-///
-/// `allow_prims` controls whether a body PURE prim (`!=`, `bool-!=`, `or`,
-/// `guard`, `ordering-min/max`) keeps the rule eligible by being inlined into
-/// the join (Stage B). The **persistent** circuit (`persistent_bindings`)
-/// drives the transaction lifecycle manually and is bit-exact for these inlined
-/// prims, so it passes `true`; this is what makes the `@congruence` /
-/// `@rebuild_cleanup` rules DBSP-eligible. The non-persistent seminaive path
-/// (`seminaive_bindings`, `run_join_seminaive`) is *not* bit-exact for them, so
-/// it passes `false` and those rules stay on the correct host path. Rules whose
-/// bodies have no prims are unaffected either way.
+/// Build the body-join [`JoinPlan`] for `rule` on the persistent DBSP engine, or
+/// return `Err(reason)` if the rule is genuinely ineligible (the caller then
+/// panics — the persistent circuit is the ONLY join path, there is no host
+/// fallback). Ineligibility means an IMPURE body prim, an arity/var count above
+/// the fixed [`JOIN_WIDTH`] row, or a structural shape the lowering cannot
+/// express. PURE prims are never a rejection cause: rep-comparable ones inline
+/// into the join (the no-lock fast path), all others (base-value
+/// `ordering-min/max`, f64 `!=`, arbitrary value prims like `+`/`int-div`) route
+/// to the on-circuit call-prim path that re-evaluates the REAL prim on actual
+/// values through the shared engine. Atom-less rules are handled by the caller
+/// before this is reached.
 ///
 /// ## Correctness gating (rep-arithmetic validity)
 ///
@@ -351,34 +408,34 @@ impl JoinPlan {
 /// value. `ordering-min/max` and `<`/`==`/`!=` on the rep are only valid when
 /// the rep order/equality matches the logical one:
 ///   - `ColumnTy::Id` columns: the rep IS the union-find id, so min/max = the
-///     leader choice and equality is identity — VALID.
+///     leader choice and equality is identity — VALID (inlined, no lock).
 ///   - bool columns: distinct logical values get distinct interned reps, so
 ///     equality / `!=` are VALID (but ordering is meaningless — we never inline
 ///     ordering on bool).
 ///   - i64 / string columns: interning is injective (distinct values get
 ///     distinct reps, and `intern(a) == intern(b)` iff `a == b`), so equality /
 ///     `!=` are VALID. Ordering is NOT — the rep is a handle whose order ≠ value
-///     order — so we never inline `<`/`ordering-min/max` on them.
+///     order — so base-value `ordering-min/max` ROUTES to the call-prim engine.
 ///   - f64 columns: an interned `NaN` rep equals itself, but IEEE says
-///     `NaN != NaN`, so rep-equality does NOT match value-`!=`. f64 is therefore
-///     EXCLUDED from equality inlining and stays on the host.
-///   - any other base value (BigInt/BigRat/…): conservatively INVALID. Any prim
-///     instance touching such a column leaves the whole rule on the host
-///     (graceful fallback).
-pub fn plan_join(eg: &EGraph, rule: &RuleIr, allow_prims: bool) -> Option<JoinPlan> {
+///     `NaN != NaN`, so rep-equality does NOT match value-`!=`. f64 `!=`
+///     therefore ROUTES to the call-prim engine (which evaluates real IEEE `!=`).
+///   - any other base value (BigInt/BigRat/…): conservatively non-rep-inlinable;
+///     any recognized prim touching such a column also routes to the call-prim
+///     engine, which evaluates the real prim semantics on the actual values.
+pub fn plan_join(eg: &EGraph, rule: &RuleIr) -> Result<JoinPlan, String> {
     // DIAGNOSTIC ONLY (gated `FELDERA_DBG_PLAN`): name the rejected rule and the
-    // blocking reason so a suite-wide survey can aggregate host-fallback causes.
-    // Purely env-gated; never affects default behavior. Only logs the
-    // prim-allowing (persistent) call so each rejection is reported once.
+    // blocking reason. Purely env-gated; never affects behavior. The reason is
+    // also returned so the caller's panic carries it.
     macro_rules! reject {
         ($($reason:tt)*) => {{
-            if allow_prims && std::env::var("FELDERA_DBG_PLAN").is_ok() {
+            let reason = format!($($reason)*);
+            if std::env::var("FELDERA_DBG_PLAN").is_ok() {
                 #[allow(clippy::disallowed_macros)]
                 {
-                    eprintln!("[DBG_PLAN] reject rule={:?} reason={}", rule.name, format!($($reason)*));
+                    eprintln!("[DBG_PLAN] reject rule={:?} reason={}", rule.name, reason);
                 }
             }
-            return None;
+            return Err(reason);
         }};
     }
 
@@ -467,26 +524,117 @@ pub fn plan_join(eg: &EGraph, rule: &RuleIr, allow_prims: bool) -> Option<JoinPl
         )
     };
 
-    // Decide the prim-lowering MODE for this rule (Stage C). If every body prim
-    // is a recognized rep-comparison, take the in-join fast path (PureExpr/Cond
-    // guards, no lock). If ANY body prim is a genuine pure VALUE prim, lower the
-    // WHOLE prim chain to on-circuit call-prim steps (engine-evaluated). If any
-    // body prim is impure (not registered as pure) the rule is ineligible — it
-    // must stay on the host / panic, never re-evaluated on-circuit.
-    let mut use_calls = false;
+    // PRE-PASS (Stage C generalization): scan the body's table atoms to populate
+    // `var_col` / `var_kind` BEFORE deciding the prim-lowering mode, so the mode
+    // decision can consult each operand's rep-arithmetic kind. (The full atom
+    // processing below re-walks atoms; this pre-pass only fills the maps the mode
+    // decision reads — it does not push `atoms`, so the canonical work is not
+    // duplicated.) Variable column order from this pre-pass is the canonical body
+    // order, the same order the main loop would assign.
     for op in &rule.body {
-        if let BodyOp::Prim { id, .. } = op {
-            if !allow_prims {
-                return None;
+        if let BodyOp::Atom(atom) = op {
+            for (col, s) in atom.slots.iter().enumerate() {
+                if let Slot::Var(v) = s {
+                    see_var(*v, &mut var_order, &mut var_col);
+                    if let Some(k) = col_kind(atom.func, col) {
+                        var_kind
+                            .entry(*v)
+                            .and_modify(|e| {
+                                if k == RepKind::Ordering {
+                                    *e = RepKind::Ordering;
+                                }
+                            })
+                            .or_insert(k);
+                    }
+                }
             }
-            if !eg.is_pure_prim(*id) {
-                reject!(
-                    "impure body prim {:?} (not eligible on-circuit)",
-                    eg.external_funcs.name(*id)
-                );
+        }
+    }
+
+    // Decide the prim-lowering MODE for this rule (Stage C). Three outcomes:
+    //   - in-join rep fast path (no lock): every body prim is a recognized
+    //     rep-comparison (`!=`/`bool-!=`/`or`/`guard`/`ordering-min/max`) AND
+    //     every operand is rep-inlinable on its column kind (Id for ordering,
+    //     Id/bool/i64/string for equality);
+    //   - on-circuit call-prim path (locks per row, evaluates the REAL prim on
+    //     actual values): ANY body prim is either unrecognized (a genuine value
+    //     prim like `+`/`int-div`/`string-concat`) OR recognized-but-not-
+    //     rep-inlinable (base-value `ordering-min/max`, f64 `!=`, …). The shared
+    //     engine handles these correctly (IEEE NaN for f64 `!=`, value-order for
+    //     base-value ordering), so we route there INSTEAD of rejecting to host;
+    //   - ineligible (host / panic): a body prim is impure (not registered pure).
+    //
+    // To decide rep-inlinability we track a lightweight `RepKind` for prim-output
+    // vars too: `bool-!=`/`or`/`guard` produce a bool (Equality), and
+    // `ordering-min/max` propagate their operand kind. If any recognized prim's
+    // operand cannot be resolved to an inlinable kind, the WHOLE rule takes the
+    // call-prim path (never a host fallback for a pure prim).
+    let mut use_calls = false;
+    // Operand-kind probe for the mode decision (does not mutate plan state).
+    let mut prim_kind: HashMap<u32, Option<RepKind>> = HashMap::new();
+    let operand_kind = |s: &Slot,
+                        prim_kind: &HashMap<u32, Option<RepKind>>,
+                        var_kind: &HashMap<u32, RepKind>|
+     -> Option<RepKind> {
+        match s {
+            // A const is rep-inlinable for equality (its rep is itself); treat as
+            // Equality (the weakest kind that still permits `!=`/`==`).
+            Slot::Const(_) => Some(RepKind::Equality),
+            Slot::Var(v) => {
+                if let Some(k) = prim_kind.get(v) {
+                    return *k;
+                }
+                var_kind.get(v).copied()
             }
-            if !is_recognized(eg.external_funcs.name(*id)) {
+        }
+    };
+    for op in &rule.body {
+        if let BodyOp::Prim { id, args, ret } = op {
+            let name = eg.external_funcs.name(*id);
+            if !is_recognized(name) {
+                // An UNrecognized prim goes to the on-circuit call-prim engine,
+                // which RE-EVALUATES the real prim — so it must be PURE
+                // (idempotent under re-evaluation). Recognized rep-comparison
+                // prims (`!=`/`bool-!=`/`or`/`guard`/`ordering-min/max`) are
+                // known-pure by construction and inlined by name, so they do NOT
+                // require the frontend's pure-prim registration (the bridge-level
+                // tests build rules without it).
+                if !eg.is_pure_prim(*id) {
+                    reject!("impure body prim {:?} (not eligible on-circuit)", name);
+                }
                 use_calls = true;
+                continue;
+            }
+            // Recognized prim: check whether it is rep-inlinable on its operands.
+            let need_ordering = matches!(name, Some(ORD_MIN_NAME) | Some(ORD_MAX_NAME));
+            let mut inlinable = true;
+            let mut out_kind = Some(RepKind::Equality);
+            for a in args {
+                match operand_kind(a, &prim_kind, &var_kind) {
+                    Some(RepKind::Ordering) => {
+                        if need_ordering {
+                            out_kind = Some(RepKind::Ordering);
+                        }
+                    }
+                    Some(RepKind::Equality) => {
+                        if need_ordering {
+                            // base-value ordering: rep order != value order ⇒
+                            // not rep-inlinable. Route to the call-prim engine.
+                            inlinable = false;
+                        }
+                    }
+                    // f64 / unvetted base value (or an unbound operand): not
+                    // rep-inlinable ⇒ call-prim engine.
+                    None => inlinable = false,
+                }
+            }
+            if !inlinable {
+                use_calls = true;
+            }
+            // Record the recognized prim's output kind for downstream operands
+            // (e.g. `or(bool-!=, bool-!=)`). Value prims bind a var.
+            if let Slot::Var(rv) = ret {
+                prim_kind.insert(*rv, out_kind);
             }
         }
     }
@@ -503,24 +651,11 @@ pub fn plan_join(eg: &EGraph, rule: &RuleIr, allow_prims: bool) -> Option<JoinPl
         }
     };
 
-    // Call-prim path: pre-allocate a binding column for EVERY atom-bound variable
-    // before lowering any prim, regardless of body order. A prim whose `ret` is a
-    // variable an atom ALSO binds must become an `AssertCol` (the join binds the
-    // column; the step then asserts the prim result equals it) — never a `Bind`,
-    // which would overwrite the atom's binding. Body order would otherwise make a
-    // prim appearing before its consuming atom (the `(predicate (+ x 1))` shape)
-    // mis-lower to `Bind`, silently dropping the atom's join constraint.
-    if use_calls {
-        for op in &rule.body {
-            if let BodyOp::Atom(atom) = op {
-                for s in &atom.slots {
-                    if let Slot::Var(v) = s {
-                        see_var(*v, &mut var_order, &mut var_col);
-                    }
-                }
-            }
-        }
-    }
+    // Note: the call-prim path needs a binding column for EVERY atom-bound
+    // variable BEFORE lowering any prim (so a prim whose `ret` is also an
+    // atom-bound var lowers to `AssertCol`, not a `Bind` that would clobber the
+    // atom's join constraint). The PRE-PASS above already populated `var_col` for
+    // all atom-bound vars in canonical body order, so this holds for both modes.
 
     for op in &rule.body {
         match op {
@@ -556,9 +691,6 @@ pub fn plan_join(eg: &EGraph, rule: &RuleIr, allow_prims: bool) -> Option<JoinPl
                 });
             }
             BodyOp::Prim { id, args, ret } => {
-                if !allow_prims {
-                    return None;
-                }
                 // Stage C call-prim path: this rule has a genuine value prim, so
                 // EVERY prim (recognized or not) is lowered to an on-circuit
                 // engine call. Args read prior binding columns; the result either
@@ -570,7 +702,9 @@ pub fn plan_join(eg: &EGraph, rule: &RuleIr, allow_prims: bool) -> Option<JoinPl
                     for a in args {
                         match arg_src(a, &var_col) {
                             Some(s) => srcs.push(s),
-                            None => reject!("call-prim {:?} arg unbound", eg.external_funcs.name(*id)),
+                            None => {
+                                reject!("call-prim {:?} arg unbound", eg.external_funcs.name(*id))
+                            }
                         }
                     }
                     let ret = match ret {
@@ -744,7 +878,7 @@ pub fn plan_join(eg: &EGraph, rule: &RuleIr, allow_prims: bool) -> Option<JoinPl
         );
     }
 
-    Some(JoinPlan {
+    Ok(JoinPlan {
         var_order,
         var_col,
         atoms,
@@ -792,104 +926,6 @@ fn head_vars(rule: &RuleIr) -> Vec<u32> {
         }
     }
     out
-}
-
-/// Per-relation input handle for the join circuit.
-struct RelHandles {
-    input: ZSetHandle<RelRow>,
-}
-
-/// Run the body join of `plan` on DBSP over the current mirror (full relations
-/// in every atom occurrence), returning one binding row per satisfying
-/// assignment. Retained for the M4 non-incremental proof; the seminaive driver
-/// uses [`run_join_seminaive`].
-pub fn run_join(eg: &EGraph, plan: &JoinPlan) -> Result<Vec<Vec<u32>>> {
-    // No delta atom: every occurrence reads the full mirror.
-    run_join_with(eg, plan, None)
-}
-
-/// Run the body join with **one atom occurrence restricted to its relation's
-/// delta** and every other occurrence over the full relation — one term of the
-/// seminaive union (see `interpret::seminaive_bindings`). `delta_atom_ord` is
-/// the occurrence's index within `plan.atoms` (plan atoms are in body order).
-pub fn run_join_seminaive(
-    eg: &EGraph,
-    plan: &JoinPlan,
-    delta_atom_ord: usize,
-    delta: &HashMap<FunctionId, HashSet<crate::compile::Row>>,
-) -> Result<Vec<Vec<u32>>> {
-    run_join_with(eg, plan, Some((delta_atom_ord, delta)))
-}
-
-/// Core join runner. Builds a fresh non-recursive circuit with **one input
-/// stream per atom occurrence** (so the same relation appearing in multiple
-/// atoms can be fed different row sets — full vs. delta — for seminaive), pushes
-/// each occurrence's rows, runs one `transaction()`, and reads the consolidated
-/// binding rows. When `delta` is `Some((ord, d))`, occurrence `ord` is fed
-/// `d[func]` (its delta) and all others the full mirror.
-fn run_join_with(
-    eg: &EGraph,
-    plan: &JoinPlan,
-    delta: Option<(usize, &HashMap<FunctionId, HashSet<crate::compile::Row>>)>,
-) -> Result<Vec<Vec<u32>>> {
-    let n_atoms = plan.atoms.len();
-
-    // Snapshot the rows feeding each atom occurrence (fixed-width, 0-padded).
-    let mut snapshot: Vec<Vec<RelRow>> = Vec::with_capacity(n_atoms);
-    for (ord, a) in plan.atoms.iter().enumerate() {
-        let rows: Vec<RelRow> = match delta {
-            Some((delta_ord, d)) if delta_ord == ord => d
-                .get(&a.func)
-                .map(|set| set.iter().map(|row| pack_row(row)).collect())
-                .unwrap_or_default(),
-            _ => eg
-                .mirror
-                .get(&a.func)
-                .map(|set| set.iter().map(|row| pack_row(row)).collect())
-                .unwrap_or_default(),
-        };
-        snapshot.push(rows);
-    }
-
-    // Clone the plan pieces the circuit closure needs (it must be `'static`).
-    let atoms: Vec<Vec<Slot>> = plan.atoms.iter().map(|a| a.slots.clone()).collect();
-    let var_col = plan.var_col.clone();
-    let guards = plan.guards.clone();
-    let n_vars = plan.var_order.len();
-
-    let (handle, (inputs, output)) = RootCircuit::build(move |root| {
-        let mut inputs: Vec<RelHandles> = Vec::with_capacity(n_atoms);
-        let mut streams: Vec<Stream<RootCircuit, OrdZSet<RelRow>>> = Vec::with_capacity(n_atoms);
-        for _ in 0..n_atoms {
-            let (stream, input) = root.add_input_zset::<RelRow>();
-            inputs.push(RelHandles { input });
-            streams.push(stream);
-        }
-
-        let out = build_join_stream(&streams, &atoms, &var_col, &guards, n_vars)?;
-        Ok((inputs, out.output()))
-    })?;
-
-    // Push each occurrence's snapshot as the circuit input delta (all +1).
-    for (ord, rows) in snapshot.iter().enumerate() {
-        for row in rows {
-            inputs[ord].input.push(*row, 1);
-        }
-    }
-
-    // One round.
-    handle.transaction()?;
-
-    // Read the consolidated binding rows (positive weight = present).
-    let consolidated = output.consolidate();
-    let mut bindings: Vec<Vec<u32>> = Vec::new();
-    for (row, (), w) in consolidated.iter() {
-        let w: ZWeight = w;
-        if w > 0 {
-            bindings.push((0..n_vars).map(|i| get_col(&row, i)).collect());
-        }
-    }
-    Ok(bindings)
 }
 
 /// Build the DBSP stream that produces the join's binding rows.
@@ -1158,7 +1194,7 @@ fn merge_atom_into(
 
 #[inline]
 fn set_col(r: BindRow, i: usize, v: u32) -> BindRow {
-    let mut a = with_row_fields!(read &r);
+    let mut a = with_row_fields!(read & r);
     a[i] = v;
     arr_to_row(a)
 }
