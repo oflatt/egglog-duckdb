@@ -578,9 +578,13 @@ fn persistent_bindings(
     };
     let var_order = plan.var_order().to_vec();
 
-    // Build the persistent circuit once for this rule.
+    // Build the persistent circuit once for this rule. The shared primitive
+    // engine (Stage C) is captured into the circuit's call-prim closures so
+    // value-computing body prims evaluate on-circuit; it is built lazily here,
+    // after all primitives are registered.
     if !eg.persistent.contains_key(&idx) {
-        let pj = dbsp_join::PersistentJoin::build(&plan)?;
+        let engine = eg.prim_engine();
+        let pj = dbsp_join::PersistentJoin::build(&plan, &engine)?;
         eg.persistent.insert(idx, pj);
     }
 

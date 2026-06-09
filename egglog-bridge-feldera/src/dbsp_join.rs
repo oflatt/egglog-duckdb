@@ -13,8 +13,9 @@
 //! operators *inside* the dataflow. One `transaction()` performs exactly one
 //! round of the join over the current relation contents (the per-iteration
 //! model M1/M2 proved). The circuit's output is a z-set of **binding rows**:
-//! one fixed-width binding row ([`BindRow`], a dbsp [`Tup10`]) per satisfying
-//! assignment, holding the rule's body variables in a fixed canonical order.
+//! one fixed-width binding row ([`BindRow`], a 32-wide [`TupRow`]) per
+//! satisfying assignment, holding the rule's body variables in a fixed
+//! canonical order (see [`JOIN_WIDTH`]).
 //!
 //! ## What stays on the host (the frontier)
 //!
@@ -30,7 +31,7 @@
 //! ## Eligibility / the row-width cap
 //!
 //! DBSP rows must be fixed-arity `DBData` (rkyv-archivable); we use a uniform
-//! [`Tup10`] (see [`JOIN_WIDTH`]). A rule is DBSP-eligible iff:
+//! 32-wide [`TupRow`] (see [`JOIN_WIDTH`]). A rule is DBSP-eligible iff:
 //!   - its body has at least one table atom;
 //!   - every table atom has arity <= [`JOIN_WIDTH`];
 //!   - the rule's body uses <= [`JOIN_WIDTH`] distinct variables (binding row);
@@ -51,29 +52,81 @@
 //! reports the split so the milestone can characterize the frontier honestly.
 
 use anyhow::{anyhow, Result};
-use dbsp::utils::Tup10;
 use dbsp::{CircuitHandle, OrdZSet, OutputHandle, RootCircuit, Stream, ZSetHandle, ZWeight};
-use egglog_backend_trait::{ColumnTy, FunctionId};
+use egglog_backend_trait::{ColumnTy, ExternalFunctionId, FunctionId, Value};
+use egglog_numeric_id::NumericId;
 use hashbrown::{HashMap, HashSet};
 
 use crate::compile::{BodyOp, RuleIr, Slot};
-use crate::EGraph;
+use crate::{EGraph, PrimEngine};
 
 /// Max distinct body variables / atom columns the DBSP join supports (the
-/// fixed-arity `DBData` row width). Width 10 uses dbsp's stock [`Tup10`]: it
-/// covers every var-rejected rule observed (the math-microbenchmark
-/// distributivity rewrites peak at 9 distinct body variables) with one column of
-/// margin, at zero extra dependency cost (a wider custom row would need to pull
-/// in dbsp's full DBData derive stack — paste/rkyv/size_of/serde/derive_more —
-/// and re-pin them to dbsp 0.150).
-pub const JOIN_WIDTH: usize = 10;
+/// fixed-arity `DBData` row width).
+///
+/// Stage C widens this from 10 (dbsp's stock [`dbsp::utils::Tup10`]) to 32 via a
+/// custom [`TupRow`] declared with dbsp's `declare_tuples!` macro, because the
+/// persistent circuit is now the ONLY join path: it must cover the WIDEST
+/// feldera-supported rule. A suite-wide survey put the peak at ~23 distinct body
+/// variables (e.g. `cykjson` `check_facts`, the `const-prop` value rules — the
+/// latter also materialize on-circuit prim outputs into binding columns), so 32
+/// gives headroom. Cost: a binding row is `32 * 4 = 128` bytes (vs 40 at width
+/// 10); rows flow through the join z-sets, so this trades memory for coverage.
+/// Pulling in dbsp's DBData derive stack (paste/rkyv/size_of/serde/derive_more)
+/// is the one-time dependency price for a row wider than `Tup10`.
+pub const JOIN_WIDTH: usize = 32;
+
+// Declare a 32-wide `DBData` tuple via dbsp's own macro, so the generated trait
+// impls (rkyv `Archive`, `SizeOf`, `MulByRef`, `HasZero`, …) match dbsp's stock
+// tuples exactly. The derive stack the macro expands to (paste/derive_more/
+// serde/rkyv/size_of) is pinned in Cargo.toml to dbsp 0.150's versions.
+// The macro binds its generic type params as value-position idents (`T1`..),
+// which trips `non_snake_case`; the names are dbsp's macro contract, not ours.
+#[allow(non_snake_case)]
+mod tup_row {
+    dbsp::declare_tuples! {
+        TupRow<
+            T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16,
+            T17, T18, T19, T20, T21, T22, T23, T24, T25, T26, T27, T28, T29, T30, T31, T32
+        >,
+    }
+}
+pub(crate) use tup_row::TupRow;
+
+/// Destructure a [`TupRow`] / build one — the two operations that touch all 32
+/// positional fields. Centralized here so the field list is written once.
+macro_rules! with_row_fields {
+    // Build a TupRow from a `[u32; 32]` array `$a`.
+    (build $a:expr) => {{
+        let a = $a;
+        TupRow(
+            a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13],
+            a[14], a[15], a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25],
+            a[26], a[27], a[28], a[29], a[30], a[31],
+        )
+    }};
+    // Destructure a `&TupRow` `$r` into a `[u32; 32]` array.
+    (read $r:expr) => {{
+        let TupRow(
+            a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18,
+            a19, a20, a21, a22, a23, a24, a25, a26, a27, a28, a29, a30, a31,
+        ) = $r;
+        [
+            *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13, *a14, *a15,
+            *a16, *a17, *a18, *a19, *a20, *a21, *a22, *a23, *a24, *a25, *a26, *a27, *a28, *a29,
+            *a30, *a31,
+        ]
+    }};
+}
 
 /// A fixed-width binding row flowing through the DBSP circuit: `bind[i]` is the
 /// value of the rule's `i`-th canonical body variable (0 if not yet bound).
-type BindRow = Tup10<u32, u32, u32, u32, u32, u32, u32, u32, u32, u32>;
+type BindRow = TupRow<
+    u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32,
+    u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32,
+>;
 
 /// A fixed-width relation row pushed into the circuit's input z-sets.
-type RelRow = Tup10<u32, u32, u32, u32, u32, u32, u32, u32, u32, u32>;
+type RelRow = BindRow;
 
 /// Build a fixed-width row from a slice of column values (0-padded to
 /// [`JOIN_WIDTH`]). Slices longer than [`JOIN_WIDTH`] are rejected upstream by
@@ -89,26 +142,14 @@ fn pack_row(vals: &[u32]) -> BindRow {
 /// Pack a fixed `[u32; JOIN_WIDTH]` array into the row tuple.
 #[inline]
 fn arr_to_row(a: [u32; JOIN_WIDTH]) -> BindRow {
-    Tup10(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9])
+    with_row_fields!(build a)
 }
 
 /// Read column `i` of a fixed-width row.
 #[inline]
 fn get_col(r: &BindRow, i: usize) -> u32 {
-    let Tup10(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9) = r;
-    match i {
-        0 => *a0,
-        1 => *a1,
-        2 => *a2,
-        3 => *a3,
-        4 => *a4,
-        5 => *a5,
-        6 => *a6,
-        7 => *a7,
-        8 => *a8,
-        9 => *a9,
-        _ => panic!("col index {i} out of range"),
-    }
+    let a = with_row_fields!(read r);
+    a[i]
 }
 
 // Names of the PURE prims that `plan_join` inlines into the persistent DBSP
@@ -210,6 +251,44 @@ impl Cond {
     }
 }
 
+/// How a [`PrimStep`] reads one of its primitive arguments from the binding row.
+#[derive(Clone, Debug)]
+enum ArgSrc {
+    /// Read binding-row column `usize`.
+    Col(usize),
+    /// A literal rep.
+    Const(u32),
+}
+
+/// What a [`PrimStep`] does with the primitive's result.
+#[derive(Clone, Debug)]
+enum PrimRet {
+    /// Bind the result into this (freshly-allocated) binding-row column.
+    Bind(usize),
+    /// Assert the result equals binding-row column `usize` (prune the row if
+    /// not).
+    AssertCol(usize),
+    /// Assert the result equals this literal rep.
+    AssertConst(u32),
+}
+
+/// An ON-CIRCUIT call-prim step (Stage C of #23): re-evaluate a PURE body
+/// primitive through the shared [`PrimEngine`] under a lock, materializing the
+/// interned result into the binding row (or pruning the row if the prim fails /
+/// the asserted return value mismatches). Applied as a DBSP `flat_map` after the
+/// join, in body order, so a step may read a column an earlier step produced.
+///
+/// This is the general path for ANY pure value prim (`+`, `-`, `>`, `int-div`,
+/// `string-concat`, `i64-to-string`, …) — semantics are never reimplemented; the
+/// real prim runs on the same engine the host uses, interning into shared tables
+/// so the result handle is bit-identical to a host evaluation.
+#[derive(Clone, Debug)]
+struct PrimStep {
+    id: ExternalFunctionId,
+    args: Vec<ArgSrc>,
+    ret: PrimRet,
+}
+
 /// The analysis of a DBSP-eligible rule body: canonical variable order, the
 /// table atoms, and the boolean guards inlined from pure body prims.
 pub struct JoinPlan {
@@ -221,8 +300,16 @@ pub struct JoinPlan {
     /// The body table atoms (in emission order).
     atoms: Vec<AtomPlan>,
     /// Boolean guards inlined from the body's pure prims, applied as DBSP
-    /// `filter`s once every binding-row column they read is bound.
+    /// `filter`s once every binding-row column they read is bound. Used by the
+    /// in-join fast path (rules whose only prims are recognized rep-comparisons).
     guards: Vec<Cond>,
+    /// ON-CIRCUIT call-prim steps (Stage C): present iff the rule has a genuine
+    /// pure VALUE prim (one not in the recognized rep-comparison set). When
+    /// non-empty, `guards` is empty and the WHOLE prim chain is lowered to these
+    /// engine-evaluated steps, applied (as `flat_map`s) after the join in body
+    /// order. Mutually exclusive with `guards`: a rule takes either the in-join
+    /// rep fast path (no lock) or the call-prim path (locks per row), never both.
+    steps: Vec<PrimStep>,
 }
 
 /// One table atom in the plan.
@@ -367,6 +454,74 @@ pub fn plan_join(eg: &EGraph, rule: &RuleIr, allow_prims: bool) -> Option<JoinPl
         }
     };
 
+    // Names recognized by the in-join rep fast path (no engine lock).
+    let is_recognized = |name: Option<&str>| {
+        matches!(
+            name,
+            Some(NEQ_NAME)
+                | Some(BOOL_NE_NAME)
+                | Some(OR_NAME)
+                | Some(GUARD_NAME)
+                | Some(ORD_MIN_NAME)
+                | Some(ORD_MAX_NAME)
+        )
+    };
+
+    // Decide the prim-lowering MODE for this rule (Stage C). If every body prim
+    // is a recognized rep-comparison, take the in-join fast path (PureExpr/Cond
+    // guards, no lock). If ANY body prim is a genuine pure VALUE prim, lower the
+    // WHOLE prim chain to on-circuit call-prim steps (engine-evaluated). If any
+    // body prim is impure (not registered as pure) the rule is ineligible — it
+    // must stay on the host / panic, never re-evaluated on-circuit.
+    let mut use_calls = false;
+    for op in &rule.body {
+        if let BodyOp::Prim { id, .. } = op {
+            if !allow_prims {
+                return None;
+            }
+            if !eg.is_pure_prim(*id) {
+                reject!(
+                    "impure body prim {:?} (not eligible on-circuit)",
+                    eg.external_funcs.name(*id)
+                );
+            }
+            if !is_recognized(eg.external_funcs.name(*id)) {
+                use_calls = true;
+            }
+        }
+    }
+
+    // Steps emitted for the call-prim path (Stage C). Empty unless `use_calls`.
+    let mut steps: Vec<PrimStep> = Vec::new();
+    // Resolve a call-prim argument slot to an `ArgSrc` (a binding-row column or a
+    // const). The var MUST already have a column (bound by an atom or an earlier
+    // call-prim's `Bind`); otherwise the rule is ineligible.
+    let arg_src = |s: &Slot, var_col: &HashMap<u32, usize>| -> Option<ArgSrc> {
+        match s {
+            Slot::Const(c) => Some(ArgSrc::Const(*c)),
+            Slot::Var(v) => var_col.get(v).map(|&c| ArgSrc::Col(c)),
+        }
+    };
+
+    // Call-prim path: pre-allocate a binding column for EVERY atom-bound variable
+    // before lowering any prim, regardless of body order. A prim whose `ret` is a
+    // variable an atom ALSO binds must become an `AssertCol` (the join binds the
+    // column; the step then asserts the prim result equals it) — never a `Bind`,
+    // which would overwrite the atom's binding. Body order would otherwise make a
+    // prim appearing before its consuming atom (the `(predicate (+ x 1))` shape)
+    // mis-lower to `Bind`, silently dropping the atom's join constraint.
+    if use_calls {
+        for op in &rule.body {
+            if let BodyOp::Atom(atom) = op {
+                for s in &atom.slots {
+                    if let Slot::Var(v) = s {
+                        see_var(*v, &mut var_order, &mut var_col);
+                    }
+                }
+            }
+        }
+    }
+
     for op in &rule.body {
         match op {
             BodyOp::Atom(atom) => {
@@ -403,6 +558,42 @@ pub fn plan_join(eg: &EGraph, rule: &RuleIr, allow_prims: bool) -> Option<JoinPl
             BodyOp::Prim { id, args, ret } => {
                 if !allow_prims {
                     return None;
+                }
+                // Stage C call-prim path: this rule has a genuine value prim, so
+                // EVERY prim (recognized or not) is lowered to an on-circuit
+                // engine call. Args read prior binding columns; the result either
+                // binds a fresh column (`ret` a new var) or asserts equality with
+                // an already-bound column/const. Pure prims are idempotent, so
+                // re-evaluating here is bit-identical to the host.
+                if use_calls {
+                    let mut srcs: Vec<ArgSrc> = Vec::with_capacity(args.len());
+                    for a in args {
+                        match arg_src(a, &var_col) {
+                            Some(s) => srcs.push(s),
+                            None => reject!("call-prim {:?} arg unbound", eg.external_funcs.name(*id)),
+                        }
+                    }
+                    let ret = match ret {
+                        // `ret` already bound (by an atom or an earlier step):
+                        // assert the prim result equals it.
+                        Slot::Var(rv) if var_col.contains_key(rv) => {
+                            PrimRet::AssertCol(var_col[rv])
+                        }
+                        // `ret` is a fresh var: allocate a column and bind it. The
+                        // result may then be read by a later step, an atom (rare),
+                        // or escape to the head (the whole point of a value prim).
+                        Slot::Var(rv) => {
+                            see_var(*rv, &mut var_order, &mut var_col);
+                            PrimRet::Bind(var_col[rv])
+                        }
+                        Slot::Const(c) => PrimRet::AssertConst(*c),
+                    };
+                    steps.push(PrimStep {
+                        id: *id,
+                        args: srcs,
+                        ret,
+                    });
+                    continue;
                 }
                 let name = eg.external_funcs.name(*id);
                 match name {
@@ -558,6 +749,7 @@ pub fn plan_join(eg: &EGraph, rule: &RuleIr, allow_prims: bool) -> Option<JoinPl
         var_col,
         atoms,
         guards,
+        steps,
     })
 }
 
@@ -804,6 +996,57 @@ fn build_join_stream(
     Ok(cur)
 }
 
+/// Apply the [`PrimStep`]s (Stage C call-prims) to the joined binding stream as
+/// a chain of `flat_map`s, in body order. Each step evaluates its pure prim
+/// through the shared [`PrimEngine`] (locking the engine per row), materializes
+/// the interned result into the binding row, or prunes the row (the prim failed,
+/// or an asserted return value mismatched). A `flat_map` returning `vec![]`
+/// drops the row; `vec![row]` keeps it.
+fn apply_steps(
+    mut cur: Stream<RootCircuit, OrdZSet<BindRow>>,
+    steps: &[PrimStep],
+    engine: &PrimEngine,
+) -> Stream<RootCircuit, OrdZSet<BindRow>> {
+    for step in steps {
+        let step = step.clone();
+        let engine = engine.clone();
+        cur = cur.flat_map(move |row: &BindRow| {
+            // Gather the prim's argument reps from the binding row / consts.
+            let argv: Vec<Value> = step
+                .args
+                .iter()
+                .map(|a| match a {
+                    ArgSrc::Col(c) => Value::new(get_col(row, *c)),
+                    ArgSrc::Const(v) => Value::new(*v),
+                })
+                .collect();
+            // Re-evaluate the real prim under the engine lock. `None` ⇒ the prim
+            // failed (e.g. `!=` of equal args, `guard` of false) ⇒ prune.
+            let Some(result) = engine.eval(step.id, &argv) else {
+                return Vec::new();
+            };
+            match step.ret {
+                PrimRet::Bind(col) => vec![set_col(*row, col, result.rep())],
+                PrimRet::AssertCol(col) => {
+                    if get_col(row, col) == result.rep() {
+                        vec![*row]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                PrimRet::AssertConst(c) => {
+                    if c == result.rep() {
+                        vec![*row]
+                    } else {
+                        Vec::new()
+                    }
+                }
+            }
+        });
+    }
+    cur
+}
+
 /// Variables appearing in an atom (in column order, may repeat).
 fn atom_vars(slots: &[Slot]) -> Vec<u32> {
     let mut out = Vec::new();
@@ -914,21 +1157,10 @@ fn merge_atom_into(
 }
 
 #[inline]
-fn set_col(mut r: BindRow, i: usize, v: u32) -> BindRow {
-    match i {
-        0 => r.0 = v,
-        1 => r.1 = v,
-        2 => r.2 = v,
-        3 => r.3 = v,
-        4 => r.4 = v,
-        5 => r.5 = v,
-        6 => r.6 = v,
-        7 => r.7 = v,
-        8 => r.8 = v,
-        9 => r.9 = v,
-        _ => panic!("set_col index {i} out of range"),
-    }
-    r
+fn set_col(r: BindRow, i: usize, v: u32) -> BindRow {
+    let mut a = with_row_fields!(read &r);
+    a[i] = v;
+    arr_to_row(a)
 }
 
 /// Apply every not-yet-applied guard whose binding-row columns are all bound,
@@ -999,11 +1231,18 @@ pub struct PersistentJoin {
 impl PersistentJoin {
     /// Build the persistent circuit for `plan` ONCE. The circuit retains the
     /// integral of every body relation across transactions.
-    pub fn build(plan: &JoinPlan) -> Result<PersistentJoin> {
+    ///
+    /// `engine` is the shared primitive engine (Stage C): captured into the
+    /// circuit's call-prim closures so value-computing body prims evaluate
+    /// on-circuit. It is only used if `plan.steps` is non-empty (a rule with a
+    /// genuine value prim); the in-join rep fast path never touches it.
+    pub fn build(plan: &JoinPlan, engine: &PrimEngine) -> Result<PersistentJoin> {
         let n_atoms = plan.atoms.len();
         let atoms: Vec<Vec<Slot>> = plan.atoms.iter().map(|a| a.slots.clone()).collect();
         let var_col = plan.var_col.clone();
         let guards = plan.guards.clone();
+        let steps = plan.steps.clone();
+        let engine = engine.clone();
         let n_vars = plan.var_order.len();
 
         let (handle, (inputs, output)) = RootCircuit::build(move |root| {
@@ -1018,6 +1257,9 @@ impl PersistentJoin {
                 streams.push(stream.distinct());
             }
             let out = build_join_stream(&streams, &atoms, &var_col, &guards, n_vars)?;
+            // Stage C: apply on-circuit call-prim steps (value prims) after the
+            // join, evaluating the real prim through the shared engine.
+            let out = apply_steps(out, &steps, &engine);
             // Non-integrated, distinct binding stream: each `step()` yields this
             // tick's binding DELTA directly. (We drive the circuit with `step()`,
             // not `transaction()`: a transaction is a *sequence* of steps for one
@@ -1116,7 +1358,14 @@ mod persistent_tests {
                 },
             ],
             guards: vec![],
+            steps: vec![],
         }
+    }
+
+    /// An engine with no prims registered — the TC plan has no `steps`, so the
+    /// engine is never invoked; this just satisfies `build`'s signature.
+    fn empty_engine() -> PrimEngine {
+        PrimEngine::new(egglog_core_relations::Database::new())
     }
 
     fn delta(
@@ -1135,7 +1384,7 @@ mod persistent_tests {
     fn persistent_join_is_incremental() {
         let f = FunctionId::new(0);
         let plan = tc_plan(f);
-        let mut pj = PersistentJoin::build(&plan).expect("build persistent join");
+        let mut pj = PersistentJoin::build(&plan, &empty_engine()).expect("build persistent join");
 
         // Step 1: seed edges (1,2) and (2,3). The only TC hop is x=1,y=2,z=3.
         let out1 = pj

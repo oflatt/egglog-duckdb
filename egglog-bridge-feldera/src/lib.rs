@@ -42,6 +42,7 @@
 //! host-side feedback that takes the next hop.
 
 use std::any::Any;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use egglog_backend_trait::{
@@ -96,6 +97,57 @@ impl ContainerPool for FelderaContainerPool {
     fn for_each_dyn(&self, _ty: std::any::TypeId, _f: &mut dyn FnMut(Value, &dyn Any)) {}
     fn size(&self, _ty: std::any::TypeId) -> usize {
         0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared primitive engine (Stage C)
+// ---------------------------------------------------------------------------
+
+/// A shareable handle to a [`Database`] used purely as the primitive engine, so
+/// that the `Send + 'static` DBSP circuit closures can evaluate value-computing
+/// body primitives ON-CIRCUIT (Stage C of #23), instead of forcing a host
+/// nested-loop fallback.
+///
+/// The handle wraps `Arc<Mutex<Database>>`. The wrapped `Database` is a **clone**
+/// of [`EGraph::db`]; crucially, a cloned `Database` *shares* its base-value
+/// intern tables (`InternTable` clones the inner `Arc<ConcurrentVec>` /
+/// `Arc<Mutex<HashTable>>`), so a pure primitive evaluated through this clone
+/// interns its result into the SAME tables the host `Value`s came from — the
+/// returned handle is bit-for-bit identical to a host evaluation. Pure prims are
+/// stateless beyond interning, so re-evaluating them on-circuit is idempotent.
+///
+/// The Feldera backend is single-threaded (DBSP runs one worker synchronously
+/// during `step()`), so the `Mutex` is uncontended and cannot deadlock: the host
+/// never holds the lock while the circuit steps (it locks, evaluates, unlocks).
+/// The `unsafe impl Send + Sync` mirrors `EGraph`'s own assertion (the egraph is
+/// only ever driven from a single thread); a `Database`'s `Rc`-free internals are
+/// `Send`-safe under that single-thread invariant.
+#[derive(Clone)]
+pub struct PrimEngine(Arc<Mutex<Database>>);
+
+// SAFETY: see `EGraph`'s `unsafe impl Send/Sync` below — the egraph (and hence
+// this handle) is only ever used from a single thread; DBSP runs its worker
+// synchronously on that same thread during `step()`.
+unsafe impl Send for PrimEngine {}
+unsafe impl Sync for PrimEngine {}
+
+impl PrimEngine {
+    /// Wrap a `Database` as a shared primitive-engine handle.
+    pub(crate) fn new(db: Database) -> Self {
+        PrimEngine(Arc::new(Mutex::new(db)))
+    }
+
+    /// Evaluate primitive `id` on `args` through the shared engine, returning
+    /// the interned result handle (or `None` if the prim "fails", e.g. `!=` of
+    /// equal args — which prunes the match). Used by the on-circuit call-prim
+    /// node; reuses the exact host eval path (`call_external_func`) so prim
+    /// semantics are never reimplemented.
+    pub(crate) fn eval(&self, id: ExternalFunctionId, args: &[Value]) -> Option<Value> {
+        self.0
+            .lock()
+            .unwrap()
+            .with_execution_state(|st| st.call_external_func(id, args))
     }
 }
 
@@ -175,6 +227,19 @@ pub struct EGraph {
     /// [`Database::with_execution_state`], not inside the DBSP circuit (DBSP map
     /// closures are `Send + 'static` and cannot borrow the database).
     db: Database,
+    /// Shared primitive-engine handle (Stage C of #23), built lazily the first
+    /// time a persistent circuit needs to evaluate a value-computing body prim
+    /// on-circuit. A clone of [`EGraph::db`] taken after all primitives are
+    /// registered; shares interning with `db` so on-circuit prim results are
+    /// bit-identical to host evaluation. See [`PrimEngine`]. `None` until first
+    /// use; reset to `None` whenever a primitive is (de)registered so the next
+    /// build picks up a fresh clone with the current prim table.
+    prim_engine: Option<PrimEngine>,
+    /// Names of PURE primitives, keyed by [`ExternalFunctionId`] rep. Recorded
+    /// by the frontend (`set_pure_prim_name`) so `dbsp_join::plan_join` knows a
+    /// body prim is pure (safe to re-evaluate on-circuit) and can lower it to a
+    /// call-prim node. Impure/IO prims are absent here and stay ineligible.
+    pub(crate) pure_prim_names: HashMap<u32, String>,
     container_pool: FelderaContainerPool,
     external_funcs: ExternalFuncRegistry,
     /// Monotonic fresh-id counter for `fresh_id` / `add_term`.
@@ -245,6 +310,8 @@ impl EGraph {
             mirror: HashMap::new(),
             seen: HashMap::new(),
             db: Database::new(),
+            prim_engine: None,
+            pure_prim_names: HashMap::new(),
             container_pool: FelderaContainerPool,
             external_funcs: ExternalFuncRegistry::default(),
             // Start at 1 so id 0 stays available as a "null"/padding sentinel
@@ -367,6 +434,34 @@ impl EGraph {
     ) -> Option<Value> {
         self.db
             .with_execution_state(|st| st.call_external_func(id, args))
+    }
+
+    /// A shareable clone of the primitive engine, built lazily on first use
+    /// (after all primitives are registered). The returned [`PrimEngine`] is
+    /// `Send + 'static` and can be captured into DBSP circuit closures so they
+    /// evaluate pure value-computing body prims ON-CIRCUIT (Stage C). The clone
+    /// shares interning with `self.db`, so on-circuit results are bit-identical
+    /// to host evaluation.
+    pub(crate) fn prim_engine(&mut self) -> PrimEngine {
+        if self.prim_engine.is_none() {
+            self.prim_engine = Some(PrimEngine::new(self.db.clone()));
+        }
+        self.prim_engine.as_ref().unwrap().clone()
+    }
+
+    /// Record a PURE primitive's user-visible name (Stage C). The frontend's
+    /// typechecker calls this for every pure prim so `dbsp_join::plan_join` can
+    /// lower an arbitrary pure value prim to an on-circuit call-prim node. Impure
+    /// prims are never recorded here and stay host-ineligible.
+    pub fn set_pure_prim_name(&mut self, id: ExternalFunctionId, name: String) {
+        self.external_funcs.set_name(id, name.clone());
+        self.pure_prim_names.insert(id.rep(), name);
+    }
+
+    /// Whether `id` names a primitive the frontend marked PURE (safe to
+    /// re-evaluate on-circuit). See [`EGraph::set_pure_prim_name`].
+    pub(crate) fn is_pure_prim(&self, id: ExternalFunctionId) -> bool {
+        self.pure_prim_names.contains_key(&id.rep())
     }
 
     /// Allocate a fresh id (used by the interpreter's eq-sort constructor
@@ -792,12 +887,17 @@ impl Backend for EGraph {
         let func2 = dyn_clone::clone_box(&*func);
         let id = self.db.add_external_function(func);
         self.external_funcs.add_func_at(id, func2);
+        // The cached prim-engine clone (if any) predates this registration;
+        // drop it so the next on-circuit eval rebuilds a clone holding this prim.
+        self.prim_engine = None;
         id
     }
 
     fn free_external_func(&mut self, func: ExternalFunctionId) {
         self.db.free_external_function(func);
         self.external_funcs.free(func);
+        self.pure_prim_names.remove(&func.rep());
+        self.prim_engine = None;
     }
 
     fn new_panic(&mut self, message: String) -> ExternalFunctionId {
@@ -808,6 +908,7 @@ impl Backend for EGraph {
         let panic_fn = external_func::PanicFunc::new(message.clone());
         let id = self.db.add_external_function(Box::new(panic_fn));
         self.external_funcs.add_panic_at(id, message);
+        self.prim_engine = None;
         id
     }
 

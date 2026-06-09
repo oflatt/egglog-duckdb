@@ -303,7 +303,7 @@ impl EGraph {
         if let Some(orig) = self.proof_state.original_typechecking.as_mut() {
             orig.add_pure_primitive(x.clone(), validator.clone());
         }
-        self.register_per_context(x, validator, PureState::valid_contexts(), |x, ctx| {
+        self.register_per_context(x, validator, PureState::valid_contexts(), true, |x, ctx| {
             Box::new(PurePrimWrapper { prim: x, ctx })
         });
     }
@@ -369,7 +369,7 @@ impl EGraph {
             .downcast_ref::<egglog_bridge_duckdb::EGraph>()
             .is_some()
         {
-            self.register_per_context(x, validator, valid_ctxs, move |x, _ctx| {
+            self.register_per_context(x, validator, valid_ctxs, false, move |x, _ctx| {
                 Box::new(DuckPlaceholderPrimWrapper {
                     name: x.name().to_owned(),
                 })
@@ -378,7 +378,7 @@ impl EGraph {
         }
 
         let registry = self.backend.action_registry().clone();
-        self.register_per_context(x, validator, valid_ctxs, move |x, ctx| {
+        self.register_per_context(x, validator, valid_ctxs, false, move |x, ctx| {
             Box::new(RegistryPrimWrapper::<T, S> {
                 prim: x,
                 registry: registry.clone(),
@@ -396,6 +396,7 @@ impl EGraph {
         x: T,
         validator: Option<PrimitiveValidator>,
         valid_ctxs: &[Context],
+        pure: bool,
         mut build_wrapper: F,
     ) where
         T: Primitive + Clone,
@@ -419,25 +420,26 @@ impl EGraph {
                 {
                     duck.set_external_func_name(id, name.clone());
                 }
-                // Feldera side-channel: record the names of the generic PURE
-                // value/guard prims that `dbsp_join::plan_join` can inline into
-                // the persistent DBSP circuit (Stage B), so the `@congruence` /
-                // `@rebuild_cleanup` rules become DBSP-eligible instead of
-                // falling back to the host nested-loop. Recognition is by name
-                // only (no `@uf`/rebuild rule-name recognition); the persistent
-                // path inlines them when the operand column types make
-                // rep-arithmetic provably correct (see `plan_join`'s gating).
-                // The non-persistent path keeps these rules on the host (see
-                // `plan_join`'s `allow_prims`).
-                if matches!(
-                    name.as_str(),
-                    "!=" | "bool-!=" | "or" | "guard" | "ordering-min" | "ordering-max"
-                ) && let Some(feld) = self
-                    .backend
-                    .as_any_mut()
-                    .downcast_mut::<egglog_bridge_feldera::EGraph>()
+                // Feldera side-channel (Stage C of #23): record the names of
+                // PURE primitives so `dbsp_join::plan_join` can lower an
+                // arbitrary pure body prim to an ON-CIRCUIT call-prim node (the
+                // closure re-evaluates the real prim through a shared engine
+                // under a lock), making the `@congruence` / `@rebuild_cleanup` /
+                // user value-prim rules DBSP-eligible instead of falling back to
+                // the host nested-loop. Pure prims are idempotent (interning is
+                // idempotent) so re-evaluating on-circuit is safe; impure/IO
+                // prims (`pure == false`) are never recorded and stay ineligible.
+                // The generic rep-comparison guards (`!=`, `bool-!=`, `or`,
+                // `guard`, `ordering-min/max`) are pure and recognized BY NAME as
+                // the in-join fast path (no lock); recording them here also lets
+                // them act as the name signal `plan_join` consults.
+                if pure
+                    && let Some(feld) = self
+                        .backend
+                        .as_any_mut()
+                        .downcast_mut::<egglog_bridge_feldera::EGraph>()
                 {
-                    feld.set_external_func_name(id, name.clone());
+                    feld.set_pure_prim_name(id, name.clone());
                 }
                 id
             })

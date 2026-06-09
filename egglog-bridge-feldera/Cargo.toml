@@ -16,6 +16,19 @@ publish = false
 # integrate, transaction, OutputHandle::consolidate) is identical across
 # 0.150 and 0.3xx, so a later toolchain bump can re-pin without code churn.
 dbsp = "=0.150.0"
+# The derive stack `dbsp::declare_tuples!` expands to (referenced by bare name
+# in the macro body). Pinned to the exact versions dbsp 0.150.0 itself depends
+# on so the generated `DBData` impls match dbsp's own tuple types. Used only to
+# declare one wide fixed-arity binding row (`Tup32`) for the persistent join —
+# stock dbsp tuples stop at `Tup10`, too narrow for the widest feldera-supported
+# rule (~23 distinct body variables, plus on-circuit prim-output columns).
+paste = "1.0.12"
+# `derive_more` 1.x: the macro expands to `derive_more::Neg`.
+derive_more = { version = "1.0", features = ["full"] }
+serde = { version = "1.0.213", features = ["derive"] }
+rkyv = { version = "0.7.45", default-features = false, features = ["std", "size_64", "validation"] }
+# dbsp renames `feldera-size-of` to `size-of` (the name the macro derives use).
+size-of = { package = "feldera-size-of", version = "0.1.6", features = ["hashbrown", "time-std"] }
 anyhow = "1"
 egglog-backend-trait = { workspace = true }
 egglog-core-relations = { workspace = true }
