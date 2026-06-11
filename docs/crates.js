@@ -1,0 +1,2 @@
+window.ALL_CRATES = ["add_example","egglog","egglog_add_primitive","egglog_ast","egglog_backend_trait","egglog_bridge","egglog_bridge_duckdb","egglog_bridge_feldera","egglog_bridge_flowlog","egglog_concurrency","egglog_core_relations","egglog_experimental","egglog_numeric_id","egglog_reports","egglog_union_find","egglog_wasm_example"];
+//{"start":21,"fragment_lengths":[13,9,23,13,23,16,23,24,24,21,24,22,20,17,20,22]}

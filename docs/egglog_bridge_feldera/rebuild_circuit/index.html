@@ -1,0 +1,57 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Persistent rebuild circuit (Stage 3 of the interpreter-deprecation migration; see `docs/feldera_persistent_circuit_design.md`)."><title>egglog_bridge_feldera::rebuild_circuit - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-e56847b5.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="egglog_bridge_feldera" data-themes="" data-resource-suffix="" data-rustdoc-version="1.91.0 (f8297e351 2025-10-28)" data-channel="1.91.0" data-search-js="search-e256b49e.js" data-stringdex-js="stringdex-c3e638e9.js" data-settings-js="settings-c38705f0.js" ><script src="../../static.files/storage-e2aeef58.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-6dc2a7f3.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-263c88ec.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module rebuild_circuit</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../egglog_bridge_feldera/index.html">egglog_<wbr>bridge_<wbr>feldera</a><span class="version">2.0.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module rebuild_<wbr>circuit</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#what-the-term-encoders-rebuild-actually-is" title="What the term encoder’s rebuild actually is">What the term encoder’s rebuild actually is</a></li><li><a href="#the-encoding-mirrors-the-spike-generalized-over-view-arity" title="The encoding (mirrors the spike, generalized over view arity)">The encoding (mirrors the spike, generalized over view arity)</a></li><li><a href="#generality-vs-the-spike" title="Generality vs. the spike">Generality vs. the spike</a></li></ul><h3><a href="#structs">Module Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#constants" title="Constants">Constants</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate egglog_<wbr>bridge_<wbr>feldera</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">egglog_bridge_feldera</a></div><h1>Module <span>rebuild_<wbr>circuit</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/egglog_bridge_feldera/rebuild_circuit.rs.html#1-310">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Persistent rebuild circuit (Stage 3 of the interpreter-deprecation
+migration; see <code>docs/feldera_persistent_circuit_design.md</code>).</p>
+<p>This is the production port of the validated feasibility spike
+(<code>spike-dbsp/src/rebuild.rs</code>): egglog <strong>rebuild</strong> (union-find find +
+congruence, non-monotone delete-and-rewrite) expressed as DBSP recursive
+views in a <strong>persistent circuit fed input deltas across transactions</strong>, with
+the §2.4 <strong>congruence-shuttle</strong> encoding that is <em>required</em> for convergence
+(the naive co-recursive <code>(uf, reach)</code> tuple silently loses closure across
+transactions; routing congruence-discovered edges back through the INPUT
+boundary fixes it — proven in the spike on all 120 iterations of a deep
+deep-chaining eqsat).</p>
+<h3 id="what-the-term-encoders-rebuild-actually-is"><a class="doc-anchor" href="#what-the-term-encoders-rebuild-actually-is">§</a>What the term encoder’s rebuild actually is</h3>
+<p>For each eq-sort, the proof/term encoder (<code>src/proofs/proof_encoding.rs</code>)
+emits:</p>
+<ul>
+<li><code>@uf(a, b)</code> — a relation of union (parent) edges. <code>path_compress</code> /
+<code>single_parent</code> mutate it (delete stale edge, set new), <code>@uf_function_index</code>
+mirrors it into <code>@uff</code>.</li>
+<li><code>@uff(a) = leader</code> — the uf-index function, <code>:merge (ordering-min …)</code>, i.e.
+<code>leader(a) = min</code> over the connected component of <code>a</code>.</li>
+<li><code>@XView(args…, out)</code> — one view table per constructor; the <code>@rebuilding</code>
+ruleset’s congruence rule unions the outputs of two view rows with equal
+args, and <code>@rebuilding_cleanup</code> rewrites each view row to its canonical
+(leader) output, deleting the stale row.</li>
+</ul>
+<p>The whole point of the migration is that this fixpoint, when scheduled by
+the host interpreter, re-reads the full relation mirror on <strong>every</strong>
+<code>run_rules</code> call — so it is O(state) per call and blows up super-linearly on
+<code>math-microbenchmark</code> (<code>(run 11)</code> ≈ 56 s vs. <code>(run 9)</code> ≈ 4 s). The
+persistent circuit feeds only per-transaction deltas, so the rebuild cost is
+sub-linear in state.</p>
+<h3 id="the-encoding-mirrors-the-spike-generalized-over-view-arity"><a class="doc-anchor" href="#the-encoding-mirrors-the-spike-generalized-over-view-arity">§</a>The encoding (mirrors the spike, generalized over view arity)</h3>
+<p><code>leader(x)</code> = the minimum id reachable from <code>x</code> over undirected union edges,
+computed with pure join/antijoin (fully incremental, no typed <code>Min</code>):</p>
+<div class="example-wrap"><pre class="language-text"><code>  reach(x,y)      :- self-reach; reach(x,z), sym(z,y).      (closure)
+  dominated(x,y)  :- reach(x,y), reach(x,z), z &lt; y.         (y not the min)
+  leader(x,y)     :- reach(x,y), not dominated(x,y).        (the unique min)</code></pre></div>
+<p><code>uf</code> is kept SYMMETRIC inside the circuit so reachability = connected
+component. <code>reach</code> is a SINGLE recursive closure over the <code>uf</code> INPUT z-set
+(the shape that provably persists across transactions). Congruence is
+computed at root from the converged <code>reach</code> + canonical views and emitted as
+an output delta; the host <strong>shuttle</strong> pushes new congruence edges back into
+the <code>uf</code> input and re-steps until no new edge appears.</p>
+<h3 id="generality-vs-the-spike"><a class="doc-anchor" href="#generality-vs-the-spike">§</a>Generality vs. the spike</h3>
+<p>The spike fixed view arity at 2 with <strong>leaf-constant</strong> args (already
+canonical). Production view-table arguments are themselves e-class ids that
+get unioned, so congruence must be over <em>leader-canonicalized</em> arguments.
+This circuit therefore carries each view row as <code>Tup4(table_tag, arg0, arg1, out)</code> of <strong>real ids</strong> and canonicalizes BOTH arguments and the output via
+<code>leader_of</code> joins before computing congruence — the production extension over
+the spike. A <code>table_tag</code> distinguishes view tables so a single shared circuit
+handles them all without cross-constructor congruence collisions. View tables
+of arity &gt; 3 (more than two arguments) are not handled here; the integration
+(<code>circuit_rebuild.rs</code>) falls back to the interpreter for them. See
+<a href="struct.RebuildCircuit.html" title="struct egglog_bridge_feldera::rebuild_circuit::RebuildCircuit"><code>RebuildCircuit</code></a>.</p>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.RebuildCircuit.html" title="struct egglog_bridge_feldera::rebuild_circuit::RebuildCircuit">Rebuild<wbr>Circuit</a></dt><dd>Handles exposed by the persistent rebuild circuit (one per view table).</dd></dl><h2 id="constants" class="section-header">Constants<a href="#constants" class="anchor">§</a></h2><dl class="item-table"><dt><a class="constant" href="constant.NO_ARG.html" title="constant egglog_bridge_feldera::rebuild_circuit::NO_ARG">NO_ARG</a></dt><dd>Sentinel for “no second argument” (arity-1 constructors). Chosen above any
+real egglog id (<code>u32</code> reps), and never a leader, so it is left unchanged by
+the leader canonicalization (it maps to itself).</dd></dl></section></div></main></body></html>

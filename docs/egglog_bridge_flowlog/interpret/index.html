@@ -1,0 +1,34 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Host-side rule interpreter for the FlowLog backend (Milestone 3)."><title>egglog_bridge_flowlog::interpret - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-e56847b5.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="egglog_bridge_flowlog" data-themes="" data-resource-suffix="" data-rustdoc-version="1.91.0 (f8297e351 2025-10-28)" data-channel="1.91.0" data-search-js="search-e256b49e.js" data-stringdex-js="stringdex-c3e638e9.js" data-settings-js="settings-c38705f0.js" ><script src="../../static.files/storage-e2aeef58.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-6dc2a7f3.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-263c88ec.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module interpret</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../egglog_bridge_flowlog/index.html">egglog_<wbr>bridge_<wbr>flowlog</a><span class="version">2.0.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module interpret</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#the-engine-split-milestone-3-mandate" title="The engine split (Milestone 3 mandate)">The engine split (Milestone 3 mandate)</a></li></ul><h3><a href="#functions">Module Items</a></h3><ul class="block"><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate egglog_<wbr>bridge_<wbr>flowlog</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">egglog_bridge_flowlog</a></div><h1>Module <span>interpret</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/egglog_bridge_flowlog/interpret.rs.html#1-631">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Host-side rule interpreter for the FlowLog backend (Milestone 3).</p>
+<p>This is the FlowLog analog of the Feldera backend’s Milestone-3 host
+interpreter, and the <strong>correctness oracle</strong> for the engine path: it runs
+real <code>.egg</code> programs (general multi-atom bodies, primitives, head actions)
+to per-function tuple-count parity with the reference backend.</p>
+<p>One <code>run_rules</code> call = <strong>one bounded egglog iteration</strong>. The interpreter:</p>
+<ol>
+<li>snapshots the relation mirror (the read view for this iteration — all
+rules match against the same pre-iteration state, egglog’s semi-naive
+“match the old database, then apply” model for a single hop);</li>
+<li>for each rule, runs a <strong>nested-loop join</strong> over the body’s table atoms,
+threading a variable→value binding environment, evaluating primitive body
+atoms (<code>BodyOp::Prim</code>) against the embedded <code>Database</code> (guards like <code>!=</code>
+prune; value-computing prims extend the env);</li>
+<li>for every surviving binding, executes the head ops in order — <code>set</code> /
+<code>remove</code> / <code>subsume</code> writes, RHS <code>lookup</code> (eq-sort constructor: create on
+miss), RHS primitive <code>call</code>, <code>union</code>, <code>panic</code>;</li>
+<li>applies all collected writes/removes to the mirror and resolves
+functional-dependency conflicts per each touched function’s merge mode.</li>
+</ol>
+<h3 id="the-engine-split-milestone-3-mandate"><a class="doc-anchor" href="#the-engine-split-milestone-3-mandate">§</a>The engine split (Milestone 3 mandate)</h3>
+<p>The relational table-atom join for the <strong>DD-eligible</strong> rule class (table
+atoms + <code>!=</code> guards, arity/width ≤ the engine row cap) runs on the
+Differential-Dataflow engine in a subprocess (see <a href="../dd_join/index.html" title="mod egglog_bridge_flowlog::dd_join"><code>crate::dd_join</code></a>); the
+primitive tail + head actions are applied HOST-side here, exactly mirroring
+Feldera M4’s “table join on the engine, prim tail host-side” split. Rules
+outside the eligible class fall back entirely to this host nested-loop
+interpreter (the oracle).</p>
+<p>Primitives are invoked through <code>Database::with_execution_state</code>, so they see
+the same interned base <code>Value</code>s the frontend created — giving the FlowLog
+backend bit-for-bit value parity with the reference backend (no
+<code>eval_prim</code> trait change — flowlog keeps its zero-trait-change posture).</p>
+</div></details><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.run_iteration.html" title="fn egglog_bridge_flowlog::interpret::run_iteration">run_<wbr>iteration</a></dt><dd>Run one bounded iteration of <code>rule_idxs</code> against the egraph. Returns whether
+the mirror changed.</dd></dl></section></div></main></body></html>

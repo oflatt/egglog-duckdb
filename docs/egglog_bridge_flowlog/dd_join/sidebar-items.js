@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_JOIN_VARS"],"fn":["plan_join","run_join","run_join_seminaive"],"struct":["JoinPlan"]};
