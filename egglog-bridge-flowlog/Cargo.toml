@@ -19,16 +19,17 @@ log = { workspace = true }
 dyn-clone = { workspace = true }
 # flowlog-runtime is linked into the build-time-generated incremental engine
 # (string interning, txn state, the differential-dataflow / timely re-exports
-# the generated `DatalogIncrementalEngine` relies on). Path-pinned to the local
-# flowlog-rs clone (workspace v0.4.0; runtime 0.2.2). See SPIKE_RESULTS.md.
-flowlog-runtime = { path = "/tmp/flowlog-main/crates/flowlog-runtime" }
+# the generated `DatalogIncrementalEngine` relies on). Pinned as a GIT dep
+# (cargo-managed in ~/.cargo/git, reproducible) rather than a path into /tmp,
+# which the OS reaps. runtime 0.2.3 / workspace crates at the pinned rev.
+flowlog-runtime = { git = "https://github.com/flowlog-rs/flowlog", rev = "fb0eeb1e9989a24478459a2bfbe3192d8475eb7d" }
 
 [build-dependencies]
 # flowlog-build compiles the bundled, build-time-FIXED `transitive_step.dl`
 # into a Rust module (incremental mode -> `DatalogIncrementalEngine`) that
 # `lib.rs` include!s. Milestone 1 uses a fixed `.dl`; runtime rule installation
 # (the FlowLog crux) is investigated in ../MILESTONE1.md and deferred to M2.
-flowlog-build = { path = "/tmp/flowlog-main/crates/flowlog-build" }
+flowlog-build = { git = "https://github.com/flowlog-rs/flowlog", rev = "fb0eeb1e9989a24478459a2bfbe3192d8475eb7d" }
 
 [dev-dependencies]
 # The reference backend, used by the milestone-1 proof test to confirm the
