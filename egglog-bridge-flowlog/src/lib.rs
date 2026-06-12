@@ -266,6 +266,12 @@ impl EGraph {
             .unwrap_or_else(|| panic!("FunctionId({}) not registered", f.rep()))
     }
 
+    /// Relation name for `f` (used by the per-ruleset profiler to detect `@uf`
+    /// body atoms — the union-find tables are named `@UF_<sort>` / `@UF_<sort>f`).
+    pub(crate) fn relation_name(&self, f: FunctionId) -> &str {
+        &self.info(f).name
+    }
+
     /// Insert a single row into the Rust mirror.
     fn mirror_insert(&mut self, f: FunctionId, row: Row) {
         std::rc::Rc::make_mut(self.mirror.entry(f).or_default()).insert(row);

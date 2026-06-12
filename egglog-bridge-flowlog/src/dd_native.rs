@@ -313,7 +313,38 @@ pub fn dd_ruleset_prof_dump() {
                 p.delta_rows,
             );
         }
+        // Cross-check: share of fused worker_step in rules whose body reads @uf.
+        let uf_step = UF_BODY_STEP_NS.load(Ordering::Relaxed);
+        let all_step = ALL_STEP_NS.load(Ordering::Relaxed);
+        let uf_pct = if all_step > 0 {
+            100.0 * uf_step as f64 / all_step as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[FLOWLOG_DD_RULESET_PROF] uf_body_worker_step={:.3}s of {:.3}s total worker_step \
+             = {:.1}% (rules whose body reads a UF_* table)",
+            s(uf_step),
+            s(all_step),
+            uf_pct,
+        );
     }
+}
+
+/// Cross-check accumulator for the per-ruleset profiler: nanoseconds of
+/// (apportioned) fused worker_step attributable to rules whose BODY reads a
+/// `@uf` table (`UF_*`), and the grand total worker_step nanos. Only touched
+/// when `FLOWLOG_DD_RULESET_PROF` is set.
+static UF_BODY_STEP_NS: AtomicU64 = AtomicU64::new(0);
+static ALL_STEP_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Record one `run_rules` call's worker_step split into UF-body-reading vs all.
+pub(crate) fn ruleset_uf_body_record(uf_body_step_ns: u64, all_step_ns: u64) {
+    if !ruleset_prof_enabled() {
+        return;
+    }
+    UF_BODY_STEP_NS.fetch_add(uf_body_step_ns, Ordering::Relaxed);
+    ALL_STEP_NS.fetch_add(all_step_ns, Ordering::Relaxed);
 }
 
 /// A planned DD join: canonical body-variable order + the table atoms.
