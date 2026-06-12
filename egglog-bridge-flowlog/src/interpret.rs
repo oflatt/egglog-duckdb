@@ -92,8 +92,15 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
         .filter_map(|&i| eg.rules.get(i).and_then(|r| r.clone()).map(|r| (i, r)))
         .collect();
 
-    for (idx, rule) in &rules {
-        let envs = dd_native_bindings(eg, &read, *idx, rule)?;
+    // Compute every rule's binding envs FIRST (so the whole atom-bearing ruleset
+    // runs on ONE fused DD worker in a single epoch — `fused_bindings`), THEN
+    // apply head actions in the original rule firing order. Atom-less rules
+    // (`(rule () …)`) have no input relation to drive the DD dataflow, so they
+    // stay host-side (fire once); they are computed inline below.
+    let envs_by_rule = fused_bindings(eg, &read, &rules)?;
+
+    for ((idx, rule), envs) in rules.iter().zip(envs_by_rule.into_iter()) {
+        let _ = idx;
         for mut env in envs {
             apply_head(
                 eg,
@@ -162,70 +169,127 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
     Ok(changed)
 }
 
-/// Run rule `idx`'s body join on its persistent in-process DD dataflow, returning
-/// the positive binding deltas as envs ready for head application. Atom-less
-/// rules fire their single unconditional binding once (tracked via `seen`).
-fn dd_native_bindings(
+/// Compute every rule's binding envs in ONE fused pass: the whole atom-bearing
+/// ruleset's body joins run on a SINGLE shared timely worker
+/// ([`dd_native::FusedDdJoin`]) clocked once this iteration, then each rule's
+/// host-side prim tail is re-run over its own bindings. Atom-less rules
+/// (`(rule () …)`) have no input relation to drive the DD dataflow, so they are
+/// fired once host-side. Returns a `Vec<Vec<Env>>` parallel to `rules` (same
+/// order), ready for `apply_head`.
+fn fused_bindings(
     eg: &mut EGraph,
     read: &HashMap<FunctionId, std::rc::Rc<HashSet<Row>>>,
-    idx: usize,
-    rule: &RuleIr,
-) -> Result<Vec<Env>> {
+    rules: &[(usize, RuleIr)],
+) -> Result<Vec<Vec<Env>>> {
     use crate::dd_native;
 
-    let has_atoms = rule.body.iter().any(|op| matches!(op, BodyOp::Atom(_)));
-    if !has_atoms {
-        // Atom-less rule (`(rule () …)`): fire once. Reuse `seen` as a fired-set
-        // marker (presence of an entry for this rule index = already fired). The
-        // DD dataflow has no input relation to drive an atom-less body, so this
-        // is the one rule shape evaluated purely host-side (no table join).
-        if eg.seen.contains_key(&idx) {
-            return Ok(Vec::new());
-        }
-        eg.seen.insert(idx, ());
-        let mut envs: Vec<Env> = vec![Env::new()];
-        for op in &rule.body {
-            envs = step_prim(eg, op, envs)?;
-            if envs.is_empty() {
-                break;
+    let prof = dd_native::prof_enabled();
+    let mut out: Vec<Vec<Env>> = vec![Vec::new(); rules.len()];
+
+    // Partition: atom-bearing rules drive the fused DD worker; atom-less rules
+    // fire once host-side. Record each atom-bearing rule's POSITION in `rules` so
+    // we can scatter the fused output back into `out` in the caller's order.
+    let mut atom_positions: Vec<usize> = Vec::new();
+    let mut atom_rule_idxs: Vec<usize> = Vec::new();
+    for (pos, (idx, rule)) in rules.iter().enumerate() {
+        let has_atoms = rule.body.iter().any(|op| matches!(op, BodyOp::Atom(_)));
+        if has_atoms {
+            atom_positions.push(pos);
+            atom_rule_idxs.push(*idx);
+        } else {
+            // Atom-less rule: fire once (presence in `seen` = already fired).
+            if eg.seen.contains_key(idx) {
+                continue;
             }
+            eg.seen.insert(*idx, ());
+            let mut envs: Vec<Env> = vec![Env::new()];
+            for op in &rule.body {
+                envs = step_prim(eg, op, envs)?;
+                if envs.is_empty() {
+                    break;
+                }
+            }
+            out[pos] = envs;
         }
-        return Ok(envs);
     }
 
-    // Plan + build the persistent DD join once. There is NO host fallback —
-    // any shape `plan_join` rejects (a binding row exceeding the fixed width
-    // cap `dd_native::W`, an over-wide atom arity) `panic!`s with the reason,
-    // mirroring the Feldera backend's Stage-C "ineligible ⇒ panic" posture.
-    let plan = match dd_native::plan_join(rule) {
-        Ok(p) => p,
-        Err(reason) => panic!(
-            "FlowLog DD join cannot lower rule {:?}: {reason} \
-             (no host fallback; the DD dataflow is the only join path)",
-            rule.name
-        ),
+    if atom_positions.is_empty() {
+        return Ok(out);
+    }
+
+    // The fused join is keyed by the SORTED atom-bearing rule-index list (the
+    // ruleset identity), exactly like feldera's `FusedJoin`. Build it ONCE
+    // (lazily) per distinct ruleset, planning each rule. Any shape `plan_join`
+    // rejects PANICS (no host fallback; the DD dataflow is the only join path).
+    let mut key: Vec<usize> = atom_rule_idxs.clone();
+    key.sort_unstable();
+
+    if !eg.dd_fused.contains_key(&key) {
+        // Plan in the SAME order as `atom_positions` so the fused build order
+        // matches our scatter order (the fused join preserves plan order).
+        let mut plans: Vec<(usize, dd_native::JoinPlan)> = Vec::with_capacity(atom_positions.len());
+        for (&pos, &idx) in atom_positions.iter().zip(atom_rule_idxs.iter()) {
+            let rule = &rules[pos].1;
+            let plan = match dd_native::plan_join(rule) {
+                Ok(p) => p,
+                Err(reason) => panic!(
+                    "FlowLog DD join cannot lower rule {:?}: {reason} \
+                     (no host fallback; the DD dataflow is the only join path)",
+                    rule.name
+                ),
+            };
+            plans.push((idx, plan));
+        }
+        let fused = dd_native::FusedDdJoin::build(&plans)?;
+        eg.dd_fused.insert(key.clone(), fused);
+    }
+
+    // The fused join's internal rule order (its build order = `atom_positions`
+    // order). Map each fused output slot back to the caller `rules` position and
+    // capture each rule's canonical var order.
+    let (fused_rule_idxs, fused_body_funcs): (Vec<usize>, Vec<Vec<FunctionId>>) = {
+        let fused = eg.dd_fused.get(&key).expect("fused join present");
+        (
+            fused.rule_indices(),
+            (0..fused.rule_indices().len())
+                .map(|p| fused.rule_body_funcs(p).to_vec())
+                .collect(),
+        )
     };
-    let var_order = plan.var_order().to_vec();
-    if !eg.dd_native.contains_key(&idx) {
-        let pj = dd_native::PersistentDdJoin::build(&plan)?;
-        eg.dd_native.insert(idx, pj);
-    }
+    // The fused build order equals `atom_rule_idxs` (we built it that way), so
+    // map fused position -> caller `rules` position via `atom_positions`.
+    debug_assert_eq!(fused_rule_idxs, atom_rule_idxs, "fused build order");
 
-    let body_funcs: Vec<FunctionId> = rule
-        .body
+    // Each atom-bearing rule's canonical var order (for env reconstruction).
+    let var_orders: Vec<Vec<u32>> = atom_positions
         .iter()
-        .filter_map(|op| match op {
-            BodyOp::Atom(a) => Some(a.func),
-            BodyOp::Prim { .. } => None,
+        .map(|&pos| {
+            let rule = &rules[pos].1;
+            dd_native::plan_join(rule)
+                .expect("plan re-derivable")
+                .var_order()
+                .to_vec()
         })
         .collect();
 
-    // Signed delta vs the rows last fed to THIS rule's join (Feldera `fed`).
+    // Distinct relations across the whole ruleset → ONE combined signed delta map
+    // fed into the fused worker's SHARED inputs. The `fed` snapshot is per-ruleset
+    // (the fused join's identity), diffed against the live mirror like the per-rule
+    // `dd_native_fed`.
+    let t_delta = std::time::Instant::now();
     let empty_set: std::rc::Rc<HashSet<Row>> = std::rc::Rc::new(HashSet::new());
+    let mut all_funcs: Vec<FunctionId> = Vec::new();
+    for bf in &fused_body_funcs {
+        for &f in bf {
+            if !all_funcs.contains(&f) {
+                all_funcs.push(f);
+            }
+        }
+    }
     let mut delta: HashMap<FunctionId, Vec<(Vec<u32>, isize)>> = HashMap::new();
     {
-        let fed = eg.dd_native_fed.entry(idx).or_default();
-        for &f in &body_funcs {
+        let fed = eg.dd_fused_fed.entry(key.clone()).or_default();
+        for &f in &all_funcs {
             let cur = read.get(&f).cloned().unwrap_or_else(|| empty_set.clone());
             let prev = fed.entry(f).or_insert_with(|| empty_set.clone());
             if std::rc::Rc::ptr_eq(&cur, prev) {
@@ -249,37 +313,54 @@ fn dd_native_bindings(
             *prev = cur;
         }
     }
+    if prof {
+        dd_native::PROF_DELTA_NS.fetch_add(
+            t_delta.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
 
-    eg.dd_rule_runs += 1;
-    let bindings = {
-        let pj = eg
-            .dd_native
-            .get_mut(&idx)
-            .expect("persistent dd join present");
-        pj.step(&delta)?
+    // ONE step of the shared worker for the WHOLE ruleset.
+    eg.dd_rule_runs += atom_positions.len() as u64;
+    let per_rule_bindings = {
+        let fused = eg.dd_fused.get_mut(&key).expect("fused join present");
+        fused.step(&delta)?
     };
 
-    // Turn positive binding deltas into envs; re-run body prims host-side over
-    // them (value prims bind fresh vars; `!=`/guard prims re-filter). Negative
-    // weights are integral bookkeeping (a body row retracted) — egglog heads are
-    // monotone-fire, so we do NOT re-fire the head on disappearance.
-    let mut out: Vec<Env> = Vec::new();
-    for (bind, w) in &bindings {
-        if *w <= 0 {
-            continue;
-        }
-        let mut env: Env = Env::new();
-        for (i, &v) in var_order.iter().enumerate() {
-            env.insert(v, bind[i]);
-        }
-        let mut es: Vec<Env> = vec![env];
-        for op in &rule.body {
-            if let BodyOp::Prim { .. } = op {
-                es = step_prim(eg, op, es)?;
+    // Turn each rule's positive binding deltas into envs; re-run its body prims
+    // host-side. Negative weights are integral bookkeeping (a body row retracted)
+    // — egglog heads are monotone-fire, so we do NOT re-fire on disappearance.
+    let t_prim = std::time::Instant::now();
+    for (fpos, bindings) in per_rule_bindings.into_iter().enumerate() {
+        let caller_pos = atom_positions[fpos];
+        let rule = &rules[caller_pos].1;
+        let var_order = &var_orders[fpos];
+        let mut envs: Vec<Env> = Vec::new();
+        for (bind, w) in &bindings {
+            if *w <= 0 {
+                continue;
             }
+            let mut env: Env = Env::new();
+            for (i, &v) in var_order.iter().enumerate() {
+                env.insert(v, bind[i]);
+            }
+            let mut es: Vec<Env> = vec![env];
+            for op in &rule.body {
+                if let BodyOp::Prim { .. } = op {
+                    es = step_prim(eg, op, es)?;
+                }
+            }
+            envs.extend(es);
         }
-        out.extend(es);
+        out[caller_pos] = envs;
     }
+    if prof {
+        dd_native::PROF_PRIM_NS.fetch_add(
+            t_prim.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     Ok(out)
 }
 

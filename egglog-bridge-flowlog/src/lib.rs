@@ -188,11 +188,27 @@ pub struct EGraph {
     /// Per-rule, per-function last-fed row snapshot `Rc`, for computing the
     /// signed delta vs what the persistent DD join was last fed (Feldera `fed`).
     pub(crate) dd_native_fed: HashMap<usize, HashMap<FunctionId, std::rc::Rc<HashSet<Row>>>>,
+    /// Per-RULESET fused DD join (one shared timely worker + one dataflow for the
+    /// whole ruleset), keyed by the sorted live rule-index list — the FlowLog
+    /// analog of feldera's `FusedJoin`. This is the perf-critical join path;
+    /// `dd_native` (per-rule) is retained only for the bridge-level unit tests.
+    pub(crate) dd_fused: HashMap<Vec<usize>, dd_native::FusedDdJoin>,
+    /// Per-ruleset, per-function last-fed row snapshot `Rc`, for computing the
+    /// signed delta fed into the FUSED join's shared inputs (the fused `fed`).
+    pub(crate) dd_fused_fed: HashMap<Vec<usize>, HashMap<FunctionId, std::rc::Rc<HashSet<Row>>>>,
 }
 
 impl Default for EGraph {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for EGraph {
+    fn drop(&mut self) {
+        // Step-0 profile dump (gated FLOWLOG_DD_PROF): #workers, #InputSessions,
+        // and the worker.step vs host-side prim/delta split. No-op otherwise.
+        dd_native::dd_prof_dump();
     }
 }
 
@@ -236,6 +252,8 @@ impl EGraph {
             seen: HashMap::new(),
             dd_native: HashMap::new(),
             dd_native_fed: HashMap::new(),
+            dd_fused: HashMap::new(),
+            dd_fused_fed: HashMap::new(),
         }
     }
 
@@ -580,6 +598,10 @@ impl Backend for EGraph {
             self.seen.remove(&i);
             self.dd_native.remove(&i);
             self.dd_native_fed.remove(&i);
+            // Any fused ruleset that included this rule is now stale: drop it so
+            // it is rebuilt (without the freed rule) on the next `run_rules`.
+            self.dd_fused.retain(|key, _| !key.contains(&i));
+            self.dd_fused_fed.retain(|key, _| !key.contains(&i));
         }
     }
 

@@ -6,7 +6,18 @@
 //! [`crate::interpret::run_iteration`]); there is no host nested-loop fallback.
 //! It panics (via the caller) on shapes it does not support — see `plan_join`.
 //!
-//! ## The architecture proven here (mirrors feldera/DBSP)
+//! ## Two implementations: per-rule vs FUSED per-ruleset
+//!
+//! [`FusedDdJoin`] is the PERF-CRITICAL path the interpreter drives: ONE shared
+//! timely `Worker` hosts ONE dataflow for a whole RULESET, every distinct body
+//! relation is a single SHARED input `Collection`, and each rule is a join
+//! sub-stream reading those shared collections (the DD analog of feldera's
+//! `FusedJoin`). [`PersistentDdJoin`] is the original per-RULE worker; it is
+//! retained for the bridge-level incrementality unit test and documents the base
+//! architecture below. Both feed only signed DELTAS into never-cleared
+//! InputSessions, so the arrangements persist across epochs = incremental.
+//!
+//! ## The base architecture (mirrors feldera/DBSP)
 //!
 //! For each atom-bearing rule we build ONE differential-dataflow dataflow, ONCE,
 //! inside a single-threaded timely `Worker` we OWN (so we can `step` it across
@@ -137,6 +148,65 @@ fn trace_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOWLOG_DD_NATIVE_TRACE").is_some())
 }
 
+// ---------------------------------------------------------------------------
+// Step-0 profiling counters (gated FLOWLOG_DD_PROF). Confirm/refute the
+// per-rule-worker duplication hypothesis BEFORE refactoring: how many timely
+// `Worker`s get spun up, how many `InputSession`s total, and where wall-time
+// goes (worker.step vs the host-side prim re-run). Read+printed by `dd_prof_dump`.
+// ---------------------------------------------------------------------------
+use std::sync::atomic::{AtomicU64, Ordering};
+/// Number of timely `Worker`s created (one per `PersistentDdJoin::build`).
+pub(crate) static PROF_WORKERS: AtomicU64 = AtomicU64::new(0);
+/// Total `InputSession`s created across all workers (sum of atom occurrences).
+pub(crate) static PROF_INPUT_SESSIONS: AtomicU64 = AtomicU64::new(0);
+/// Total time spent in `worker.step_while` (the DD epoch fixpoint loop).
+pub(crate) static PROF_STEP_NS: AtomicU64 = AtomicU64::new(0);
+/// Total time spent feeding deltas into InputSessions + advancing/flushing.
+pub(crate) static PROF_FEED_NS: AtomicU64 = AtomicU64::new(0);
+/// Number of `step` calls that actually clocked the worker (pushed a delta).
+pub(crate) static PROF_STEP_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Total time spent re-running body primitives host-side over the bindings.
+pub(crate) static PROF_PRIM_NS: AtomicU64 = AtomicU64::new(0);
+/// Total time spent computing the per-rule signed body-relation delta.
+pub(crate) static PROF_DELTA_NS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn prof_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOWLOG_DD_PROF").is_some())
+}
+
+#[inline]
+fn add_ns(c: &AtomicU64, d: std::time::Duration) {
+    c.fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// Print the Step-0 profile to stderr if `FLOWLOG_DD_PROF` is set.
+pub fn dd_prof_dump() {
+    if !prof_enabled() {
+        return;
+    }
+    let workers = PROF_WORKERS.load(Ordering::Relaxed);
+    let sessions = PROF_INPUT_SESSIONS.load(Ordering::Relaxed);
+    let step_ns = PROF_STEP_NS.load(Ordering::Relaxed);
+    let feed_ns = PROF_FEED_NS.load(Ordering::Relaxed);
+    let calls = PROF_STEP_CALLS.load(Ordering::Relaxed);
+    let prim_ns = PROF_PRIM_NS.load(Ordering::Relaxed);
+    let delta_ns = PROF_DELTA_NS.load(Ordering::Relaxed);
+    #[allow(clippy::disallowed_macros)]
+    {
+        eprintln!(
+            "[FLOWLOG_DD_PROF] workers={workers} input_sessions={sessions} \
+             nonempty_step_calls={calls} worker_step={:.3}s feed={:.3}s \
+             host_prim={:.3}s delta_compute={:.3}s",
+            step_ns as f64 / 1e9,
+            feed_ns as f64 / 1e9,
+            prim_ns as f64 / 1e9,
+            delta_ns as f64 / 1e9,
+        );
+    }
+}
+
 /// A planned DD join: canonical body-variable order + the table atoms.
 pub struct JoinPlan {
     /// `var_order[i]` is the variable id at binding-row column `i`.
@@ -243,6 +313,10 @@ impl PersistentDdJoin {
             alloc,
             Some(std::time::Instant::now()),
         );
+        if prof_enabled() {
+            PROF_WORKERS.fetch_add(1, Ordering::Relaxed);
+            PROF_INPUT_SESSIONS.fetch_add(plan.atoms.len() as u64, Ordering::Relaxed);
+        }
 
         let n_atoms = plan.atoms.len();
         let atom_slots: Vec<Vec<Slot>> = plan.atoms.iter().map(|a| a.slots.clone()).collect();
@@ -369,6 +443,8 @@ impl PersistentDdJoin {
         &mut self,
         deltas: &HashMap<FunctionId, Vec<(Vec<u32>, isize)>>,
     ) -> Result<Vec<(Vec<u32>, isize)>> {
+        let prof = prof_enabled();
+        let t_feed = std::time::Instant::now();
         let mut pushed = false;
         for (func, rows) in deltas {
             if let Some(occs) = self.occ_of_func.get(func) {
@@ -398,8 +474,16 @@ impl PersistentDdJoin {
             inp.advance_to(next_epoch);
             inp.flush();
         }
+        if prof {
+            add_ns(&PROF_FEED_NS, t_feed.elapsed());
+            PROF_STEP_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        let t_step = std::time::Instant::now();
         let probe = self.probe.clone();
         self.worker.step_while(|| probe.less_than(&next_epoch));
+        if prof {
+            add_ns(&PROF_STEP_NS, t_step.elapsed());
+        }
         self.epoch = next_epoch;
 
         // Drain the capture buffer; consolidate duplicate rows that may have been
@@ -428,6 +512,343 @@ impl PersistentDdJoin {
             }
         }
         Ok(out)
+    }
+}
+
+// ===========================================================================
+// FusedDdJoin — ONE shared worker + ONE dataflow per RULESET
+// ===========================================================================
+//
+// `PersistentDdJoin` builds one timely `Worker` PER RULE: a program with R
+// atom-bearing rules spins up R independent workers, and a body relation read by
+// K rules gets K separate `InputSession`s (each fed the same delta) + K separate
+// arrangements, each stepped to fixpoint separately. Step-0 profiling
+// (`FLOWLOG_DD_PROF`) on math-microbenchmark N=9 showed 79 workers, 173
+// InputSessions, and 1.996s of 2.43s total spent inside `worker.step_while` — the
+// per-rule-worker duplication is the dominant cost.
+//
+// `FusedDdJoin` collapses this to ONE worker hosting ONE `worker.dataflow(...)`
+// scope for the whole ruleset (keyed by the sorted live rule-index list, exactly
+// like feldera's `FusedJoin`). Within that scope:
+//   - every DISTINCT body relation across all rules gets ONE `InputSession` →
+//     ONE base `Collection`, `.distinct()`'d ONCE and SHARED by every atom
+//     occurrence (in every rule) that reads it. Cloning a DD collection is a
+//     handle copy, so the shared `.distinct()` arrangement is built once, not K
+//     times — the dedup win.
+//   - each rule is a left-deep join sub-stream reading those shared collections,
+//     with its OWN `inspect_batch` capture into a per-rule `Rc<RefCell<Vec>>`.
+// Per epoch: feed each relation's delta ONCE into its shared input, advance +
+// step the SINGLE worker once, then drain each rule's capture buffer. The
+// host-side prim re-run + `apply_head` are unchanged (the caller does them).
+//
+// The NEVER-CLEAR / fed-only-deltas invariant is preserved (the InputSessions
+// persist across epochs = genuinely incremental), as is the external epoch-drive.
+
+/// A fused, delta-fed body join for a WHOLE ruleset on a single shared timely
+/// `Worker`. Built once via [`FusedDdJoin::build`]; driven across epochs via
+/// [`FusedDdJoin::step`] with a SINGLE `worker.step_while` per call.
+pub struct FusedDdJoin {
+    worker: Worker,
+    /// One shared input session per DISTINCT body relation across all rules.
+    inputs: HashMap<FunctionId, InputSession<u32, Row, isize>>,
+    /// Single probe on all rule outputs (they share the dataflow scope, so one
+    /// probe gates the whole epoch's fixpoint).
+    probe: ProbeHandle<u32>,
+    /// The fused rules, in build (= sorted rule-index) order. Each carries its
+    /// own capture buffer + var width.
+    rules: Vec<FusedRule>,
+    /// Current epoch (monotonic; advanced once per [`step`]).
+    epoch: u32,
+}
+
+/// One rule's lowering inside a [`FusedDdJoin`]: its rule index (for routing
+/// bindings to its head), its per-epoch output capture buffer, and its width.
+struct FusedRule {
+    idx: usize,
+    /// This rule's per-epoch output binding-delta capture (`inspect_batch`
+    /// appends `(row, weight)`; drained by [`FusedDdJoin::step`]).
+    captured: Rc<RefCell<Vec<(Row, isize)>>>,
+    /// Number of canonical body variables (binding-row width in use).
+    n_vars: usize,
+    /// `func` -> atom-occurrence indices reading it within THIS rule (self-join
+    /// fan-out is handled at build time via the shared collection, so this is
+    /// only used to know which relations this rule reads).
+    body_funcs: Vec<FunctionId>,
+}
+
+impl FusedDdJoin {
+    /// Build ONE worker + ONE dataflow for the whole ruleset. `plans` pairs each
+    /// rule's index with its [`JoinPlan`], in the order they should fire.
+    pub fn build(plans: &[(usize, JoinPlan)]) -> Result<FusedDdJoin> {
+        let alloc = Allocator::Thread(Thread::default());
+        let mut worker = Worker::new(
+            WorkerConfig::default(),
+            alloc,
+            Some(std::time::Instant::now()),
+        );
+        if prof_enabled() {
+            PROF_WORKERS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Distinct body relations across all rules → one shared input each.
+        let mut funcs: Vec<FunctionId> = Vec::new();
+        for (_, plan) in plans {
+            for a in &plan.atoms {
+                if !funcs.contains(&a.func) {
+                    funcs.push(a.func);
+                }
+            }
+        }
+        if prof_enabled() {
+            PROF_INPUT_SESSIONS.fetch_add(funcs.len() as u64, Ordering::Relaxed);
+        }
+
+        // Owned per-rule plan snapshots so the `move` dataflow closure is 'static.
+        struct RulePlan {
+            idx: usize,
+            atoms: Vec<Vec<Slot>>,
+            atom_funcs: Vec<FunctionId>,
+            var_col: HashMap<u32, usize>,
+            n_vars: usize,
+            body_funcs: Vec<FunctionId>,
+        }
+        let rule_plans: Vec<RulePlan> = plans
+            .iter()
+            .map(|(idx, plan)| {
+                let atom_funcs: Vec<FunctionId> = plan.atoms.iter().map(|a| a.func).collect();
+                let mut body_funcs: Vec<FunctionId> = Vec::new();
+                for &f in &atom_funcs {
+                    if !body_funcs.contains(&f) {
+                        body_funcs.push(f);
+                    }
+                }
+                RulePlan {
+                    idx: *idx,
+                    atoms: plan.atoms.iter().map(|a| a.slots.clone()).collect(),
+                    atom_funcs,
+                    var_col: plan.var_col.clone(),
+                    n_vars: plan.var_order.len(),
+                    body_funcs,
+                }
+            })
+            .collect();
+
+        let probe: ProbeHandle<u32> = ProbeHandle::new();
+        let probe_in = probe.clone();
+        // Per-rule capture buffers, allocated outside the closure so we can keep a
+        // clone here and route each rule's output to its head after `step`.
+        let captures: Vec<Rc<RefCell<Vec<(Row, isize)>>>> = rule_plans
+            .iter()
+            .map(|_| Rc::new(RefCell::new(Vec::new())))
+            .collect();
+        let captures_in = captures.clone();
+        let funcs_in = funcs.clone();
+        // The per-rule metadata `FusedRule` needs (kept here; the closure consumes
+        // `rule_plans` for the dataflow build).
+        let rule_meta: Vec<(usize, usize, Vec<FunctionId>)> = rule_plans
+            .iter()
+            .map(|rp| (rp.idx, rp.n_vars, rp.body_funcs.clone()))
+            .collect();
+
+        // PERF: the per-epoch input delta is already set-semantic — it is built
+        // from a `HashSet` set-difference vs the fed view (`interpret::fused_bindings`),
+        // so each row appears at most once with weight ±1. The input integral
+        // therefore stays 0/1 per row WITHOUT `.distinct()`, making the input
+        // distinct (a full integral + per-key consolidation every epoch, over the
+        // LARGE relation integrals) pure overhead. Dropped by default; set
+        // `FLOWLOG_DD_KEEP_INPUT_DISTINCT` to restore it. (Mirrors feldera's
+        // `FELDERA_KEEP_INPUT_DISTINCT` finding.)
+        let keep_input_distinct = std::env::var_os("FLOWLOG_DD_KEEP_INPUT_DISTINCT").is_some();
+        let keep_output_distinct = std::env::var_os("FLOWLOG_DD_KEEP_OUTPUT_DISTINCT").is_some();
+        let inputs = worker.dataflow::<u32, _, _>(move |scope| {
+            // ONE shared input + base collection per distinct relation, shared by
+            // every atom occurrence (in every rule) that reads it.
+            let mut inputs: HashMap<FunctionId, InputSession<u32, Row, isize>> = HashMap::new();
+            let mut rel_coll: HashMap<FunctionId, _> = HashMap::new();
+            for &f in &funcs_in {
+                let mut session: InputSession<u32, Row, isize> = InputSession::new();
+                let base = session.to_collection(scope);
+                let coll = if keep_input_distinct {
+                    base.map(|r: Row| (r, ())).distinct().map(|(r, ())| r)
+                } else {
+                    base
+                };
+                inputs.insert(f, session);
+                rel_coll.insert(f, coll);
+            }
+
+            for (rp, cap) in rule_plans.iter().zip(captures_in.iter()) {
+                // This rule's per-atom collection vector, from the SHARED relation
+                // collections (cloning a DD collection is just a handle copy).
+                let n_atoms = rp.atoms.len();
+                let atom_slots = &rp.atoms;
+                let var_col = &rp.var_col;
+                let n_vars = rp.n_vars;
+
+                let mut bound = vec![false; n_vars];
+                let slots0 = atom_slots[0].clone();
+                let vc0 = var_col.clone();
+                let mut cur = rel_coll[&rp.atom_funcs[0]]
+                    .clone()
+                    .flat_map(move |r: Row| bind_atom(&r, &slots0, &vc0));
+                mark_bound(&atom_slots[0], var_col, &mut bound);
+
+                for i in 1..n_atoms {
+                    let slots = atom_slots[i].clone();
+                    let shared: Vec<u32> = atom_vars(&slots)
+                        .into_iter()
+                        .filter(|v| var_col.get(v).map(|&c| bound[c]).unwrap_or(false))
+                        .collect();
+                    let shared_cols_left: Vec<usize> = shared.iter().map(|v| var_col[v]).collect();
+                    let shared_atom_cols: Vec<usize> = shared
+                        .iter()
+                        .map(|v| {
+                            slots
+                                .iter()
+                                .position(|s| matches!(s, Slot::Var(x) if x == v))
+                                .expect("shared var present in atom")
+                        })
+                        .collect();
+
+                    let scl = shared_cols_left.clone();
+                    let left = cur.map(move |b: Row| (pack_key(&b, &scl), b));
+                    let sac = shared_atom_cols.clone();
+                    let right = rel_coll[&rp.atom_funcs[i]]
+                        .clone()
+                        .map(move |r: Row| (pack_key(&r, &sac), r));
+
+                    let slotsc = slots.clone();
+                    let vc = var_col.clone();
+                    let bound_now = bound.clone();
+                    cur = left
+                        .join(right)
+                        .flat_map(move |(_k, (b, r)): (Key, (Row, Row))| {
+                            merge_atom_into(&b, &r, &slotsc, &vc, &bound_now)
+                        });
+                    mark_bound(&slots, var_col, &mut bound);
+                }
+
+                // PERF: the output `.distinct()` is redundant here. `step`
+                // accumulates each rule's binding deltas into a per-key weight map
+                // and `interpret::fused_bindings` inspects only the SIGN of the net
+                // weight (>0 ⇒ one env; net-zero already filtered). distinct would
+                // clamp the binding multiplicity to {0,1}, but since only the sign
+                // is observed and net-zero rows are dropped, the clamp is
+                // unobservable. `.consolidate()` still collapses per-key
+                // multiplicities so the captured batch is one signed row per key.
+                // Dropped by default; set `FLOWLOG_DD_KEEP_OUTPUT_DISTINCT` to
+                // restore. (Mirrors feldera's `FELDERA_KEEP_OUTPUT_DISTINCT`.)
+                let consolidated = if keep_output_distinct {
+                    cur.map(|b: Row| (b, ()))
+                        .distinct()
+                        .map(|(b, ())| b)
+                        .consolidate()
+                } else {
+                    cur.consolidate()
+                };
+                let out = consolidated;
+
+                let cap = Rc::clone(cap);
+                out.inner
+                    .inspect_batch(move |_t, batch| {
+                        let mut buf = cap.borrow_mut();
+                        for (row, _time, w) in batch.iter() {
+                            buf.push((*row, *w));
+                        }
+                    })
+                    .probe_with(&probe_in);
+            }
+
+            inputs
+        });
+
+        let rules: Vec<FusedRule> = rule_meta
+            .into_iter()
+            .zip(captures)
+            .map(|((idx, n_vars, body_funcs), captured)| FusedRule {
+                idx,
+                captured,
+                n_vars,
+                body_funcs,
+            })
+            .collect();
+
+        Ok(FusedDdJoin {
+            worker,
+            inputs,
+            probe,
+            rules,
+            epoch: 0,
+        })
+    }
+
+    /// The rule indices this fused worker serves (build order).
+    pub fn rule_indices(&self) -> Vec<usize> {
+        self.rules.iter().map(|r| r.idx).collect()
+    }
+
+    /// The body relations the fused rule at build position `pos` reads.
+    pub fn rule_body_funcs(&self, pos: usize) -> &[FunctionId] {
+        &self.rules[pos].body_funcs
+    }
+
+    /// Feed one epoch of signed relation deltas into the SHARED inputs, advance
+    /// the timestamp, run the SINGLE worker to this epoch's fixpoint, and return
+    /// per-rule binding deltas. The outer `Vec` is in [`rule_indices`] order; each
+    /// inner `Vec` is `(binding_row_as_var_order_vec, weight)`.
+    ///
+    /// CRUCIAL: the InputSessions are NEVER cleared — only the delta is pushed, so
+    /// the DD arrangements persist and the join is genuinely incremental.
+    pub fn step(
+        &mut self,
+        deltas: &HashMap<FunctionId, Vec<(Vec<u32>, isize)>>,
+    ) -> Result<Vec<Vec<(Vec<u32>, isize)>>> {
+        let prof = prof_enabled();
+        let t_feed = std::time::Instant::now();
+        let mut pushed = false;
+        for (func, rows) in deltas {
+            if let Some(inp) = self.inputs.get_mut(func) {
+                for (row, w) in rows {
+                    inp.update(pack_row(row), *w);
+                    pushed = true;
+                }
+            }
+        }
+        let next_epoch = self.epoch + 1;
+        if !pushed {
+            self.epoch = next_epoch;
+            return Ok(vec![Vec::new(); self.rules.len()]);
+        }
+
+        for rule in &self.rules {
+            rule.captured.borrow_mut().clear();
+        }
+        for inp in self.inputs.values_mut() {
+            inp.advance_to(next_epoch);
+            inp.flush();
+        }
+        if prof {
+            add_ns(&PROF_FEED_NS, t_feed.elapsed());
+            PROF_STEP_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        let t_step = std::time::Instant::now();
+        let probe = self.probe.clone();
+        self.worker.step_while(|| probe.less_than(&next_epoch));
+        if prof {
+            add_ns(&PROF_STEP_NS, t_step.elapsed());
+        }
+        self.epoch = next_epoch;
+
+        let mut outs: Vec<Vec<(Vec<u32>, isize)>> = Vec::with_capacity(self.rules.len());
+        for rule in &self.rules {
+            let mut acc: HashMap<Vec<u32>, isize> = HashMap::new();
+            for (row, w) in rule.captured.borrow_mut().drain(..) {
+                let key: Vec<u32> = (0..rule.n_vars).map(|i| row[i]).collect();
+                *acc.entry(key).or_insert(0) += w;
+            }
+            outs.push(acc.into_iter().filter(|(_, w)| *w != 0).collect());
+        }
+        Ok(outs)
     }
 }
 
