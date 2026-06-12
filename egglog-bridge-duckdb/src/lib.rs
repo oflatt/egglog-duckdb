@@ -1195,10 +1195,14 @@ pub fn q(name: &str) -> String {
 /// `?2` -> `cur`, and execute it. Values are i64s, so direct
 /// inlining is safe.
 ///
-/// We tried `prepare_cached` with proper positional binds, but
-/// duckdb-rust 1.5 didn't actually keep the planned representation
-/// across calls in our setup — overall wall time roughly doubled.
-/// Plain `execute` with string substitution beats it.
+/// We tried `prepare_cached` (with a generous statement-cache capacity
+/// so templates don't evict each other) and binding `?1`/`?2` as real
+/// params instead of substituting them: it does NOT help. Profiling
+/// the cached path shows preparing is only ~2% of run time (e.g. 0.05s
+/// of a 2.6s math-microbenchmark N=9 run); the other ~89% is the SQL
+/// `raw_execute` itself (the joins/scans over growing tables), which
+/// caching the plan cannot speed up. So plain `execute` with string
+/// substitution is kept — it is simplest and no slower.
 pub(crate) fn exec_bound(conn: &Connection, sql: &str, last: i64, cur: i64) -> Result<usize> {
     let bound = sql
         .replace("?1", &last.to_string())
