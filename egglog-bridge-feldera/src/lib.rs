@@ -251,6 +251,18 @@ pub struct EGraph {
     /// `@uf` rules — no recognition. The host nested-loop + `seen` fallback was
     /// retired; a genuinely-ineligible (impure) rule panics.
     pub(crate) persistent: HashMap<usize, dbsp_join::PersistentJoin>,
+    /// FUSED per-RULESET DBSP join circuit, keyed by the sorted live rule-index
+    /// list of the `run_rules` call. Collapses the ruleset's R per-rule
+    /// transactions into ONE transaction per call (the dominant fixed
+    /// per-transaction clocking cost — see [`dbsp_join::FusedJoin`]). The
+    /// per-rule [`EGraph::persistent`] map is retained only for the unit test and
+    /// the atom-less path; the fused circuit is the production join path.
+    pub(crate) fused: HashMap<Vec<usize>, dbsp_join::FusedJoin>,
+    /// Per-FUSED-circuit, per-body-relation last-fed row set (keyed by the same
+    /// sorted rule-index list as [`EGraph::fused`]). The fused circuit shares one
+    /// input per relation across all its rules, so the fed view is per-circuit,
+    /// not per-rule. Same `Rc`-snapshot fast-path as [`EGraph::fed`].
+    pub(crate) fed_fused: HashMap<Vec<usize>, HashMap<FunctionId, std::rc::Rc<HashSet<Row>>>>,
     /// Rule indices for ATOM-LESS rules (`(rule () …)` / `eval_actions` /
     /// `eval_resolved_expr`) that have already fired their single unconditional
     /// binding. An atom-less rule has no body relation to drive a join, so its
@@ -271,6 +283,10 @@ pub struct EGraph {
     pub(crate) prof_read_rows: u64,
     pub(crate) prof_fed_diff: std::time::Duration,
     pub(crate) prof_circuit_step: std::time::Duration,
+    /// Diagnostics: number of DBSP `transaction()`s clocked (gated
+    /// `FELDERA_PROFILE`). With fused per-ruleset circuits this is ~1 per
+    /// `run_rules` call, vs ~R (one per rule) before fusion.
+    pub(crate) prof_transactions: u64,
     pub(crate) prof_apply: std::time::Duration,
     pub(crate) prof_merge: std::time::Duration,
     pub(crate) prof_change: std::time::Duration,
@@ -305,12 +321,15 @@ impl EGraph {
             circuit_rebuild_runs: 0,
             rebuild_cache: None,
             persistent: HashMap::new(),
+            fused: HashMap::new(),
+            fed_fused: HashMap::new(),
             atomless_fired: HashSet::new(),
             fed: HashMap::new(),
             prof_read_clone: std::time::Duration::ZERO,
             prof_read_rows: 0,
             prof_fed_diff: std::time::Duration::ZERO,
             prof_circuit_step: std::time::Duration::ZERO,
+            prof_transactions: 0,
             prof_apply: std::time::Duration::ZERO,
             prof_merge: std::time::Duration::ZERO,
             prof_change: std::time::Duration::ZERO,
@@ -557,11 +576,12 @@ impl Drop for EGraph {
         }
         if std::env::var("FELDERA_PROFILE").is_ok() {
             eprintln!(
-                "[PROF] read_clone={:.2}s (rows_total={}) fed_diff={:.2}s circuit_step={:.2}s",
+                "[PROF] read_clone={:.2}s (rows_total={}) fed_diff={:.2}s circuit_step={:.2}s transactions={}",
                 self.prof_read_clone.as_secs_f64(),
                 self.prof_read_rows,
                 self.prof_fed_diff.as_secs_f64(),
                 self.prof_circuit_step.as_secs_f64(),
+                self.prof_transactions,
             );
             eprintln!(
                 "[PROF] apply_writes={:.2}s resolve_merge={:.2}s change_detect={:.2}s (folded into apply/merge)",
@@ -572,6 +592,14 @@ impl Drop for EGraph {
             eprintln!(
                 "[PROF] dbsp_runs={} host_runs={} (host rebuild/congruence join is the residual bottleneck)",
                 self.dbsp_rule_runs, self.host_rule_runs,
+            );
+            use std::sync::atomic::Ordering;
+            let feed = crate::dbsp_join::PROF_FEED_NS.load(Ordering::Relaxed) as f64 / 1e9;
+            let step = crate::dbsp_join::PROF_STEP_NS.load(Ordering::Relaxed) as f64 / 1e9;
+            let read = crate::dbsp_join::PROF_READ_NS.load(Ordering::Relaxed) as f64 / 1e9;
+            let calls = crate::dbsp_join::PROF_STEP_CALLS.load(Ordering::Relaxed);
+            eprintln!(
+                "[PROF-PHASE] feed={feed:.2}s step(transaction)={step:.2}s read(consolidate)={read:.2}s nonempty_steps={calls}",
             );
         }
     }
@@ -801,6 +829,10 @@ impl Backend for EGraph {
             self.persistent.remove(&i);
             self.fed.remove(&i);
             self.atomless_fired.remove(&i);
+            // Drop any FUSED circuit whose ruleset includes this freed rule, so
+            // a reused index never reuses a stale fused circuit.
+            self.fused.retain(|key, _| !key.contains(&i));
+            self.fed_fused.retain(|key, _| !key.contains(&i));
             self.invalidate_circuit();
         }
     }
