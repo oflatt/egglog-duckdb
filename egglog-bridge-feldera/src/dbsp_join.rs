@@ -12,8 +12,9 @@
 //! `!=` guards applied as DBSP `filter` operators *inside* the dataflow. It is
 //! fed only the per-relation signed DELTA each iteration; the incremental join +
 //! integral do the seminaive bookkeeping and retraction natively. The circuit's
-//! output is a z-set of **binding rows** ([`BindRow`], a [`JOIN_WIDTH`]-wide
-//! [`TupRow`]) holding the rule's body variables in a fixed canonical order.
+//! output is a z-set of **binding rows** (a fixed-width [`Row`] bucket — 8, 16 or
+//! 32 columns, chosen per ruleset) holding the rule's body variables in a fixed
+//! canonical order.
 //!
 //! ## Pure body prims run ON-CIRCUIT
 //!
@@ -27,11 +28,12 @@
 //!
 //! ## Eligibility / the row-width cap
 //!
-//! DBSP rows must be fixed-arity `DBData` (rkyv-archivable); we use a uniform
-//! [`JOIN_WIDTH`]-wide [`TupRow`]. A rule is eligible (does not panic) iff:
+//! DBSP rows must be fixed-arity `DBData` (rkyv-archivable); we use a fixed-width
+//! [`Row`] bucket per ruleset (the smallest of 8/16/32 columns that fits — see
+//! [`pick_width`]). A rule is eligible (does not panic) iff:
 //!   - it has at least one table atom (atom-less rules are fired once by the
 //!     caller, not planned here);
-//!   - every table atom has arity <= [`JOIN_WIDTH`];
+//!   - every table atom has arity <= [`JOIN_WIDTH`] (the widest bucket, 32);
 //!   - the rule's body uses <= [`JOIN_WIDTH`] distinct variables (binding row);
 //!   - every body primitive is PURE. A recognized rep-comparison prim (`!=`,
 //!     `bool-!=`, `or`, `guard`, `ordering-min/max`) is inlined when its operand
@@ -68,103 +70,139 @@ fn add_ns(c: &AtomicU64, d: std::time::Duration) {
     c.fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
 }
 
-/// Max distinct body variables / atom columns the DBSP join supports (the
-/// fixed-arity `DBData` row width).
+/// Hard upper bound on distinct body variables / atom columns the DBSP join
+/// supports (the WIDEST fixed-arity `DBData` row bucket).
 ///
-/// Stage C widens this from 10 (dbsp's stock [`dbsp::utils::Tup10`]) to 32 via a
-/// custom [`TupRow`] declared with dbsp's `declare_tuples!` macro, because the
-/// persistent circuit is now the ONLY join path: it must cover the WIDEST
-/// feldera-supported rule. A suite-wide survey put the peak among PASSING
+/// The circuit row is no longer a single fixed width: the binding/relation row
+/// is one of several [`declare_tuples!`]-generated buckets (8 / 16 / 32 columns),
+/// and [`FusedJoin::build`] picks the SMALLEST bucket that fits the ruleset's
+/// actual max binding-row width (see [`pick_width`]). Since every DBSP operator
+/// (join, map_index, integral consolidation, z-set hashing/ordering) copies,
+/// hashes and compares the FULL fixed-width row, a ruleset whose rules bind only
+/// a handful of variables (the common case: math-microbenchmark's hot ruleset
+/// peaks at 7 vars) flows through 8-wide (32-byte) rows instead of 32-wide
+/// (128-byte) ones — 4x less per-row memory traffic across the whole circuit.
+///
+/// The widest bucket is still 32: a suite-wide survey put the peak among PASSING
 /// programs at ~23 distinct body variables (`cykjson` `check_facts`, the
-/// `const-prop` value rules — the latter also materialize on-circuit prim
-/// outputs into binding columns), so 32 gives headroom. A rule wider than this
-/// PANICS as ineligible (`plan_join`'s "too many vars" reject); the only suite
-/// program that trips it is `luminal-llama`'s `@rebuild_rule34` (35 vars), which
-/// is independently unsupported (it fails the frontend with an unbound-global
-/// error regardless of the backend). Widening to cover it (48) regressed the
-/// `math-microbenchmark` N=11 run to OOM (50% larger rows through the saturation
-/// z-sets), so 32 is the chosen ceiling: it covers every program that actually
-/// completes. Cost: a binding row is `32 * 4 = 128` bytes (vs 40 at width 10).
-/// Pulling in dbsp's DBData derive stack (paste/rkyv/size_of/serde/derive_more)
-/// is the one-time dependency price for a row wider than `Tup10`.
-pub const JOIN_WIDTH: usize = 32;
+/// `const-prop` value rules). A rule wider than 32 PANICS as ineligible
+/// (`plan_join`'s "too many vars" reject); the only suite program that trips it
+/// is `luminal-llama`'s `@rebuild_rule34` (35 vars), which is independently
+/// unsupported. Widening to 48 regressed the N=11 run to OOM, so 32 stays the
+/// ceiling. The DBData derive stack (paste/rkyv/size_of/serde/derive_more) is
+/// pinned in Cargo.toml to dbsp 0.150's versions.
+pub const JOIN_WIDTH: usize = MAX_WIDTH;
 
-// Declare a 32-wide `DBData` tuple via dbsp's own macro, so the generated trait
-// impls (rkyv `Archive`, `SizeOf`, `MulByRef`, `HasZero`, …) match dbsp's stock
-// tuples exactly. The derive stack the macro expands to (paste/derive_more/
-// serde/rkyv/size_of) is pinned in Cargo.toml to dbsp 0.150's versions.
-// The macro binds its generic type params as value-position idents (`T1`..),
-// which trips `non_snake_case`; the names are dbsp's macro contract, not ours.
+/// The width buckets available, smallest first. A ruleset is lowered into the
+/// smallest bucket >= its max binding-row width.
+const WIDTH_BUCKETS: [usize; 3] = [8, 16, 32];
+/// The widest bucket (the eligibility cap).
+const MAX_WIDTH: usize = 32;
+
+/// Pick the smallest width bucket that holds `needed` columns. Returns
+/// [`MAX_WIDTH`] if `needed` exceeds every bucket (the caller — `plan_join` —
+/// has already rejected `needed > MAX_WIDTH`).
+fn pick_width(needed: usize) -> usize {
+    WIDTH_BUCKETS
+        .iter()
+        .copied()
+        .find(|&w| w >= needed)
+        .unwrap_or(MAX_WIDTH)
+}
+
+// Declare the bucket `DBData` tuples via dbsp's own macro, so the generated
+// trait impls (rkyv `Archive`, `SizeOf`, `MulByRef`, `HasZero`, …) match dbsp's
+// stock tuples exactly. The macro binds its generic type params as value-
+// position idents (`T1`..), which trips `non_snake_case`; the names are dbsp's
+// macro contract, not ours.
 #[allow(non_snake_case)]
 mod tup_row {
     dbsp::declare_tuples! {
-        TupRow<
+        TupRow8<T1, T2, T3, T4, T5, T6, T7, T8>,
+        TupRow16<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16>,
+        TupRow32<
             T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16,
             T17, T18, T19, T20, T21, T22, T23, T24, T25, T26, T27, T28, T29, T30, T31, T32
         >,
     }
 }
-pub(crate) use tup_row::TupRow;
+pub(crate) use tup_row::{TupRow16, TupRow32, TupRow8};
 
-/// Destructure a [`TupRow`] / build one — the two operations that touch all 32
-/// positional fields. Centralized here so the field list is written once.
-macro_rules! with_row_fields {
-    // Build a TupRow from a `[u32; 32]` array `$a`.
-    (build $a:expr) => {{
-        let a = $a;
-        TupRow(
-            a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13],
-            a[14], a[15], a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23], a[24], a[25],
-            a[26], a[27], a[28], a[29], a[30], a[31],
-        )
-    }};
-    // Destructure a `&TupRow` `$r` into a `[u32; 32]` array.
-    (read $r:expr) => {{
-        let TupRow(
-            a0,
-            a1,
-            a2,
-            a3,
-            a4,
-            a5,
-            a6,
-            a7,
-            a8,
-            a9,
-            a10,
-            a11,
-            a12,
-            a13,
-            a14,
-            a15,
-            a16,
-            a17,
-            a18,
-            a19,
-            a20,
-            a21,
-            a22,
-            a23,
-            a24,
-            a25,
-            a26,
-            a27,
-            a28,
-            a29,
-            a30,
-            a31,
-        ) = $r;
-        [
-            *a0, *a1, *a2, *a3, *a4, *a5, *a6, *a7, *a8, *a9, *a10, *a11, *a12, *a13, *a14, *a15,
-            *a16, *a17, *a18, *a19, *a20, *a21, *a22, *a23, *a24, *a25, *a26, *a27, *a28, *a29,
-            *a30, *a31,
-        ]
-    }};
+/// A fixed-width binding/relation row flowing through the DBSP circuit, abstract
+/// over the bucket width so every circuit-building function is monomorphized per
+/// chosen width. `bind[i]` is the value of the rule's `i`-th canonical body
+/// variable (0 if not yet bound / unused).
+///
+/// The bounds are exactly what DBSP's stream operators require of a z-set element
+/// (`DBData`) plus `Copy` (the join/map_index closures dereference-copy rows).
+pub trait Row: dbsp::DBData + Copy {
+    /// Number of `u32` columns in this row.
+    const WIDTH: usize;
+    /// Build a row from a slice of column values (0-padded to [`Row::WIDTH`]).
+    /// The slice is `<= WIDTH` (enforced by `plan_join`'s width cap + bucket
+    /// pick).
+    fn pack(vals: &[u32]) -> Self;
+    /// Read column `i`.
+    fn get(&self, i: usize) -> u32;
+    /// Return a copy of the row with column `i` set to `v`.
+    fn set(self, i: usize, v: u32) -> Self;
 }
 
-/// A fixed-width binding row flowing through the DBSP circuit: `bind[i]` is the
-/// value of the rule's `i`-th canonical body variable (0 if not yet bound).
-type BindRow = TupRow<
+/// Generate the [`Row`] impl for a `TupRow{N}` bucket of width `$w` with the
+/// positional field idents `$f`. Build/read touch every field positionally so
+/// the compiler sees a fixed-size struct (no array indexing through a `Vec`).
+macro_rules! impl_row {
+    ($ty:ident, $w:expr, $($f:tt),+) => {
+        impl Row for $ty<$( impl_row!(@u32 $f) ),+> {
+            const WIDTH: usize = $w;
+            #[inline]
+            fn pack(vals: &[u32]) -> Self {
+                let mut a = [0u32; $w];
+                for (i, v) in vals.iter().enumerate() {
+                    a[i] = *v;
+                }
+                let mut k = 0usize;
+                $( let $f = { let x = a[k]; k += 1; x }; )+
+                let _ = k;
+                $ty($($f),+)
+            }
+            #[inline]
+            fn get(&self, i: usize) -> u32 {
+                let $ty($($f),+) = self;
+                let mut k = 0usize;
+                $( if i == k { return *$f; } k += 1; )+
+                let _ = k;
+                0
+            }
+            #[inline]
+            fn set(mut self, i: usize, v: u32) -> Self {
+                let $ty($($f),+) = &mut self;
+                let mut k = 0usize;
+                $( if i == k { *$f = v; return self; } k += 1; )+
+                let _ = k;
+                self
+            }
+        }
+    };
+    (@u32 $f:tt) => { u32 };
+}
+
+impl_row!(TupRow8, 8, a0, a1, a2, a3, a4, a5, a6, a7);
+impl_row!(
+    TupRow16, 16, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15
+);
+impl_row!(
+    TupRow32, 32, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17,
+    a18, a19, a20, a21, a22, a23, a24, a25, a26, a27, a28, a29, a30, a31
+);
+
+/// The width-8 binding/relation row (32 bytes).
+type Row8 = TupRow8<u32, u32, u32, u32, u32, u32, u32, u32>;
+/// The width-16 binding/relation row (64 bytes).
+type Row16 =
+    TupRow16<u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32>;
+/// The width-32 binding/relation row (128 bytes) — the eligibility-cap bucket.
+type Row32 = TupRow32<
     u32,
     u32,
     u32,
@@ -199,31 +237,17 @@ type BindRow = TupRow<
     u32,
 >;
 
-/// A fixed-width relation row pushed into the circuit's input z-sets.
-type RelRow = BindRow;
-
-/// Build a fixed-width row from a slice of column values (0-padded to
-/// [`JOIN_WIDTH`]). Slices longer than [`JOIN_WIDTH`] are rejected upstream by
-/// [`plan_join`].
-fn pack_row(vals: &[u32]) -> BindRow {
-    let mut a = [0u32; JOIN_WIDTH];
-    for (i, v) in vals.iter().enumerate() {
-        a[i] = *v;
-    }
-    arr_to_row(a)
-}
-
-/// Pack a fixed `[u32; JOIN_WIDTH]` array into the row tuple.
+/// Build a fixed-width row from a slice of column values (0-padded). Slices
+/// longer than the bucket width are rejected upstream by [`plan_join`].
 #[inline]
-fn arr_to_row(a: [u32; JOIN_WIDTH]) -> BindRow {
-    with_row_fields!(build a)
+fn pack_row<R: Row>(vals: &[u32]) -> R {
+    R::pack(vals)
 }
 
 /// Read column `i` of a fixed-width row.
 #[inline]
-fn get_col(r: &BindRow, i: usize) -> u32 {
-    let a = with_row_fields!(read r);
-    a[i]
+fn get_col<R: Row>(r: &R, i: usize) -> u32 {
+    r.get(i)
 }
 
 // Names of the PURE prims that `plan_join` inlines into the persistent DBSP
@@ -285,7 +309,7 @@ enum Cond {
 
 impl PureExpr {
     /// Evaluate against a binding row.
-    fn eval(&self, row: &BindRow) -> u32 {
+    fn eval<R: Row>(&self, row: &R) -> u32 {
         match self {
             PureExpr::Col(c) => get_col(row, *c),
             PureExpr::Const(v) => *v,
@@ -307,7 +331,7 @@ impl PureExpr {
 }
 
 impl Cond {
-    fn eval(&self, row: &BindRow) -> bool {
+    fn eval<R: Row>(&self, row: &R) -> bool {
         match self {
             Cond::Ne(a, b) => a.eval(row) != b.eval(row),
             Cond::Eq(a, b) => a.eval(row) == b.eval(row),
@@ -949,13 +973,13 @@ fn head_vars(rule: &RuleIr) -> Vec<u32> {
 /// subsequent atom join on the variables already bound (shared variables). The
 /// binding row carries all canonical variables bound so far (others 0). `!=`
 /// guards are applied as `filter`s as soon as both operands are bound.
-fn build_join_stream(
-    streams: &[Stream<RootCircuit, OrdZSet<RelRow>>],
+fn build_join_stream<R: Row>(
+    streams: &[Stream<RootCircuit, OrdZSet<R>>],
     atoms: &[Vec<Slot>],
     var_col: &HashMap<u32, usize>,
     guards: &[Cond],
     n_vars: usize,
-) -> Result<Stream<RootCircuit, OrdZSet<BindRow>>> {
+) -> Result<Stream<RootCircuit, OrdZSet<R>>> {
     // `bound`: which canonical variable columns are filled after each atom.
     let mut bound: Vec<bool> = vec![false; n_vars];
     // Track which guards have already been applied (each is applied once, as
@@ -972,7 +996,7 @@ fn build_join_stream(
     let slots0c = slots0.clone();
     // A row matches atom 0 if its constant columns agree and repeated variables
     // within the atom agree; bind the variables into the canonical row.
-    let mut cur = s0.flat_map(move |r: &RelRow| match bind_atom(r, &slots0c, &vc0) {
+    let mut cur = s0.flat_map(move |r: &R| match bind_atom::<R>(r, &slots0c, &vc0) {
         Some(b) => vec![b],
         None => vec![],
     });
@@ -997,14 +1021,14 @@ fn build_join_stream(
             // No shared bound variable: cartesian product. Index both sides by
             // a unit key so `join` produces the full cross product.
             let bound_now = bound.clone();
-            let left = cur.map_index(|b: &BindRow| ((), *b));
+            let left = cur.map_index(|b: &R| ((), *b));
             let vc2 = vc.clone();
-            let right = s.map_index(move |r: &RelRow| ((), *r));
+            let right = s.map_index(move |r: &R| ((), *r));
             cur = left
-                .join(&right, move |_k, b: &BindRow, r: &RelRow| {
-                    merge_atom_into(b, r, &slotsc, &vc2, &bound_now)
+                .join(&right, move |_k, b: &R, r: &R| {
+                    merge_atom_into::<R>(b, r, &slotsc, &vc2, &bound_now)
                 })
-                .flat_map(|o: &Option<BindRow>| match o {
+                .flat_map(|o: &Option<R>| match o {
                     Some(b) => vec![*b],
                     None => vec![],
                 });
@@ -1012,7 +1036,7 @@ fn build_join_stream(
             // Hash-join on the shared variable columns.
             let shared_cols_left: Vec<usize> = shared.iter().map(|v| var_col[v]).collect();
             let scl = shared_cols_left.clone();
-            let left = cur.map_index(move |b: &BindRow| (join_key(b, &scl, get_col), *b));
+            let left = cur.map_index(move |b: &R| (join_key::<R>(b, &scl), *b));
 
             // For the right side, the key is read from the row's columns that
             // correspond to the shared variables (the atom's slot positions).
@@ -1026,15 +1050,15 @@ fn build_join_stream(
                 })
                 .collect();
             let sac = shared_atom_cols.clone();
-            let right = s.map_index(move |r: &RelRow| (join_key(r, &sac, get_col), *r));
+            let right = s.map_index(move |r: &R| (join_key::<R>(r, &sac), *r));
 
             let bound_now = bound.clone();
             let vc2 = vc.clone();
             cur = left
-                .join(&right, move |_k, b: &BindRow, r: &RelRow| {
-                    merge_atom_into(b, r, &slotsc, &vc2, &bound_now)
+                .join(&right, move |_k, b: &R, r: &R| {
+                    merge_atom_into::<R>(b, r, &slotsc, &vc2, &bound_now)
                 })
-                .flat_map(|o: &Option<BindRow>| match o {
+                .flat_map(|o: &Option<R>| match o {
                     Some(b) => vec![*b],
                     None => vec![],
                 });
@@ -1053,15 +1077,15 @@ fn build_join_stream(
 /// the interned result into the binding row, or prunes the row (the prim failed,
 /// or an asserted return value mismatched). A `flat_map` returning `vec![]`
 /// drops the row; `vec![row]` keeps it.
-fn apply_steps(
-    mut cur: Stream<RootCircuit, OrdZSet<BindRow>>,
+fn apply_steps<R: Row>(
+    mut cur: Stream<RootCircuit, OrdZSet<R>>,
     steps: &[PrimStep],
     engine: &PrimEngine,
-) -> Stream<RootCircuit, OrdZSet<BindRow>> {
+) -> Stream<RootCircuit, OrdZSet<R>> {
     for step in steps {
         let step = step.clone();
         let engine = engine.clone();
-        cur = cur.flat_map(move |row: &BindRow| {
+        cur = cur.flat_map(move |row: &R| {
             // Gather the prim's argument reps from the binding row / consts.
             let argv: Vec<Value> = step
                 .args
@@ -1125,18 +1149,18 @@ fn mark_bound(slots: &[Slot], var_col: &HashMap<u32, usize>, bound: &mut [bool])
 /// Build a `u64`/`u128`-free join key from selected columns. DBSP requires the
 /// key be `DBData` (`Vec<u32>` is not), so the key reuses the fixed-width row
 /// tuple with the selected columns packed into the low slots (others 0).
-fn join_key<R>(r: &R, cols: &[usize], get: fn(&R, usize) -> u32) -> BindRow {
-    let mut a = [0u32; JOIN_WIDTH];
+fn join_key<R: Row>(r: &R, cols: &[usize]) -> R {
+    let mut a = [0u32; MAX_WIDTH];
     for (i, &c) in cols.iter().enumerate() {
-        a[i] = get(r, c);
+        a[i] = r.get(c);
     }
-    arr_to_row(a)
+    R::pack(&a[..R::WIDTH])
 }
 
 /// Match the first atom's row against its slots and produce the initial binding
 /// row, or `None` if a constant / repeated-variable constraint fails.
-fn bind_atom(r: &RelRow, slots: &[Slot], var_col: &HashMap<u32, usize>) -> Option<BindRow> {
-    let mut out = [0u32; JOIN_WIDTH];
+fn bind_atom<R: Row>(r: &R, slots: &[Slot], var_col: &HashMap<u32, usize>) -> Option<R> {
+    let mut out = [0u32; MAX_WIDTH];
     // Track values bound to each canonical var within this row to enforce
     // repeated-variable equality.
     let mut local: HashMap<u32, u32> = HashMap::new();
@@ -1160,19 +1184,19 @@ fn bind_atom(r: &RelRow, slots: &[Slot], var_col: &HashMap<u32, usize>) -> Optio
             }
         }
     }
-    Some(arr_to_row(out))
+    Some(R::pack(&out[..R::WIDTH]))
 }
 
 /// Merge atom row `r` into binding `b` (already-bound columns must agree with
 /// the row; previously-unbound atom variables are written). Returns `None` if a
 /// constant / shared-variable / repeated-variable constraint fails.
-fn merge_atom_into(
-    b: &BindRow,
-    r: &RelRow,
+fn merge_atom_into<R: Row>(
+    b: &R,
+    r: &R,
     slots: &[Slot],
     var_col: &HashMap<u32, usize>,
     bound: &[bool],
-) -> Option<BindRow> {
+) -> Option<R> {
     let mut out = *b;
     let mut local: HashMap<u32, u32> = HashMap::new();
     for (i, s) in slots.iter().enumerate() {
@@ -1208,21 +1232,19 @@ fn merge_atom_into(
 }
 
 #[inline]
-fn set_col(r: BindRow, i: usize, v: u32) -> BindRow {
-    let mut a = with_row_fields!(read & r);
-    a[i] = v;
-    arr_to_row(a)
+fn set_col<R: Row>(r: R, i: usize, v: u32) -> R {
+    r.set(i, v)
 }
 
 /// Apply every not-yet-applied guard whose binding-row columns are all bound,
 /// as a `filter` on the binding stream. Each guard is applied exactly once (the
 /// `applied` flags persist across atoms).
-fn apply_guards(
-    stream: Stream<RootCircuit, OrdZSet<BindRow>>,
+fn apply_guards<R: Row>(
+    stream: Stream<RootCircuit, OrdZSet<R>>,
     guards: &[Cond],
     bound: &[bool],
     applied: &mut [bool],
-) -> Stream<RootCircuit, OrdZSet<BindRow>> {
+) -> Stream<RootCircuit, OrdZSet<R>> {
     let mut cur = stream;
     for (i, g) in guards.iter().enumerate() {
         if applied[i] {
@@ -1236,7 +1258,7 @@ fn apply_guards(
         }
         applied[i] = true;
         let g = g.clone();
-        cur = cur.filter(move |row: &BindRow| g.eval(row));
+        cur = cur.filter(move |row: &R| g.eval(row));
     }
     cur
 }
@@ -1264,20 +1286,24 @@ fn apply_guards(
 pub struct PersistentJoin {
     handle: CircuitHandle,
     /// One input handle per atom occurrence (in `plan.atoms` order).
-    inputs: Vec<ZSetHandle<RelRow>>,
+    inputs: Vec<ZSetHandle<PjRow>>,
     /// The INTEGRATED (accumulated) distinct binding set. We read the full
     /// accumulated set each step and diff it against [`PersistentJoin::prev`]
     /// in Rust to get the new matches. Reading non-integrated per-transaction
     /// deltas under-reports on large single-transaction batches (a DBSP
     /// delta-read quirk), so we mirror the proven `rebuild_circuit` pattern of
     /// reading the integral and diffing host-side.
-    output: OutputHandle<OrdZSet<BindRow>>,
+    output: OutputHandle<OrdZSet<PjRow>>,
     /// `func` → the atom-occurrence indices that read it, so a relation's delta
     /// is fanned out to every occurrence (correct for self-joins).
     occ_of_func: HashMap<FunctionId, Vec<usize>>,
     /// Number of canonical body variables (binding-row width in use).
     n_vars: usize,
 }
+
+/// `PersistentJoin` is the (test-only) per-rule circuit; it is pinned to the
+/// widest bucket since it is not on the perf-critical fused path.
+type PjRow = Row32;
 
 impl PersistentJoin {
     /// Build the persistent circuit for `plan` ONCE. The circuit retains the
@@ -1297,11 +1323,11 @@ impl PersistentJoin {
         let n_vars = plan.var_order.len();
 
         let (handle, (inputs, output)) = RootCircuit::build(move |root| {
-            let mut inputs: Vec<ZSetHandle<RelRow>> = Vec::with_capacity(n_atoms);
-            let mut streams: Vec<Stream<RootCircuit, OrdZSet<RelRow>>> =
+            let mut inputs: Vec<ZSetHandle<PjRow>> = Vec::with_capacity(n_atoms);
+            let mut streams: Vec<Stream<RootCircuit, OrdZSet<PjRow>>> =
                 Vec::with_capacity(n_atoms);
             for _ in 0..n_atoms {
-                let (stream, input) = root.add_input_zset::<RelRow>();
+                let (stream, input) = root.add_input_zset::<PjRow>();
                 inputs.push(input);
                 // `.distinct()` makes each input set-semantic (weights 0/1),
                 // matching egglog relations.
@@ -1405,34 +1431,103 @@ impl PersistentJoin {
 // The output is read per-rule, non-integrated, accumulated across commit steps
 // exactly as `PersistentJoin::step` does.
 
-/// The per-rule lowering inside a [`FusedJoin`]: the rule's index (for routing
-/// bindings to its head), its canonical var order, and its DBSP output handle.
-struct FusedRule {
+/// The per-rule lowering inside a [`FusedJoinImpl`]: the rule's index (for
+/// routing bindings to its head), its canonical var order, and its DBSP output
+/// handle.
+struct FusedRuleW<R: Row> {
     idx: usize,
     /// Canonical body-variable order (column i holds variable `var_order[i]`).
     var_order: Vec<u32>,
     /// This rule's binding-delta output handle (non-integrated, distinct).
-    output: OutputHandle<OrdZSet<BindRow>>,
+    output: OutputHandle<OrdZSet<R>>,
     /// Number of canonical body variables (binding-row width in use).
     n_vars: usize,
 }
 
-/// A fused, delta-fed body join for a WHOLE ruleset. Built once via
-/// [`FusedJoin::build`] for a given sorted rule-index list; driven across
-/// iterations via [`FusedJoin::step`] with a SINGLE `transaction()` per call.
-pub struct FusedJoin {
+/// A fused, delta-fed body join for a WHOLE ruleset, MONOMORPHIZED to a fixed
+/// row-width bucket `R`. Built once via [`FusedJoinImpl::build`]; driven via
+/// [`FusedJoinImpl::step`] with a SINGLE `transaction()` per call.
+pub struct FusedJoinImpl<R: Row> {
     handle: CircuitHandle,
     /// One shared input handle per distinct body relation across all rules.
-    inputs: HashMap<FunctionId, ZSetHandle<RelRow>>,
+    inputs: HashMap<FunctionId, ZSetHandle<R>>,
     /// The fused rules, in build order. Each carries its own output handle.
-    rules: Vec<FusedRule>,
+    rules: Vec<FusedRuleW<R>>,
+}
+
+/// A fused body join for a whole ruleset, width-dispatched: the row carried
+/// through the circuit is the SMALLEST bucket ([`WIDTH_BUCKETS`]) that fits the
+/// ruleset's max binding-row width, so narrow rulesets pay 4x less per-row
+/// memory/hash/compare cost across every DBSP operator (the integrals are large,
+/// and every join/map_index/consolidate touches the full fixed-width row).
+pub enum FusedJoin {
+    W8(FusedJoinImpl<Row8>),
+    W16(FusedJoinImpl<Row16>),
+    W32(FusedJoinImpl<Row32>),
 }
 
 impl FusedJoin {
+    /// Build ONE circuit for the whole ruleset, dispatching to the smallest
+    /// width bucket that fits. `plans` pairs each rule's index with its
+    /// [`JoinPlan`]; `engine` is the shared primitive engine.
+    pub fn build(plans: &[(usize, JoinPlan)], engine: &PrimEngine) -> Result<FusedJoin> {
+        let needed = plans
+            .iter()
+            .map(|(_, p)| p.var_order.len())
+            .max()
+            .unwrap_or(0);
+        // A/B knob: force the widest bucket to reproduce the pre-narrowing
+        // single-width behavior for back-to-back comparison under concurrent
+        // machine load.
+        let needed = if std::env::var("FELDERA_FORCE_W32").is_ok() {
+            MAX_WIDTH
+        } else {
+            needed
+        };
+        Ok(match pick_width(needed) {
+            8 => FusedJoin::W8(FusedJoinImpl::build(plans, engine)?),
+            16 => FusedJoin::W16(FusedJoinImpl::build(plans, engine)?),
+            _ => FusedJoin::W32(FusedJoinImpl::build(plans, engine)?),
+        })
+    }
+
+    /// The rule indices this fused circuit serves (build order).
+    pub fn rule_indices(&self) -> Vec<usize> {
+        match self {
+            FusedJoin::W8(f) => f.rule_indices(),
+            FusedJoin::W16(f) => f.rule_indices(),
+            FusedJoin::W32(f) => f.rule_indices(),
+        }
+    }
+
+    /// The canonical var order for the fused rule at build position `pos`.
+    pub fn var_order_at(&self, pos: usize) -> &[u32] {
+        match self {
+            FusedJoin::W8(f) => f.var_order_at(pos),
+            FusedJoin::W16(f) => f.var_order_at(pos),
+            FusedJoin::W32(f) => f.var_order_at(pos),
+        }
+    }
+
+    /// Feed one round of relation deltas and run a SINGLE transaction, returning
+    /// per-rule binding deltas. Dispatches to the chosen-width impl.
+    pub fn step(
+        &mut self,
+        deltas: &HashMap<FunctionId, Vec<(Vec<u32>, ZWeight)>>,
+    ) -> Result<Vec<Vec<(Vec<u32>, ZWeight)>>> {
+        match self {
+            FusedJoin::W8(f) => f.step(deltas),
+            FusedJoin::W16(f) => f.step(deltas),
+            FusedJoin::W32(f) => f.step(deltas),
+        }
+    }
+}
+
+impl<R: Row> FusedJoinImpl<R> {
     /// Build ONE circuit for the whole ruleset. `plans` pairs each rule's index
     /// with its [`JoinPlan`]; `engine` is the shared primitive engine captured
     /// into call-prim closures (only used by rules with genuine value prims).
-    pub fn build(plans: &[(usize, JoinPlan)], engine: &PrimEngine) -> Result<FusedJoin> {
+    fn build(plans: &[(usize, JoinPlan)], engine: &PrimEngine) -> Result<FusedJoinImpl<R>> {
         // Snapshot the per-rule plan data the circuit closure needs (owned, so
         // the `move` closure is `'static`).
         struct RulePlan {
@@ -1473,9 +1568,8 @@ impl FusedJoin {
         let (handle, (input_vec, rule_outs)) = RootCircuit::build(move |root| {
             // Build ONE distinct'd stream per relation, shared by every atom
             // occurrence (in every rule) that reads it.
-            let mut input_vec: Vec<(FunctionId, ZSetHandle<RelRow>)> =
-                Vec::with_capacity(funcs.len());
-            let mut rel_stream: HashMap<FunctionId, Stream<RootCircuit, OrdZSet<RelRow>>> =
+            let mut input_vec: Vec<(FunctionId, ZSetHandle<R>)> = Vec::with_capacity(funcs.len());
+            let mut rel_stream: HashMap<FunctionId, Stream<RootCircuit, OrdZSet<R>>> =
                 HashMap::new();
             // PERF (#23): the per-step input delta is already set-semantic — it
             // is built from a `HashSet` set-difference vs the fed view
@@ -1488,7 +1582,7 @@ impl FusedJoin {
             // bit-exact output. Set `FELDERA_KEEP_INPUT_DISTINCT` to restore it.
             let keep_input_distinct = std::env::var("FELDERA_KEEP_INPUT_DISTINCT").is_ok();
             for &f in &funcs {
-                let (stream, input) = root.add_input_zset::<RelRow>();
+                let (stream, input) = root.add_input_zset::<R>();
                 input_vec.push((f, input));
                 let s = if keep_input_distinct {
                     stream.distinct()
@@ -1501,10 +1595,10 @@ impl FusedJoin {
             // For each rule, assemble its per-atom stream vector from the shared
             // relation streams (cloning a stream is just a handle copy in DBSP),
             // build its join + steps, and expose its own output handle.
-            let mut rule_outs: Vec<(usize, Vec<u32>, usize, OutputHandle<OrdZSet<BindRow>>)> =
+            let mut rule_outs: Vec<(usize, Vec<u32>, usize, OutputHandle<OrdZSet<R>>)> =
                 Vec::with_capacity(rule_plans.len());
             for rp in &rule_plans {
-                let streams: Vec<Stream<RootCircuit, OrdZSet<RelRow>>> = rp
+                let streams: Vec<Stream<RootCircuit, OrdZSet<R>>> = rp
                     .atom_funcs
                     .iter()
                     .map(|f| rel_stream[f].clone())
@@ -1533,10 +1627,10 @@ impl FusedJoin {
             Ok((input_vec, rule_outs))
         })?;
 
-        let inputs: HashMap<FunctionId, ZSetHandle<RelRow>> = input_vec.into_iter().collect();
-        let rules: Vec<FusedRule> = rule_outs
+        let inputs: HashMap<FunctionId, ZSetHandle<R>> = input_vec.into_iter().collect();
+        let rules: Vec<FusedRuleW<R>> = rule_outs
             .into_iter()
-            .map(|(idx, var_order, n_vars, output)| FusedRule {
+            .map(|(idx, var_order, n_vars, output)| FusedRuleW {
                 idx,
                 var_order,
                 output,
@@ -1544,7 +1638,7 @@ impl FusedJoin {
             })
             .collect();
 
-        Ok(FusedJoin {
+        Ok(FusedJoinImpl {
             handle,
             inputs,
             rules,
@@ -1552,20 +1646,20 @@ impl FusedJoin {
     }
 
     /// The rule indices this fused circuit serves (build order).
-    pub fn rule_indices(&self) -> Vec<usize> {
+    fn rule_indices(&self) -> Vec<usize> {
         self.rules.iter().map(|r| r.idx).collect()
     }
 
     /// The canonical var order for the fused rule at build position `pos`.
-    pub fn var_order_at(&self, pos: usize) -> &[u32] {
+    fn var_order_at(&self, pos: usize) -> &[u32] {
         &self.rules[pos].var_order
     }
 
     /// Feed one round of relation deltas into the SHARED inputs and run a SINGLE
     /// transaction, returning per-rule binding deltas. The outer `Vec` is in the
-    /// same order as [`FusedJoin::rule_indices`]; each inner `Vec` is that rule's
-    /// `(binding_row, weight)` pairs (positive = new match, negative = retracted).
-    pub fn step(
+    /// same order as [`FusedJoinImpl::rule_indices`]; each inner `Vec` is that
+    /// rule's `(binding_row, weight)` pairs (positive = new, negative = retracted).
+    fn step(
         &mut self,
         deltas: &HashMap<FunctionId, Vec<(Vec<u32>, ZWeight)>>,
     ) -> Result<Vec<Vec<(Vec<u32>, ZWeight)>>> {
