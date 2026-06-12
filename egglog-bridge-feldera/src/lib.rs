@@ -593,6 +593,14 @@ impl Drop for EGraph {
                 "[PROF] dbsp_runs={} host_runs={} (host rebuild/congruence join is the residual bottleneck)",
                 self.dbsp_rule_runs, self.host_rule_runs,
             );
+            use std::sync::atomic::Ordering;
+            let feed = crate::dbsp_join::PROF_FEED_NS.load(Ordering::Relaxed) as f64 / 1e9;
+            let step = crate::dbsp_join::PROF_STEP_NS.load(Ordering::Relaxed) as f64 / 1e9;
+            let read = crate::dbsp_join::PROF_READ_NS.load(Ordering::Relaxed) as f64 / 1e9;
+            let calls = crate::dbsp_join::PROF_STEP_CALLS.load(Ordering::Relaxed);
+            eprintln!(
+                "[PROF-PHASE] feed={feed:.2}s step(transaction)={step:.2}s read(consolidate)={read:.2}s nonempty_steps={calls}",
+            );
         }
     }
 }

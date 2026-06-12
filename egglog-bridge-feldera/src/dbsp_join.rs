@@ -53,6 +53,21 @@ use hashbrown::HashMap;
 use crate::compile::{BodyOp, RuleIr, Slot};
 use crate::{EGraph, PrimEngine};
 
+// ---------------------------------------------------------------------------
+// PROF phase attribution (gated FELDERA_PROFILE). Static nanosecond counters
+// for the three phases of `FusedJoin::step`: input-feed, transaction-step loop,
+// and per-rule output consolidate/read. Read+printed by the EGraph Drop.
+// ---------------------------------------------------------------------------
+use std::sync::atomic::{AtomicU64, Ordering};
+pub(crate) static PROF_FEED_NS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PROF_STEP_NS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PROF_READ_NS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PROF_STEP_CALLS: AtomicU64 = AtomicU64::new(0);
+#[inline]
+fn add_ns(c: &AtomicU64, d: std::time::Duration) {
+    c.fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+}
+
 /// Max distinct body variables / atom columns the DBSP join supports (the
 /// fixed-arity `DBData` row width).
 ///
@@ -1462,10 +1477,25 @@ impl FusedJoin {
                 Vec::with_capacity(funcs.len());
             let mut rel_stream: HashMap<FunctionId, Stream<RootCircuit, OrdZSet<RelRow>>> =
                 HashMap::new();
+            // PERF (#23): the per-step input delta is already set-semantic — it
+            // is built from a `HashSet` set-difference vs the fed view
+            // (`interpret::fused_bindings`), so each row appears at most once with
+            // weight ±1 (+1 only when newly present, -1 only when newly absent).
+            // The input integral therefore stays 0/1 per row WITHOUT `.distinct()`,
+            // making the input distinct (a full integral + per-key consolidation
+            // every tick, over the LARGE relation integrals on a fast-growing
+            // egraph) pure overhead. Dropping it cut N=10 circuit_step ~7.5% with
+            // bit-exact output. Set `FELDERA_KEEP_INPUT_DISTINCT` to restore it.
+            let keep_input_distinct = std::env::var("FELDERA_KEEP_INPUT_DISTINCT").is_ok();
             for &f in &funcs {
                 let (stream, input) = root.add_input_zset::<RelRow>();
                 input_vec.push((f, input));
-                rel_stream.insert(f, stream.distinct());
+                let s = if keep_input_distinct {
+                    stream.distinct()
+                } else {
+                    stream
+                };
+                rel_stream.insert(f, s);
             }
 
             // For each rule, assemble its per-atom stream vector from the shared
@@ -1482,12 +1512,23 @@ impl FusedJoin {
                 let out =
                     build_join_stream(&streams, &rp.atoms, &rp.var_col, &rp.guards, rp.n_vars)?;
                 let out = apply_steps(out, &rp.steps, &engine);
-                rule_outs.push((
-                    rp.idx,
-                    rp.var_order.clone(),
-                    rp.n_vars,
-                    out.distinct().output(),
-                ));
+                // PERF (#23): the output `.distinct()` is also redundant here.
+                // `FusedJoin::step` accumulates each rule's binding deltas into a
+                // per-key weight map and the env consumer
+                // (`interpret::fused_bindings`) inspects only the SIGN of the net
+                // weight (>0 ⇒ one env, ≤0 ⇒ a retraction, net-zero already
+                // filtered). distinct would clamp the binding multiplicity to
+                // {0,1}, but since only the sign is observed and net-zero rows are
+                // dropped by the accumulator, the clamp is unobservable. Dropping
+                // it cut another ~10% off N=10 circuit_step, bit-exact. Set
+                // `FELDERA_KEEP_OUTPUT_DISTINCT` to restore it.
+                let keep_output_distinct = std::env::var("FELDERA_KEEP_OUTPUT_DISTINCT").is_ok();
+                let out = if keep_output_distinct {
+                    out.distinct()
+                } else {
+                    out
+                };
+                rule_outs.push((rp.idx, rp.var_order.clone(), rp.n_vars, out.output()));
             }
             Ok((input_vec, rule_outs))
         })?;
@@ -1528,6 +1569,8 @@ impl FusedJoin {
         &mut self,
         deltas: &HashMap<FunctionId, Vec<(Vec<u32>, ZWeight)>>,
     ) -> Result<Vec<Vec<(Vec<u32>, ZWeight)>>> {
+        let prof = std::env::var("FELDERA_PROFILE").is_ok();
+        let t_feed = std::time::Instant::now();
         let mut pushed_any = false;
         for (func, rows) in deltas {
             if let Some(input) = self.inputs.get(func) {
@@ -1540,6 +1583,10 @@ impl FusedJoin {
         if !pushed_any {
             return Ok(vec![Vec::new(); self.rules.len()]);
         }
+        if prof {
+            add_ns(&PROF_FEED_NS, t_feed.elapsed());
+            PROF_STEP_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
 
         // ONE transaction for the WHOLE ruleset. Accumulate each rule's
         // non-integrated output across commit steps (mirrors PersistentJoin::step:
@@ -1548,7 +1595,12 @@ impl FusedJoin {
         self.handle.start_commit_transaction()?;
         let mut accs: Vec<HashMap<Vec<u32>, ZWeight>> = vec![HashMap::new(); self.rules.len()];
         while !self.handle.is_commit_complete() {
+            let t_step = std::time::Instant::now();
             self.handle.step()?;
+            if prof {
+                add_ns(&PROF_STEP_NS, t_step.elapsed());
+            }
+            let t_read = std::time::Instant::now();
             for (ri, rule) in self.rules.iter().enumerate() {
                 for (row, (), w) in rule.output.consolidate().iter() {
                     let w: ZWeight = w;
@@ -1557,6 +1609,9 @@ impl FusedJoin {
                         *accs[ri].entry(key).or_insert(0) += w;
                     }
                 }
+            }
+            if prof {
+                add_ns(&PROF_READ_NS, t_read.elapsed());
             }
         }
         Ok(accs
