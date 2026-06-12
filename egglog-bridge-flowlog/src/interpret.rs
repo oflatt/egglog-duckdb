@@ -47,6 +47,188 @@ use crate::EGraph;
 /// Binding environment: variable id → bound `u32` value.
 pub(crate) type Env = HashMap<u32, u32>;
 
+/// A shared empty row set for atoms whose relation is absent from a snapshot —
+/// `'static` so it satisfies any `step_atom` rows lifetime.
+fn empty_rows() -> &'static HashSet<Row> {
+    static EMPTY: std::sync::OnceLock<HashSet<Row>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(HashSet::new)
+}
+
+/// Persistent, delta-maintained hash-join index store, owned by the [`EGraph`]
+/// and living **across iterations**.
+///
+/// ## The asymptote problem this fixes
+///
+/// The host nested-loop join probes every non-delta body atom against the
+/// `read[f]` start-of-iteration snapshot. Building a fresh `HashMap<key, rows>`
+/// over that full relation every probe is `O(state)` per iteration — and the
+/// relations grow monotonically during saturation, so the per-iteration join
+/// cost grows with the state, producing the super-linear wall-clock blowup.
+///
+/// Instead we keep one hash-join index per `(FunctionId, key_cols)` that is
+/// **maintained incrementally**: on every committed mirror change (head `set`
+/// inserts, retraction removes, merge-resolution rewrites, and the
+/// `lookup_or_create` hash-cons inserts) we patch the affected indices by the
+/// `O(delta)` row diff rather than rebuilding. A probe is then an `O(1)` hash
+/// lookup against an already-maintained index.
+///
+/// ## Correctness: the index must equal `read`, not the live mirror
+///
+/// The join probes the **start-of-iteration** `read` snapshot, NOT the live
+/// mirror — mid-iteration `lookup_or_create` hash-cons rows are absent from
+/// `read` even though they are already in the live mirror. So index maintenance
+/// is **buffered**: every mirror mutation pushes its row diff into the per-func
+/// `pending` log, and that log is flushed into the live indices only at the
+/// **iteration boundary** (the first `index_for` of the next iteration, when the
+/// `read` pointer moves), bringing each index from "equals the previous `read`"
+/// to "equals the current `read`". Within an iteration the indices stay frozen
+/// at the `read` contents, exactly matching what the old per-iteration cache
+/// indexed.
+///
+/// ## Defense against unexpected mutations
+///
+/// Each function's index records the `Rc` pointer of the `read` snapshot it
+/// currently reflects. When the `read` pointer moves, `index_for` replays the
+/// buffered `pending` log and checks the resulting row count equals the new
+/// `read`. If anything is off (an external mutation path — seed
+/// `add_values`/`insert_rows`, `clear_table`, a mode that bypasses the buffered
+/// hooks — changed the relation without a matching diff), it falls back to an
+/// `O(state)` rebuild from `read[f]` for that one function. Correctness is never
+/// at the mercy of complete hook coverage; the incremental path is purely an
+/// optimization that the pointer check validates.
+#[derive(Default)]
+pub(crate) struct IndexStore {
+    funcs: HashMap<FunctionId, FuncIndices>,
+}
+
+/// Per-function maintained indices plus the buffered, not-yet-applied diff.
+#[derive(Default)]
+struct FuncIndices {
+    /// Pointer address of the `read` snapshot `Rc<HashSet<Row>>` the live
+    /// `indices` currently reflect. `0` = never synced (force a rebuild).
+    reflects_ptr: usize,
+    /// Built indices keyed by join key columns: `key_cols -> key tuple -> rows`.
+    indices: HashMap<Vec<usize>, HashMap<Vec<u32>, Vec<Row>>>,
+    /// Ordered log of committed mirror mutations since the last sync, awaiting
+    /// application: `(true, row)` = insert, `(false, row)` = remove. Replayed
+    /// **in order** so an insert-then-remove of the same row (a `set` whose row
+    /// merge-resolution later drops) nets out correctly.
+    pending: Vec<(bool, Row)>,
+}
+
+impl FuncIndices {
+    /// Patch every built index for a single inserted row.
+    fn apply_insert(indices: &mut HashMap<Vec<usize>, HashMap<Vec<u32>, Vec<Row>>>, row: &Row) {
+        for (key_cols, index) in indices.iter_mut() {
+            let key: Vec<u32> = key_cols.iter().map(|&i| row[i]).collect();
+            index.entry(key).or_default().push(row.clone());
+        }
+    }
+
+    /// Patch every built index for a single removed row.
+    fn apply_remove(indices: &mut HashMap<Vec<usize>, HashMap<Vec<u32>, Vec<Row>>>, row: &Row) {
+        for (key_cols, index) in indices.iter_mut() {
+            let key: Vec<u32> = key_cols.iter().map(|&i| row[i]).collect();
+            if let Some(bucket) = index.get_mut(&key) {
+                if let Some(pos) = bucket.iter().position(|r| r == row) {
+                    bucket.swap_remove(pos);
+                }
+                if bucket.is_empty() {
+                    index.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// Rebuild a single index over `rows` on `key_cols` (the `O(state)` path).
+    fn build_index(rows: &HashSet<Row>, key_cols: &[usize]) -> HashMap<Vec<u32>, Vec<Row>> {
+        let mut index: HashMap<Vec<u32>, Vec<Row>> = HashMap::new();
+        for row in rows {
+            let key: Vec<u32> = key_cols.iter().map(|&i| row[i]).collect();
+            index.entry(key).or_default().push(row.clone());
+        }
+        index
+    }
+}
+
+impl IndexStore {
+    /// Record a committed insert of `row` into `func`'s mirror (buffered; applied
+    /// in order at the next `index_for`).
+    pub(crate) fn record_insert(&mut self, func: FunctionId, row: Row) {
+        self.funcs.entry(func).or_default().pending.push((true, row));
+    }
+
+    /// Record a committed removal of `row` from `func`'s mirror (buffered).
+    pub(crate) fn record_remove(&mut self, func: FunctionId, row: Row) {
+        self.funcs
+            .entry(func)
+            .or_default()
+            .pending
+            .push((false, row));
+    }
+
+    /// Drop everything we know about `func` (e.g. `clear_table`): force a full
+    /// rebuild on next use.
+    pub(crate) fn forget(&mut self, func: FunctionId) {
+        self.funcs.remove(&func);
+    }
+
+    /// Bring `func`'s indices into agreement with `read_set` (the current
+    /// start-of-iteration snapshot, pointer `read_ptr`), then return the index
+    /// for `key_cols`, building it on first request.
+    ///
+    /// Fast path: the buffered `pending` log is replayed in order and the result
+    /// is validated to reflect `read_ptr` (its row count must equal `read_set`).
+    /// If validation fails (an unexpected mutation bypassed the buffered hooks),
+    /// every index is rebuilt from `read_set` (`O(state)`, rare).
+    fn index_for(
+        &mut self,
+        func: FunctionId,
+        read_ptr: usize,
+        read_set: &HashSet<Row>,
+        key_cols: &[usize],
+    ) -> &HashMap<Vec<u32>, Vec<Row>> {
+        let fi = self.funcs.entry(func).or_default();
+
+        if fi.reflects_ptr != read_ptr {
+            // The snapshot moved since we last synced. Try the incremental diff,
+            // replaying the buffered mutation log IN ORDER.
+            let pending = std::mem::take(&mut fi.pending);
+            let consistent = fi.reflects_ptr != 0;
+            if consistent {
+                for (is_insert, row) in &pending {
+                    if *is_insert {
+                        FuncIndices::apply_insert(&mut fi.indices, row);
+                    } else {
+                        FuncIndices::apply_remove(&mut fi.indices, row);
+                    }
+                }
+            }
+            // Validate: the total row count across any one index must equal the
+            // snapshot size; if not (or we had no prior anchor), rebuild.
+            let rebuild = !consistent
+                || fi
+                    .indices
+                    .values()
+                    .next()
+                    .map(|idx| idx.values().map(|v| v.len()).sum::<usize>() != read_set.len())
+                    .unwrap_or(false);
+            if rebuild {
+                for (kc, index) in fi.indices.iter_mut() {
+                    *index = FuncIndices::build_index(read_set, kc);
+                }
+            }
+            fi.reflects_ptr = read_ptr;
+        }
+
+        if !fi.indices.contains_key(key_cols) {
+            let index = FuncIndices::build_index(read_set, key_cols);
+            fi.indices.insert(key_cols.to_vec(), index);
+        }
+        &fi.indices[key_cols]
+    }
+}
+
 /// A pending write to apply after all matches are computed.
 enum Write {
     /// Insert/overwrite a full row.
@@ -211,12 +393,23 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
     for (f, (keylen, keys)) in removes_by_func {
         if let Some(set) = eg.mirror.get_mut(&f) {
             let before_len = set.len();
+            // Collect the rows actually retracted so the persistent join index
+            // can be patched by exactly this `O(delta)` diff (buffered; flushed
+            // at the next iteration's `index_for`).
+            let mut removed: Vec<Row> = Vec::new();
             std::rc::Rc::make_mut(set).retain(|row| {
                 let k: Box<[u32]> = (0..keylen).map(|i| row_col(row, i)).collect();
-                !keys.contains(&k)
+                let keep = !keys.contains(&k);
+                if !keep {
+                    removed.push(row.clone());
+                }
+                keep
             });
             // A retraction that actually removed a row is a real change.
             changed |= set.len() != before_len;
+            for row in removed {
+                eg.index_store.record_remove(f, row);
+            }
         }
     }
     // Per-function set of input keys touched by a `set` this call — the only
@@ -227,8 +420,13 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
         let key: Vec<u32> = (0..inputs_len).map(|i| row_col(&row, i)).collect();
         // `insert` returns true iff the row was genuinely new (set a row that
         // already exists ⇒ no content change, so don't flag `changed`).
-        let inserted = std::rc::Rc::make_mut(eg.mirror.entry(f).or_default()).insert(row);
+        let inserted = std::rc::Rc::make_mut(eg.mirror.entry(f).or_default()).insert(row.clone());
         changed |= inserted;
+        // Only a genuinely-new row changes the relation contents; record it for
+        // the persistent index (re-setting an existing row is a no-op there).
+        if inserted {
+            eg.index_store.record_insert(f, row);
+        }
         touched_keys.entry(f).or_default().insert(key);
     }
 
@@ -257,11 +455,18 @@ pub(crate) fn step_body(
     envs: Vec<Env>,
 ) -> Result<Vec<Env>> {
     match op {
-        BodyOp::Atom(atom) => {
-            let empty: HashSet<Row> = HashSet::new();
-            let rows = read.get(&atom.func).map(|v| &**v).unwrap_or(&empty);
-            Ok(step_atom(&atom.slots, rows, envs))
-        }
+        BodyOp::Atom(atom) => match read.get(&atom.func) {
+            Some(rc) => {
+                let ptr = std::rc::Rc::as_ptr(rc) as usize;
+                Ok(step_atom(
+                    &atom.slots,
+                    rc,
+                    envs,
+                    Some((&mut eg.index_store, atom.func, ptr)),
+                ))
+            }
+            None => Ok(step_atom(&atom.slots, empty_rows(), envs, None)),
+        },
         BodyOp::Prim { id, args, ret } => {
             let mut out = Vec::new();
             for env in envs {
@@ -303,7 +508,20 @@ pub(crate) fn step_body(
 /// (`step_body`) and the seminaive delta match (`seminaive_bindings`): when
 /// `rows` is a relation's delta slice, this performs the delta-restricted join
 /// of that atom occurrence.
-pub(crate) fn step_atom(slots: &[Slot], rows: &HashSet<Row>, envs: Vec<Env>) -> Vec<Env> {
+///
+/// `index_src = Some((store, func, read_ptr))` routes the probe through the
+/// **persistent, delta-maintained** [`IndexStore`]: the hash-join index over
+/// `rows` (which MUST be the `read[func]` snapshot owned by the `Rc` whose
+/// pointer is `read_ptr`) is maintained incrementally across iterations and
+/// reused for every probe on the same `(func, key_cols)`. Pass `Some` ONLY for
+/// the `read[f]` full-relation snapshot. Pass `None` for the transient per-call
+/// delta slices (no stable identity; a one-shot index is built instead).
+pub(crate) fn step_atom(
+    slots: &[Slot],
+    rows: &HashSet<Row>,
+    envs: Vec<Env>,
+    index_src: Option<(&mut IndexStore, FunctionId, usize)>,
+) -> Vec<Env> {
     // JOIN KEY: columns whose slot is a variable already bound in the incoming
     // envs (the same var must agree between env and row). If non-empty,
     // hash-join on it instead of a full cartesian scan.
@@ -333,7 +551,23 @@ pub(crate) fn step_atom(slots: &[Slot], rows: &HashSet<Row>, envs: Vec<Env>) -> 
                 }
             }
         }
+    } else if let Some((store, func, read_ptr)) = index_src {
+        // Persistent delta-maintained full-relation hash-join: the index over
+        // `read[func]` on `key_cols` is kept incrementally across iterations and
+        // reused for every probe this iteration.
+        let index = store.index_for(func, read_ptr, rows, &key_cols);
+        for env in &envs {
+            let key: Vec<u32> = key_vars.iter().map(|v| env[v]).collect();
+            if let Some(cands) = index.get(&key) {
+                for row in cands {
+                    if let Some(next) = match_atom(slots, row, env) {
+                        out.push(next);
+                    }
+                }
+            }
+        }
     } else {
+        // Uncached one-shot hash-join (transient delta slice).
         let mut index: HashMap<Vec<u32>, Vec<&Row>> = HashMap::new();
         for row in rows {
             let key: Vec<u32> = key_cols.iter().map(|&i| row[i]).collect();
@@ -451,31 +685,100 @@ fn seminaive_bindings(
             }
             envs
         } else {
-            // Host fallback: nested-loop body scan where the atom at `delta_pos`
-            // ranges over the delta rows, all others over the full read view.
+            // Host fallback: nested-loop body scan. The atom evaluation order is
+            // chosen to FLATTEN the join's asymptote: the **delta atom is matched
+            // FIRST** (it ranges over the small seminaive delta), so every
+            // remaining atom is then probed with join keys already bound by the
+            // delta row — an `O(1)` hash lookup against the persistent index
+            // instead of an `O(state)` full cartesian scan of a leading atom.
+            //
+            // Prims are applied **greedily** as soon as all their input vars are
+            // bound (after each atom), preserving body-order semantics: the
+            // binding set of a conjunctive body is order-independent, and a prim
+            // is a pure function/filter of its (now-bound) inputs. A prim is
+            // never run before its inputs exist, so it can't spuriously prune.
             eg.host_rule_runs += 1;
-            let empty: HashSet<Row> = HashSet::new();
-            let mut envs: Vec<Env> = vec![Env::new()];
-            for (pos, op) in rule.body.iter().enumerate() {
-                match op {
-                    BodyOp::Atom(atom) => {
-                        // Borrow the row set directly (no per-call clone): the
-                        // delta atom ranges over its delta set, the rest over
-                        // `read[f]`.
-                        let rows: &HashSet<Row> = if pos == delta_pos {
-                            delta.get(&atom.func).unwrap_or(&empty)
-                        } else {
-                            read.get(&atom.func).map(|v| &**v).unwrap_or(&empty)
+
+            // Atom evaluation order: delta atom first, then the rest in body
+            // order.
+            let mut atom_order: Vec<usize> = vec![delta_pos];
+            atom_order.extend(atom_positions.iter().copied().filter(|&p| p != delta_pos));
+
+            // Prim positions, tracked so each fires exactly once when ready.
+            let prim_positions: Vec<usize> = rule
+                .body
+                .iter()
+                .enumerate()
+                .filter_map(|(i, op)| matches!(op, BodyOp::Prim { .. }).then_some(i))
+                .collect();
+            let mut prim_done = vec![false; prim_positions.len()];
+
+            // Greedily apply every prim whose inputs are all currently bound.
+            // Repeats until no progress (a value-prim may unlock another).
+            let apply_ready_prims = |eg: &mut EGraph,
+                                     envs: &mut Vec<Env>,
+                                     prim_done: &mut [bool]|
+             -> Result<()> {
+                loop {
+                    let mut progressed = false;
+                    for (k, &pp) in prim_positions.iter().enumerate() {
+                        if prim_done[k] || envs.is_empty() {
+                            continue;
+                        }
+                        let BodyOp::Prim { args, .. } = &rule.body[pp] else {
+                            continue;
                         };
-                        envs = step_atom(&atom.slots, rows, envs);
+                        // Ready iff every variable argument is bound in (the
+                        // representative of) the current envs.
+                        let ready = args.iter().all(|s| match s {
+                            Slot::Var(v) => envs.first().map(|e| e.contains_key(v)).unwrap_or(true),
+                            Slot::Const(_) => true,
+                        });
+                        if !ready {
+                            continue;
+                        }
+                        *envs = step_body(eg, read, &rule.body[pp], std::mem::take(envs))?;
+                        prim_done[k] = true;
+                        progressed = true;
                     }
-                    BodyOp::Prim { .. } => {
-                        envs = step_body(eg, read, op, envs)?;
+                    if !progressed {
+                        break;
                     }
                 }
+                Ok(())
+            };
+
+            let mut envs: Vec<Env> = vec![Env::new()];
+            // Prims with no var inputs (constant guards) can fire immediately.
+            apply_ready_prims(eg, &mut envs, &mut prim_done)?;
+            for &pos in &atom_order {
                 if envs.is_empty() {
                     break;
                 }
+                let BodyOp::Atom(atom) = &rule.body[pos] else {
+                    unreachable!()
+                };
+                if pos == delta_pos {
+                    let rows = delta.get(&atom.func).unwrap_or_else(|| empty_rows());
+                    envs = step_atom(&atom.slots, rows, envs, None);
+                } else {
+                    match read.get(&atom.func) {
+                        Some(rc) => {
+                            let ptr = std::rc::Rc::as_ptr(rc) as usize;
+                            envs = step_atom(
+                                &atom.slots,
+                                rc,
+                                envs,
+                                Some((&mut eg.index_store, atom.func, ptr)),
+                            );
+                        }
+                        None => {
+                            envs = step_atom(&atom.slots, empty_rows(), envs, None);
+                        }
+                    }
+                }
+                // Fire any prim whose inputs the just-matched atom completed.
+                apply_ready_prims(eg, &mut envs, &mut prim_done)?;
             }
             envs
         };
@@ -626,6 +929,12 @@ fn lookup_or_create(
     idx.insert(k, id);
     let mut full: Vec<u32> = key.iter().map(|v| v.rep()).collect();
     full.push(id);
-    std::rc::Rc::make_mut(eg.mirror.entry(func).or_default()).insert(full.into_boxed_slice());
+    let row: Row = full.into_boxed_slice();
+    std::rc::Rc::make_mut(eg.mirror.entry(func).or_default()).insert(row.clone());
+    // Buffer the hash-cons insert for the persistent join index. It is NOT
+    // applied this iteration (the row is absent from `read`, the start-of-
+    // iteration snapshot the join probes); it lands at the next iteration's
+    // `index_for`, when `read` advances to include it.
+    eg.index_store.record_insert(func, row);
     Value::new(id)
 }

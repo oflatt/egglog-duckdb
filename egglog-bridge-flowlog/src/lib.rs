@@ -201,6 +201,12 @@ pub struct EGraph {
     /// `f`, so the view is built once and shared by refcount instead of cloning
     /// the full (growing) relation per rule.
     pub(crate) seen: HashMap<usize, HashMap<FunctionId, std::rc::Rc<HashSet<Row>>>>,
+    /// Persistent, delta-maintained hash-join indices over the body relations,
+    /// living across iterations (see [`interpret::IndexStore`]). Each committed
+    /// mirror mutation buffers an `O(delta)` diff into it; the host join probes
+    /// it as an `O(1)` lookup instead of rebuilding an `O(state)` index every
+    /// iteration — flattening the FlowLog interpreter's super-linear join cost.
+    pub(crate) index_store: interpret::IndexStore,
 }
 
 impl Default for EGraph {
@@ -251,6 +257,7 @@ impl EGraph {
             dd_rule_runs: 0,
             host_rule_runs: 0,
             seen: HashMap::new(),
+            index_store: interpret::IndexStore::default(),
         }
     }
 
@@ -383,11 +390,23 @@ impl EGraph {
             return false;
         }
         let set = std::rc::Rc::make_mut(self.mirror.get_mut(&f).unwrap());
+        let mut inserted: Vec<Row> = Vec::new();
         for r in &drop_rows {
             set.remove(r);
         }
         for r in new_rows {
-            set.insert(r);
+            if set.insert(r.clone()) {
+                inserted.push(r);
+            }
+        }
+        // Buffer the merge rewrite into the persistent join index by exactly the
+        // rows that changed: the dropped non-winners and the (newly) inserted
+        // winners. Flushed at the next iteration's `index_for`.
+        for r in &drop_rows {
+            self.index_store.record_remove(f, r.clone());
+        }
+        for r in inserted {
+            self.index_store.record_insert(f, r);
         }
         true
     }
@@ -572,6 +591,9 @@ impl Backend for EGraph {
         for per_rel in self.seen.values_mut() {
             per_rel.remove(&func);
         }
+        // Drop the persistent join index for this table — it must rebuild from
+        // the (now empty / re-populated) relation on next use.
+        self.index_store.forget(func);
     }
 
     fn base_values(&self) -> &egglog_core_relations::BaseValues {
