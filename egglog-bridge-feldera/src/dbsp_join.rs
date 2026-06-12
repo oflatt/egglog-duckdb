@@ -1367,6 +1367,205 @@ impl PersistentJoin {
     }
 }
 
+// ===========================================================================
+// FusedJoin — ONE circuit per RULESET (transaction-count reduction)
+// ===========================================================================
+//
+// `PersistentJoin` builds one circuit PER RULE, and each rule's `step()` runs
+// its OWN DBSP `transaction()`. Profiling (`FELDERA_PROFILE`) showed the fixed
+// per-transaction circuit-clocking cost (~6.8ms, independent of delta size)
+// dominates: with R rules × C `run_rules` calls that is R·C transactions.
+//
+// `FusedJoin` collapses this to ONE transaction per `run_rules` call by building
+// a SINGLE circuit for the whole ruleset: every distinct body relation gets ONE
+// shared input z-set, each rule's join is a parallel sub-stream reading those
+// shared streams, and each rule keeps its own `OutputHandle<OrdZSet<BindRow>>`
+// (so per-rule bindings route to that rule's head unchanged). One `step()`
+// pushes every relation delta into the shared inputs ONCE and clocks ONE
+// transaction, amortizing the fixed clocking cost across all R rules.
+//
+// Semantics are identical to R separate `PersistentJoin`s: DBSP's incremental
+// join maintains each input relation's integral, and a shared input feeding K
+// sub-streams is mathematically the same as K inputs each fed the same delta.
+// The output is read per-rule, non-integrated, accumulated across commit steps
+// exactly as `PersistentJoin::step` does.
+
+/// The per-rule lowering inside a [`FusedJoin`]: the rule's index (for routing
+/// bindings to its head), its canonical var order, and its DBSP output handle.
+struct FusedRule {
+    idx: usize,
+    /// Canonical body-variable order (column i holds variable `var_order[i]`).
+    var_order: Vec<u32>,
+    /// This rule's binding-delta output handle (non-integrated, distinct).
+    output: OutputHandle<OrdZSet<BindRow>>,
+    /// Number of canonical body variables (binding-row width in use).
+    n_vars: usize,
+}
+
+/// A fused, delta-fed body join for a WHOLE ruleset. Built once via
+/// [`FusedJoin::build`] for a given sorted rule-index list; driven across
+/// iterations via [`FusedJoin::step`] with a SINGLE `transaction()` per call.
+pub struct FusedJoin {
+    handle: CircuitHandle,
+    /// One shared input handle per distinct body relation across all rules.
+    inputs: HashMap<FunctionId, ZSetHandle<RelRow>>,
+    /// The fused rules, in build order. Each carries its own output handle.
+    rules: Vec<FusedRule>,
+}
+
+impl FusedJoin {
+    /// Build ONE circuit for the whole ruleset. `plans` pairs each rule's index
+    /// with its [`JoinPlan`]; `engine` is the shared primitive engine captured
+    /// into call-prim closures (only used by rules with genuine value prims).
+    pub fn build(plans: &[(usize, JoinPlan)], engine: &PrimEngine) -> Result<FusedJoin> {
+        // Snapshot the per-rule plan data the circuit closure needs (owned, so
+        // the `move` closure is `'static`).
+        struct RulePlan {
+            idx: usize,
+            atoms: Vec<Vec<Slot>>,
+            atom_funcs: Vec<FunctionId>,
+            var_col: HashMap<u32, usize>,
+            var_order: Vec<u32>,
+            guards: Vec<Cond>,
+            steps: Vec<PrimStep>,
+            n_vars: usize,
+        }
+        let rule_plans: Vec<RulePlan> = plans
+            .iter()
+            .map(|(idx, plan)| RulePlan {
+                idx: *idx,
+                atoms: plan.atoms.iter().map(|a| a.slots.clone()).collect(),
+                atom_funcs: plan.atoms.iter().map(|a| a.func).collect(),
+                var_col: plan.var_col.clone(),
+                var_order: plan.var_order.clone(),
+                guards: plan.guards.clone(),
+                steps: plan.steps.clone(),
+                n_vars: plan.var_order.len(),
+            })
+            .collect();
+
+        // Distinct body relations across all rules → one shared input each.
+        let mut funcs: Vec<FunctionId> = Vec::new();
+        for rp in &rule_plans {
+            for &f in &rp.atom_funcs {
+                if !funcs.contains(&f) {
+                    funcs.push(f);
+                }
+            }
+        }
+        let engine = engine.clone();
+
+        let (handle, (input_vec, rule_outs)) = RootCircuit::build(move |root| {
+            // Build ONE distinct'd stream per relation, shared by every atom
+            // occurrence (in every rule) that reads it.
+            let mut input_vec: Vec<(FunctionId, ZSetHandle<RelRow>)> =
+                Vec::with_capacity(funcs.len());
+            let mut rel_stream: HashMap<FunctionId, Stream<RootCircuit, OrdZSet<RelRow>>> =
+                HashMap::new();
+            for &f in &funcs {
+                let (stream, input) = root.add_input_zset::<RelRow>();
+                input_vec.push((f, input));
+                rel_stream.insert(f, stream.distinct());
+            }
+
+            // For each rule, assemble its per-atom stream vector from the shared
+            // relation streams (cloning a stream is just a handle copy in DBSP),
+            // build its join + steps, and expose its own output handle.
+            let mut rule_outs: Vec<(usize, Vec<u32>, usize, OutputHandle<OrdZSet<BindRow>>)> =
+                Vec::with_capacity(rule_plans.len());
+            for rp in &rule_plans {
+                let streams: Vec<Stream<RootCircuit, OrdZSet<RelRow>>> = rp
+                    .atom_funcs
+                    .iter()
+                    .map(|f| rel_stream[f].clone())
+                    .collect();
+                let out =
+                    build_join_stream(&streams, &rp.atoms, &rp.var_col, &rp.guards, rp.n_vars)?;
+                let out = apply_steps(out, &rp.steps, &engine);
+                rule_outs.push((
+                    rp.idx,
+                    rp.var_order.clone(),
+                    rp.n_vars,
+                    out.distinct().output(),
+                ));
+            }
+            Ok((input_vec, rule_outs))
+        })?;
+
+        let inputs: HashMap<FunctionId, ZSetHandle<RelRow>> = input_vec.into_iter().collect();
+        let rules: Vec<FusedRule> = rule_outs
+            .into_iter()
+            .map(|(idx, var_order, n_vars, output)| FusedRule {
+                idx,
+                var_order,
+                output,
+                n_vars,
+            })
+            .collect();
+
+        Ok(FusedJoin {
+            handle,
+            inputs,
+            rules,
+        })
+    }
+
+    /// The rule indices this fused circuit serves (build order).
+    pub fn rule_indices(&self) -> Vec<usize> {
+        self.rules.iter().map(|r| r.idx).collect()
+    }
+
+    /// The canonical var order for the fused rule at build position `pos`.
+    pub fn var_order_at(&self, pos: usize) -> &[u32] {
+        &self.rules[pos].var_order
+    }
+
+    /// Feed one round of relation deltas into the SHARED inputs and run a SINGLE
+    /// transaction, returning per-rule binding deltas. The outer `Vec` is in the
+    /// same order as [`FusedJoin::rule_indices`]; each inner `Vec` is that rule's
+    /// `(binding_row, weight)` pairs (positive = new match, negative = retracted).
+    pub fn step(
+        &mut self,
+        deltas: &HashMap<FunctionId, Vec<(Vec<u32>, ZWeight)>>,
+    ) -> Result<Vec<Vec<(Vec<u32>, ZWeight)>>> {
+        let mut pushed_any = false;
+        for (func, rows) in deltas {
+            if let Some(input) = self.inputs.get(func) {
+                for (row, w) in rows {
+                    input.push(pack_row(row), *w);
+                    pushed_any = true;
+                }
+            }
+        }
+        if !pushed_any {
+            return Ok(vec![Vec::new(); self.rules.len()]);
+        }
+
+        // ONE transaction for the WHOLE ruleset. Accumulate each rule's
+        // non-integrated output across commit steps (mirrors PersistentJoin::step:
+        // the non-integrated handle only retains the last internal step's delta).
+        self.handle.start_transaction()?;
+        self.handle.start_commit_transaction()?;
+        let mut accs: Vec<HashMap<Vec<u32>, ZWeight>> = vec![HashMap::new(); self.rules.len()];
+        while !self.handle.is_commit_complete() {
+            self.handle.step()?;
+            for (ri, rule) in self.rules.iter().enumerate() {
+                for (row, (), w) in rule.output.consolidate().iter() {
+                    let w: ZWeight = w;
+                    if w != 0 {
+                        let key: Vec<u32> = (0..rule.n_vars).map(|i| get_col(&row, i)).collect();
+                        *accs[ri].entry(key).or_insert(0) += w;
+                    }
+                }
+            }
+        }
+        Ok(accs
+            .into_iter()
+            .map(|acc| acc.into_iter().filter(|(_, w)| *w != 0).collect())
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod persistent_tests {
     use super::*;

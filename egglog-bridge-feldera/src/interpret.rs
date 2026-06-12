@@ -102,8 +102,33 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
     // their single unconditional binding once. A genuinely-ineligible rule (an
     // IMPURE body prim, or a shape above the row-width cap) PANICS — there is no
     // longer a graceful fallback.
+    // Partition the ruleset into ATOM-LESS rules (fired once via the dedicated
+    // helper) and ATOM-BEARING rules (joined on the FUSED per-ruleset circuit,
+    // ONE transaction for the whole set — see `fused_bindings`).
+    let mut atom_rules: Vec<(usize, &RuleIr)> = Vec::new();
     for (idx, rule) in &rules {
-        let envs = persistent_bindings(eg, &read, *idx, rule)?;
+        let has_atoms = rule.body.iter().any(|op| matches!(op, BodyOp::Atom(_)));
+        if has_atoms {
+            atom_rules.push((*idx, rule));
+        } else {
+            let envs = atomless_bindings(eg, *idx, rule)?;
+            for mut env in envs {
+                apply_head(
+                    eg,
+                    &rule.head,
+                    &mut env,
+                    &mut writes,
+                    &mut touched,
+                    &mut lookup_index,
+                )?;
+            }
+        }
+    }
+
+    // Run all atom-bearing rules' joins in ONE fused transaction, then apply
+    // each rule's head over its bindings.
+    let fused = fused_bindings(eg, &read, &atom_rules)?;
+    for ((_idx, rule), envs) in atom_rules.iter().zip(fused) {
         for mut env in envs {
             apply_head(
                 eg,
@@ -250,108 +275,108 @@ fn eval_body_prim(eg: &mut EGraph, op: &BodyOp, envs: Vec<Env>) -> Result<Vec<En
     Ok(out)
 }
 
-/// Run rule `idx`'s body join on its PERSISTENT DBSP circuit (the ONLY join
-/// path — the host nested-loop fallback has been retired), returning the
-/// positive binding deltas as envs ready for head application.
+/// Fire an ATOM-LESS rule (`(rule () …)` / `eval_actions` / `eval_resolved_expr`)
+/// once: there is no body relation to drive a join, so the (trivially-satisfied)
+/// empty binding fires EXACTLY ONCE. Evaluate the body prims once over the empty
+/// env (a guard may prune; a value prim binds a var the head reads) and record
+/// that the rule has fired so it never re-fires. NOT a join.
+fn atomless_bindings(eg: &mut EGraph, idx: usize, rule: &RuleIr) -> Result<Vec<Env>> {
+    if eg.atomless_fired.contains(&idx) {
+        return Ok(Vec::new());
+    }
+    // An impure body prim here is still safe (it runs exactly once), so we do
+    // not gate on purity for the atom-less case.
+    let mut envs: Vec<Env> = vec![Env::new()];
+    for op in &rule.body {
+        envs = eval_body_prim(eg, op, envs)?;
+        if envs.is_empty() {
+            break;
+        }
+    }
+    eg.atomless_fired.insert(idx);
+    Ok(envs)
+}
+
+/// Run ALL atom-bearing rules of a ruleset on ONE FUSED DBSP circuit (#23
+/// transaction-count fix): a single circuit per ruleset, one shared input
+/// z-set per body relation, each rule a parallel join sub-stream with its own
+/// output handle — clocked in a SINGLE `transaction()` per `run_rules` call.
+/// This collapses the ruleset's R per-rule transactions (the dominant fixed
+/// per-transaction clocking cost) into one.
 ///
-/// The circuit's integral is kept equal to the start-of-call read view by
-/// pushing, per body relation, only the `+/-` diff vs the rows last fed to this
-/// rule. DBSP's incremental join then emits exactly the binding delta: positive
-/// weights are new matches (fire the head once), negative weights are matches
-/// retracted because a body row was retracted — integral bookkeeping only, no
-/// head re-firing (egglog heads are monotone-fire; explicit `delete`s in the
-/// head, not binding disappearance, remove rows). `.distinct()` in the circuit
-/// makes every weight `±1`.
-///
-/// Atom-less rules fire their single unconditional binding once. A genuinely
-/// ineligible rule (an IMPURE body prim, or a shape above the row-width cap)
-/// PANICS — there is no fallback.
+/// Returns one env vector per rule, in the SAME order as `atom_rules`. Semantics
+/// are identical to running each rule's join on its own persistent circuit: the
+/// fused circuit's shared-input integrals do the seminaive bookkeeping and
+/// retraction (signed weights); positive binding weights are new matches,
+/// negatives are integral bookkeeping (no head re-fire). A genuinely-ineligible
+/// rule (an IMPURE body prim, or a shape above the row-width cap) PANICS — there
+/// is no host fallback.
 // The `FELDERA_DEBUG_COUNTS` block below is an env-gated stderr diagnostic (off
 // in normal runs); `eprintln!` is intentional.
 #[allow(clippy::disallowed_macros)]
-fn persistent_bindings(
+fn fused_bindings(
     eg: &mut EGraph,
     read: &HashMap<FunctionId, std::rc::Rc<HashSet<Row>>>,
-    idx: usize,
-    rule: &RuleIr,
-) -> Result<Vec<Env>> {
-    // ATOM-LESS rules (`(rule () …)` / `eval_actions` / `eval_resolved_expr`):
-    // there is no body relation to drive a join, so the (trivially-satisfied)
-    // empty binding fires EXACTLY ONCE. Handle it here without the host
-    // nested-loop: evaluate the body prims once over the empty env (a guard may
-    // prune; a value prim binds a var the head reads), fire, and record that the
-    // rule has fired so it never re-fires. This is a tiny dedicated "fire
-    // unconditional rule once" helper, NOT a seminaive nested-loop join.
-    let has_atoms = rule.body.iter().any(|op| matches!(op, BodyOp::Atom(_)));
-    if !has_atoms {
-        if eg.atomless_fired.contains(&idx) {
-            return Ok(Vec::new());
+    atom_rules: &[(usize, &RuleIr)],
+) -> Result<Vec<Vec<Env>>> {
+    if atom_rules.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // The fused circuit is keyed by the sorted rule-index list of this ruleset.
+    let key: Vec<usize> = {
+        let mut k: Vec<usize> = atom_rules.iter().map(|(i, _)| *i).collect();
+        k.sort_unstable();
+        k
+    };
+
+    // Build the fused circuit once for this ruleset. Plan every rule's join; an
+    // ineligible rule PANICS (the persistent circuit is the only join path).
+    if !eg.fused.contains_key(&key) {
+        let mut plans: Vec<(usize, dbsp_join::JoinPlan)> = Vec::with_capacity(atom_rules.len());
+        for (idx, rule) in atom_rules {
+            let plan = match dbsp_join::plan_join(eg, rule) {
+                Ok(p) => p,
+                Err(reason) => panic!(
+                    "unsupported on feldera persistent engine: {reason} (rule {:?})",
+                    rule.name
+                ),
+            };
+            plans.push((*idx, plan));
         }
-        // Evaluate the body prims once on the empty binding. An impure body prim
-        // here is still safe to evaluate (it runs exactly once, like the host
-        // path would), so we do not gate on purity for the atom-less case.
-        let mut envs: Vec<Env> = vec![Env::new()];
+        let engine = eg.prim_engine();
+        let fj = dbsp_join::FusedJoin::build(&plans, &engine)?;
+        eg.fused.insert(key.clone(), fj);
+    }
+
+    // The fused circuit shares one input per relation across all its rules, so
+    // the body relations are the UNION of every rule's body relations.
+    let mut body_funcs: Vec<FunctionId> = Vec::new();
+    for (_idx, rule) in atom_rules {
         for op in &rule.body {
-            envs = eval_body_prim(eg, op, envs)?;
-            if envs.is_empty() {
-                break;
+            if let BodyOp::Atom(a) = op {
+                if !body_funcs.contains(&a.func) {
+                    body_funcs.push(a.func);
+                }
             }
         }
-        eg.atomless_fired.insert(idx);
-        return Ok(envs);
     }
 
-    // Plan the body join. The persistent circuit is the ONLY join path, so an
-    // ineligible rule (an IMPURE body prim, or a shape above the row-width cap)
-    // PANICS with the reason — there is no graceful fallback. Pure prims never
-    // reach here as a rejection: rep-comparable ones inline, all others route to
-    // the on-circuit call-prim engine (`plan_join` docs).
-    let plan = match dbsp_join::plan_join(eg, rule) {
-        Ok(p) => p,
-        Err(reason) => panic!(
-            "unsupported on feldera persistent engine: {reason} (rule {:?})",
-            rule.name
-        ),
-    };
-    let var_order = plan.var_order().to_vec();
-
-    // Build the persistent circuit once for this rule. The shared primitive
-    // engine (Stage C) is captured into the circuit's call-prim closures so
-    // value-computing body prims evaluate on-circuit; it is built lazily here,
-    // after all primitives are registered.
-    if !eg.persistent.contains_key(&idx) {
-        let engine = eg.prim_engine();
-        let pj = dbsp_join::PersistentJoin::build(&plan, &engine)?;
-        eg.persistent.insert(idx, pj);
-    }
-
-    let body_funcs: Vec<FunctionId> = rule
-        .body
-        .iter()
-        .filter_map(|op| match op {
-            BodyOp::Atom(a) => Some(a.func),
-            BodyOp::Prim { .. } => None,
-        })
-        .collect();
-
-    // Compute the +/- delta vs the last-fed view per body relation, and advance
-    // the fed view to the current read view. The fed view is the `Rc` snapshot
-    // handle from the previous call: if the current read view shares that same
-    // `Rc` (the function was untouched since this rule last ran), the delta is
-    // empty and we skip the O(state) set diff entirely — the O(delta) fast path.
+    // Compute the +/- delta vs the last-fed view per body relation (one fed view
+    // per fused circuit), and advance it to the current read view. Same
+    // `Rc`-ptr-eq fast path as the per-rule code: an untouched function is
+    // skipped in O(1).
     let prof = std::env::var("FELDERA_PROFILE").is_ok();
     let diag = std::env::var("FELDERA_DEBUG_COUNTS").is_ok();
     let t_diff = std::time::Instant::now();
     let mut delta: HashMap<FunctionId, Vec<(Vec<u32>, ZWeight)>> = HashMap::new();
-    // DIAGNOSTIC ONLY (gated): the +1 (added) rows per func, as a host delta set.
     let mut added_delta: HashMap<FunctionId, HashSet<Row>> = HashMap::new();
     let empty_set: std::rc::Rc<HashSet<Row>> = std::rc::Rc::new(HashSet::new());
     {
-        let fed = eg.fed.entry(idx).or_default();
+        let fed = eg.fed_fused.entry(key.clone()).or_default();
         for &f in &body_funcs {
             let cur = read.get(&f).cloned().unwrap_or_else(|| empty_set.clone());
             let prev = fed.entry(f).or_insert_with(|| empty_set.clone());
-            // Fast path: same `Rc` ⇒ identical contents ⇒ no delta.
             if std::rc::Rc::ptr_eq(&cur, prev) {
                 *prev = cur;
                 continue;
@@ -380,52 +405,69 @@ fn persistent_bindings(
             *prev = cur;
         }
     }
-
     if prof {
         eg.prof_fed_diff += t_diff.elapsed();
     }
 
-    eg.dbsp_rule_runs += 1;
+    eg.dbsp_rule_runs += atom_rules.len() as u64;
     let t_step = std::time::Instant::now();
-    let bindings = {
-        let pj = eg
-            .persistent
-            .get_mut(&idx)
-            .expect("persistent circuit present");
-        pj.step(&delta)?
+    let per_rule = {
+        let fj = eg.fused.get_mut(&key).expect("fused circuit present");
+        fj.step(&delta)?
     };
     if prof {
         eg.prof_circuit_step += t_step.elapsed();
+        // ONE transaction per fused step (and only when a delta was pushed).
+        if !delta.is_empty() {
+            eg.prof_transactions += 1;
+        }
     }
 
-    // Eligible rules carry only inlined pure prims (guards applied in-circuit,
-    // value prims kept symbolic and never escaping to the head — verified by
-    // `plan_join`), so the env is fully determined by `var_order`.
-    let mut envs: Vec<Env> = Vec::new();
-    let mut neg_count = 0usize;
-    for (bind, w) in &bindings {
-        if *w <= 0 {
-            neg_count += 1;
-            continue; // retracted binding: integral bookkeeping only
+    // Route each fused rule's bindings back to its env vector. The fused circuit
+    // reports rules in the SAME order as the `plans`/`atom_rules` slice it was
+    // built from (its `rule_indices()` mirror that), and `atom_rules` here is the
+    // same slice in the same order, so positions line up directly.
+    debug_assert_eq!(
+        eg.fused.get(&key).map(|f| f.rule_indices()),
+        Some(atom_rules.iter().map(|(i, _)| *i).collect::<Vec<_>>()),
+        "fused rule order must match atom_rules order"
+    );
+    let mut out: Vec<Vec<Env>> = Vec::with_capacity(atom_rules.len());
+    for (pos, (_idx, rule)) in atom_rules.iter().enumerate() {
+        let var_order = eg
+            .fused
+            .get(&key)
+            .expect("fused circuit present")
+            .var_order_at(pos)
+            .to_vec();
+        let bindings = &per_rule[pos];
+        let mut envs: Vec<Env> = Vec::new();
+        let mut neg_count = 0usize;
+        for (bind, w) in bindings {
+            if *w <= 0 {
+                neg_count += 1;
+                continue;
+            }
+            let mut env: Env = Env::new();
+            for (i, &v) in var_order.iter().enumerate() {
+                env.insert(v, bind[i]);
+            }
+            envs.push(env);
         }
-        let mut env: Env = Env::new();
-        for (i, &v) in var_order.iter().enumerate() {
-            env.insert(v, bind[i]);
+        if diag {
+            let added_n: usize = added_delta.values().map(|s| s.len()).sum();
+            eprintln!(
+                "[CNT] rule={} added={} pos_emit={} neg_emit={}",
+                rule.name,
+                added_n,
+                envs.len(),
+                neg_count
+            );
         }
-        envs.push(env);
-    }
-    if std::env::var("FELDERA_DEBUG_COUNTS").is_ok() {
-        let added_n: usize = added_delta.values().map(|s| s.len()).sum();
-        eprintln!(
-            "[CNT] rule={} added={} pos_emit={} neg_emit={}",
-            rule.name,
-            added_n,
-            envs.len(),
-            neg_count
-        );
+        out.push(envs);
     }
 
-    Ok(envs)
+    Ok(out)
 }
 
 /// Execute the head ops for one binding, accumulating writes.
