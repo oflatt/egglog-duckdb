@@ -1784,6 +1784,7 @@ dependencies = [
  "flowlog-runtime",
  "hashbrown 0.16.0",
  "log",
+ "serde",
  "timely",
 ]
 

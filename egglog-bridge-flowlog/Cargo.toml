@@ -29,6 +29,11 @@ flowlog-runtime = { git = "https://github.com/flowlog-rs/flowlog", rev = "fb0eeb
 # already in Cargo.lock (pulled by flowlog-runtime) so no duplicate copies.
 differential-dataflow = "=0.24.0"
 timely = "=0.30.0"
+# serde is needed for the wide ([u32; W>32]) DD binding row: timely's
+# `ExchangeData` requires `Serialize + Deserialize`, and serde only derives
+# those for arrays up to length 32, so `dd_native::Row` is a newtype with a
+# hand-written serde impl over the fixed array.
+serde = { workspace = true }
 
 [build-dependencies]
 # flowlog-build compiles the bundled, build-time-FIXED `transitive_step.dl`

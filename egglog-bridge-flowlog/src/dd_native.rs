@@ -52,19 +52,83 @@ use timely::WorkerConfig;
 use crate::compile::{BodyOp, RuleIr, Slot};
 
 /// Fixed binding-row width (DD `Data` needs a `Sized + Ord + Hash` type; an
-/// array gives us that without dbsp's `declare_tuples!`). Generous for the spike.
-pub const W: usize = 16;
+/// array gives us that without dbsp's `declare_tuples!`). Mirrors feldera's
+/// `JOIN_WIDTH = 32` but bumped to 48 to cover the widest rebuild rule the
+/// flowlog test corpus generates: `luminal-llama`'s `@rebuild_rule34` uses 35
+/// distinct body vars (a wide-arity congruence-closure rebuild). 48 covers
+/// every reachable program with headroom; a rule exceeding this is reported as
+/// a row-width-cap wall (raise `W` to extend coverage — it is purely a fixed
+/// array size, costing `W * 4` bytes per binding row).
+pub const W: usize = 48;
 
 /// A fixed-width binding / relation row flowing through the DD dataflow:
 /// `row[i]` is the value of canonical body variable `i` (0 if not yet bound).
-type Row = [u32; W];
+///
+/// A NEWTYPE over `[u32; W]` (rather than the bare array) because timely's
+/// `ExchangeData` bound — required by DD `.join`/`.distinct` — is
+/// `Serialize + Deserialize`, and `serde` only derives those for arrays up to
+/// length 32. The hand-written serde impl (serialize as a fixed-length seq of
+/// `W` `u32`s) lifts that cap so `W` can exceed 32 (the corpus needs 35). All
+/// other derives (`Ord`/`Hash`/`Clone`/`Copy`) are auto for any array size.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Row([u32; W]);
 
 /// The join key carried between DD `.join` stages: the shared bound columns
-/// packed into a fixed-width array (others 0).
-type Key = [u32; W];
+/// packed into a fixed-width array (others 0). Same newtype as [`Row`].
+type Key = Row;
+
+impl std::ops::Index<usize> for Row {
+    type Output = u32;
+    #[inline]
+    fn index(&self, i: usize) -> &u32 {
+        &self.0[i]
+    }
+}
+
+impl std::ops::IndexMut<usize> for Row {
+    #[inline]
+    fn index_mut(&mut self, i: usize) -> &mut u32 {
+        &mut self.0[i]
+    }
+}
+
+impl serde::Serialize for Row {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        // Fixed-length tuple of W u32s — bincode-friendly, no length prefix
+        // needed (the deserializer knows W). Sidesteps serde's 32-array cap.
+        let mut t = s.serialize_tuple(W)?;
+        for v in &self.0 {
+            t.serialize_element(v)?;
+        }
+        t.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Row {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Row, D::Error> {
+        struct RowVisitor;
+        impl<'de> serde::de::Visitor<'de> for RowVisitor {
+            type Value = Row;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(f, "a tuple of {W} u32s")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Row, A::Error> {
+                let mut a = [0u32; W];
+                for (i, slot) in a.iter_mut().enumerate() {
+                    *slot = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(i, &self))?;
+                }
+                Ok(Row(a))
+            }
+        }
+        d.deserialize_tuple(W, RowVisitor)
+    }
+}
 
 fn empty_row() -> Row {
-    [0u32; W]
+    Row([0u32; W])
 }
 
 /// SPIKE evidence flag: `FLOWLOG_DD_NATIVE_TRACE=1` prints per-epoch input/output
@@ -380,7 +444,7 @@ fn pack_row(vals: &[u32]) -> Row {
 
 /// Build a join key from selected columns (packed into the low slots).
 fn pack_key(r: &Row, cols: &[usize]) -> Key {
-    let mut a = [0u32; W];
+    let mut a = empty_row();
     for (i, &c) in cols.iter().enumerate() {
         a[i] = r[c];
     }
