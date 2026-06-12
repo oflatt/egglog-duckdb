@@ -22,9 +22,67 @@ use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 
 use crate::{
-    Action, Atom, CompiledAction, CompiledRule, CompiledVariant, FunctionInfo, Rule, Term,
-    conflict_clause, prefix_with_comma, q,
+    Action, Atom, CompiledAction, CompiledRule, CompiledVariant, DeltaVariant, FunctionInfo, Rule,
+    Term, UF_CHANGED_PLACEHOLDER, conflict_clause, prefix_with_comma, q,
 };
+
+/// Scan generated WHERE fragments for the `tI.cN` operands of a
+/// `duck_uf_<sort>_find(tI.cN)` call. Those operands are exactly the
+/// eq-sort id columns the native UF canonicalizes, which is the set a
+/// delta-restricted rebuild scan needs to test against the changed
+/// set. Returns each distinct operand (in first-seen order) as the
+/// literal SQL `tI.cN`. A purely structural scan: it does not depend
+/// on the `find` UDF's per-sort suffix beyond the shared `duck_uf_`
+/// prefix and `_find(` open-paren.
+fn collect_uf_find_id_columns(where_parts: &[String]) -> Vec<String> {
+    const PREFIX: &str = "duck_uf_";
+    const MARKER: &str = "_find(";
+    let mut out: Vec<String> = Vec::new();
+    for part in where_parts {
+        let bytes = part.as_bytes();
+        let mut search_from = 0usize;
+        while let Some(rel) = part[search_from..].find(MARKER) {
+            let open = search_from + rel + MARKER.len();
+            // Confirm this `_find(` belongs to a `duck_uf_…` call by
+            // looking back for the prefix on the same identifier.
+            let call_start = part[..search_from + rel].rfind(PREFIX);
+            // Extract the argument up to the matching close paren.
+            // The find UDF takes a single column operand, so the arg
+            // ends at the first `)`.
+            let close = part[open..].find(')').map(|c| open + c);
+            search_from = open;
+            let (Some(_), Some(close)) = (call_start, close) else {
+                continue;
+            };
+            let arg = part[open..close].trim();
+            // Only accept a bare `tI.cN` operand (no nested calls /
+            // expressions). That is what term encoding emits for the
+            // rebuild filter.
+            if is_table_col_ref(arg) && !out.iter().any(|c| c == arg) {
+                out.push(arg.to_string());
+            }
+        }
+        let _ = bytes;
+    }
+    out
+}
+
+/// True iff `s` is a bare `t<digits>.c<digits>` column reference.
+fn is_table_col_ref(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix('t') else {
+        return false;
+    };
+    let Some((tnum, col)) = rest.split_once('.') else {
+        return false;
+    };
+    if tnum.is_empty() || !tnum.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let Some(cnum) = col.strip_prefix('c') else {
+        return false;
+    };
+    !cnum.is_empty() && cnum.bytes().all(|b| b.is_ascii_digit())
+}
 
 /// Glue a list of WHERE atoms into a single SQL fragment that
 /// starts with a leading space + `WHERE`, or "" if empty.
@@ -439,6 +497,15 @@ fn compile_fused_variant(
     // predicates). For gated variants, no `>= ?1` lower bound: the
     // variant is triggered by an external watermark and wants a
     // full scan. Empty body → one branch with no ts predicates.
+    // For gated (native-UF recovery) variants, additionally build a
+    // delta predicate that restricts the otherwise full scan to rows
+    // referencing an id whose canonical changed (tracked in the
+    // runner's `__UF_CHANGED__` temp table). The adaptive runner
+    // chooses per-iteration between this predicate and the full scan.
+    // When `gate_table` is set this holds the gated branch's WHERE
+    // parts *before* `format_where`, so we can derive an alternate
+    // delta-restricted branch by appending the changed-set predicate.
+    let mut delta_branch_wheres: Option<Vec<String>> = None;
     let branch_wheres: Vec<String> = if gate_table.is_some() {
         // Gated: full scan of non-demoted Func atoms with only the
         // upper-bound `< ?2` filter (avoid seeing rows inserted by
@@ -452,6 +519,62 @@ fn compile_fused_variant(
                 continue;
             }
             parts.push(format!("t{i}.ts < ?2"));
+        }
+        // Delta-restrict the scan to rows that reference a changed
+        // id. SOUNDNESS requires the predicate to fire for *every*
+        // row that could be stale, i.e. every row holding an id
+        // whose canonical changed. A row is stale only if one of its
+        // id columns is in the changed set, so the predicate must
+        // cover all id columns the scan reads.
+        //
+        // We cannot distinguish eq-sort id columns from base `i64`
+        // columns by SQL type alone (both are `BIGINT`), so we
+        // over-approximate: include every potential-id column
+        // (`I64`/`PairI64`) of every non-demoted body Func atom, plus
+        // any `tI.cN` directly wrapped by a `duck_uf_..._find(...)`
+        // call. Over-inclusion is sound — the predicate is ANDed with
+        // the body's own `cN <> find(cN)` staleness filter, so a
+        // false-positive id-set hit on a base value at most adds a
+        // row that the staleness filter immediately discards; it can
+        // never *drop* a genuinely stale row.
+        let mut id_cols: Vec<String> = Vec::new();
+        for (i, atom) in rule.body.iter().enumerate() {
+            let Atom::Func { name, .. } = atom else {
+                continue;
+            };
+            if demote.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            if let Some(info) = functions.get(name) {
+                for (c, ty) in info.cols.iter().enumerate() {
+                    // Only plain `I64` columns can hold (and be
+                    // compared against) a `BIGINT` id. `PairI64`
+                    // columns are DuckDB STRUCTs — a direct `IN` test
+                    // would be a type error — and proof-mode pair
+                    // tables aren't the eq-sort views the rebuild
+                    // canonicalizes, so skipping them is sound here.
+                    if matches!(ty, crate::ColumnTy::I64) {
+                        let col = format!("t{i}.c{c}");
+                        if !id_cols.contains(&col) {
+                            id_cols.push(col);
+                        }
+                    }
+                }
+            }
+        }
+        for col in collect_uf_find_id_columns(&base_where_parts) {
+            if !id_cols.contains(&col) {
+                id_cols.push(col);
+            }
+        }
+        if !id_cols.is_empty() {
+            let ors: Vec<String> = id_cols
+                .iter()
+                .map(|c| format!("{c} IN (SELECT id FROM {UF_CHANGED_PLACEHOLDER})"))
+                .collect();
+            let mut dparts = parts.clone();
+            dparts.push(format!("({})", ors.join(" OR ")));
+            delta_branch_wheres = Some(dparts);
         }
         vec![format_where(&parts)]
     } else if func_atom_indices.is_empty() {
@@ -474,29 +597,34 @@ fn compile_fused_variant(
         // For K-way fusion we UNION ALL the per-focus branches as
         // the source of the action; the partitioning is disjoint so
         // no rows are duplicated.
-        let actions = rule
-            .actions
-            .iter()
-            .map(|a| {
-                let sql = compile_simple_action_fused(
-                    a,
-                    &binding,
-                    &from,
-                    &branch_wheres,
-                    &rule.name,
-                    functions,
-                )?;
-                Ok(CompiledAction {
-                    sql,
-                    target: action_target(a, functions),
+        let build_actions = |bw: &[String]| -> Result<Vec<CompiledAction>> {
+            rule.actions
+                .iter()
+                .map(|a| {
+                    let sql =
+                        compile_simple_action_fused(a, &binding, &from, bw, &rule.name, functions)?;
+                    Ok(CompiledAction {
+                        sql,
+                        target: action_target(a, functions),
+                    })
                 })
-            })
-            .collect::<Result<_>>()?;
+                .collect::<Result<_>>()
+        };
+        let actions = build_actions(&branch_wheres)?;
+        let delta = match &delta_branch_wheres {
+            Some(dbw) => Some(DeltaVariant {
+                materialize: None,
+                temp_table: None,
+                actions: build_actions(&[format_where(dbw)])?,
+            }),
+            None => None,
+        };
         return Ok(CompiledVariant {
             materialize: None,
             temp_table: None,
             actions,
             gate_table: gate_table.map(str::to_string),
+            delta,
         });
     }
 
@@ -668,15 +796,18 @@ fn compile_fused_variant(
     // changes. Seminaive partitions are disjoint by construction,
     // so UNION ALL is exact — no need for UNION/DISTINCT.
     let select_cols_str = select_cols.join(", ");
-    let branches: Vec<String> = branch_wheres
-        .iter()
-        .map(|w| format!("SELECT {select_cols_str} FROM {from_with_hc}{w}"))
-        .collect();
-    let materialize = format!(
-        "CREATE OR REPLACE TEMP TABLE {} AS {}",
-        q(&temp_table),
-        branches.join(" UNION ALL "),
-    );
+    let build_materialize = |bw: &[String]| -> String {
+        let branches: Vec<String> = bw
+            .iter()
+            .map(|w| format!("SELECT {select_cols_str} FROM {from_with_hc}{w}"))
+            .collect();
+        format!(
+            "CREATE OR REPLACE TEMP TABLE {} AS {}",
+            q(&temp_table),
+            branches.join(" UNION ALL "),
+        )
+    };
+    let materialize = build_materialize(&branch_wheres);
 
     // 4) Build per-action SQLs that select FROM the temp table.
     let mut action_sqls: Vec<CompiledAction> = Vec::new();
@@ -688,6 +819,15 @@ fn compile_fused_variant(
             target: action_target(action, functions),
         });
     }
+    // Delta rendering (adaptive path): only the materialize scan
+    // differs — the temp table name and the actions reading from it
+    // are unchanged, so we reuse the action SQLs at run time and just
+    // swap in the delta-restricted materialize.
+    let delta = delta_branch_wheres.as_ref().map(|dbw| DeltaVariant {
+        materialize: Some(build_materialize(&[format_where(dbw)])),
+        temp_table: Some(temp_table.clone()),
+        actions: Vec::new(),
+    });
 
     // Suppress `binding` unused warnings; it's only relevant on the
     // simple path above.
@@ -701,6 +841,7 @@ fn compile_fused_variant(
         temp_table: Some(temp_table),
         actions: action_sqls,
         gate_table: gate_table.map(str::to_string),
+        delta,
     })
 }
 

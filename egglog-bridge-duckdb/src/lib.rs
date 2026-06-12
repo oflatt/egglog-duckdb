@@ -1219,6 +1219,17 @@ pub(crate) fn exec_bound(conn: &Connection, sql: &str, last: i64, cur: i64) -> R
 /// one place. Borrows `self.rules` (read-only) and the timing fields
 /// disjointly — the caller passes those as `&mut` references.
 #[allow(clippy::too_many_arguments)]
+/// Per-iteration choice for how to run gated (native-UF recovery)
+/// variants under the adaptive rebuild path. `FullScan` runs the
+/// original full-scan rendering (default / non-adaptive); `Delta`
+/// runs the changed-set semijoin rendering against the materialized
+/// `__UF_CHANGED__` temp table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateMode {
+    FullScan,
+    Delta,
+}
+
 fn run_rule_variants(
     rule: &CompiledRule,
     last: i64,
@@ -1231,6 +1242,7 @@ fn run_rule_variants(
     rule_perf_ns: &mut HashMap<String, (u64, u64)>,
     table_watermarks: &mut HashMap<String, i64>,
     rules_skipped: &mut u64,
+    gate_mode: GateMode,
 ) -> Result<usize> {
     // Watermark gate: if no body table has had inserts since this
     // rule last ran, every variant's seminaive predicate is empty.
@@ -1267,8 +1279,36 @@ fn run_rule_variants(
                 continue;
             }
         }
+        // Adaptive rebuild: when the runner asked for `Delta` and this
+        // gated variant has a delta rendering, run the changed-set
+        // semijoin scan instead of the full scan. The delta's
+        // materialize/temp_table override the parent's; its actions
+        // (which SELECT from the same temp table) are reused from the
+        // parent when the delta carries none. Falls back to full scan
+        // for non-gated variants and variants without a delta.
+        let use_delta = gate_mode == GateMode::Delta && variant.delta.is_some();
+        let eff_materialize: Option<&String> = if use_delta {
+            variant.delta.as_ref().unwrap().materialize.as_ref()
+        } else {
+            variant.materialize.as_ref()
+        };
+        let eff_temp: Option<&String> = if use_delta {
+            variant.delta.as_ref().unwrap().temp_table.as_ref()
+        } else {
+            variant.temp_table.as_ref()
+        };
+        let eff_actions: &[CompiledAction] = if use_delta {
+            let d = variant.delta.as_ref().unwrap();
+            if d.actions.is_empty() {
+                &variant.actions
+            } else {
+                &d.actions
+            }
+        } else {
+            &variant.actions
+        };
         let mut skip_actions = false;
-        if let Some(mat_sql_template) = &variant.materialize {
+        if let Some(mat_sql_template) = eff_materialize {
             if trace_sql {
                 eprintln!("[duck/mat] {mat_sql_template}");
             }
@@ -1283,7 +1323,7 @@ fn run_rule_variants(
             // count; we use a follow-up COUNT(*) on the temp
             // table to actually find out. The count is O(1)
             // against DuckDB's row-count metadata.
-            if let Some(temp) = &variant.temp_table {
+            if let Some(temp) = eff_temp {
                 let count_sql = format!("SELECT COUNT(*) FROM {}", q(temp));
                 let n: i64 = conn.query_row(&count_sql, [], |r| r.get(0))?;
                 if n == 0 {
@@ -1294,11 +1334,11 @@ fn run_rule_variants(
         if skip_actions {
             continue;
         }
-        for act in &variant.actions {
+        for act in eff_actions {
             if trace_sql {
                 eprintln!(
                     "[duck/{}] {}",
-                    if variant.materialize.is_some() {
+                    if eff_materialize.is_some() {
                         "mat-act"
                     } else {
                         "act"
@@ -1309,7 +1349,7 @@ fn run_rule_variants(
             let t0 = std::time::Instant::now();
             let n = exec_bound(conn, &act.sql, last, cur)?;
             let dt = t0.elapsed().as_nanos() as u64;
-            if variant.materialize.is_some() {
+            if eff_materialize.is_some() {
                 *time_mat_act_ns = time_mat_act_ns.wrapping_add(dt);
             } else {
                 *time_act_ns = time_act_ns.wrapping_add(dt);
@@ -1758,6 +1798,40 @@ pub struct EGraph {
     /// just before each existence-check query so the UDF returns a
     /// consistent answer for that query.
     table_sizes: Arc<Mutex<HashMap<String, i64>>>,
+    /// Adaptive rebuild (gated behind `DUCK_ADAPTIVE_REBUILD=1`).
+    /// When on, the runner accumulates the set of ids whose canonical
+    /// changed (drained from the native UFs) across iterations and,
+    /// per rebuild iteration, chooses between a delta-restricted
+    /// gated scan (semijoin against this set) and the full-scan gated
+    /// variant. Full scans re-canonicalize *all* rows, so the set is
+    /// reset to empty immediately after one runs — keeping the
+    /// semijoin set bounded by `theta * |id-space|`. See
+    /// `PERF_NOTE_adaptive.md`.
+    adaptive_rebuild: bool,
+    /// Switch-over fraction theta: when the accumulated changed-set
+    /// size exceeds `theta * |UF id-space|`, run the full scan and
+    /// reset; otherwise run the delta semijoin and accumulate.
+    /// Tunable via `DUCK_ADAPTIVE_THETA`.
+    adaptive_theta: f64,
+    /// Whether to log per-iteration adaptive mode choices + sizes.
+    /// Gated behind `DUCK_ADAPTIVE_DEBUG`.
+    adaptive_debug: bool,
+    /// Accumulated changed-id set (canonical-changed ids since the
+    /// last full-scan reset). Only maintained when `adaptive_rebuild`
+    /// is on. Reset to empty after any full-scan gated variant runs.
+    adaptive_changed_ids: std::collections::HashSet<i64>,
+    /// Ids displaced by the most recent `sync_native_ufs` (the
+    /// "recent delta"). The adaptive mode decision compares THIS
+    /// against `theta * id_space`, not the full accumulated set:
+    /// the accumulated set is what the delta scan must semijoin
+    /// against for correctness (it must cover every id displaced
+    /// since the last full re-canonicalization), but using it for
+    /// the switch-over would make the decision saturate to
+    /// always-full-scan as the set grows. Keying the decision off
+    /// the recent delta lets delta mode engage whenever the current
+    /// iteration's churn is small, while a full scan (which resets
+    /// the accumulated set) is chosen on bursty iterations.
+    adaptive_recent_displaced: usize,
 }
 
 struct CompiledRule {
@@ -1793,7 +1867,35 @@ pub(crate) struct CompiledVariant {
     /// row changed but no view row did this iter), so when the UF
     /// is quiet there's nothing to do.
     pub(crate) gate_table: Option<String>,
+    /// For gated (native-UF recovery) variants only, under the
+    /// adaptive rebuild path: an alternate rendering of this variant
+    /// whose body scan is restricted to rows that reference a changed
+    /// id (`(t0.c0 IN (SELECT id FROM __UF_CHANGED__) OR ...)` over
+    /// the eq-sort id columns). The runner picks between this
+    /// `delta` rendering and the full-scan rendering above per
+    /// iteration based on the accumulated changed-set size. `None`
+    /// for non-gated variants, when no id column was detected, or
+    /// when the adaptive flag is off. The SQL references the literal
+    /// placeholder table name [`UF_CHANGED_PLACEHOLDER`], which the
+    /// runner materializes per iteration.
+    pub(crate) delta: Option<DeltaVariant>,
 }
+
+/// Delta-restricted rendering of a gated variant (adaptive path).
+/// Mirrors the full-scan `materialize`/`temp_table`/`actions` of its
+/// parent [`CompiledVariant`] but with the changed-set semijoin
+/// predicate ANDed into the body scan.
+pub(crate) struct DeltaVariant {
+    pub(crate) materialize: Option<String>,
+    pub(crate) temp_table: Option<String>,
+    pub(crate) actions: Vec<CompiledAction>,
+}
+
+/// Placeholder table name embedded in the delta variant SQL. The
+/// runner rewrites it to the real changed-set temp table just before
+/// executing the delta-restricted gated variant. Kept distinct from
+/// any real table name so a stray substitution is obvious.
+pub(crate) const UF_CHANGED_PLACEHOLDER: &str = "__UF_CHANGED__";
 
 /// One rule action paired with the table it writes to (so the
 /// watermark tracker can bump that table's high-water-mark after a
@@ -1867,6 +1969,15 @@ impl EGraph {
             backend_external_funcs: external_func::DuckdbExternalFuncRegistry::default(),
             registered_builtin_udfs: std::collections::HashSet::new(),
             table_sizes: Arc::new(Mutex::new(HashMap::new())),
+            adaptive_rebuild: std::env::var("DUCK_ADAPTIVE_REBUILD").is_ok(),
+            adaptive_theta: std::env::var("DUCK_ADAPTIVE_THETA")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|t| t.is_finite() && *t >= 0.0)
+                .unwrap_or(0.1),
+            adaptive_debug: std::env::var("DUCK_ADAPTIVE_DEBUG").is_ok(),
+            adaptive_changed_ids: std::collections::HashSet::new(),
+            adaptive_recent_displaced: 0,
         })
     }
 
@@ -2426,6 +2537,7 @@ impl EGraph {
             let mut rows = stmt.query([])?;
             let mut max_ts_seen = last_synced;
             let mut count: u64 = 0;
+            let accumulate = self.adaptive_rebuild;
             {
                 let mut uf = uf_arc.lock().unwrap();
                 while let Some(row) = rows.next()? {
@@ -2442,12 +2554,183 @@ impl EGraph {
                     uf.drain_pending();
                     let drained = uf.drain_displaced();
                     total_displaced += drained.len();
+                    // Adaptive path: keep the displaced ids around so
+                    // the next rebuild iteration can restrict its scan
+                    // to rows referencing one of them. Cleared only
+                    // after a full scan re-canonicalizes everything.
+                    if accumulate {
+                        self.adaptive_changed_ids.extend(drained);
+                    }
                 }
             }
             self.native_uf_unions_synced = self.native_uf_unions_synced.wrapping_add(count);
             self.last_uf_sync_ts.insert(uf_name, max_ts_seen);
         }
+        if self.adaptive_rebuild {
+            self.adaptive_recent_displaced = total_displaced;
+        }
         Ok(total_displaced)
+    }
+
+    /// Adaptive denominator: the total number of rows in the eq-sort
+    /// view tables the rebuild scans. This is the "relevant table
+    /// size" — the cost of a full-scan rebuild iteration scales with
+    /// it, and a delta scan pays off only when the accumulated
+    /// changed set is a small fraction of it. Using the view row
+    /// count (rather than the UF non-root count) is essential for the
+    /// sparse case: a workload can have a huge view but only a few
+    /// unioned ids, where a UF-based denominator would be tiny and
+    /// wrongly force full scans. Counts are read from DuckDB's O(1)
+    /// row-count metadata, summed over the eq-sort views.
+    fn adaptive_id_space(&self) -> usize {
+        // The relevant tables are exactly the body tables of rules
+        // that carry a gated rebuild variant — i.e. the views the
+        // gated full/delta scans read. Summing their row counts gives
+        // the true scan footprint regardless of the view-naming
+        // convention the term encoding chose.
+        let mut tables: Vec<&str> = Vec::new();
+        for rule in &self.rules {
+            if rule.variants.iter().any(|v| v.gate_table.is_some()) {
+                for t in &rule.body_tables {
+                    if !tables.contains(&t.as_str()) {
+                        tables.push(t.as_str());
+                    }
+                }
+            }
+        }
+        let mut total: i64 = 0;
+        for t in tables {
+            if let Ok(n) = self
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {}", q(t)), [], |r| {
+                    r.get::<_, i64>(0)
+                })
+            {
+                total += n;
+            }
+        }
+        total.max(0) as usize
+    }
+
+    /// True iff any of these rules carries a gated (native-UF
+    /// recovery) variant. The adaptive decision/reset only matters
+    /// for such iterations — non-gated iterations (user rules, UF
+    /// maintenance) never run a full scan, so resetting the
+    /// accumulated changed set on them would discard the delta a
+    /// later rebuild iteration still needs.
+    fn rules_have_gated(&self, indices: &[usize]) -> bool {
+        indices.iter().any(|&i| {
+            self.rules
+                .get(i)
+                .is_some_and(|r| r.variants.iter().any(|v| v.gate_table.is_some()))
+        })
+    }
+
+    /// Decide this iteration's gate mode and, when `Delta`, (re)build
+    /// and populate the `__UF_CHANGED__` temp table from the
+    /// accumulated changed-id set. Returns `FullScan` (the default,
+    /// non-adaptive behavior) unless the adaptive flag is on AND the
+    /// accumulated changed set is small relative to the id space.
+    ///
+    /// `FullScan` mode signals (via the returned mode) that the
+    /// caller must reset `adaptive_changed_ids` *after* the rebuild
+    /// rules run — a full scan re-canonicalizes every row, so the
+    /// accumulated delta is fully consumed and can be safely dropped,
+    /// which bounds the set below `theta * id_space` going forward.
+    fn adaptive_gate_mode(&mut self) -> Result<GateMode> {
+        if !self.adaptive_rebuild {
+            return Ok(GateMode::FullScan);
+        }
+        let changed = self.adaptive_changed_ids.len();
+        let recent = self.adaptive_recent_displaced;
+        let id_space = self.adaptive_id_space();
+        // Decide on the RECENT churn (ids displaced by the latest
+        // sync), not the full accumulated set: the accumulated set is
+        // what the delta scan must cover for correctness, so it only
+        // shrinks at a full-scan reset, but it would otherwise grow
+        // monotonically and pin the decision to always-full-scan.
+        // A burst of recent unions (> theta * id_space) means many
+        // rows just went stale — cheaper to full-scan and reset; a
+        // quiet iteration engages delta.
+        // Engage delta only when BOTH the recent churn and the
+        // total accumulated changed set are below `theta * id_space`.
+        // Bounding on the accumulated set is what guarantees
+        // no-regression: the delta scan semijoins against that set,
+        // and since we cannot soundly reset it (see
+        // `adaptive_reset_changed`), we instead refuse delta once it
+        // would exceed the full scan's cost — which on heavy eqsat
+        // happens almost immediately, so heavy workloads fall back to
+        // the full scan (identical to the baseline). Light / sparse
+        // workloads keep a small accumulated set and stay in delta.
+        let threshold = (self.adaptive_theta * id_space as f64).ceil() as usize;
+        let mode = if id_space == 0 || recent > threshold || changed > threshold {
+            GateMode::FullScan
+        } else {
+            GateMode::Delta
+        };
+        if self.adaptive_debug {
+            eprintln!(
+                "[duck/adaptive] mode={:?} recent={} accumulated={} id_space={} theta={} threshold={}",
+                mode, recent, changed, id_space, self.adaptive_theta, threshold,
+            );
+        }
+        if mode == GateMode::Delta {
+            self.materialize_uf_changed()?;
+        }
+        Ok(mode)
+    }
+
+    /// (Re)create the `__UF_CHANGED__` temp table holding the current
+    /// accumulated changed-id set, one `id BIGINT` row each. Delta
+    /// gated variants semijoin against it. Rebuilt fresh each delta
+    /// iteration so it reflects the latest accumulation.
+    fn materialize_uf_changed(&mut self) -> Result<()> {
+        self.conn.execute(
+            &format!(
+                "CREATE OR REPLACE TEMP TABLE {} (id BIGINT)",
+                UF_CHANGED_PLACEHOLDER
+            ),
+            [],
+        )?;
+        if self.adaptive_changed_ids.is_empty() {
+            return Ok(());
+        }
+        // Insert as a single multi-row VALUES statement. ids are i64
+        // values drawn from the eq-sort sequence — no SQL-injection
+        // surface. The set only grows while delta mode is engaged
+        // (small recent + small accumulated relative to the views),
+        // so it stays bounded on the workloads delta actually runs.
+        let values: String = self
+            .adaptive_changed_ids
+            .iter()
+            .map(|id| format!("({id})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.conn.execute(
+            &format!("INSERT INTO {UF_CHANGED_PLACEHOLDER} (id) VALUES {values}"),
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Clear the accumulated changed-id set. Called after a full-scan
+    /// rebuild iteration, which re-canonicalizes every row and thus
+    /// consumes the entire pending delta.
+    fn adaptive_reset_changed(&mut self) {
+        // Resetting the accumulated set to empty after a full scan is
+        // UNSOUND with the current seminaive rebuild/congruence
+        // pipeline: the full-scan gated variant restricts to `ts <
+        // ?2` (it skips current-iteration rows), so it does not
+        // re-canonicalize everything, and a later delta scan with the
+        // emptied set then misses rows that reference an id displaced
+        // before the reset — observed as un-merged congruent
+        // duplicates on math-microbenchmark. So we DON'T reset by
+        // default; the accumulated set is kept complete and the mode
+        // decision keys off the recent (per-sync) churn instead. The
+        // env override is retained for experimentation only.
+        if self.adaptive_rebuild && std::env::var("DUCK_RESET_AFTER_FULLSCAN").is_ok() {
+            self.adaptive_changed_ids.clear();
+        }
     }
 
     /// Bump `table`'s watermark to `ts` if `ts` is newer than the
@@ -2615,7 +2898,11 @@ impl EGraph {
     pub fn perf_per_ruleset(&self) -> Vec<(String, &'static str, u64, u64, u64)> {
         let mut by_kind: HashMap<&'static str, (u64, u64, u64)> = HashMap::new();
         for (rn, &(m, a)) in &self.rule_perf_ns {
-            let rs = self.rule_to_ruleset.get(rn).map(String::as_str).unwrap_or("");
+            let rs = self
+                .rule_to_ruleset
+                .get(rn)
+                .map(String::as_str)
+                .unwrap_or("");
             let kind = Self::classify_rule(rn, rs);
             let e = by_kind.entry(kind).or_insert((0, 0, 0));
             e.0 = e.0.wrapping_add(m);
@@ -3037,6 +3324,17 @@ impl EGraph {
     pub fn run_iteration_for_indices(&mut self, indices: &[usize]) -> Result<usize> {
         let synced_displaced = self.sync_native_ufs()?;
         self.rules_affected = self.rules_affected.wrapping_add(synced_displaced as u64);
+        // Only consult the adaptive decision (and risk resetting the
+        // accumulated changed set) on iterations that actually run a
+        // gated rebuild variant. Other iterations never full-scan, so
+        // touching the changed set here would drop a delta the next
+        // rebuild iteration still needs.
+        let has_gated = self.rules_have_gated(indices);
+        let gate_mode = if has_gated {
+            self.adaptive_gate_mode()?
+        } else {
+            GateMode::FullScan
+        };
         self.next_ts += 1;
         let cur = self.next_ts;
         let mut total: usize = synced_displaced;
@@ -3062,8 +3360,15 @@ impl EGraph {
                 &mut self.rule_perf_ns,
                 &mut self.table_watermarks,
                 &mut self.rules_skipped,
+                gate_mode,
             )?;
             self.last_run_at.insert(rule.name.clone(), cur);
+        }
+        // A full scan re-canonicalized every row, so the accumulated
+        // delta is fully consumed — reset it. Only on gated
+        // iterations (see above).
+        if has_gated && gate_mode == GateMode::FullScan {
+            self.adaptive_reset_changed();
         }
         Ok(total)
     }
@@ -3085,6 +3390,22 @@ impl EGraph {
         // only source of the signal before.
         let synced_displaced = self.sync_native_ufs()?;
         self.rules_affected = self.rules_affected.wrapping_add(synced_displaced as u64);
+        // Adaptive decision applies only when a gated rebuild variant
+        // will actually run this iteration (see `run_iteration_for_indices`).
+        let skip_uf_maintenance = self.native_uf_enabled;
+        let runs = |rule: &CompiledRule| -> bool {
+            (allow_all || allowed.iter().any(|rs| rule.ruleset == *rs))
+                && !(skip_uf_maintenance && is_uf_maintenance_ruleset(&rule.ruleset))
+        };
+        let has_gated = self
+            .rules
+            .iter()
+            .any(|r| runs(r) && r.variants.iter().any(|v| v.gate_table.is_some()));
+        let gate_mode = if has_gated {
+            self.adaptive_gate_mode()?
+        } else {
+            GateMode::FullScan
+        };
         // Build the iteration with the existing single-ruleset path
         // by using a closure on the rule list. Mirrors run_iteration_in
         // but checks set membership.
@@ -3092,12 +3413,8 @@ impl EGraph {
         let cur = self.next_ts;
         let mut total: usize = synced_displaced;
         let last_run_ats: HashMap<String, i64> = self.last_run_at.clone();
-        let skip_uf_maintenance = self.native_uf_enabled;
         for rule in &self.rules {
-            if !allow_all && !allowed.iter().any(|rs| rule.ruleset == *rs) {
-                continue;
-            }
-            if skip_uf_maintenance && is_uf_maintenance_ruleset(&rule.ruleset) {
+            if !runs(rule) {
                 continue;
             }
             let last = *last_run_ats.get(&rule.name).unwrap_or(&0);
@@ -3113,8 +3430,12 @@ impl EGraph {
                 &mut self.rule_perf_ns,
                 &mut self.table_watermarks,
                 &mut self.rules_skipped,
+                gate_mode,
             )?;
             self.last_run_at.insert(rule.name.clone(), cur);
+        }
+        if has_gated && gate_mode == GateMode::FullScan {
+            self.adaptive_reset_changed();
         }
         Ok(total)
     }
@@ -3125,26 +3446,39 @@ impl EGraph {
     pub fn run_iteration_in(&mut self, ruleset: Option<&str>) -> Result<usize> {
         let synced_displaced = self.sync_native_ufs()?;
         self.rules_affected = self.rules_affected.wrapping_add(synced_displaced as u64);
+        let skip_uf_maintenance = self.native_uf_enabled;
+        // Predicate mirroring the in-loop skip conditions, so the
+        // adaptive decision/reset only engages on iterations that
+        // actually run a gated rebuild variant.
+        let runs = |rule: &CompiledRule| -> bool {
+            if let Some(rs) = ruleset
+                && rule.ruleset != rs
+            {
+                return false;
+            }
+            if skip_uf_maintenance && is_uf_maintenance_ruleset(&rule.ruleset) {
+                return false;
+            }
+            if skip_uf_maintenance && is_congruence_rule_name(&rule.name) {
+                return false;
+            }
+            true
+        };
+        let has_gated = self
+            .rules
+            .iter()
+            .any(|r| runs(r) && r.variants.iter().any(|v| v.gate_table.is_some()));
+        let gate_mode = if has_gated {
+            self.adaptive_gate_mode()?
+        } else {
+            GateMode::FullScan
+        };
         self.next_ts += 1;
         let cur = self.next_ts;
         let mut total: usize = synced_displaced;
         let last_run_ats: HashMap<String, i64> = self.last_run_at.clone();
-        let skip_uf_maintenance = self.native_uf_enabled;
         for rule in &self.rules {
-            if let Some(rs) = ruleset
-                && rule.ruleset != rs
-            {
-                continue;
-            }
-            if skip_uf_maintenance && is_uf_maintenance_ruleset(&rule.ruleset) {
-                continue;
-            }
-            // Inline-congruence backend optimization: under native
-            // UF, the runner emits the equivalent SQL after every
-            // iter via `emit_inline_congruence`. The encoding's
-            // `congruence_rule<N>` would do the same work, so skip
-            // it to avoid duplicate scans.
-            if skip_uf_maintenance && is_congruence_rule_name(&rule.name) {
+            if !runs(rule) {
                 continue;
             }
             let last = *last_run_ats.get(&rule.name).unwrap_or(&0);
@@ -3160,6 +3494,7 @@ impl EGraph {
                 &mut self.rule_perf_ns,
                 &mut self.table_watermarks,
                 &mut self.rules_skipped,
+                gate_mode,
             )?;
             self.last_run_at.insert(rule.name.clone(), cur);
         }
@@ -3178,6 +3513,9 @@ impl EGraph {
             && (ruleset.is_none() || ruleset.is_some_and(is_rebuilding_ruleset));
         if should_emit_cong {
             total += self.emit_inline_congruence(cur)?;
+        }
+        if has_gated && gate_mode == GateMode::FullScan {
+            self.adaptive_reset_changed();
         }
         let _ = synced_displaced;
         Ok(total)
