@@ -1774,6 +1774,7 @@ name = "egglog-bridge-flowlog"
 version = "2.0.0"
 dependencies = [
  "anyhow",
+ "differential-dataflow",
  "dyn-clone",
  "egglog-backend-trait",
  "egglog-bridge",
@@ -1783,6 +1784,7 @@ dependencies = [
  "flowlog-runtime",
  "hashbrown 0.16.0",
  "log",
+ "timely",
 ]
 
 [[package]]

@@ -23,6 +23,12 @@ dyn-clone = { workspace = true }
 # (cargo-managed in ~/.cargo/git, reproducible) rather than a path into /tmp,
 # which the OS reaps. runtime 0.2.3 / workspace crates at the pinned rev.
 flowlog-runtime = { git = "https://github.com/flowlog-rs/flowlog", rev = "fb0eeb1e9989a24478459a2bfbe3192d8475eb7d" }
+# SPIKE (spike-flowlog-dd): raw differential-dataflow + timely, used IN-PROCESS
+# by `dd_native.rs` behind `EGGLOG_FLOWLOG_DD_NATIVE=1` to prove a build-once,
+# epoch-driven incremental join (the Feldera/DBSP analog). EXACT versions
+# already in Cargo.lock (pulled by flowlog-runtime) so no duplicate copies.
+differential-dataflow = "=0.24.0"
+timely = "=0.30.0"
 
 [build-dependencies]
 # flowlog-build compiles the bundled, build-time-FIXED `transitive_step.dl`

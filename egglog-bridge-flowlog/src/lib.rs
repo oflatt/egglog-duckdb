@@ -52,6 +52,7 @@ mod base_values;
 pub mod codegen;
 pub mod compile;
 pub mod dd_join;
+pub mod dd_native;
 mod engine;
 mod external_func;
 pub mod interpret;
@@ -205,6 +206,17 @@ pub struct EGraph {
     /// means a never-run rule (cursor 0, every present row fresh); `clear_table`
     /// removes the entry so a re-populated table presents its rows as fresh.
     pub(crate) seen: HashMap<usize, HashMap<FunctionId, interpret::SeenState>>,
+    /// SPIKE (spike-flowlog-dd): when set (via `EGGLOG_FLOWLOG_DD_NATIVE=1`), the
+    /// body join runs on an in-process, build-once, epoch-driven raw
+    /// differential-dataflow dataflow (`dd_native`) instead of the host
+    /// nested-loop / shell-out join. NEW code path; does not disturb the default.
+    pub(crate) dd_native_enabled: bool,
+    /// SPIKE: per-rule persistent DD join, built once (lazily) and stepped each
+    /// iteration with only the per-relation delta (the Feldera `persistent` analog).
+    pub(crate) dd_native: HashMap<usize, dd_native::PersistentDdJoin>,
+    /// SPIKE: per-rule, per-function last-fed row snapshot `Rc`, for computing the
+    /// signed delta vs what the persistent DD join was last fed (Feldera `fed`).
+    pub(crate) dd_native_fed: HashMap<usize, HashMap<FunctionId, std::rc::Rc<HashSet<Row>>>>,
     /// Persistent, delta-maintained hash-join indices over the body relations,
     /// living across iterations (see [`interpret::IndexStore`]). Each committed
     /// mirror mutation buffers an `O(delta)` diff into it; the host join probes
@@ -269,6 +281,9 @@ impl EGraph {
             dd_rule_runs: 0,
             host_rule_runs: 0,
             seen: HashMap::new(),
+            dd_native_enabled: std::env::var_os("EGGLOG_FLOWLOG_DD_NATIVE").is_some(),
+            dd_native: HashMap::new(),
+            dd_native_fed: HashMap::new(),
             index_store: interpret::IndexStore::default(),
         }
     }

@@ -283,7 +283,11 @@ impl IndexStore {
     /// Record a committed insert of `row` into `func`'s mirror (buffered; applied
     /// in order at the next `index_for`).
     pub(crate) fn record_insert(&mut self, func: FunctionId, row: Row) {
-        self.funcs.entry(func).or_default().pending.push((true, row));
+        self.funcs
+            .entry(func)
+            .or_default()
+            .pending
+            .push((true, row));
     }
 
     /// Record a committed removal of `row` from `func`'s mirror (buffered).
@@ -476,6 +480,12 @@ enum Write {
 /// the Differential-Dataflow engine for the DD-eligible class (now fed the
 /// delta per atom-occurrence); the primitive tail + head actions are host-side.
 pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
+    // SPIKE (spike-flowlog-dd): route the whole iteration through the in-process
+    // raw-DD path when `EGGLOG_FLOWLOG_DD_NATIVE=1`. NEW code path; the default
+    // host interpreter below is untouched.
+    if eg.dd_native_enabled {
+        return run_iteration_dd_native(eg, rule_idxs);
+    }
     // Snapshot the read view: rules match against the pre-iteration mirror.
     //
     // The snapshot shares each function's row set by `Rc` rather than
@@ -735,6 +745,211 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
     // `change_detect` is now folded incrementally into apply/merge (O(delta));
     // there is no separate full before/after compare.
     Ok(changed)
+}
+
+// ===========================================================================
+// SPIKE (spike-flowlog-dd): in-process raw-DD iteration driver
+// ===========================================================================
+
+/// One bounded egglog iteration with the body join running on the in-process,
+/// build-once, epoch-driven raw differential-dataflow dataflow
+/// (`crate::dd_native`). This is the FlowLog analog of the Feldera backend's
+/// `interpret::run_iteration` + `persistent_bindings`.
+///
+/// Per rule: compute the signed `+/-` delta of each body relation vs the rows
+/// last fed to that rule's persistent DD join, `step` the join (which feeds ONLY
+/// the delta into never-cleared InputSessions — genuinely incremental), turn the
+/// positive binding deltas into envs, re-run body prims host-side (value prims /
+/// guards the spike keeps off-circuit, exactly like `dd_join`), then apply head
+/// actions. Writes + FD-merge are applied exactly like the host path so results
+/// are bit-exact.
+fn run_iteration_dd_native(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
+    let read: HashMap<FunctionId, std::rc::Rc<HashSet<Row>>> = eg
+        .mirror
+        .iter()
+        .map(|(f, set)| (*f, std::rc::Rc::clone(set)))
+        .collect();
+    let next_id_at_start = eg.next_id;
+
+    let mut writes: Vec<Write> = Vec::new();
+    let mut touched: HashSet<FunctionId> = HashSet::new();
+    let mut lookup_index: HashMap<FunctionId, HashMap<Box<[u32]>, u32>> = HashMap::new();
+
+    let rules: Vec<(usize, RuleIr)> = rule_idxs
+        .iter()
+        .filter_map(|&i| eg.rules.get(i).and_then(|r| r.clone()).map(|r| (i, r)))
+        .collect();
+
+    for (idx, rule) in &rules {
+        let envs = dd_native_bindings(eg, &read, *idx, rule)?;
+        for mut env in envs {
+            apply_head(
+                eg,
+                &rule.head,
+                &mut env,
+                &mut writes,
+                &mut touched,
+                &mut lookup_index,
+            )?;
+        }
+    }
+
+    // Apply collected writes to the mirror (same logic as the host path so the
+    // result is bit-exact). Removes batched per function, then sets, then merge.
+    let mut changed = eg.next_id != next_id_at_start;
+    let mut removes_by_func: HashMap<FunctionId, (usize, HashSet<Box<[u32]>>)> = HashMap::new();
+    let mut sets: Vec<(FunctionId, Row)> = Vec::new();
+    for w in writes {
+        match w {
+            Write::Set(f, row) => sets.push((f, row)),
+            Write::Remove(f, key) => {
+                let entry = removes_by_func
+                    .entry(f)
+                    .or_insert_with(|| (key.len(), HashSet::new()));
+                entry.1.insert(key.into_boxed_slice());
+            }
+        }
+    }
+    for (f, (keylen, keys)) in removes_by_func {
+        if let Some(set) = eg.mirror.get_mut(&f) {
+            let before_len = set.len();
+            std::rc::Rc::make_mut(set).retain(|row| {
+                let k: Box<[u32]> = (0..keylen).map(|i| row_col(row, i)).collect();
+                !keys.contains(&k)
+            });
+            changed |= set.len() != before_len;
+        }
+    }
+    let mut touched_keys: HashMap<FunctionId, HashSet<Vec<u32>>> = HashMap::new();
+    for (f, row) in sets {
+        let inputs_len = eg.info(f).arity.saturating_sub(1);
+        let key: Vec<u32> = (0..inputs_len).map(|i| row_col(&row, i)).collect();
+        let inserted = std::rc::Rc::make_mut(eg.mirror.entry(f).or_default()).insert(row);
+        changed |= inserted;
+        touched_keys.entry(f).or_default().insert(key);
+    }
+    let empty_keys: HashSet<Vec<u32>> = HashSet::new();
+    for &f in &touched {
+        let keys = touched_keys.get(&f).unwrap_or(&empty_keys);
+        changed |= eg.resolve_merge(f, keys);
+    }
+    Ok(changed)
+}
+
+/// Run rule `idx`'s body join on its persistent in-process DD dataflow, returning
+/// the positive binding deltas as envs ready for head application. Atom-less
+/// rules fire their single unconditional binding once (tracked via `seen`).
+fn dd_native_bindings(
+    eg: &mut EGraph,
+    read: &HashMap<FunctionId, std::rc::Rc<HashSet<Row>>>,
+    idx: usize,
+    rule: &RuleIr,
+) -> Result<Vec<Env>> {
+    use crate::dd_native;
+
+    let has_atoms = rule.body.iter().any(|op| matches!(op, BodyOp::Atom(_)));
+    if !has_atoms {
+        // Atom-less rule (`(rule () …)`): fire once. Reuse `seen` as a fired-set
+        // marker (any entry for this rule index = already fired).
+        if eg.seen.contains_key(&idx) {
+            return Ok(Vec::new());
+        }
+        eg.seen.insert(idx, HashMap::new());
+        let mut envs: Vec<Env> = vec![Env::new()];
+        for op in &rule.body {
+            envs = step_body(eg, read, op, envs)?;
+            if envs.is_empty() {
+                break;
+            }
+        }
+        return Ok(envs);
+    }
+
+    // Plan + build the persistent DD join once. The spike PANICS on unsupported
+    // shapes (no graceful fallback) — it exists to prove the architecture.
+    let plan = match dd_native::plan_join(rule) {
+        Ok(p) => p,
+        Err(reason) => panic!(
+            "spike dd_native: unsupported rule shape: {reason} (rule {:?})",
+            rule.name
+        ),
+    };
+    let var_order = plan.var_order().to_vec();
+    if !eg.dd_native.contains_key(&idx) {
+        let pj = dd_native::PersistentDdJoin::build(&plan)?;
+        eg.dd_native.insert(idx, pj);
+    }
+
+    let body_funcs: Vec<FunctionId> = rule
+        .body
+        .iter()
+        .filter_map(|op| match op {
+            BodyOp::Atom(a) => Some(a.func),
+            BodyOp::Prim { .. } => None,
+        })
+        .collect();
+
+    // Signed delta vs the rows last fed to THIS rule's join (Feldera `fed`).
+    let empty_set: std::rc::Rc<HashSet<Row>> = std::rc::Rc::new(HashSet::new());
+    let mut delta: HashMap<FunctionId, Vec<(Vec<u32>, isize)>> = HashMap::new();
+    {
+        let fed = eg.dd_native_fed.entry(idx).or_default();
+        for &f in &body_funcs {
+            let cur = read.get(&f).cloned().unwrap_or_else(|| empty_set.clone());
+            let prev = fed.entry(f).or_insert_with(|| empty_set.clone());
+            if std::rc::Rc::ptr_eq(&cur, prev) {
+                *prev = cur;
+                continue;
+            }
+            let mut rows: Vec<(Vec<u32>, isize)> = Vec::new();
+            for r in cur.iter() {
+                if !prev.contains(r) {
+                    rows.push((r.to_vec(), 1));
+                }
+            }
+            for r in prev.iter() {
+                if !cur.contains(r) {
+                    rows.push((r.to_vec(), -1));
+                }
+            }
+            if !rows.is_empty() {
+                delta.insert(f, rows);
+            }
+            *prev = cur;
+        }
+    }
+
+    eg.dd_rule_runs += 1;
+    let bindings = {
+        let pj = eg
+            .dd_native
+            .get_mut(&idx)
+            .expect("persistent dd join present");
+        pj.step(&delta)?
+    };
+
+    // Turn positive binding deltas into envs; re-run body prims host-side over
+    // them (value prims bind fresh vars; `!=`/guard prims re-filter). Negative
+    // weights are integral bookkeeping (a body row retracted) — egglog heads are
+    // monotone-fire, so we do NOT re-fire the head on disappearance.
+    let mut out: Vec<Env> = Vec::new();
+    for (bind, w) in &bindings {
+        if *w <= 0 {
+            continue;
+        }
+        let mut env: Env = Env::new();
+        for (i, &v) in var_order.iter().enumerate() {
+            env.insert(v, bind[i]);
+        }
+        let mut es: Vec<Env> = vec![env];
+        for op in &rule.body {
+            if let BodyOp::Prim { .. } = op {
+                es = step_body(eg, read, op, es)?;
+            }
+        }
+        out.extend(es);
+    }
+    Ok(out)
 }
 
 /// Extend each binding env by matching `op` against the read view (table atom)
