@@ -47,6 +47,80 @@ use crate::EGraph;
 /// Binding environment: variable id → bound `u32` value.
 pub(crate) type Env = HashMap<u32, u32>;
 
+/// Per-rule, per-function seminaive cursor. `version` is the snapshot version
+/// the rule last matched against (`0` = never); `snapshot` is the `read[f]` set
+/// `Rc` at that version, retained so a rule whose window contains removals can
+/// compute the exact `read[f] \ snapshot` set difference instead of the
+/// incremental streak delta (which over-reports across a remove+readd).
+#[derive(Clone)]
+pub(crate) struct SeenState {
+    pub(crate) version: u64,
+    pub(crate) snapshot: std::rc::Rc<HashSet<Row>>,
+}
+
+/// Optional phase timer isolating the per-rule seminaive **delta-derivation**
+/// cost (the `read[f] \ seen[r][f]` step). Enabled by `FLOWLOG_DELTA_TIMER=1`;
+/// the accumulated nanoseconds are printed to stderr when the process exits via
+/// [`dump_delta_timer`]. Used purely as A/B perf evidence — off by default and
+/// never affects results.
+pub(crate) mod delta_timer {
+    use std::cell::Cell;
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    thread_local! {
+        static ACCUM: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+        static SYNC: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+        static FAST: Cell<u64> = const { Cell::new(0) };
+        static SLOW: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn count(fast: bool) {
+        if fast {
+            FAST.with(|c| c.set(c.get() + 1));
+        } else {
+            SLOW.with(|c| c.set(c.get() + 1));
+        }
+    }
+
+    pub(crate) fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("FLOWLOG_DELTA_TIMER").is_ok())
+    }
+
+    pub(crate) fn add(d: Duration) {
+        ACCUM.with(|c| c.set(c.get() + d));
+    }
+
+    pub(crate) fn add_sync(d: Duration) {
+        SYNC.with(|c| c.set(c.get() + d));
+    }
+
+    /// Print the accumulated delta-derivation time to stderr (called once after
+    /// the run when the timer is enabled). Debug-only perf instrumentation gated
+    /// on `FLOWLOG_DELTA_TIMER`, hence the deliberate `eprintln!`.
+    #[allow(clippy::disallowed_macros)]
+    pub fn dump() {
+        if enabled() {
+            ACCUM.with(|c| {
+                SYNC.with(|s| {
+                    FAST.with(|f| {
+                        SLOW.with(|sl| {
+                            eprintln!(
+                                "[flowlog] delta-derivation total: {:.3}s (per-rule delta: incremental fast path + O(state) removal fallback) + {:.3}s (index/present sync flush); fast={} fallback={}",
+                                c.get().as_secs_f64(),
+                                s.get().as_secs_f64(),
+                                f.get(),
+                                sl.get(),
+                            );
+                        });
+                    });
+                });
+            });
+        }
+    }
+}
+
 /// A shared empty row set for atoms whose relation is absent from a snapshot —
 /// `'static` so it satisfies any `step_atom` rows lifetime.
 fn empty_rows() -> &'static HashSet<Row> {
@@ -96,12 +170,40 @@ fn empty_rows() -> &'static HashSet<Row> {
 /// `O(state)` rebuild from `read[f]` for that one function. Correctness is never
 /// at the mercy of complete hook coverage; the incremental path is purely an
 /// optimization that the pointer check validates.
+///
+/// ## Incremental seminaive delta (the `O(state)` term this also removes)
+///
+/// The same buffered mutation log drives the per-rule seminaive delta. The old
+/// delta was `read[f] \ seen[r][f]`, computed by scanning ALL of `read[f]` and
+/// testing membership in the rule's `seen` snapshot — `O(state)` per (rule,
+/// function, iteration), the dominant super-linear term at saturation. Instead:
+///
+///  * Each function carries a monotonic snapshot `version` (bumped once per
+///    iteration it changes) and, per currently-present row, the `present_since`
+///    version its presence streak began at. A rule records a per-function
+///    `version` cursor when it fires.
+///  * `delta_since(f, cursor)` walks only the `delta_log` suffix newer than the
+///    cursor — `O(delta)`, not `O(state)`. When the window since the cursor is
+///    insert-only (`window_insert_only`, i.e. `cursor >= last_remove_version`),
+///    this is *exactly* `read[f] \ seen`.
+///  * When the window contains removals the streak delta can diverge from the
+///    set difference (a remove + identical readd, or a row re-derived along a
+///    different path, shifts streak versions in ways the cursor alone cannot
+///    reconstruct), so the rule falls back to the exact `read[f] \ snapshot`
+///    scan for that one function — `O(state)`, but only on removal-touched
+///    functions. The retained `snapshot` `Rc` (shared by refcount, O(1)) is the
+///    exact-diff baseline. Bit-exactness is the hard gate, so the fallback is
+///    taken whenever the incremental delta would be unsound.
+///  * `delta_log` is pruned to the lowest cursor any rule reading `f` could
+///    still need, so its memory tracks the active delta window, not total
+///    derivation history.
 #[derive(Default)]
 pub(crate) struct IndexStore {
     funcs: HashMap<FunctionId, FuncIndices>,
 }
 
-/// Per-function maintained indices plus the buffered, not-yet-applied diff.
+/// Per-function maintained indices plus the buffered, not-yet-applied diff and
+/// the incremental seminaive-delta bookkeeping.
 #[derive(Default)]
 struct FuncIndices {
     /// Pointer address of the `read` snapshot `Rc<HashSet<Row>>` the live
@@ -114,6 +216,32 @@ struct FuncIndices {
     /// **in order** so an insert-then-remove of the same row (a `set` whose row
     /// merge-resolution later drops) nets out correctly.
     pending: Vec<(bool, Row)>,
+
+    // --- incremental seminaive-delta state (see `IndexStore` doc) ---
+    /// Snapshot version: how many distinct `read[f]` snapshots have been synced.
+    /// Bumped once per iteration in which `f` changed (its `read` pointer moved).
+    /// A rule's seminaive cursor is one of these versions; its delta is the rows
+    /// that became present after that cursor.
+    version: u64,
+    /// For every row CURRENTLY present in `read[f]`, the version at which its
+    /// current continuous-presence streak began (reset on a remove-then-reinsert).
+    /// `present_since[row] > cursor` ⟺ the row is new to a rule at `cursor` —
+    /// the incremental analog of `read[f] \ seen[r][f]`.
+    present_since: HashMap<Row, u64>,
+    /// The most recent version at which ANY row was removed from `func`. If a
+    /// rule's cursor is `>= last_remove_version`, the window `(cursor, version]`
+    /// is insert-only, so the streak-based `delta_since` exactly equals the
+    /// `read \ seen` set difference (no remove-then-readd can have happened in
+    /// the window, so no row present now was present at the cursor). If the
+    /// cursor is older, removals occurred in the window and a remove+readd of an
+    /// identical row would make `delta_since` over-report (it re-fires a row that
+    /// was already in `seen`), so the rule falls back to the exact set diff.
+    last_remove_version: u64,
+    /// Append-only log of `(version, row)` for each insert that established a new
+    /// presence streak, in version order. A rule's delta is the suffix of this
+    /// log with `version > cursor`, filtered to rows still present at that
+    /// streak — an `O(delta)` scan instead of the `O(state)` set difference.
+    delta_log: Vec<(u64, Row)>,
 }
 
 impl FuncIndices {
@@ -173,14 +301,144 @@ impl IndexStore {
         self.funcs.remove(&func);
     }
 
+    /// Bring `func`'s indices and delta bookkeeping into agreement with
+    /// `read_set` (the current start-of-iteration snapshot, pointer `read_ptr`),
+    /// replaying the buffered `pending` mutation log in order, and bumping the
+    /// snapshot version if the pointer moved. Idempotent within one iteration:
+    /// re-syncing the same `read_ptr` is a no-op.
+    ///
+    /// Validation: after replaying the buffered diff, the maintained row count
+    /// (`present_since.len()`) must equal `read_set.len()`. If not (an unexpected
+    /// mutation bypassed the buffered hooks), every index and the `present_since`
+    /// map are rebuilt from `read_set` (`O(state)`, rare) and the divergent rows
+    /// are stamped at the new version (treated as fresh — conservative: a missed
+    /// firing is worse than a spurious one, and the head is idempotent).
+    fn sync(&mut self, func: FunctionId, read_ptr: usize, read_set: &HashSet<Row>) {
+        let fi = self.funcs.entry(func).or_default();
+        if fi.reflects_ptr == read_ptr {
+            return;
+        }
+        let consistent = fi.reflects_ptr != 0;
+        let new_version = fi.version + 1;
+        let pending = std::mem::take(&mut fi.pending);
+        if consistent {
+            for (is_insert, row) in &pending {
+                if *is_insert {
+                    // A genuinely-new presence streak: stamp it at the new
+                    // version and log it for `delta_since`. Re-inserting an
+                    // already-present row (set semantics) is not a new streak.
+                    if !fi.present_since.contains_key(row) {
+                        fi.present_since.insert(row.clone(), new_version);
+                        fi.delta_log.push((new_version, row.clone()));
+                    }
+                    FuncIndices::apply_insert(&mut fi.indices, row);
+                } else {
+                    fi.present_since.remove(row);
+                    FuncIndices::apply_remove(&mut fi.indices, row);
+                    // A removal in this iteration: any rule whose cursor predates
+                    // this version must fall back to the exact set diff (a
+                    // remove+readd in its window would make `delta_since`
+                    // over-report). Inserts-only windows stay on the fast path.
+                    fi.last_remove_version = new_version;
+                }
+            }
+        }
+        // Validate against the authoritative snapshot.
+        let rebuild = !consistent || fi.present_since.len() != read_set.len();
+        if rebuild {
+            for (kc, index) in fi.indices.iter_mut() {
+                *index = FuncIndices::build_index(read_set, kc);
+            }
+            // Rebuild present_since: rows already tracked keep their streak
+            // version; rows newly seen (or all rows, if inconsistent) are stamped
+            // fresh at the new version so a rule re-fires on them.
+            let mut next: HashMap<Row, u64> = HashMap::with_capacity(read_set.len());
+            for row in read_set {
+                let v = if consistent {
+                    fi.present_since.get(row).copied().unwrap_or(new_version)
+                } else {
+                    new_version
+                };
+                if v == new_version {
+                    fi.delta_log.push((new_version, row.clone()));
+                }
+                next.insert(row.clone(), v);
+            }
+            fi.present_since = next;
+            // A rebuild means the buffered diff didn't reconcile (a removal may
+            // have been missed); force older cursors onto the exact set diff.
+            fi.last_remove_version = new_version;
+        }
+        fi.version = new_version;
+        fi.reflects_ptr = read_ptr;
+    }
+
+    /// The seminaive delta of `func` for a rule whose cursor is `cursor`: the
+    /// rows present in the current snapshot whose presence streak began *after*
+    /// `cursor`. This is the incremental analog of `read[func] \ seen[r][func]`.
+    /// `O(inserts since cursor)`, not `O(state)`. Caller must `sync` first.
+    fn delta_since(&self, func: FunctionId, cursor: u64) -> HashSet<Row> {
+        let Some(fi) = self.funcs.get(&func) else {
+            return HashSet::new();
+        };
+        if cursor >= fi.version {
+            return HashSet::new();
+        }
+        // The delta_log is in version order; walk the suffix with version >
+        // cursor. Keep only rows whose CURRENT streak still began after cursor
+        // (a row removed-and-reinserted appears under its latest version; an
+        // older log entry for it has a stale version that `present_since` no
+        // longer matches, so it's filtered out — and de-duplication is free
+        // because we test the authoritative `present_since`).
+        let start = fi.delta_log.partition_point(|(v, _)| *v <= cursor);
+        let mut out = HashSet::new();
+        for (v, row) in &fi.delta_log[start..] {
+            if fi.present_since.get(row) == Some(v) {
+                out.insert(row.clone());
+            }
+        }
+        out
+    }
+
+    /// Whether the window `(cursor, version]` for `func` is insert-only — i.e.
+    /// no removal happened since `cursor`. When true, the streak-based
+    /// `delta_since` is exactly the `read \ seen` set difference; when false the
+    /// caller must fall back to the exact set diff (remove+readd ambiguity).
+    fn window_insert_only(&self, func: FunctionId, cursor: u64) -> bool {
+        self.funcs
+            .get(&func)
+            .map(|fi| cursor >= fi.last_remove_version)
+            .unwrap_or(true)
+    }
+
+    /// The current snapshot version for `func` (0 if never synced). A rule
+    /// records this as its per-function cursor after firing.
+    fn version_of(&self, func: FunctionId) -> u64 {
+        self.funcs.get(&func).map(|fi| fi.version).unwrap_or(0)
+    }
+
+    /// Prune `func`'s `delta_log` of entries no live cursor can still need:
+    /// anything with `version <= watermark`, where `watermark` is the minimum
+    /// cursor over every rule that reads `func` (0 ⇒ a never-run reader needs the
+    /// full log ⇒ no prune). Keeps memory bounded by the active delta window
+    /// rather than total derivation history. `delta_since` with `cursor >=
+    /// watermark` is unaffected because it only walks entries with `version >
+    /// cursor >= watermark`.
+    fn prune(&mut self, func: FunctionId, watermark: u64) {
+        if watermark == 0 {
+            return;
+        }
+        if let Some(fi) = self.funcs.get_mut(&func) {
+            let cut = fi.delta_log.partition_point(|(v, _)| *v <= watermark);
+            if cut > 0 {
+                fi.delta_log.drain(0..cut);
+            }
+        }
+    }
+
     /// Bring `func`'s indices into agreement with `read_set` (the current
     /// start-of-iteration snapshot, pointer `read_ptr`), then return the index
     /// for `key_cols`, building it on first request.
-    ///
-    /// Fast path: the buffered `pending` log is replayed in order and the result
-    /// is validated to reflect `read_ptr` (its row count must equal `read_set`).
-    /// If validation fails (an unexpected mutation bypassed the buffered hooks),
-    /// every index is rebuilt from `read_set` (`O(state)`, rare).
     fn index_for(
         &mut self,
         func: FunctionId,
@@ -188,39 +446,8 @@ impl IndexStore {
         read_set: &HashSet<Row>,
         key_cols: &[usize],
     ) -> &HashMap<Vec<u32>, Vec<Row>> {
+        self.sync(func, read_ptr, read_set);
         let fi = self.funcs.entry(func).or_default();
-
-        if fi.reflects_ptr != read_ptr {
-            // The snapshot moved since we last synced. Try the incremental diff,
-            // replaying the buffered mutation log IN ORDER.
-            let pending = std::mem::take(&mut fi.pending);
-            let consistent = fi.reflects_ptr != 0;
-            if consistent {
-                for (is_insert, row) in &pending {
-                    if *is_insert {
-                        FuncIndices::apply_insert(&mut fi.indices, row);
-                    } else {
-                        FuncIndices::apply_remove(&mut fi.indices, row);
-                    }
-                }
-            }
-            // Validate: the total row count across any one index must equal the
-            // snapshot size; if not (or we had no prior anchor), rebuild.
-            let rebuild = !consistent
-                || fi
-                    .indices
-                    .values()
-                    .next()
-                    .map(|idx| idx.values().map(|v| v.len()).sum::<usize>() != read_set.len())
-                    .unwrap_or(false);
-            if rebuild {
-                for (kc, index) in fi.indices.iter_mut() {
-                    *index = FuncIndices::build_index(read_set, kc);
-                }
-            }
-            fi.reflects_ptr = read_ptr;
-        }
-
         if !fi.indices.contains_key(key_cols) {
             let index = FuncIndices::build_index(read_set, key_cols);
             fi.indices.insert(key_cols.to_vec(), index);
@@ -283,12 +510,33 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
         .filter_map(|&i| eg.rules.get(i).and_then(|r| r.clone()).map(|r| (i, r)))
         .collect();
 
-    // Shared start-of-iteration snapshots, built lazily once per function and
-    // reused (by refcount) for every rule's `seen` advance this call.
-    let mut shared_snapshot: HashMap<FunctionId, std::rc::Rc<HashSet<Row>>> = HashMap::new();
+    // Sync every body function's incremental delta state to the current
+    // start-of-iteration `read` snapshot ONCE up front: this flushes the
+    // previous iteration's buffered mutations into `present_since` / `delta_log`
+    // and bumps each changed function's version. After this, every rule reads
+    // its delta as an O(delta) `delta_since` against the now-current version.
+    // NOTE: this flush is the SAME pending-replay work the old code did lazily
+    // inside `index_for` (index maintenance) — NOT timed as delta-derivation.
+    let sync_timer = delta_timer::enabled().then(std::time::Instant::now);
+    let mut synced: HashSet<FunctionId> = HashSet::new();
+    for (_idx, rule) in &rules {
+        for op in &rule.body {
+            if let BodyOp::Atom(a) = op {
+                if synced.insert(a.func) {
+                    if let Some(rc) = read.get(&a.func) {
+                        let ptr = std::rc::Rc::as_ptr(rc) as usize;
+                        eg.index_store.sync(a.func, ptr, rc);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(t) = sync_timer {
+        delta_timer::add_sync(t.elapsed());
+    }
+
     for (idx, rule) in &rules {
-        // The table relations this rule's body reads, and the seminaive delta of
-        // each (rows present now that this rule has not yet matched against).
+        // The table relations this rule's body reads.
         let body_funcs: Vec<FunctionId> = rule
             .body
             .iter()
@@ -297,28 +545,44 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
                 BodyOp::Prim { .. } => None,
             })
             .collect();
+        // The seminaive delta of each body function. Fast path: if no removal
+        // happened in this rule's window for `f`, the streak-based `delta_since`
+        // is *exactly* `read[f] \ seen` and is computed in O(delta). Fallback: if
+        // a removal occurred in the window, the streak delta can diverge from the
+        // exact set difference (a remove+readd, or a row dropped then re-derived
+        // along a different path, shifts streak versions in ways the cursor
+        // alone cannot reconstruct), so we compute the exact `read[f] \ seen`
+        // against the retained snapshot — O(state) for that one function only.
+        // Bit-exactness is the hard gate, so correctness wins over the fast path
+        // whenever removals make the incremental delta unsound.
+        let timer_start = delta_timer::enabled().then(std::time::Instant::now);
         let delta: HashMap<FunctionId, HashSet<Row>> = body_funcs
             .iter()
             .map(|&f| {
-                let empty: HashSet<Row> = HashSet::new();
-                let cur = read.get(&f).map(|v| &**v).unwrap_or(&empty);
-                let seen = eg.seen.get(idx).and_then(|m| m.get(&f));
-                // Fast path: if this rule's `seen[f]` snapshot is the SAME `Rc`
-                // as the current read view, `f` is unchanged since the rule last
-                // ran ⇒ empty delta, no O(state) scan (the proven fed-diff trick).
-                if let (Some(cur_rc), Some(seen_rc)) = (read.get(&f), seen) {
-                    if std::rc::Rc::ptr_eq(cur_rc, seen_rc) {
-                        return (f, HashSet::new());
-                    }
+                let st = eg.seen.get(idx).and_then(|m| m.get(&f));
+                let cursor = st.map(|s| s.version).unwrap_or(0);
+                let insert_only = eg.index_store.window_insert_only(f, cursor);
+                if delta_timer::enabled() {
+                    delta_timer::count(insert_only);
                 }
-                let d: HashSet<Row> = cur
-                    .iter()
-                    .filter(|r| seen.map(|s| !s.contains(*r)).unwrap_or(true))
-                    .cloned()
-                    .collect();
-                (f, d)
+                if insert_only {
+                    (f, eg.index_store.delta_since(f, cursor))
+                } else {
+                    let empty: HashSet<Row> = HashSet::new();
+                    let cur = read.get(&f).map(|v| &**v).unwrap_or(&empty);
+                    let seen = st.map(|s| &*s.snapshot);
+                    let d: HashSet<Row> = cur
+                        .iter()
+                        .filter(|r| seen.map(|s| !s.contains(*r)).unwrap_or(true))
+                        .cloned()
+                        .collect();
+                    (f, d)
+                }
             })
             .collect();
+        if let Some(t) = timer_start {
+            delta_timer::add(t.elapsed());
+        }
 
         // The seminaive binding set: union over table-atom positions of the join
         // with exactly that atom restricted to the delta. Each variant runs on
@@ -336,27 +600,54 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
             )?;
         }
 
-        // Advance this rule's seen snapshot to the START-OF-ITERATION read view
-        // (NOT the post-write mirror): the rule has now matched everything
-        // currently present. A row deleted+readded later reappears in the delta.
-        // Build each touched function's snapshot once (shared by Rc across all
-        // rules in this call), then bump the refcount into this rule's seen.
-        for &f in &body_funcs {
-            if !shared_snapshot.contains_key(&f) {
-                // `read[f]` is already the start-of-call `Rc<HashSet<Row>>`;
-                // reuse its handle directly as this rule's seen snapshot (no
-                // rebuild). This also makes the next-iteration `Rc::ptr_eq`
-                // delta short-circuit fire when `f` is untouched.
-                let cur = read
-                    .get(&f)
-                    .map(std::rc::Rc::clone)
-                    .unwrap_or_else(|| std::rc::Rc::new(HashSet::new()));
-                shared_snapshot.insert(f, cur);
-            }
-        }
+        // Advance this rule's cursor to the current snapshot version of each
+        // body function (NOT the post-write state): the rule has now matched
+        // everything present at this iteration's `read`. A row removed and
+        // readded later gets a fresh streak version > this cursor, so the rule
+        // re-fires on it (correct seminaive handling of rule-driven retraction).
         let entry = eg.seen.entry(*idx).or_default();
         for &f in &body_funcs {
-            entry.insert(f, std::rc::Rc::clone(&shared_snapshot[&f]));
+            // The retained `Rc` is the start-of-iteration `read[f]` (shared by
+            // refcount, O(1)); it is the fallback exact-diff baseline if a future
+            // window for this rule contains removals.
+            let snapshot = read
+                .get(&f)
+                .map(std::rc::Rc::clone)
+                .unwrap_or_else(|| std::rc::Rc::new(HashSet::new()));
+            entry.insert(
+                f,
+                SeenState {
+                    version: eg.index_store.version_of(f),
+                    snapshot,
+                },
+            );
+        }
+    }
+
+    // Prune each function's `delta_log` to the lowest cursor any rule that reads
+    // it could still need. A rule that reads `f` but has never run on it (no
+    // cursor entry ⇒ cursor 0) needs the FULL log, so such a function is pruned
+    // to 0 (i.e. not at all). The watermark is computed over ALL installed rules
+    // (not just this call's), so a rule scheduled in a later ruleset still finds
+    // its delta intact.
+    let mut watermark: HashMap<FunctionId, u64> = HashMap::new();
+    for (rid, rule) in eg.rules.iter().enumerate() {
+        let Some(rule) = rule else { continue };
+        let cursors = eg.seen.get(&rid);
+        for op in &rule.body {
+            if let BodyOp::Atom(a) = op {
+                let c = cursors
+                    .and_then(|m| m.get(&a.func))
+                    .map(|s| s.version)
+                    .unwrap_or(0);
+                let w = watermark.entry(a.func).or_insert(u64::MAX);
+                *w = (*w).min(c);
+            }
+        }
+    }
+    for (f, w) in watermark {
+        if w != u64::MAX {
+            eg.index_store.prune(f, w);
         }
     }
 

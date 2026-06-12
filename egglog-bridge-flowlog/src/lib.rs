@@ -196,11 +196,15 @@ pub struct EGraph {
     /// rows produced by an earlier-scheduled ruleset must count as fresh to a
     /// later ruleset's rules, which have never matched them.
     ///
-    /// Stored as a shared `Rc<HashSet<Row>>`: within one `run_rules` call every
-    /// rule advances its `seen[r][f]` to the SAME start-of-iteration view of
-    /// `f`, so the view is built once and shared by refcount instead of cloning
-    /// the full (growing) relation per rule.
-    pub(crate) seen: HashMap<usize, HashMap<FunctionId, std::rc::Rc<HashSet<Row>>>>,
+    /// Per-rule, per-function seminaive cursor (see [`interpret::SeenState`]):
+    /// the snapshot **version** the rule last matched against, plus the `read`
+    /// snapshot `Rc` at that version. The delta of `f` is normally computed
+    /// incrementally as `index_store.delta_since(f, cursor)` in `O(delta)`; when
+    /// removals occurred in the window the rule falls back to the exact `read[f]
+    /// \ snapshot` set difference (the `Rc` is kept for that). A missing entry
+    /// means a never-run rule (cursor 0, every present row fresh); `clear_table`
+    /// removes the entry so a re-populated table presents its rows as fresh.
+    pub(crate) seen: HashMap<usize, HashMap<FunctionId, interpret::SeenState>>,
     /// Persistent, delta-maintained hash-join indices over the body relations,
     /// living across iterations (see [`interpret::IndexStore`]). Each committed
     /// mirror mutation buffers an `O(delta)` diff into it; the host join probes
@@ -212,6 +216,14 @@ pub struct EGraph {
 impl Default for EGraph {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for EGraph {
+    fn drop(&mut self) {
+        // Print the optional delta-derivation phase timer (no-op unless
+        // `FLOWLOG_DELTA_TIMER=1`); pure perf-A/B evidence.
+        interpret::delta_timer::dump();
     }
 }
 
