@@ -169,6 +169,56 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
     Ok(changed)
 }
 
+/// Derive a stable ruleset LABEL for a `run_rules` call from the rules it runs,
+/// for `FLOWLOG_DD_RULESET_PROF`. The backend trait does not carry the ruleset
+/// name down to `run_rules`, but the term encoder gives each maintenance rule a
+/// `fresh()`-suffixed name with a stable PREFIX that identifies its ruleset
+/// (`uf_update*` / `singleparent*` / `uf_function_index*` / `congruence_rule*` /
+/// `rebuild_rule*` / `merge_rule*` / `merge_cleanup*` / `delete_rule*`); user
+/// rewrite rules are named by their full s-expression text. We map each rule
+/// name to its category, then label the call by the categories present (all
+/// rules in one `run_rules` call belong to one egglog ruleset).
+fn ruleset_label(rules: &[(usize, RuleIr)]) -> String {
+    fn category(name: &str) -> &'static str {
+        // Maintenance rules emitted by the term encoder (proof_encoding.rs) carry
+        // a stable, `fresh()`-suffixed name; most are `@`-prefixed (`@uf_update`,
+        // `@congruence_rule`, …) but `singleparent@uf_update` is not. Match the
+        // identifying substring so the leading `@` and trailing digits don't
+        // matter. Order: most specific first (`singleparent` and the `_subsume`
+        // variant before their bare forms; `uf_function_index` before `uf_update`).
+        const MAINT: &[(&str, &str)] = &[
+            ("singleparent", "single_parent"),
+            ("uf_function_index", "uf_function_index"),
+            ("uf_update", "path_compress/uf_update"),
+            ("delete_rule_subsume", "delete_subsume"),
+            ("delete_rule", "delete_subsume"),
+            // `@congruence_rule` and `@rebuild_rule` are both in the term
+            // encoder's `rebuilding` ruleset, so map them to one label.
+            ("congruence_rule", "rebuilding"),
+            ("rebuild_rule", "rebuilding"),
+            ("merge_cleanup", "rebuilding_cleanup"),
+            ("merge_rule", "merge_rule"),
+        ];
+        for (needle, label) in MAINT {
+            if name.contains(needle) {
+                return label;
+            }
+        }
+        if name.starts_with("eval_actions") {
+            return "eval_actions";
+        }
+        "<user>"
+    }
+    let mut cats: Vec<&'static str> = rules.iter().map(|(_, r)| category(&r.name)).collect();
+    cats.sort_unstable();
+    cats.dedup();
+    if cats.len() == 1 {
+        cats[0].to_string()
+    } else {
+        cats.join("+")
+    }
+}
+
 /// Compute every rule's binding envs in ONE fused pass: the whole atom-bearing
 /// ruleset's body joins run on a SINGLE shared timely worker
 /// ([`dd_native::FusedDdJoin`]) clocked once this iteration, then each rule's
@@ -184,6 +234,20 @@ fn fused_bindings(
     use crate::dd_native;
 
     let prof = dd_native::prof_enabled();
+    let rs_prof = dd_native::ruleset_prof_enabled();
+    // Per-ruleset attribution: the wall clock for the WHOLE atom-bearing path
+    // this call, the ruleset label, and the per-bucket nanos we accumulate below.
+    let rs_label = if rs_prof {
+        ruleset_label(rules)
+    } else {
+        String::new()
+    };
+    let rs_t_total = std::time::Instant::now();
+    let mut rs_delta_ns: u64 = 0;
+    let mut rs_prim_ns: u64 = 0;
+    let mut rs_feed_ns: u64 = 0;
+    let mut rs_step_ns: u64 = 0;
+    let mut rs_delta_rows: u64 = 0;
     let mut out: Vec<Vec<Env>> = vec![Vec::new(); rules.len()];
 
     // Partition: atom-bearing rules drive the fused DD worker; atom-less rules
@@ -308,24 +372,38 @@ fn fused_bindings(
                 }
             }
             if !rows.is_empty() {
+                rs_delta_rows += rows.len() as u64;
                 delta.insert(f, rows);
             }
             *prev = cur;
         }
     }
+    let delta_elapsed = t_delta.elapsed().as_nanos() as u64;
     if prof {
-        dd_native::PROF_DELTA_NS.fetch_add(
-            t_delta.elapsed().as_nanos() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        dd_native::PROF_DELTA_NS.fetch_add(delta_elapsed, std::sync::atomic::Ordering::Relaxed);
     }
+    rs_delta_ns += delta_elapsed;
 
-    // ONE step of the shared worker for the WHOLE ruleset.
+    // ONE step of the shared worker for the WHOLE ruleset. `step` updates the
+    // global PROF_FEED_NS / PROF_STEP_NS counters when profiling is on (which it
+    // is whenever either env var is set), so snapshot them before/after to split
+    // this ruleset's feed vs worker_step time.
+    use std::sync::atomic::Ordering as ProfOrd;
+    let feed_before = dd_native::PROF_FEED_NS.load(ProfOrd::Relaxed);
+    let step_before = dd_native::PROF_STEP_NS.load(ProfOrd::Relaxed);
     eg.dd_rule_runs += atom_positions.len() as u64;
     let per_rule_bindings = {
         let fused = eg.dd_fused.get_mut(&key).expect("fused join present");
         fused.step(&delta)?
     };
+    if rs_prof {
+        rs_feed_ns += dd_native::PROF_FEED_NS
+            .load(ProfOrd::Relaxed)
+            .wrapping_sub(feed_before);
+        rs_step_ns += dd_native::PROF_STEP_NS
+            .load(ProfOrd::Relaxed)
+            .wrapping_sub(step_before);
+    }
 
     // Turn each rule's positive binding deltas into envs; re-run its body prims
     // host-side. Negative weights are integral bookkeeping (a body row retracted)
@@ -354,10 +432,21 @@ fn fused_bindings(
         }
         out[caller_pos] = envs;
     }
+    let prim_elapsed = t_prim.elapsed().as_nanos() as u64;
     if prof {
-        dd_native::PROF_PRIM_NS.fetch_add(
-            t_prim.elapsed().as_nanos() as u64,
-            std::sync::atomic::Ordering::Relaxed,
+        dd_native::PROF_PRIM_NS.fetch_add(prim_elapsed, std::sync::atomic::Ordering::Relaxed);
+    }
+    rs_prim_ns += prim_elapsed;
+
+    if rs_prof {
+        dd_native::ruleset_prof_record(
+            &rs_label,
+            rs_t_total.elapsed().as_nanos() as u64,
+            rs_step_ns,
+            rs_feed_ns,
+            rs_prim_ns,
+            rs_delta_ns,
+            rs_delta_rows,
         );
     }
 

@@ -173,12 +173,74 @@ pub(crate) static PROF_DELTA_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn prof_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOWLOG_DD_PROF").is_some())
+    // The low-level feed/step/call counters update whenever EITHER the global
+    // profile or the per-ruleset profile is requested — the per-ruleset path
+    // reads their before/after deltas around each `step` to attribute
+    // worker_step / feed time to the ruleset being run.
+    *ON.get_or_init(|| {
+        std::env::var_os("FLOWLOG_DD_PROF").is_some()
+            || std::env::var_os("FLOWLOG_DD_RULESET_PROF").is_some()
+    })
+}
+
+/// Per-ruleset profiling (gated `FLOWLOG_DD_RULESET_PROF`): attribute DD wall
+/// time to the NAME of the ruleset being run, split into the same buckets as
+/// the global profile, plus a call count and the summed input-delta row count.
+pub(crate) fn ruleset_prof_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOWLOG_DD_RULESET_PROF").is_some())
 }
 
 #[inline]
 fn add_ns(c: &AtomicU64, d: std::time::Duration) {
     c.fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// One ruleset's accumulated DD profile (nanoseconds + counts).
+#[derive(Default, Clone)]
+pub(crate) struct RulesetProf {
+    pub calls: u64,
+    pub total_ns: u64,
+    pub worker_step_ns: u64,
+    pub feed_ns: u64,
+    pub host_prim_ns: u64,
+    pub delta_compute_ns: u64,
+    pub delta_rows: u64,
+}
+
+/// Accumulator keyed by ruleset NAME. Only touched when
+/// `FLOWLOG_DD_RULESET_PROF` is set (zero overhead otherwise).
+pub(crate) fn ruleset_prof_table() -> &'static std::sync::Mutex<HashMap<String, RulesetProf>> {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<std::sync::Mutex<HashMap<String, RulesetProf>>> = OnceLock::new();
+    TABLE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Record one ruleset's DD work for a single `run_rules` call. No-op unless
+/// `FLOWLOG_DD_RULESET_PROF` is set.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ruleset_prof_record(
+    ruleset: &str,
+    total_ns: u64,
+    worker_step_ns: u64,
+    feed_ns: u64,
+    host_prim_ns: u64,
+    delta_compute_ns: u64,
+    delta_rows: u64,
+) {
+    if !ruleset_prof_enabled() {
+        return;
+    }
+    let mut table = ruleset_prof_table().lock().expect("ruleset prof lock");
+    let e = table.entry(ruleset.to_string()).or_default();
+    e.calls += 1;
+    e.total_ns += total_ns;
+    e.worker_step_ns += worker_step_ns;
+    e.feed_ns += feed_ns;
+    e.host_prim_ns += host_prim_ns;
+    e.delta_compute_ns += delta_compute_ns;
+    e.delta_rows += delta_rows;
 }
 
 /// Print the Step-0 profile to stderr if `FLOWLOG_DD_PROF` is set.
@@ -204,6 +266,53 @@ pub fn dd_prof_dump() {
             prim_ns as f64 / 1e9,
             delta_ns as f64 / 1e9,
         );
+    }
+}
+
+/// Print the per-ruleset DD profile to stderr if `FLOWLOG_DD_RULESET_PROF` is
+/// set: one row per ruleset, sorted by total DD time descending, with each
+/// ruleset's share of the grand total.
+pub fn dd_ruleset_prof_dump() {
+    if !ruleset_prof_enabled() {
+        return;
+    }
+    let table = ruleset_prof_table().lock().expect("ruleset prof lock");
+    if table.is_empty() {
+        return;
+    }
+    let mut rows: Vec<(String, RulesetProf)> =
+        table.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    rows.sort_by(|a, b| b.1.total_ns.cmp(&a.1.total_ns));
+    let grand_total: u64 = rows.iter().map(|(_, p)| p.total_ns).sum();
+    let s = |ns: u64| ns as f64 / 1e9;
+    #[allow(clippy::disallowed_macros)]
+    {
+        eprintln!(
+            "[FLOWLOG_DD_RULESET_PROF] grand_total_dd={:.3}s",
+            s(grand_total)
+        );
+        eprintln!(
+            "{:<28} {:>6} {:>9} {:>6} {:>11} {:>9} {:>9} {:>11}",
+            "ruleset", "calls", "total", "%dd", "worker_step", "feed", "host_prim", "delta_rows"
+        );
+        for (name, p) in &rows {
+            let pct = if grand_total > 0 {
+                100.0 * p.total_ns as f64 / grand_total as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "{:<28} {:>6} {:>8.3}s {:>5.1}% {:>10.3}s {:>8.3}s {:>8.3}s {:>11}",
+                name,
+                p.calls,
+                s(p.total_ns),
+                pct,
+                s(p.worker_step_ns),
+                s(p.feed_ns),
+                s(p.host_prim_ns),
+                p.delta_rows,
+            );
+        }
     }
 }
 

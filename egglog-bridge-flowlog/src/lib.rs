@@ -209,6 +209,9 @@ impl Drop for EGraph {
         // Step-0 profile dump (gated FLOWLOG_DD_PROF): #workers, #InputSessions,
         // and the worker.step vs host-side prim/delta split. No-op otherwise.
         dd_native::dd_prof_dump();
+        // Per-ruleset profile dump (gated FLOWLOG_DD_RULESET_PROF): attribute
+        // DD wall time to the ruleset NAME, sorted descending. No-op otherwise.
+        dd_native::dd_ruleset_prof_dump();
     }
 }
 
