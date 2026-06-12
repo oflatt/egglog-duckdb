@@ -1,11 +1,10 @@
-//! SPIKE (spike-flowlog-dd): in-process, build-once, epoch-driven incremental
-//! body join on RAW `differential-dataflow` + `timely` — the FlowLog analog of
-//! the Feldera backend's `dbsp_join::PersistentJoin`.
+//! In-process, build-once, epoch-driven incremental body join on RAW
+//! `differential-dataflow` + `timely` — the FlowLog analog of the Feldera
+//! backend's `dbsp_join::PersistentJoin`.
 //!
-//! This is a NEW code path, gated behind `EGGLOG_FLOWLOG_DD_NATIVE=1`, that does
-//! NOT disturb the default host interpreter (`interpret.rs`) or the shell-out DD
-//! path (`dd_join.rs`). It is messy, special-cased, and panics on shapes it does
-//! not support — it exists to prove the architecture, not to ship.
+//! This is the ONLY join path for the FlowLog `Interpret` backend (driven by
+//! [`crate::interpret::run_iteration`]); there is no host nested-loop fallback.
+//! It panics (via the caller) on shapes it does not support — see `plan_join`.
 //!
 //! ## The architecture proven here (mirrors feldera/DBSP)
 //!
@@ -23,8 +22,7 @@
 //! drains the capture buffer to get the OUTPUT binding deltas. The
 //! InputSessions are NEVER cleared — the DD arrangements persist across epochs,
 //! which is what makes the join genuinely incremental (epoch K does only
-//! delta·integral work, not a full recompute). This is the whole point of the
-//! spike and the anti-pattern `dd_join.rs` (clear+restage every call) avoids.
+//! delta·integral work, not a full recompute) — the whole point of the design.
 //!
 //! ## Fixpoint structure
 //!
@@ -160,12 +158,12 @@ impl JoinPlan {
     }
 }
 
-/// Build the join plan for `rule`, or `Err(reason)` if the spike does not
-/// support its shape (the caller PANICS — this is a spike, no graceful
-/// fallback). Supported: >=1 table atom, <= [`W`] distinct body vars, atom
-/// arity <= [`W`], and body prims limited to the recognized `!=` guard (other
-/// body prims are re-run host-side over the bindings, exactly like the existing
-/// `dd_join` split, so we accept them by leaving them to the host tail).
+/// Build the join plan for `rule`, or `Err(reason)` if the DD dataflow cannot
+/// support its shape (the caller PANICS — there is no host fallback). Supported:
+/// one or more table atoms, at most [`W`] distinct body vars, atom arity at most
+/// [`W`]. Body prims (`!=` guards, value prims like `+`) are re-run host-side
+/// over the bindings by the caller (the table-join-on-engine /
+/// prim-tail-host-side split), so we accept them by leaving them to the host tail.
 pub fn plan_join(rule: &RuleIr) -> Result<JoinPlan, String> {
     let mut var_order: Vec<u32> = Vec::new();
     let mut var_col: HashMap<u32, usize> = HashMap::new();
@@ -195,9 +193,9 @@ pub fn plan_join(rule: &RuleIr) -> Result<JoinPlan, String> {
                 });
             }
             // Body prims (e.g. `!=` guards, value prims like `+`) are re-run
-            // host-side over the join bindings by the caller (mirrors the
-            // existing `dd_join` split). They do not affect join planning; a
-            // value prim may bind a fresh var the head reads, evaluated host-side.
+            // host-side over the join bindings by the caller (the table-join-on-
+            // engine / prim-tail-host-side split). They do not affect join
+            // planning; a value prim may bind a fresh var the head reads.
             BodyOp::Prim { .. } => {}
         }
     }

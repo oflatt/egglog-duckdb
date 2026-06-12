@@ -51,7 +51,6 @@ use hashbrown::{HashMap, HashSet};
 mod base_values;
 pub mod codegen;
 pub mod compile;
-pub mod dd_join;
 pub mod dd_native;
 mod engine;
 mod external_func;
@@ -62,7 +61,6 @@ pub mod subprocess;
 use base_values::base_values_as_pool_mut;
 use compile::{pack_row, row_col, unpack_row, BodyOp, HeadOp, MergeMode, Row, RuleIr, Slot};
 use external_func::ExternalFuncRegistry;
-use subprocess::DriverHandle;
 
 // ---------------------------------------------------------------------------
 // Container pool stub (milestone 1 has no containers; mirror DuckDB/Feldera)
@@ -128,10 +126,13 @@ pub enum ExecMode {
     /// (cached by rule-set hash), and drive it as a subprocess over a pipe
     /// (used by `run_n_shellout_proof`).
     ShellOut,
-    /// M3 (the frontend default): the host-side ordered-IR interpreter runs
-    /// general multi-atom bodies + primitives + head actions, and routes
-    /// DD-eligible table-atom joins onto the Differential-Dataflow engine (the
-    /// subprocess) when `dd_enabled`. This is what real `.egg` files run on.
+    /// M3 (the frontend default): the in-process iteration driver
+    /// ([`interpret::run_iteration`]) runs general multi-atom bodies +
+    /// primitives + head actions. Every body table-atom join runs on the
+    /// in-process Differential-Dataflow dataflow ([`dd_native`]); the primitive
+    /// tail + head actions are applied host-side. This is what real `.egg` files
+    /// run on. There is NO host nested-loop fallback — an unsupported rule shape
+    /// panics with a reason.
     Interpret,
 }
 
@@ -173,69 +174,25 @@ pub struct EGraph {
     /// Monotonic fresh-id counter for `fresh_id` / `add_term`.
     pub(crate) next_id: u32,
     report_level: ReportLevel,
-    /// Whether the relational table-atom join runs on the Differential-Dataflow
-    /// engine (`interpret`'s DD branch). Default `false`: the host interpreter
-    /// (the oracle) runs the join, which is fast and disk-free across the whole
-    /// `.egg` survey. Set via [`EGraph::enable_dd_join`] (or `EGGLOG_FLOWLOG_DD=1`)
-    /// to route eligible joins onto DD — the milestone's "joins on DD" mandate,
-    /// proven in `tests/dd_join_proof.rs`.
-    pub(crate) dd_enabled: bool,
-    /// Warm dd-join driver subprocesses, keyed by the join `.dl` text (one per
-    /// distinct join shape, reused across iterations).
-    pub(crate) dd_drivers: HashMap<String, DriverHandle>,
-    /// Diagnostics: rule firings whose join ran on the DD engine.
+    /// Diagnostics: rule firings whose body join ran on the DD engine.
     pub(crate) dd_rule_runs: u64,
-    /// Diagnostics: rule firings that fell back to the host interpreter.
-    pub(crate) host_rule_runs: u64,
-    /// Per-rule seminaive state (Milestone 3 / mirrors Feldera M5): for each
-    /// rule index, the rows of each body relation that rule has ALREADY matched
-    /// against. The seminaive delta of rule `r` over relation `f` is
-    /// `mirror[f] \ seen[r][f]`; after `r` fires, `seen[r][f]` is advanced to
-    /// the START-OF-ITERATION snapshot (not the post-write mirror) so a
-    /// deleted-then-readded row reappears in the delta and the consuming rule
-    /// re-fires (the rebuild/retraction trap). Keyed by RULE (not globally):
-    /// rows produced by an earlier-scheduled ruleset must count as fresh to a
-    /// later ruleset's rules, which have never matched them.
-    ///
-    /// Per-rule, per-function seminaive cursor (see [`interpret::SeenState`]):
-    /// the snapshot **version** the rule last matched against, plus the `read`
-    /// snapshot `Rc` at that version. The delta of `f` is normally computed
-    /// incrementally as `index_store.delta_since(f, cursor)` in `O(delta)`; when
-    /// removals occurred in the window the rule falls back to the exact `read[f]
-    /// \ snapshot` set difference (the `Rc` is kept for that). A missing entry
-    /// means a never-run rule (cursor 0, every present row fresh); `clear_table`
-    /// removes the entry so a re-populated table presents its rows as fresh.
-    pub(crate) seen: HashMap<usize, HashMap<FunctionId, interpret::SeenState>>,
-    /// SPIKE (spike-flowlog-dd): when set (via `EGGLOG_FLOWLOG_DD_NATIVE=1`), the
-    /// body join runs on an in-process, build-once, epoch-driven raw
-    /// differential-dataflow dataflow (`dd_native`) instead of the host
-    /// nested-loop / shell-out join. NEW code path; does not disturb the default.
-    pub(crate) dd_native_enabled: bool,
-    /// SPIKE: per-rule persistent DD join, built once (lazily) and stepped each
+    /// Atom-less rules (`(rule () …)`) fire ONCE; an entry here marks a rule
+    /// index as already fired. The DD dataflow has no input relation to drive an
+    /// atom-less body, so this fired-marker is the one piece of seminaive
+    /// bookkeeping the DD path reuses (see `interpret::dd_native_bindings`).
+    /// `free_rule` removes the entry so a re-installed rule can fire again.
+    pub(crate) seen: HashMap<usize, ()>,
+    /// Per-rule persistent DD join, built once (lazily) and stepped each
     /// iteration with only the per-relation delta (the Feldera `persistent` analog).
     pub(crate) dd_native: HashMap<usize, dd_native::PersistentDdJoin>,
-    /// SPIKE: per-rule, per-function last-fed row snapshot `Rc`, for computing the
+    /// Per-rule, per-function last-fed row snapshot `Rc`, for computing the
     /// signed delta vs what the persistent DD join was last fed (Feldera `fed`).
     pub(crate) dd_native_fed: HashMap<usize, HashMap<FunctionId, std::rc::Rc<HashSet<Row>>>>,
-    /// Persistent, delta-maintained hash-join indices over the body relations,
-    /// living across iterations (see [`interpret::IndexStore`]). Each committed
-    /// mirror mutation buffers an `O(delta)` diff into it; the host join probes
-    /// it as an `O(1)` lookup instead of rebuilding an `O(state)` index every
-    /// iteration — flattening the FlowLog interpreter's super-linear join cost.
-    pub(crate) index_store: interpret::IndexStore,
 }
 
 impl Default for EGraph {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl Drop for EGraph {
-    fn drop(&mut self) {
-        // Print the optional delta-derivation phase timer (no-op unless
-        // `FLOWLOG_DELTA_TIMER=1`); pure perf-A/B evidence.
-        interpret::delta_timer::dump();
     }
 }
 
@@ -251,11 +208,10 @@ impl EGraph {
         Self::with_mode(ExecMode::ShellOut)
     }
 
-    /// Construct a fresh FlowLog-backed egraph driven by the M3 host-side
-    /// interpreter (general bodies + primitives + head actions; DD-eligible
-    /// table joins routed onto the Differential-Dataflow engine when
-    /// `dd_enabled`). This is the constructor the egglog frontend uses
-    /// (`EGraph::with_flowlog_backend`).
+    /// Construct a fresh FlowLog-backed egraph driven by the M3 iteration driver
+    /// (general bodies + primitives + head actions; every body table-atom join
+    /// runs on the in-process Differential-Dataflow dataflow). This is the
+    /// constructor the egglog frontend uses (`EGraph::with_flowlog_backend`).
     pub fn new_interpret() -> Self {
         Self::with_mode(ExecMode::Interpret)
     }
@@ -276,15 +232,10 @@ impl EGraph {
             // Start at 1 so id 0 stays a "null"/padding sentinel.
             next_id: 1,
             report_level: ReportLevel::default(),
-            dd_enabled: std::env::var_os("EGGLOG_FLOWLOG_DD").is_some(),
-            dd_drivers: HashMap::new(),
             dd_rule_runs: 0,
-            host_rule_runs: 0,
             seen: HashMap::new(),
-            dd_native_enabled: std::env::var_os("EGGLOG_FLOWLOG_DD_NATIVE").is_some(),
             dd_native: HashMap::new(),
             dd_native_fed: HashMap::new(),
-            index_store: interpret::IndexStore::default(),
         }
     }
 
@@ -305,19 +256,12 @@ impl EGraph {
         self.db.base_values()
     }
 
-    /// Enable routing of DD-eligible table-atom joins onto the
-    /// Differential-Dataflow engine (the subprocess shell-out). Off by default;
-    /// the host interpreter (the oracle) otherwise runs the join.
-    pub fn enable_dd_join(&mut self) {
-        self.dd_enabled = true;
-    }
-
-    /// Diagnostics: `(dd_rule_runs, host_rule_runs)` — the number of rule
-    /// firings whose table-atom join ran on the DD engine vs. fell back to the
-    /// host interpreter. Mirrors Feldera's `dbsp_join_stats`; lets a test assert
-    /// which fraction of joins genuinely ran on DD.
-    pub fn flowlog_join_stats(&self) -> (u64, u64) {
-        (self.dd_rule_runs, self.host_rule_runs)
+    /// Diagnostics: the number of rule firings whose body table-atom join ran on
+    /// the in-process Differential-Dataflow dataflow. Every atom-bearing rule
+    /// runs there (no host fallback); lets a test assert the join genuinely ran
+    /// on DD.
+    pub fn flowlog_dd_rule_runs(&self) -> u64 {
+        self.dd_rule_runs
     }
 
     /// The functional-dependency merge mode of a function (from `add_table`).
@@ -417,23 +361,11 @@ impl EGraph {
             return false;
         }
         let set = std::rc::Rc::make_mut(self.mirror.get_mut(&f).unwrap());
-        let mut inserted: Vec<Row> = Vec::new();
         for r in &drop_rows {
             set.remove(r);
         }
         for r in new_rows {
-            if set.insert(r.clone()) {
-                inserted.push(r);
-            }
-        }
-        // Buffer the merge rewrite into the persistent join index by exactly the
-        // rows that changed: the dropped non-winners and the (newly) inserted
-        // winners. Flushed at the next iteration's `index_for`.
-        for r in &drop_rows {
-            self.index_store.record_remove(f, r.clone());
-        }
-        for r in inserted {
-            self.index_store.record_insert(f, r);
+            set.insert(r);
         }
         true
     }
@@ -613,14 +545,9 @@ impl Backend for EGraph {
         if let Some(set) = self.mirror.get_mut(&func) {
             std::rc::Rc::make_mut(set).clear();
         }
-        // Forget what every rule had matched in this table: a re-populated table
-        // must present its rows as fresh seminaive deltas.
-        for per_rel in self.seen.values_mut() {
-            per_rel.remove(&func);
-        }
-        // Drop the persistent join index for this table — it must rebuild from
-        // the (now empty / re-populated) relation on next use.
-        self.index_store.forget(func);
+        // The per-rule DD `fed` snapshots (`dd_native_fed`) are diffed against
+        // the live mirror each iteration, so clearing the mirror is picked up as
+        // a retraction delta automatically — no extra bookkeeping needed here.
     }
 
     fn base_values(&self) -> &egglog_core_relations::BaseValues {
@@ -649,7 +576,10 @@ impl Backend for EGraph {
     fn free_rule(&mut self, id: RuleId) {
         if let Some(slot) = self.rules.get_mut(id.rep() as usize) {
             *slot = None;
-            self.seen.remove(&(id.rep() as usize));
+            let i = id.rep() as usize;
+            self.seen.remove(&i);
+            self.dd_native.remove(&i);
+            self.dd_native_fed.remove(&i);
         }
     }
 
@@ -709,8 +639,8 @@ impl Backend for EGraph {
     }
 
     fn eval_prim(&self, id: ExternalFunctionId, args: &[Value]) -> Option<Value> {
-        // Delegate to the inherent stopgap (`eval_prim_internal`) that the host
-        // interpreter and the DD-join path already use, so primitive evaluation
+        // Delegate to the inherent stopgap (`eval_prim_internal`) that the
+        // host-side primitive tail already uses, so primitive evaluation
         // stays bit-for-bit identical to the reference backend. The merged
         // `Backend` trait (from the Feldera milestones) now requires this entry
         // point; flowlog satisfies it without changing its internal posture.
