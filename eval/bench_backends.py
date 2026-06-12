@@ -159,20 +159,62 @@ def find_benchmarks(path: Path) -> list[Path]:
     return sorted(path.rglob("*.egg"))
 
 
-def run_once(binary: Path, flags: list[str], bench: Path, timeout: float):
+def parse_duck_phases(stderr: str):
+    """Parse the `--- by class ---` block emitted by the duckdb backend's
+    DUCK_PERF_DUMP into {phase: {"search": s, "apply": s}}. Returns {} if
+    the block is absent (non-duckdb backend, or env flag unset)."""
+    phases = {}
+    in_block = False
+    for line in stderr.splitlines():
+        if "by class" in line:
+            in_block = True
+            continue
+        if not in_block:
+            continue
+        # Format: "    1.364s  search   1.151s  apply   0.212s   42.0%wall  rebuild"
+        toks = line.replace("s", " ").split()
+        # Expect: <total> search <search> apply <apply> <pct>%wall <kind>
+        if "search" in line and "apply" in line and line.strip():
+            parts = line.split()
+            try:
+                kind = parts[-1]
+                # values are at fixed positions: [0]=total, [2]=search, [4]=apply
+                search = float(parts[2].rstrip("s"))
+                apply_ = float(parts[4].rstrip("s"))
+                phases[kind] = {"search": search, "apply": apply_}
+            except (IndexError, ValueError):
+                in_block = False
+        else:
+            in_block = False
+    return phases
+
+
+def run_once(binary: Path, flags: list[str], bench: Path, timeout: float,
+             capture_phases: bool = False):
     """Run one invocation. Returns (elapsed_seconds, None) on success or
-    (None, error_message) on failure/timeout."""
+    (None, error_message) on failure/timeout. When `capture_phases` is set
+    (duckdb backend), enables DUCK_PERF_DUMP and returns
+    (elapsed, None, phases) instead."""
     cmd = [str(binary), *flags, str(bench)]
+    env = None
+    if capture_phases:
+        import os
+        env = dict(os.environ, DUCK_PERF_DUMP="1")
     start = time.perf_counter()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                              env=env)
     except subprocess.TimeoutExpired:
-        return None, f"timeout after {timeout}s"
+        return (None, f"timeout after {timeout}s", {}) if capture_phases \
+            else (None, f"timeout after {timeout}s")
     elapsed = time.perf_counter() - start
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout or "").strip().splitlines()
         msg = tail[-1] if tail else f"exit code {proc.returncode}"
-        return None, f"exit {proc.returncode}: {msg}"
+        return (None, f"exit {proc.returncode}: {msg}", {}) if capture_phases \
+            else (None, f"exit {proc.returncode}: {msg}")
+    if capture_phases:
+        return elapsed, None, parse_duck_phases(proc.stderr or "")
     return elapsed, None
 
 
@@ -182,20 +224,43 @@ def bench_cell(binary, bench, rel, condition, backend, mode, flags, warmup, runs
     folds into the DB. Pure (no shared state) so it is safe to run in a worker
     process; a failing cell returns an error result rather than raising, so one
     cell's failure never kills the pool."""
+    # Capture per-phase timing (search vs apply, by ruleset class) for the
+    # duckdb backend, which emits a DUCK_PERF_DUMP breakdown on stderr.
+    capture = backend == "duckdb"
+
     # Warm-up runs (discarded): pay one-time costs (page cache, etc.).
     for _ in range(warmup):
         run_once(binary, flags, bench, timeout)
 
     timings = []
+    phase_runs = []
     for _ in range(runs):
-        elapsed, err = run_once(binary, flags, bench, timeout)
+        out = run_once(binary, flags, bench, timeout, capture_phases=capture)
+        if capture:
+            elapsed, err, phases = out
+        else:
+            elapsed, err = out
+            phases = None
         if err is not None:
             return {"benchmark": rel, "backend": backend, "mode": mode,
                     "condition": condition, "error": err}
         timings.append(round(elapsed, 6))
+        if phases:
+            phase_runs.append(phases)
 
-    return {"benchmark": rel, "backend": backend, "mode": mode,
-            "condition": condition, "timing_list": timings}
+    result = {"benchmark": rel, "backend": backend, "mode": mode,
+              "condition": condition, "timing_list": timings}
+    if phase_runs:
+        # Median across runs, per phase, for search and apply seconds.
+        kinds = set().union(*[set(p) for p in phase_runs])
+        agg = {}
+        for k in kinds:
+            for field in ("search", "apply"):
+                vals = sorted(p[k][field] for p in phase_runs if k in p)
+                if vals:
+                    agg.setdefault(k, {})[field] = vals[len(vals) // 2]
+        result["duck_phases"] = agg
+    return result
 
 
 def _bench_cell_worker(task):
@@ -218,6 +283,15 @@ def apply_cell_result(result, db):
     db.add_timing(rel, backend, mode, condition, timings)
     mean = sum(timings) / len(timings)
     print(f"    {rel}: {condition:24} mean {mean:8.3f}s  (runs: {timings})", flush=True)
+    phases = result.get("duck_phases")
+    if phases:
+        # Per-phase median search/apply seconds (duckdb DUCK_PERF_DUMP).
+        order = sorted(phases, key=lambda k: -(phases[k].get("search", 0)
+                                               + phases[k].get("apply", 0)))
+        parts = [f"{k}={phases[k].get('search', 0) + phases[k].get('apply', 0):.3f}s"
+                 f"(s{phases[k].get('search', 0):.3f}/a{phases[k].get('apply', 0):.3f})"
+                 for k in order]
+        print(f"      phases: {'  '.join(parts)}", flush=True)
 
 
 def serve_results(results_path: Path, port: int):
