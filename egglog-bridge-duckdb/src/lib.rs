@@ -2558,6 +2558,78 @@ impl EGraph {
         rows
     }
 
+    /// Classify a single (rule_name, ruleset) into a coarse phase
+    /// bucket. In the default `--duckdb` (non-native-uf) path the
+    /// term-encoding maintenance rules carry an empty ruleset, so we
+    /// key off the rule NAME (which is reliably populated:
+    /// `@rebuild_rule*`, `@congruence_rule*`, `*uf_update`,
+    /// `*parent*`, `*cleanup*`); we still consult the ruleset name as
+    /// a fallback for the native-uf path.
+    fn classify_rule(rule_name: &str, ruleset: &str) -> &'static str {
+        let bare_name = rule_name.trim_start_matches('@');
+        // Strip a trailing `#<idx>` instance suffix, then trailing
+        // digits, to get the family prefix.
+        let fam = bare_name
+            .split('#')
+            .next()
+            .unwrap_or(bare_name)
+            .trim_end_matches(|c: char| c.is_ascii_digit());
+        if fam.starts_with("rebuild_rule") || is_rebuilding_ruleset(ruleset) {
+            "rebuild"
+        } else if fam.starts_with("congruence_rule")
+            || is_congruence_rule_name(rule_name)
+            || ruleset
+                .trim_end_matches(|c: char| c.is_ascii_digit())
+                .trim_start_matches('@')
+                == "congruence"
+        {
+            "congruence"
+        } else if fam.ends_with("uf_update")
+            || fam.contains("parent")
+            || fam.contains("uf_function_index")
+            || is_uf_maintenance_ruleset(ruleset)
+        {
+            "maintenance"
+        } else if fam.contains("cleanup")
+            || ruleset
+                .trim_end_matches(|c: char| c.is_ascii_digit())
+                .trim_start_matches('@')
+                == "cleanup"
+        {
+            "cleanup"
+        } else {
+            "user"
+        }
+    }
+
+    /// `(label, kind, mat_ns, act_ns, n_rules)` rows rolled up from
+    /// the per-rule timings and grouped by phase `kind`, sorted by
+    /// total time descending. `kind` is one of `"rebuild"`,
+    /// `"congruence"`, `"maintenance"` (UF canonicalization: parent /
+    /// single_parent / uf_function_index / uf_update), `"cleanup"`,
+    /// or `"user"` (the actual rewrite rules). `label` mirrors `kind`.
+    /// Surfaced by `DUCK_PERF_DUMP` so we can attribute runtime to
+    /// rebuild/UF-maintenance vs user rewrites. Classification keys on
+    /// rule name because term-encoded maintenance rules carry an empty
+    /// ruleset in the default path.
+    pub fn perf_per_ruleset(&self) -> Vec<(String, &'static str, u64, u64, u64)> {
+        let mut by_kind: HashMap<&'static str, (u64, u64, u64)> = HashMap::new();
+        for (rn, &(m, a)) in &self.rule_perf_ns {
+            let rs = self.rule_to_ruleset.get(rn).map(String::as_str).unwrap_or("");
+            let kind = Self::classify_rule(rn, rs);
+            let e = by_kind.entry(kind).or_insert((0, 0, 0));
+            e.0 = e.0.wrapping_add(m);
+            e.1 = e.1.wrapping_add(a);
+            e.2 += 1;
+        }
+        let mut rows: Vec<(String, &'static str, u64, u64, u64)> = by_kind
+            .into_iter()
+            .map(|(kind, (m, a, n))| (kind.to_string(), kind, m, a, n))
+            .collect();
+        rows.sort_by(|x, y| (y.2 + y.3).cmp(&(x.2 + x.3)));
+        rows
+    }
+
     /// Cumulative count of rows affected by rule action SQLs across
     /// all iterations so far. Frontend snapshots this around its
     /// schedule loops to detect saturation precisely.

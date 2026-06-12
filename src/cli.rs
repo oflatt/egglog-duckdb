@@ -200,8 +200,10 @@ pub fn cli(mut egraph: EGraph) {
                         tmp.dump_debug_info();
                         continue;
                     }
+                    let _duck_wall0 = std::time::Instant::now();
                     let result = egraph
                         .parse_and_run_program(Some(input.to_str().unwrap().into()), &program);
+                    let _duck_wall_ns = _duck_wall0.elapsed().as_nanos() as u64;
                     // Dump per-rule timing if DUCK_PERF_DUMP is set
                     // (env-flag activated; no CLI flag). Reads the
                     // duckdb backend's per-rule counters directly.
@@ -211,30 +213,7 @@ pub fn cli(mut egraph: EGraph) {
                             .as_any()
                             .downcast_ref::<egglog_bridge_duckdb::EGraph>()
                     {
-                        eprintln!("\n=== DUCK_PERF_DUMP: top 20 rules by total ns ===");
-                        let mut rows = duck.perf_per_rule();
-                        rows.truncate(20);
-                        eprintln!(
-                            "{:>10} {:>10} {:>10}  {:<40} rule",
-                            "total_s", "mat_s", "act_s", "ruleset"
-                        );
-                        for (rn, rs, m, a) in &rows {
-                            eprintln!(
-                                "{:>10.3} {:>10.3} {:>10.3}  {:<40} {}",
-                                (m + a) as f64 / 1e9,
-                                *m as f64 / 1e9,
-                                *a as f64 / 1e9,
-                                rs,
-                                rn
-                            );
-                        }
-                        let (mat, mat_act, act) = duck.perf_timings_ns();
-                        eprintln!(
-                            "totals: materialize {:.3}s, mat_action {:.3}s, action {:.3}s",
-                            mat as f64 / 1e9,
-                            mat_act as f64 / 1e9,
-                            act as f64 / 1e9,
-                        );
+                        duck_perf_dump(duck, _duck_wall_ns);
                     }
                     if let Err(err) = result {
                         log::error!("{err}");
@@ -253,9 +232,19 @@ pub fn cli(mut egraph: EGraph) {
                 duck_eg.parser = std::mem::take(&mut egraph.parser);
                 duck_eg.fact_directory.clone_from(&args.fact_directory);
                 duck_eg.ensure_no_reserved_symbols(false);
-                if let Err(err) =
-                    duck_eg.parse_and_run_program(Some(input.to_str().unwrap().into()), &program)
+                let duck_wall0 = std::time::Instant::now();
+                let duck_result =
+                    duck_eg.parse_and_run_program(Some(input.to_str().unwrap().into()), &program);
+                let duck_wall_ns = duck_wall0.elapsed().as_nanos() as u64;
+                if std::env::var("DUCK_PERF_DUMP").is_ok()
+                    && let Some(duck) = duck_eg
+                        .backend_for_diagnostics()
+                        .as_any()
+                        .downcast_ref::<egglog_bridge_duckdb::EGraph>()
                 {
+                    duck_perf_dump(duck, duck_wall_ns);
+                }
+                if let Err(err) = duck_result {
                     log::error!("{err}");
                     std::process::exit(1);
                 }
@@ -421,6 +410,105 @@ impl EGraph {
 
         Ok(())
     }
+}
+
+/// Print the DUCK_PERF_DUMP breakdown to stderr: top rules, global
+/// search(mat)/apply(act) totals, a per-ruleset rollup classified into
+/// rebuild / UF-maintenance / congruence / cleanup / user, and an
+/// "other" bucket = wall time not attributed to any rule SQL (planning,
+/// snapshotting, watermark/skip bookkeeping, parse). `wall_ns` is the
+/// measured wall time of `parse_and_run_program`.
+fn duck_perf_dump(duck: &egglog_bridge_duckdb::EGraph, wall_ns: u64) {
+    eprintln!("\n=== DUCK_PERF_DUMP: top 20 rules by total ns ===");
+    let mut rows = duck.perf_per_rule();
+    rows.truncate(20);
+    eprintln!(
+        "{:>10} {:>10} {:>10}  {:<40} rule",
+        "total_s", "mat_s", "act_s", "ruleset"
+    );
+    for (rn, rs, m, a) in &rows {
+        eprintln!(
+            "{:>10.3} {:>10.3} {:>10.3}  {:<40} {}",
+            (m + a) as f64 / 1e9,
+            *m as f64 / 1e9,
+            *a as f64 / 1e9,
+            rs,
+            rn
+        );
+    }
+    let (mat, mat_act, act) = duck.perf_timings_ns();
+    eprintln!(
+        "totals: materialize {:.3}s, mat_action {:.3}s, action {:.3}s",
+        mat as f64 / 1e9,
+        mat_act as f64 / 1e9,
+        act as f64 / 1e9,
+    );
+
+    let wall_s = wall_ns as f64 / 1e9;
+    let rs_rows = duck.perf_per_ruleset();
+    let accounted_ns = mat + mat_act + act;
+    let other_ns = wall_ns.saturating_sub(accounted_ns);
+    let pct = |x: u64| {
+        if wall_ns > 0 {
+            x as f64 / wall_ns as f64 * 100.0
+        } else {
+            0.0
+        }
+    };
+    eprintln!("\n=== DUCK_PERF_DUMP: per-ruleset rollup ===");
+    eprintln!(
+        "wall: {wall_s:.3}s (accounted {:.3}s in rule SQL, other {:.3}s = planning/snapshot/skip-gates/parse)",
+        accounted_ns as f64 / 1e9,
+        other_ns as f64 / 1e9
+    );
+    eprintln!(
+        "{:>9} {:>9} {:>9} {:>6} {:>5}  {:<28} {}",
+        "total_s", "search_s", "apply_s", "%wall", "rules", "ruleset", "kind"
+    );
+    let mut cls: std::collections::HashMap<&'static str, (u64, u64)> =
+        std::collections::HashMap::new();
+    for (rs, kind, m, a, n) in &rs_rows {
+        let tot = m + a;
+        eprintln!(
+            "{:>9.3} {:>9.3} {:>9.3} {:>5.1}% {:>5}  {:<28} {}",
+            tot as f64 / 1e9,
+            *m as f64 / 1e9,
+            *a as f64 / 1e9,
+            pct(tot),
+            n,
+            rs,
+            kind,
+        );
+        let e = cls.entry(kind).or_insert((0, 0));
+        e.0 = e.0.wrapping_add(*m);
+        e.1 = e.1.wrapping_add(*a);
+    }
+    eprintln!("\n--- by class (search=mat, apply=act) ---");
+    let mut cls_rows: Vec<(&'static str, u64, u64)> =
+        cls.into_iter().map(|(k, (m, a))| (k, m, a)).collect();
+    cls_rows.sort_by(|x, y| (y.1 + y.2).cmp(&(x.1 + x.2)));
+    for (k, m, a) in cls_rows {
+        let tot = m + a;
+        eprintln!(
+            "{:>9.3}s  search {:>7.3}s  apply {:>7.3}s  {:>5.1}%wall  {}",
+            tot as f64 / 1e9,
+            m as f64 / 1e9,
+            a as f64 / 1e9,
+            pct(tot),
+            k,
+        );
+    }
+    eprintln!(
+        "  search(mat) {:.1}%  apply(act+mat_act) {:.1}%  other {:.1}%  of wall",
+        pct(mat),
+        pct(act + mat_act),
+        pct(other_ns),
+    );
+    eprintln!(
+        "  rule firings skipped by watermark gate: {}; rows affected total: {}",
+        duck.rules_skipped(),
+        duck.rules_affected_total(),
+    );
 }
 
 fn welcome_prompt() -> String {
