@@ -577,6 +577,27 @@ impl RuleBuilder<'_> {
                     Ok(())
                 })
             }
+            DefaultVal::Identity => {
+                // Identity-on-miss ("lookup-or-self"): a missing key resolves
+                // to the key itself, with no row inserted. Only valid for the
+                // single-key UF-index functions this default is set on.
+                assert_eq!(
+                    entries.len(),
+                    1,
+                    "DefaultVal::Identity requires exactly one key column"
+                );
+                Box::new(move |inner, rb| {
+                    let dst_vars = inner.convert_all(&entries);
+                    let var = rb.lookup_with_default(
+                        table,
+                        &dst_vars,
+                        dst_vars[0],
+                        ColumnId::from_usize(schema_math.ret_val_col()),
+                    )?;
+                    inner.mapping.insert(res.id, var.into());
+                    Ok(())
+                })
+            }
         };
         self.query.add_rule.push(cb);
         res

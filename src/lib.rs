@@ -945,15 +945,30 @@ impl EGraph {
         };
 
         use egglog_bridge::{DefaultVal, MergeFn};
+        // Canonicalize-at-creation: the flat UF-index functions (`@UF_Sf`) are
+        // declared with identity-on-miss lookup semantics so the encoder can
+        // emit `find_UFold` lookups (lookup-or-self against the frozen UF_old
+        // table) at constructor-creation time. Detected by name against the
+        // encoder's `uf_function` map. Default off => no function is Identity.
+        let is_uf_index = self.proof_state.canon_at_creation
+            && self
+                .proof_state
+                .uf_function
+                .values()
+                .any(|n| n == &*decl.name);
         let backend_id = self.backend.add_table(egglog_bridge::FunctionConfig {
             schema: input
                 .iter()
                 .chain([&output])
                 .map(|sort| sort.column_ty(&*self.backend))
                 .collect(),
-            default: match decl.subtype {
-                FunctionSubtype::Constructor => DefaultVal::FreshId,
-                FunctionSubtype::Custom => DefaultVal::Fail,
+            default: if is_uf_index {
+                DefaultVal::Identity
+            } else {
+                match decl.subtype {
+                    FunctionSubtype::Constructor => DefaultVal::FreshId,
+                    FunctionSubtype::Custom => DefaultVal::Fail,
+                }
             },
             merge: match decl.subtype {
                 FunctionSubtype::Constructor => MergeFn::UnionId,

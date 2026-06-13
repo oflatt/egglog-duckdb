@@ -118,6 +118,13 @@ pub enum DefaultVal {
     Fail,
     /// Insert a constant of some kind.
     Const(Value),
+    /// Identity-on-miss ("lookup-or-self"): a failing lookup returns the
+    /// (single) lookup key unchanged, and does NOT insert a row. Only valid
+    /// for single-key functions whose key and return column share a type
+    /// (e.g. the term-encoder's flat union-find index `@UF_Sf`). Used by the
+    /// canonicalize-at-creation encoding to express a `find` against the
+    /// frozen UF_old table.
+    Identity,
 }
 
 /// How to resolve FD conflicts for a table.

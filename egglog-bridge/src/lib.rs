@@ -1225,7 +1225,11 @@ impl TableAction {
             },
             default: match &func_info.default_val {
                 DefaultVal::FreshId => Some(MergeVal::Counter(egraph.id_counter)),
-                DefaultVal::Fail => None,
+                // `Identity` is consumed only by the rule-compilation lookup
+                // path (see `lookup_with_subsumed`); the `TableAction` exec path
+                // never looks up an Identity-default function, so fall back to
+                // plain `lookup` semantics here.
+                DefaultVal::Fail | DefaultVal::Identity => None,
                 DefaultVal::Const(val) => Some(MergeVal::Constant(*val)),
             },
             timestamp: egraph.timestamp_counter,

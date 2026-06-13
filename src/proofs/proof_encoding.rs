@@ -18,6 +18,20 @@ pub(crate) struct EncodingState {
     pub proofs_enabled: bool,
     pub proof_testing: bool,
     pub proof_names: EncodingNames,
+    /// Canonicalize-at-creation: when on, each eq-sort child of a constructor
+    /// (and custom-function view) created in a rule RHS is replaced with its
+    /// UF_old leader via an identity-on-miss lookup against the flat UF index
+    /// `@UF_Sf` (frozen at the last completed rebuild). This makes every newly
+    /// inserted view row canonical w.r.t. UF_old, which lets the FlowLog DD
+    /// backend skip the `δ(constructor) ⋈ UF_old` rebuild join soundly.
+    /// Default OFF; the default encoding is byte-for-byte unchanged. Gated by
+    /// the `EGGLOG_CANON_AT_CREATION` environment variable.
+    pub canon_at_creation: bool,
+    /// Transient flag set while instrumenting a single rule's actions: true once
+    /// a canonicalize-at-creation `find_UFold` lookup has been emitted into the
+    /// RHS, so the generated rule must opt into `:unsafe-seminaive` (RHS
+    /// function-table lookups). Reset per rule in `instrument_rule`.
+    pub emitted_canon_lookup: bool,
 }
 
 impl EncodingState {
@@ -31,6 +45,10 @@ impl EncodingState {
             proofs_enabled: false,
             proof_names: EncodingNames::new(symbol_gen),
             proof_testing: false,
+            canon_at_creation: std::env::var("EGGLOG_CANON_AT_CREATION")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false),
+            emitted_canon_lookup: false,
         }
     }
 }
@@ -310,11 +328,20 @@ impl<'a> ProofInstrumentor<'a> {
             "()".to_string()
         };
         let mut merge_fn_code = vec![];
+        // canonicalize-at-creation may inject `find_UFold` RHS lookups into the
+        // merge expression's constructor creations, which force the generated
+        // merge rule to opt into :unsafe-seminaive (see `add_term_and_view`).
+        self.egraph.proof_state.emitted_canon_lookup = false;
         let merge_fn_var = self.instrument_action_expr(
             merge_fn,
             &mut merge_fn_code,
             &Justification::Merge(name.clone(), p1_fresh.clone(), p2_fresh.clone()),
         );
+        let merge_unsafe_opt = if self.egraph.proof_state.emitted_canon_lookup {
+            ":unsafe-seminaive"
+        } else {
+            ""
+        };
         let merge_fn_code_str = merge_fn_code.join("\n");
         let mut updated = child_names.to_vec();
         updated.push(merge_fn_var.clone());
@@ -355,7 +382,7 @@ impl<'a> ProofInstrumentor<'a> {
                         ({cleanup_constructor} {merge_fn_var} old)
                         ({cleanup_constructor} {merge_fn_var} new)
                        )
-                        :ruleset {rebuilding_ruleset}
+                        :ruleset {rebuilding_ruleset} {merge_unsafe_opt}
                         :name \"{fresh_name}\")
                 
                  (rule (({cleanup_constructor} merged old)
@@ -978,6 +1005,42 @@ impl<'a> ProofInstrumentor<'a> {
         // A fresh variable for the new term.
         let fv = self.fresh_var();
         let mut res = vec![];
+
+        // Canonicalize-at-creation: replace every eq-sort child argument with
+        // its UF_old leader, via an identity-on-miss lookup against the flat UF
+        // index `@UF_Sf` (frozen at the last completed rebuild). The resulting
+        // row is then canonical w.r.t. UF_old, which is what lets the FlowLog DD
+        // backend skip the `δ(constructor) ⋈ UF_old` rebuild join. Off by
+        // default, so the emitted args are unchanged for the default encoding.
+        let args: Vec<String> = if self.egraph.proof_state.canon_at_creation {
+            args.iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    // Sort for this argument position. For constructors `args`
+                    // are exactly the inputs; for custom functions the trailing
+                    // arg is the output.
+                    let sort = if i < func_type.input.len() {
+                        Some(&func_type.input[i])
+                    } else {
+                        Some(&func_type.output)
+                    };
+                    match sort {
+                        Some(s) if s.is_eq_sort() => {
+                            let uf_function_name = self.uf_function_name(s.name());
+                            // RHS function-table lookup => rule needs
+                            // :unsafe-seminaive (set in instrument_rule).
+                            self.egraph.proof_state.emitted_canon_lookup = true;
+                            format!("({uf_function_name} {a})")
+                        }
+                        _ => a.clone(),
+                    }
+                })
+                .collect()
+        } else {
+            args.to_vec()
+        };
+        let args = args.as_slice();
+
         // TODO might be able to get rid of this intermediate variable in encoding
         res.push(format!(
             "(let {fv} ({} {}))",
@@ -1131,7 +1194,9 @@ impl<'a> ProofInstrumentor<'a> {
         let (facts, action_lookups, proof_str) = self.instrument_facts(&rule.body);
         let proof_var = self.fresh_var();
         let proof = Justification::Rule(rule.name.clone(), proof_var.clone());
-        let needs_unsafe_seminaive = !action_lookups.is_empty();
+        // Reset the per-rule canon-lookup flag; `add_term_and_view` sets it when
+        // it emits a `find_UFold` RHS lookup (canonicalize-at-creation).
+        self.egraph.proof_state.emitted_canon_lookup = false;
         // The looked-up proofs feed `proof_str`, so bind them first.
         let action_lookups_str = ListDisplay(&action_lookups, "\n                    ");
         let proof_var_binding = if self.egraph.proof_state.proofs_enabled {
@@ -1145,6 +1210,10 @@ impl<'a> ProofInstrumentor<'a> {
         };
 
         let actions = self.instrument_actions(&rule.head.0, &proof);
+        // RHS `find_UFold` lookups (canonicalize-at-creation) also force
+        // :unsafe-seminaive, since they are function-table lookups in actions.
+        let needs_unsafe_seminaive =
+            !action_lookups.is_empty() || self.egraph.proof_state.emitted_canon_lookup;
         let name = &rule.name;
         let ruleset_opt = if rule.ruleset.is_empty() {
             "".to_string()

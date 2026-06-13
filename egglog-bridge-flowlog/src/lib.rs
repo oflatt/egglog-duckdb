@@ -40,7 +40,7 @@ use std::any::Any;
 
 use anyhow::Result;
 use egglog_backend_trait::{
-    Backend, BaseValueId, BaseValuePool, ColumnTy, ContainerPool, ExternalFunction,
+    Backend, BaseValueId, BaseValuePool, ColumnTy, ContainerPool, DefaultVal, ExternalFunction,
     ExternalFunctionId, FunctionConfig, FunctionId, FunctionRow, IterationReport, MergeFn,
     QueryEntry, ReportLevel, RuleBuilderOps, RuleId, Value,
 };
@@ -110,6 +110,11 @@ pub(crate) struct RelationInfo {
     has_output: bool,
     /// How functional-dependency conflicts are resolved.
     pub(crate) merge: MergeMode,
+    /// True iff this function uses identity-on-miss lookup semantics
+    /// (`DefaultVal::Identity`): an action-position lookup of an absent key
+    /// resolves to the key itself, with no row inserted. Used by the
+    /// canonicalize-at-creation encoding for the flat UF-index `@UF_Sf`.
+    pub(crate) identity_on_miss: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -455,11 +460,13 @@ impl Backend for EGraph {
                 MergeFn::Function(_, _) | MergeFn::Const(_) => MergeMode::Old,
             }
         };
+        let identity_on_miss = matches!(config.default, DefaultVal::Identity);
         self.relations.push(RelationInfo {
             name: config.name,
             arity,
             has_output,
             merge,
+            identity_on_miss,
         });
         self.mirror.insert(id, std::rc::Rc::new(HashSet::new()));
         id

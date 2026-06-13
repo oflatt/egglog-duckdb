@@ -548,7 +548,11 @@ impl Backend for EGraph {
                 };
                 self.add_eq_sort_constructor(&name, inputs, None)
             }
-            DefaultVal::Fail | DefaultVal::Const(_) => {
+            // `DefaultVal::Identity` (canonicalize-at-creation, flowlog-only)
+            // is not implemented here; treat it as a plain function table.
+            // Under the canon-at-creation flag the duckdb backend is allowed to
+            // misbehave/reject — only the flowlog backend is validated.
+            DefaultVal::Fail | DefaultVal::Const(_) | DefaultVal::Identity => {
                 // Either a function with an explicit output, or a
                 // relation if the output is Unit (term encoding's
                 // pattern for view tables — `(function @XView (...)
