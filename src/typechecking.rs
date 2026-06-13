@@ -930,7 +930,12 @@ impl TypeInfo {
         // run; mirrors the backend's `self.seminaive && !rule.naive`
         // check at rule-build time.
         let seminaive = global_seminaive && !*naive;
-        let (query_ctx, action_ctx) = if seminaive {
+        // `:unsafe-seminaive` keeps seminaive evaluation but widens the
+        // typecheck (and backend) primitive contexts to Read/Full, so the
+        // RHS may read the database — read-primitives (FullPrim) *and*
+        // function-table lookups. See `GenericRule::unsafe_seminaive`.
+        let context_seminaive = seminaive && !*unsafe_seminaive;
+        let (query_ctx, action_ctx) = if context_seminaive {
             (Context::Pure, Context::Write)
         } else {
             (Context::Read, Context::Full)
