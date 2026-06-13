@@ -45,9 +45,11 @@ impl EncodingState {
             proofs_enabled: false,
             proof_names: EncodingNames::new(symbol_gen),
             proof_testing: false,
-            canon_at_creation: std::env::var("EGGLOG_CANON_AT_CREATION")
-                .map(|v| v != "0" && !v.is_empty())
-                .unwrap_or(false),
+            // Canonicalize-at-creation is always-on for all term-encoding
+            // backends in TERM mode. It is additionally gated off in PROOF mode
+            // at the emission sites in `add_term_and_view` (the `@UF_Sf` lookup
+            // returns an `@UFPair_Sort` in proof mode, not a bare sort).
+            canon_at_creation: true,
             emitted_canon_lookup: false,
         }
     }
@@ -1010,9 +1012,14 @@ impl<'a> ProofInstrumentor<'a> {
         // its UF_old leader, via an identity-on-miss lookup against the flat UF
         // index `@UF_Sf` (frozen at the last completed rebuild). The resulting
         // row is then canonical w.r.t. UF_old, which is what lets the FlowLog DD
-        // backend skip the `δ(constructor) ⋈ UF_old` rebuild join. Off by
-        // default, so the emitted args are unchanged for the default encoding.
-        let args: Vec<String> = if self.egraph.proof_state.canon_at_creation {
+        // backend skip the `δ(constructor) ⋈ UF_old` rebuild join. Always-on for
+        // all term-encoding backends, but skipped in PROOF mode.
+        // TODO(wave2): support canon-at-creation in proof mode — the @UF_Sortf
+        // lookup returns @UFPair_Sort; project pair-first + thread pair-second
+        // into the proof tree (mirror rebuilding_rules).
+        let args: Vec<String> = if self.egraph.proof_state.canon_at_creation
+            && !self.egraph.proof_state.proofs_enabled
+        {
             args.iter()
                 .enumerate()
                 .map(|(i, a)| {
@@ -1050,7 +1057,26 @@ impl<'a> ProofInstrumentor<'a> {
 
         let args_with_fv = if func_type.subtype == FunctionSubtype::Constructor {
             let mut a = args.to_vec();
-            a.push(fv.clone());
+            // Canonicalize-at-creation: the constructor hash-cons `(name args)`
+            // returns a possibly-STALE eclass (its output is not kept canonical
+            // when the eclass is later unioned), so the view's representative
+            // column would otherwise reference a non-canonical id. Wrap `fv` in
+            // the same `@UF_Sf` identity-on-miss lookup used for the input args,
+            // so the view row is born canonical in its eclass column too.
+            // Always-on for term-encoding backends, but skipped in PROOF mode.
+            // TODO(wave2): support canon-at-creation in proof mode — the @UF_Sortf
+            // lookup returns @UFPair_Sort; project pair-first + thread pair-second
+            // into the proof tree (mirror rebuilding_rules).
+            if self.egraph.proof_state.canon_at_creation
+                && !self.egraph.proof_state.proofs_enabled
+                && func_type.output.is_eq_sort()
+            {
+                let uf_function_name = self.uf_function_name(func_type.output.name());
+                self.egraph.proof_state.emitted_canon_lookup = true;
+                a.push(format!("({uf_function_name} {fv})"));
+            } else {
+                a.push(fv.clone());
+            }
             a
         } else {
             args.to_vec()

@@ -297,7 +297,26 @@ fn fused_bindings(
             };
             plans.push((idx, plan));
         }
-        let fused = dd_native::FusedDdJoin::build(&plans)?;
+        // Phase-2 transient-UF rebuild (gated `EGGLOG_CANON_AT_CREATION`): a
+        // transient input is a `@UF_Sf` flat index (identity-on-miss, only set
+        // under the flag) read by a `@rebuild_rule`. Keeping its integral at zero
+        // makes the rebuild join compute only `view_all ⋈ δuf`. Empty otherwise,
+        // so user-rule joins and the flag-off path are byte-for-byte unchanged.
+        let mut transient_funcs: HashSet<FunctionId> = HashSet::new();
+        for &pos in &atom_positions {
+            let rule = &rules[pos].1;
+            if rule_category(&rule.name) != "canonicalize" {
+                continue;
+            }
+            for op in &rule.body {
+                if let BodyOp::Atom(a) = op {
+                    if eg.info(a.func).identity_on_miss {
+                        transient_funcs.insert(a.func);
+                    }
+                }
+            }
+        }
+        let fused = dd_native::FusedDdJoin::build(&plans, &transient_funcs)?;
         eg.dd_fused.insert(key.clone(), fused);
     }
 
@@ -431,6 +450,7 @@ fn fused_bindings(
         }
         out[caller_pos] = envs;
     }
+
     let prim_elapsed = t_prim.elapsed().as_nanos() as u64;
     if prof {
         dd_native::PROF_PRIM_NS.fetch_add(prim_elapsed, std::sync::atomic::Ordering::Relaxed);

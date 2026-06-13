@@ -548,11 +548,48 @@ impl Backend for EGraph {
                 };
                 self.add_eq_sort_constructor(&name, inputs, None)
             }
-            // `DefaultVal::Identity` (canonicalize-at-creation, flowlog-only)
-            // is not implemented here; treat it as a plain function table.
-            // Under the canon-at-creation flag the duckdb backend is allowed to
-            // misbehave/reject — only the flowlog backend is validated.
-            DefaultVal::Fail | DefaultVal::Const(_) | DefaultVal::Identity => {
+            // `DefaultVal::Identity` (canonicalize-at-creation): the flat
+            // UF-index `@UF_Sf` — a single-key key->output function whose lookup
+            // must return the key itself on miss (`find_UFold(x)=x` for an id
+            // with no recorded leader). Register it as an ordinary function
+            // (so inserts/merges of recorded leaders behave normally), then set
+            // `identity_on_miss` so `compile::term_sql` wraps reads in
+            // `COALESCE((SELECT c1 …), <key>)`. Validated as exactly a 2-column
+            // (single key -> output) function.
+            DefaultVal::Identity => {
+                assert_eq!(
+                    duck_cols.len(),
+                    2,
+                    "DefaultVal::Identity (`{name}`) expects a single key column \
+                     (2-column key->output function), got {} columns",
+                    duck_cols.len()
+                );
+                // Map the merge mode the same way the Fail/Const arm does; the
+                // term encoder declares `@UF_Sf` with `:merge (ordering-min …)`
+                // (a `Primitive` referencing `ordering-min`) => `MergeMode::Min`.
+                let merge_mode = match &config.merge {
+                    MergeFn::Old | MergeFn::AssertEq => MergeMode::Old,
+                    MergeFn::New => MergeMode::New,
+                    MergeFn::UnionId => MergeMode::Min,
+                    MergeFn::Primitive(ext_id, _) => {
+                        match self.backend_external_funcs.name(*ext_id) {
+                            Some("ordering-min") => MergeMode::Min,
+                            _ => MergeMode::Old,
+                        }
+                    }
+                    MergeFn::Const(_) | MergeFn::Function(_, _) => MergeMode::Old,
+                };
+                let inputs = &duck_cols[..duck_cols.len() - 1];
+                let output = duck_cols[duck_cols.len() - 1];
+                let r = self.add_function(&name, inputs, output, merge_mode);
+                if r.is_ok()
+                    && let Some(info) = self.functions.get_mut(&name)
+                {
+                    info.identity_on_miss = true;
+                }
+                r
+            }
+            DefaultVal::Fail | DefaultVal::Const(_) => {
                 // Either a function with an explicit output, or a
                 // relation if the output is Unit (term encoding's
                 // pattern for view tables — `(function @XView (...)

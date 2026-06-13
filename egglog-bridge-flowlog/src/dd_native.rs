@@ -50,7 +50,7 @@ use std::rc::Rc;
 use anyhow::Result;
 use differential_dataflow::input::InputSession;
 use egglog_backend_trait::FunctionId;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use timely::communication::allocator::thread::Thread;
 use timely::communication::allocator::Allocator;
 use timely::dataflow::operators::probe::Handle as ProbeHandle;
@@ -146,6 +146,20 @@ fn trace_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOWLOG_DD_NATIVE_TRACE").is_some())
+}
+
+/// PROTOTYPE (gated `FLOWLOG_DELTA_REBUILD`, needs the canon flag so the UF funcs
+/// are tagged transient): drive the rebuild join from δUF only. Two sub-steps:
+/// A feeds δview and KEEPS only non-rebuild rules (congruence), DISCARDING the
+/// rebuild's `δview ⋈ uf` output; B feeds δUF and keeps the rebuild's
+/// `view ⋈ δuf` output. So the δview-driven derivative of the rebuild is never
+/// emitted — sound iff new view rows are canonical (the eclass fix), which makes
+/// that term empty. Unlike the old transient path it does NOT zero the UF
+/// arrangement; it just doesn't let δview drive rebuild output.
+fn delta_rebuild_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOWLOG_DELTA_REBUILD").is_some())
 }
 
 // ---------------------------------------------------------------------------
@@ -699,6 +713,12 @@ pub struct FusedDdJoin {
     rules: Vec<FusedRule>,
     /// Current epoch (monotonic; advanced once per [`step`]).
     epoch: u32,
+    /// Phase-2 transient-UF rebuild (gated `EGGLOG_CANON_AT_CREATION`): the set
+    /// of input relations whose integral is kept at ZERO across epochs by a
+    /// feed/step/retract pulse, so a rebuild rule's `view ⋈ @UF_Sf` join computes
+    /// ONLY `view_all ⋈ δuf`. Empty unless the flag is on and a rule in this
+    /// ruleset reads such a relation; then `step` runs the symmetric path.
+    transient_funcs: HashSet<FunctionId>,
 }
 
 /// One rule's lowering inside a [`FusedDdJoin`]: its rule index (for routing
@@ -714,12 +734,20 @@ struct FusedRule {
     /// fan-out is handled at build time via the shared collection, so this is
     /// only used to know which relations this rule reads).
     body_funcs: Vec<FunctionId>,
+    /// Phase-2: true iff this rule's body reads a TRANSIENT relation (a rebuild
+    /// rule reading `@UF_Sf`); captured from the +δuf pulse sub-step.
+    reads_transient: bool,
 }
 
 impl FusedDdJoin {
     /// Build ONE worker + ONE dataflow for the whole ruleset. `plans` pairs each
     /// rule's index with its [`JoinPlan`], in the order they should fire.
-    pub fn build(plans: &[(usize, JoinPlan)]) -> Result<FusedDdJoin> {
+    /// `transient_funcs` (Phase-2): input relations [`step`] pulses to keep at a
+    /// zero integral; empty => the original symmetric `step` (no behavior change).
+    pub fn build(
+        plans: &[(usize, JoinPlan)],
+        transient_funcs: &HashSet<FunctionId>,
+    ) -> Result<FusedDdJoin> {
         let alloc = Allocator::Thread(Thread::default());
         let mut worker = Worker::new(
             WorkerConfig::default(),
@@ -785,9 +813,12 @@ impl FusedDdJoin {
         let funcs_in = funcs.clone();
         // The per-rule metadata `FusedRule` needs (kept here; the closure consumes
         // `rule_plans` for the dataflow build).
-        let rule_meta: Vec<(usize, usize, Vec<FunctionId>)> = rule_plans
+        let rule_meta: Vec<(usize, usize, Vec<FunctionId>, bool)> = rule_plans
             .iter()
-            .map(|rp| (rp.idx, rp.n_vars, rp.body_funcs.clone()))
+            .map(|rp| {
+                let reads_transient = rp.body_funcs.iter().any(|f| transient_funcs.contains(f));
+                (rp.idx, rp.n_vars, rp.body_funcs.clone(), reads_transient)
+            })
             .collect();
 
         // PERF: the per-epoch input delta is already set-semantic — it is built
@@ -905,12 +936,21 @@ impl FusedDdJoin {
         let rules: Vec<FusedRule> = rule_meta
             .into_iter()
             .zip(captures)
-            .map(|((idx, n_vars, body_funcs), captured)| FusedRule {
-                idx,
-                captured,
-                n_vars,
-                body_funcs,
-            })
+            .map(
+                |((idx, n_vars, body_funcs, reads_transient), captured)| FusedRule {
+                    idx,
+                    captured,
+                    n_vars,
+                    body_funcs,
+                    reads_transient,
+                },
+            )
+            .collect();
+
+        let transient_funcs: HashSet<FunctionId> = transient_funcs
+            .iter()
+            .copied()
+            .filter(|f| inputs.contains_key(f))
             .collect();
 
         Ok(FusedDdJoin {
@@ -919,6 +959,7 @@ impl FusedDdJoin {
             probe,
             rules,
             epoch: 0,
+            transient_funcs,
         })
     }
 
@@ -943,6 +984,120 @@ impl FusedDdJoin {
         &mut self,
         deltas: &HashMap<FunctionId, Vec<(Vec<u32>, isize)>>,
     ) -> Result<Vec<Vec<(Vec<u32>, isize)>>> {
+        // The transient-UF rebuild (Phase 2) is a PROVEN-UNSOUND construction for
+        // this rebuild structure — it is off unless explicitly opted in via
+        // `FLOWLOG_ENABLE_PHASE2`, so the canonicalize-at-creation flag keeps its
+        // bit-exact Phase-1 (symmetric) behavior. See the module note below and
+        // `CANON_UF_NOTE.md`: the rebuild work lives in `δview ⋈ uf` (≈12.8k
+        // surviving rewrites at math N=7), NOT `view_all ⋈ δuf` (≈37); dropping
+        // the former collapses the fixpoint (1165/1330 → 86/74). Retained behind
+        // the opt-in for the negative-result record + further investigation.
+        if !self.transient_funcs.is_empty() && delta_rebuild_enabled() {
+            return self.step_delta_rebuild(deltas);
+        }
+        if self.transient_funcs.is_empty() || std::env::var_os("FLOWLOG_ENABLE_PHASE2").is_none() {
+            return self.step_symmetric(deltas);
+        }
+        self.step_transient(deltas)
+    }
+
+    /// PROTOTYPE δUF-driven rebuild (see [`delta_rebuild_enabled`]). Same two
+    /// persistent sub-steps as the measurement, but DROP the δview-driven rebuild
+    /// output: A keeps only non-rebuild rules (congruence), B keeps rebuild rules
+    /// (`view ⋈ δuf`). The UF arrangement is maintained normally (NOT zeroed).
+    fn step_delta_rebuild(
+        &mut self,
+        deltas: &HashMap<FunctionId, Vec<(Vec<u32>, isize)>>,
+    ) -> Result<Vec<Vec<(Vec<u32>, isize)>>> {
+        let prof = prof_enabled();
+        let mut accs: Vec<HashMap<Vec<u32>, isize>> =
+            (0..self.rules.len()).map(|_| HashMap::new()).collect();
+
+        // Sub-step A: feed δview (non-transient). Keep congruence; DROP the
+        // rebuild's δview⋈uf output (the term the eclass fix makes empty).
+        let ta = std::time::Instant::now();
+        for (func, rows) in deltas {
+            if self.transient_funcs.contains(func) {
+                continue;
+            }
+            if let Some(inp) = self.inputs.get_mut(func) {
+                for (row, w) in rows {
+                    inp.update(pack_row(row), *w);
+                }
+            }
+        }
+        for rule in &self.rules {
+            rule.captured.borrow_mut().clear();
+        }
+        let ea = self.epoch + 1;
+        self.drive_to(ea, ta, prof);
+        self.drain_into(&mut accs, |r| !r.reads_transient);
+
+        // Sub-step B: feed δUF (transient). Keep the rebuild's view⋈δuf output.
+        let tb = std::time::Instant::now();
+        for (func, rows) in deltas {
+            if !self.transient_funcs.contains(func) {
+                continue;
+            }
+            if let Some(inp) = self.inputs.get_mut(func) {
+                for (row, w) in rows {
+                    inp.update(pack_row(row), *w);
+                }
+            }
+        }
+        for rule in &self.rules {
+            rule.captured.borrow_mut().clear();
+        }
+        let eb = self.epoch + 2;
+        self.drive_to(eb, tb, prof);
+        self.drain_into(&mut accs, |r| r.reads_transient);
+        self.epoch = eb;
+
+        Ok(accs
+            .into_iter()
+            .map(|acc| acc.into_iter().filter(|(_, w)| *w != 0).collect())
+            .collect())
+    }
+
+    /// Step the SINGLE worker to `epoch`, accounting feed/step time.
+    fn drive_to(&mut self, epoch: u32, t_feed: std::time::Instant, prof: bool) {
+        for inp in self.inputs.values_mut() {
+            inp.advance_to(epoch);
+            inp.flush();
+        }
+        if prof {
+            add_ns(&PROF_FEED_NS, t_feed.elapsed());
+            PROF_STEP_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        let t_step = std::time::Instant::now();
+        let probe = self.probe.clone();
+        self.worker.step_while(|| probe.less_than(&epoch));
+        if prof {
+            add_ns(&PROF_STEP_NS, t_step.elapsed());
+        }
+    }
+
+    /// Drain each rule's capture buffer; keep a rule's output into `accs` only if
+    /// `keep(rule)` (route a sub-step's output to the rules it is meant for).
+    fn drain_into(&self, accs: &mut [HashMap<Vec<u32>, isize>], keep: impl Fn(&FusedRule) -> bool) {
+        for (rule, acc) in self.rules.iter().zip(accs.iter_mut()) {
+            let drained: Vec<(Row, isize)> = rule.captured.borrow_mut().drain(..).collect();
+            if !keep(rule) {
+                continue;
+            }
+            for (row, w) in drained {
+                let key: Vec<u32> = (0..rule.n_vars).map(|i| row[i]).collect();
+                *acc.entry(key).or_insert(0) += w;
+            }
+        }
+    }
+
+    /// The original symmetric incremental join: feed ALL deltas, one sub-step,
+    /// capture every rule. Behavior-identical to the pre-Phase-2 `step`.
+    fn step_symmetric(
+        &mut self,
+        deltas: &HashMap<FunctionId, Vec<(Vec<u32>, isize)>>,
+    ) -> Result<Vec<Vec<(Vec<u32>, isize)>>> {
         let prof = prof_enabled();
         let t_feed = std::time::Instant::now();
         let mut pushed = false;
@@ -963,32 +1118,174 @@ impl FusedDdJoin {
         for rule in &self.rules {
             rule.captured.borrow_mut().clear();
         }
-        for inp in self.inputs.values_mut() {
-            inp.advance_to(next_epoch);
-            inp.flush();
-        }
-        if prof {
-            add_ns(&PROF_FEED_NS, t_feed.elapsed());
-            PROF_STEP_CALLS.fetch_add(1, Ordering::Relaxed);
-        }
-        let t_step = std::time::Instant::now();
-        let probe = self.probe.clone();
-        self.worker.step_while(|| probe.less_than(&next_epoch));
-        if prof {
-            add_ns(&PROF_STEP_NS, t_step.elapsed());
-        }
+        self.drive_to(next_epoch, t_feed, prof);
         self.epoch = next_epoch;
 
-        let mut outs: Vec<Vec<(Vec<u32>, isize)>> = Vec::with_capacity(self.rules.len());
-        for rule in &self.rules {
-            let mut acc: HashMap<Vec<u32>, isize> = HashMap::new();
-            for (row, w) in rule.captured.borrow_mut().drain(..) {
-                let key: Vec<u32> = (0..rule.n_vars).map(|i| row[i]).collect();
-                *acc.entry(key).or_insert(0) += w;
+        if trace_enabled() {
+            let total: usize = self.rules.iter().map(|r| r.captured.borrow().len()).sum();
+            let reb: usize = self
+                .rules
+                .iter()
+                .filter(|r| r.reads_transient)
+                .map(|r| r.captured.borrow().len())
+                .sum();
+            let n_rules = self.rules.len();
+            use egglog_numeric_id::NumericId;
+            let funcs: Vec<u32> = deltas.keys().map(|f| f.rep()).collect();
+            let delta_rows: usize = deltas.values().map(|r| r.len()).sum();
+            #[allow(clippy::disallowed_macros)]
+            {
+                eprintln!(
+                    "[dd_symmetric] n_rules={n_rules} delta_funcs={funcs:?} delta_rows={delta_rows} total_out={total} rebuild_rule_out={reb}"
+                );
             }
-            outs.push(acc.into_iter().filter(|(_, w)| *w != 0).collect());
         }
-        Ok(outs)
+
+        let mut accs: Vec<HashMap<Vec<u32>, isize>> =
+            (0..self.rules.len()).map(|_| HashMap::new()).collect();
+        self.drain_into(&mut accs, |_| true);
+        Ok(accs
+            .into_iter()
+            .map(|acc| acc.into_iter().filter(|(_, w)| *w != 0).collect())
+            .collect())
+    }
+
+    /// Phase-2 transient-UF rebuild — **PROVEN UNSOUND for this rebuild
+    /// structure; off unless `FLOWLOG_ENABLE_PHASE2` is set.** Three sub-steps so
+    /// each rebuild rule sees `view_all ⋈ δuf` while the `δview ⋈ uf_old` term is
+    /// never built: A feeds δview (transient integral = 0 ⇒ rebuild emits nothing;
+    /// capture non-rebuild rules); B pulses +δuf (rebuild gets `view_all ⋈ δuf`;
+    /// capture rebuild rules); C pulses −δuf (reset integral to 0; discard).
+    ///
+    /// ## Why this is unsound (the measured negative result)
+    ///
+    /// The premise (CANON_UF_NOTE.md Phase 2) was that canonical-at-creation makes
+    /// `δview ⋈ uf_old` empty, so it can be dropped. Instrumenting the SYMMETRIC
+    /// (correct) rebuilding worker on math N=7 refutes that: of its 28.6k total
+    /// rebuild+congruence bindings, the rebuild rule alone produces **12,828
+    /// surviving rewrites**, essentially all from `δview ⋈ uf` — because `@UF_Sf`
+    /// is large and near-stable per rebuilding step (δuf = 2–35 rows) while δview
+    /// is the large driver (hundreds–thousands of rows). Canonical-at-creation
+    /// only makes a row canonical AT CREATION; a later union changes a child's
+    /// leader and the EXISTING view row must be repaired — that repair IS the
+    /// `δview ⋈ uf` term. `view_all ⋈ δuf` captures only ~37 of those 12.8k, so
+    /// dropping `δview ⋈ uf` starves the rebuild → no new canonical view rows →
+    /// congruence never fires on a growing view → the fixpoint collapses
+    /// (math N=7 1165/1330 → 86/74; 52 rebuilding steps → 21). The asymmetry the
+    /// design assumed is BACKWARDS: the work is on the δview side, not δuf.
+    fn step_transient(
+        &mut self,
+        deltas: &HashMap<FunctionId, Vec<(Vec<u32>, isize)>>,
+    ) -> Result<Vec<Vec<(Vec<u32>, isize)>>> {
+        let prof = prof_enabled();
+        let trace = trace_enabled();
+
+        let mut view_pushed = false;
+        let mut uf_rows: Vec<(FunctionId, Vec<u32>, isize)> = Vec::new();
+        let t_feed_a = std::time::Instant::now();
+        for (func, rows) in deltas {
+            let Some(inp) = self.inputs.get_mut(func) else {
+                continue;
+            };
+            if self.transient_funcs.contains(func) {
+                for (row, w) in rows {
+                    uf_rows.push((*func, row.clone(), *w));
+                }
+            } else {
+                for (row, w) in rows {
+                    inp.update(pack_row(row), *w);
+                    view_pushed = true;
+                }
+            }
+        }
+        let view_delta_rows: usize = deltas
+            .iter()
+            .filter(|(f, _)| !self.transient_funcs.contains(*f))
+            .map(|(_, r)| r.len())
+            .sum();
+        let uf_pushed = !uf_rows.is_empty();
+        if !view_pushed && !uf_pushed {
+            self.epoch += 1;
+            return Ok(vec![Vec::new(); self.rules.len()]);
+        }
+
+        let mut accs: Vec<HashMap<Vec<u32>, isize>> =
+            (0..self.rules.len()).map(|_| HashMap::new()).collect();
+
+        // A (δview)
+        for rule in &self.rules {
+            rule.captured.borrow_mut().clear();
+        }
+        let ea = self.epoch + 1;
+        self.drive_to(ea, t_feed_a, prof);
+        let a_rebuild: usize = self
+            .rules
+            .iter()
+            .filter(|r| r.reads_transient)
+            .map(|r| r.captured.borrow().len())
+            .sum();
+        let a_congruence: usize = self
+            .rules
+            .iter()
+            .filter(|r| !r.reads_transient)
+            .map(|r| r.captured.borrow().len())
+            .sum();
+        self.drain_into(&mut accs, |r| !r.reads_transient);
+
+        // B (+δuf)
+        for rule in &self.rules {
+            rule.captured.borrow_mut().clear();
+        }
+        let t_feed_b = std::time::Instant::now();
+        for (func, row, w) in &uf_rows {
+            if let Some(inp) = self.inputs.get_mut(func) {
+                inp.update(pack_row(row), *w);
+            }
+        }
+        let eb = self.epoch + 2;
+        self.drive_to(eb, t_feed_b, prof);
+        let b_rebuild: usize = self
+            .rules
+            .iter()
+            .filter(|r| r.reads_transient)
+            .map(|r| r.captured.borrow().len())
+            .sum();
+        self.drain_into(&mut accs, |r| r.reads_transient);
+
+        // C (−δuf): reset integral, discard output.
+        for rule in &self.rules {
+            rule.captured.borrow_mut().clear();
+        }
+        let t_feed_c = std::time::Instant::now();
+        for (func, row, w) in &uf_rows {
+            if let Some(inp) = self.inputs.get_mut(func) {
+                inp.update(pack_row(row), -*w);
+            }
+        }
+        let ec = self.epoch + 3;
+        self.drive_to(ec, t_feed_c, prof);
+        for rule in &self.rules {
+            rule.captured.borrow_mut().clear();
+        }
+        self.epoch = ec;
+
+        if trace {
+            #[allow(clippy::disallowed_macros)]
+            {
+                eprintln!(
+                    "[dd_transient] n_rules={} view_delta_rows={view_delta_rows} uf_delta_rows={} \
+                     congruence_out_A(kept)={a_congruence} \
+                     rebuild_out_A(δview⋈uf,dropped)={a_rebuild} rebuild_out_B(view⋈δuf,kept)={b_rebuild}",
+                    self.rules.len(),
+                    uf_rows.len()
+                );
+            }
+        }
+
+        Ok(accs
+            .into_iter()
+            .map(|acc| acc.into_iter().filter(|(_, w)| *w != 0).collect())
+            .collect())
     }
 }
 

@@ -234,9 +234,14 @@ impl<'a> DuckRuleBuilderOps<'a> {
             Term::Prim(op, args) => {
                 Term::Prim(op, args.into_iter().map(|a| self.inline_term(a)).collect())
             }
-            Term::FuncCall { name, args } => Term::FuncCall {
+            Term::FuncCall {
+                name,
+                args,
+                identity_on_miss,
+            } => Term::FuncCall {
                 name,
                 args: args.into_iter().map(|a| self.inline_term(a)).collect(),
+                identity_on_miss,
             },
         }
     }
@@ -346,6 +351,19 @@ impl<'a> DuckRuleBuilderOps<'a> {
             .functions
             .get(name)
             .map(|info| info.eq_sort_ctor)
+            .unwrap_or(false)
+    }
+
+    /// `true` iff `name` is a function declared with `DefaultVal::Identity`
+    /// (the canonicalize-at-creation flat UF-index `@UF_Sf`). A `lookup`
+    /// against it must resolve a missing key to the key itself; the inlined
+    /// `Term::FuncCall` carries this so `compile::term_sql` emits a
+    /// `COALESCE((SELECT c1 …), <key>)` instead of a bare SELECT (NULL on miss).
+    fn is_identity_on_miss(&self, name: &str) -> bool {
+        self.egraph
+            .functions
+            .get(name)
+            .map(|info| info.identity_on_miss)
             .unwrap_or(false)
     }
 }
@@ -637,8 +655,15 @@ impl<'a> RuleBuilderOps for DuckRuleBuilderOps<'a> {
                 args,
             });
         } else {
-            self.inline_terms
-                .insert(var.id.rep(), Term::FuncCall { name, args });
+            let identity_on_miss = self.is_identity_on_miss(&name);
+            self.inline_terms.insert(
+                var.id.rep(),
+                Term::FuncCall {
+                    name,
+                    args,
+                    identity_on_miss,
+                },
+            );
         }
         QueryEntry::Var(var)
     }

@@ -1519,9 +1519,15 @@ pub enum Term {
     /// a synthetic `(function v () Sort :no-merge)` plus `(set (v)
     /// ...)`, and later references `(v)` are reads of this function.
     /// Cannot be used on relations (no output column).
+    ///
+    /// `identity_on_miss`: when true (the term encoder's flat UF-index
+    /// `@UF_Sf`, declared `DefaultVal::Identity`), a missing key must resolve
+    /// to the (single) key itself rather than NULL — the read compiles to
+    /// `COALESCE((SELECT c1 …), <arg0>)`.
     FuncCall {
         name: String,
         args: Vec<Term>,
+        identity_on_miss: bool,
     },
 }
 
@@ -1631,6 +1637,14 @@ pub struct FunctionInfo {
     /// as `(max, min)` union assertions. Replaces the
     /// `@congruence_rule*` rules emitted by term encoding.
     pub eq_sort_pname: Option<String>,
+    /// True iff this function uses identity-on-miss lookup semantics
+    /// (`DefaultVal::Identity`): a function-table lookup of an absent key
+    /// resolves to the key itself, with no row inserted. Used by the
+    /// canonicalize-at-creation encoding for the flat UF-index `@UF_Sf`.
+    /// Only valid for a single-key function (2 columns) whose key and output
+    /// share a type. A `Term::FuncCall` against such a function compiles to
+    /// `COALESCE((SELECT c1 …), <key>)` in `compile::term_sql`.
+    pub identity_on_miss: bool,
 }
 
 impl FunctionInfo {
@@ -3007,6 +3021,7 @@ impl EGraph {
                 eq_sort_ctor: false,
                 native_uf_udf: None,
                 eq_sort_pname: pname_resolved,
+                identity_on_miss: false,
             },
         )
     }
@@ -3032,6 +3047,7 @@ impl EGraph {
                 eq_sort_ctor: false,
                 native_uf_udf: None,
                 eq_sort_pname: None,
+                identity_on_miss: false,
             },
         )
     }
@@ -3072,6 +3088,7 @@ impl EGraph {
                 eq_sort_ctor: true,
                 native_uf_udf: None,
                 eq_sort_pname: pname_resolved,
+                identity_on_miss: false,
             },
         )?;
         Ok(())

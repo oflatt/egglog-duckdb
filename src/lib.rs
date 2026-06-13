@@ -558,6 +558,9 @@ impl EGraph {
             Box::new(egglog_bridge_flowlog::EGraph::new_interpret());
         let mut eg = Self::with_backend(backend);
 
+        // Canonicalize-at-creation is always-on for all term-encoding backends
+        // (set in `EncodingState::new`); no per-backend override is needed here.
+
         // Term encoding requires a separate bridge-backed typechecker EGraph for
         // re-typechecking after the encoder runs. Mirror the DuckDB/Feldera setup.
         let typechecker = EGraph::default().with_term_encoding_enabled();
@@ -949,8 +952,12 @@ impl EGraph {
         // declared with identity-on-miss lookup semantics so the encoder can
         // emit `find_UFold` lookups (lookup-or-self against the frozen UF_old
         // table) at constructor-creation time. Detected by name against the
-        // encoder's `uf_function` map. Default off => no function is Identity.
+        // encoder's `uf_function` map. Always-on for term-encoding backends, but
+        // skipped in PROOF mode (where the encoder emits no `find_UFold` lookup,
+        // so the Identity default would be inert at best and a behavior change at
+        // worst — proof mode stays baseline).
         let is_uf_index = self.proof_state.canon_at_creation
+            && !self.proof_state.proofs_enabled
             && self
                 .proof_state
                 .uf_function

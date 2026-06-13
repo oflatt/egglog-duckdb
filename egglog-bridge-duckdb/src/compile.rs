@@ -240,7 +240,11 @@ fn lift_term(
     functions: &HashMap<String, FunctionInfo>,
 ) -> Term {
     match term {
-        Term::FuncCall { name, args } => {
+        Term::FuncCall {
+            name,
+            args,
+            identity_on_miss,
+        } => {
             let lifted_args: Vec<Term> = args
                 .into_iter()
                 .map(|a| lift_term(a, rule_name, counter, out, functions))
@@ -262,6 +266,7 @@ fn lift_term(
                 Term::FuncCall {
                     name,
                     args: lifted_args,
+                    identity_on_miss,
                 }
             }
         }
@@ -674,10 +679,16 @@ fn compile_fused_variant(
     for action in &rule.actions {
         match action {
             Action::LetCtor { var, name, args } => {
-                let body_resolvable = args.iter().all(|t| match t {
-                    Term::Var(v) => binding.contains_key(v),
-                    _ => true,
-                });
+                // Hash-cons only when every variable transitively referenced by
+                // every arg is resolvable against the BODY binding (`term_sql`
+                // below uses `&binding`, not `mat_binding`). A bare `Term::Var`
+                // that names an EARLIER LetCtor's result lives in `mat_binding`
+                // only, so it is not body-resolvable — and neither is a
+                // `Term::FuncCall`/`Term::Prim` that wraps such a var (e.g. the
+                // canonicalize-at-creation `(@UF_Sf <prev-ctor-id>)` lookup).
+                // Recurse with `term_vars_all_bound` so a wrapped LetCtor var is
+                // caught; otherwise `term_sql` would hit it as an unbound var.
+                let body_resolvable = args.iter().all(|t| term_vars_all_bound(t, &binding));
                 // Which table to hash-cons against. In non-proof mode
                 // we use the canonicalized `@<name>View`: its id column
                 // is rewritten to the e-class leader by rebuild, so
@@ -1355,7 +1366,11 @@ fn term_sql(t: &Term, binding: &HashMap<String, String>, rule_name: &str) -> Res
                 .collect::<Result<_>>()?;
             prim_sql(op, &arg_sqls, rule_name)
         }
-        Term::FuncCall { name, args } => {
+        Term::FuncCall {
+            name,
+            args,
+            identity_on_miss,
+        } => {
             let arg_sqls: Vec<String> = args
                 .iter()
                 .map(|a| term_sql(a, binding, rule_name))
@@ -1371,10 +1386,22 @@ fn term_sql(t: &Term, binding: &HashMap<String, String>, rule_name: &str) -> Res
                     .collect();
                 format!(" WHERE {}", conjs.join(" AND "))
             };
-            Ok(format!(
-                "(SELECT c{out_col} FROM {}{where_clause} LIMIT 1)",
-                q(name)
-            ))
+            let select = format!("(SELECT c{out_col} FROM {}{where_clause} LIMIT 1)", q(name));
+            if *identity_on_miss {
+                // Identity-on-miss ("lookup-or-self"): a missing key resolves to
+                // the (single) key itself. The flat UF-index `@UF_Sf` is a 2-col
+                // key->output function, so the lone key is `arg_sqls[0]`.
+                if arg_sqls.len() != 1 {
+                    return Err(anyhow!(
+                        "rule {rule_name}: identity-on-miss function `{name}` expects a \
+                         single key, got {} args",
+                        arg_sqls.len()
+                    ));
+                }
+                Ok(format!("COALESCE({select}, {})", arg_sqls[0]))
+            } else {
+                Ok(select)
+            }
         }
     }
 }

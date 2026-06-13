@@ -568,6 +568,7 @@ fn lookup_or_create(
 ) -> Value {
     let info = eg.info(func);
     let inputs_len = info.arity.saturating_sub(1);
+    let identity_on_miss = info.identity_on_miss;
     // Lazily populate the key->output index for this function from the mirror.
     let idx = index.entry(func).or_insert_with(|| {
         let mut m: HashMap<Box<[u32]>, u32> = HashMap::new();
@@ -584,6 +585,14 @@ fn lookup_or_create(
     let k: Box<[u32]> = key.iter().map(|v| v.rep()).collect();
     if let Some(&out) = idx.get(&k) {
         return Value::new(out);
+    }
+    // Identity-on-miss ("lookup-or-self"): a missing key resolves to the key
+    // itself and inserts no row. Used by the canonicalize-at-creation encoding
+    // for the flat UF-index `@UF_Sf`, where this is exactly `find_UFold(x)=x`
+    // for an id with no recorded leader.
+    if identity_on_miss {
+        debug_assert_eq!(key.len(), 1, "identity-on-miss expects a single key column");
+        return key[0];
     }
     // Not present: allocate a fresh id, insert the row, and update the index.
     let id = eg.fresh_id_internal();

@@ -173,6 +173,12 @@ struct RelationInfo {
     /// is resolved per this mode; for a relation it is [`MergeMode::Relation`]
     /// (whole row is the key, nothing to resolve).
     merge: MergeMode,
+    /// True iff this function uses identity-on-miss lookup semantics
+    /// (`DefaultVal::Identity`): an action-position lookup of an absent key
+    /// resolves to the key itself, with no row inserted. Used by the
+    /// canonicalize-at-creation encoding for the flat UF-index `@UF_Sf`.
+    /// Only valid for a single-key function whose key and output share a type.
+    identity_on_miss: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -661,12 +667,25 @@ impl Backend for EGraph {
                 MergeFn::Function(_, _) | MergeFn::Const(_) => MergeMode::Old,
             }
         };
+        // Identity-on-miss ("lookup-or-self"): an action-position lookup of an
+        // absent key resolves to the key itself, inserting no row. Only valid for
+        // a single-key function (2 columns) whose key and output share a type —
+        // the term encoder's flat UF-index `@UF_Sf`.
+        let identity_on_miss = matches!(config.default, egglog_backend_trait::DefaultVal::Identity);
+        if identity_on_miss {
+            assert_eq!(
+                arity, 2,
+                "DefaultVal::Identity (`{}`) expects a single key column (2-column key->output function)",
+                config.name
+            );
+        }
         self.relations.push(RelationInfo {
             name: config.name,
             arity,
             schema: config.schema.clone(),
             has_output,
             merge,
+            identity_on_miss,
         });
         self.mirror.insert(id, std::rc::Rc::new(HashSet::new()));
         self.invalidate_circuit();
