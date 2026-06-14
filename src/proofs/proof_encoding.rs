@@ -934,8 +934,10 @@ impl<'a> ProofInstrumentor<'a> {
             }
             ResolvedAction::Set(_span, h, generic_exprs, generic_expr) => {
                 let mut exprs = vec![];
+                let mut exprs_fresh = vec![];
                 for e in generic_exprs.iter().chain(std::iter::once(generic_expr)) {
                     exprs.push(self.instrument_action_expr(e, &mut res, justification));
+                    exprs_fresh.push(self.expr_is_fresh_constructor(e));
                 }
 
                 let ResolvedCall::Func(func_type) = h else {
@@ -944,7 +946,8 @@ impl<'a> ProofInstrumentor<'a> {
                     );
                 };
 
-                let (add_code, _fv) = self.add_term_and_view(func_type, &exprs, justification);
+                let (add_code, _fv) =
+                    self.add_term_and_view(func_type, &exprs, &exprs_fresh, justification);
                 res.extend(add_code);
             }
             ResolvedAction::Change(_span, change, h, generic_exprs) => {
@@ -1002,6 +1005,11 @@ impl<'a> ProofInstrumentor<'a> {
         &mut self,
         func_type: &FuncType,
         args: &[String],
+        // Per-arg flag: true if the arg is a constructor created in this same
+        // action and so is already its own canonical leader (no `@UF_Sortf`
+        // index entry exists yet — looking it up would fail). Such args are
+        // skipped by proof-mode canon-at-creation. Length matches `args`.
+        args_fresh: &[bool],
         justification: &Justification,
     ) -> (Vec<String>, String) {
         // A fresh variable for the new term.
@@ -1013,13 +1021,33 @@ impl<'a> ProofInstrumentor<'a> {
         // index `@UF_Sf` (frozen at the last completed rebuild). The resulting
         // row is then canonical w.r.t. UF_old, which is what lets the FlowLog DD
         // backend skip the `δ(constructor) ⋈ UF_old` rebuild join. Always-on for
-        // all term-encoding backends, but skipped in PROOF mode.
-        // TODO(wave2): support canon-at-creation in proof mode — the @UF_Sortf
-        // lookup returns @UFPair_Sort; project pair-first + thread pair-second
-        // into the proof tree (mirror rebuilding_rules).
-        let args: Vec<String> = if self.egraph.proof_state.canon_at_creation
-            && !self.egraph.proof_state.proofs_enabled
-        {
+        // all term-encoding backends.
+        //
+        // PROOF mode (Wave 2): the `@UF_Sortf` lookup returns an `@UFPair_Sort`
+        // `(pair leader proof)`, not a bare sort, so we project `(pair-first …)`
+        // for the leader value AND collect `(pair-second …)` as the proof that
+        // `argi = leaderi`, to thread congruence into the term proof below.
+        // `canon_arg_proofs[i]` is `Some(proof_var)` when arg i was canonicalized.
+        //
+        // In proof mode we KEEP `fv` bound to the original-args term (so the
+        // Rule/Fiat proof justifies the term the rule actually built); only the
+        // VIEW's input columns are rewritten to leaders, and the view's
+        // representative-equals-term proof is derived from `fv`'s proof by
+        // congruence (mirror `rebuilding_rules`). No separate canonical term is
+        // materialized — the constructor table stays row-identical to reference.
+        let proofs_enabled = self.egraph.proof_state.proofs_enabled;
+        // In proof mode we only canonicalize CONSTRUCTOR creations: those are
+        // the rows the FlowLog rebuild-join targets, and they carry the
+        // eclass/UF machinery (term_proof, self-row, function index) that the
+        // proof threading below relies on. Custom-function views in proof mode
+        // keep their original args and are canonicalized later by the rebuild
+        // rule (sound, just unoptimized).
+        let do_canon = self.egraph.proof_state.canon_at_creation
+            && (!proofs_enabled || func_type.subtype == FunctionSubtype::Constructor);
+        let mut canon_arg_proofs: Vec<Option<String>> = vec![None; args.len()];
+        // `canon_args` are the leader-projected args (used for the view in proof
+        // mode and for everything in term mode).
+        let canon_args: Vec<String> = if do_canon {
             args.iter()
                 .enumerate()
                 .map(|(i, a)| {
@@ -1032,12 +1060,29 @@ impl<'a> ProofInstrumentor<'a> {
                         Some(&func_type.output)
                     };
                     match sort {
-                        Some(s) if s.is_eq_sort() => {
+                        // Proof mode: a freshly-created constructor arg is
+                        // already its own leader and has no index entry yet, so
+                        // skip the lookup (leader == arg, reflexive — no congr).
+                        Some(s)
+                            if s.is_eq_sort()
+                                && !(proofs_enabled && args_fresh.get(i).copied().unwrap_or(false)) =>
+                        {
                             let uf_function_name = self.uf_function_name(s.name());
                             // RHS function-table lookup => rule needs
                             // :unsafe-seminaive (set in instrument_rule).
                             self.egraph.proof_state.emitted_canon_lookup = true;
-                            format!("({uf_function_name} {a})")
+                            if proofs_enabled {
+                                // Bind the (leader, proof) pair once; project both.
+                                let pair_var = self.fresh_var();
+                                res.push(format!(
+                                    "(let {pair_var} ({uf_function_name} {a}))"
+                                ));
+                                canon_arg_proofs[i] =
+                                    Some(format!("(pair-second {pair_var})"));
+                                format!("(pair-first {pair_var})")
+                            } else {
+                                format!("({uf_function_name} {a})")
+                            }
                         }
                         _ => a.clone(),
                     }
@@ -1046,29 +1091,49 @@ impl<'a> ProofInstrumentor<'a> {
         } else {
             args.to_vec()
         };
-        let args = args.as_slice();
+        // In term mode `fv` is bound directly to the canonical term. In proof
+        // mode `fv` is the ORIGINAL-args term (the one the rule literally
+        // produced, so its Rule/Fiat proof is checkable); the canonical args are
+        // used only for the VIEW row, and the view's congruence proof is built
+        // below from the per-arg `pair-second` proofs (mirror `rebuilding_rules`).
+        let any_arg_canonicalized = canon_arg_proofs.iter().any(|p| p.is_some());
+        // `eclass_value` is the value used for the eclass/representative column
+        // and as the returned expression value: in proof mode the canonical
+        // term so callers thread canonicalization, in term mode `fv` itself.
+        // The single materialized constructor term. In term mode this is built
+        // directly from the canonical args (so the constructor row is born
+        // canonical). In proof mode we keep it on the ORIGINAL args — `fv` is a
+        // fresh eclass (its own UF leader), so it is already canonical w.r.t.
+        // UF_old, and crucially the constructor table then has exactly the same
+        // rows as term/reference mode (no duplicate canonical row). Only the
+        // VIEW is rewritten to canonical input columns, with a congruence proof.
+        let term_args: Vec<String> = if proofs_enabled {
+            args.to_vec()
+        } else {
+            canon_args.clone()
+        };
+        let term_args = term_args.as_slice();
 
         // TODO might be able to get rid of this intermediate variable in encoding
         res.push(format!(
             "(let {fv} ({} {}))",
             func_type.name,
-            ListDisplay(args, " ")
+            ListDisplay(term_args, " ")
         ));
 
         let args_with_fv = if func_type.subtype == FunctionSubtype::Constructor {
-            let mut a = args.to_vec();
-            // Canonicalize-at-creation: the constructor hash-cons `(name args)`
-            // returns a possibly-STALE eclass (its output is not kept canonical
-            // when the eclass is later unioned), so the view's representative
-            // column would otherwise reference a non-canonical id. Wrap `fv` in
-            // the same `@UF_Sf` identity-on-miss lookup used for the input args,
-            // so the view row is born canonical in its eclass column too.
-            // Always-on for term-encoding backends, but skipped in PROOF mode.
-            // TODO(wave2): support canon-at-creation in proof mode — the @UF_Sortf
-            // lookup returns @UFPair_Sort; project pair-first + thread pair-second
-            // into the proof tree (mirror rebuilding_rules).
+            // Eclass (representative) column. Term mode wraps `fv` in the
+            // `@UF_Sf` identity-on-miss lookup so the row is born canonical.
+            // Proof mode uses `fv` directly: a freshly created eclass is its own
+            // leader, so it's already canonical. The view's INPUT columns use
+            // `canon_args` (computed above), making the view born-canonical.
+            let mut a = if proofs_enabled {
+                canon_args.clone()
+            } else {
+                term_args.to_vec()
+            };
             if self.egraph.proof_state.canon_at_creation
-                && !self.egraph.proof_state.proofs_enabled
+                && !proofs_enabled
                 && func_type.output.is_eq_sort()
             {
                 let uf_function_name = self.uf_function_name(func_type.output.name());
@@ -1079,14 +1144,34 @@ impl<'a> ProofInstrumentor<'a> {
             }
             a
         } else {
-            args.to_vec()
+            // For custom functions the trailing arg is the output; in proof mode
+            // canon is disabled (canon_args == args), so this is the orig args.
+            if proofs_enabled {
+                canon_args.clone()
+            } else {
+                term_args.to_vec()
+            }
         };
 
-        let (proof_str, view_proof_var) = if self.egraph.proof_state.proofs_enabled {
-            let to_ast = self.fname_to_ast_name(&func_type.name);
-            let rule_constructor = &self.proof_names().rule_constructor;
-            let fiat_constructor = &self.proof_names().fiat_constructor;
+        // Proof building.
+        //   proof_str      — code binding all proof vars
+        //   view_proof_var — proof that the view's representative equals the view
+        //                    term `(name canon_args)`. Without canon this is the
+        //                    Rule/Fiat proof `fv = fv`; with canon it is the
+        //                    congruence proof `fv = (name canon_args)` (the view
+        //                    representative is `fv`, the input columns are
+        //                    canonical, so this is exactly the view proposition).
+        // `self_proof_var` proves `fv = fv` (the term's existence proof), used
+        // for the term_proof and the self-UF-row. `view_proof_var` proves the
+        // view proposition `fv = (name canon_args)` (= `self_proof_var` when no
+        // arg was canonicalized).
+        let (proof_str, view_proof_var, self_proof_var) = if self.egraph.proof_state.proofs_enabled {
+            let to_ast = self.fname_to_ast_name(&func_type.name).to_string();
+            let rule_constructor = self.proof_names().rule_constructor.clone();
+            let fiat_constructor = self.proof_names().fiat_constructor.clone();
 
+            // `proof` justifies the term `fv` the rule literally produced
+            // (proves `fv = fv` where `fv = (name orig_args)`).
             let proof = match justification {
                 Justification::Rule(rule_name, rule_proof) => {
                     format!(
@@ -1097,42 +1182,68 @@ impl<'a> ProofInstrumentor<'a> {
                     format!("({fiat_constructor} ({to_ast} {fv}) ({to_ast} {fv}))",)
                 }
                 Justification::Merge(fn_name, p1, p2) => {
-                    let merge_constructor = &self.proof_names().merge_fn_constructor;
+                    let merge_constructor = self.proof_names().merge_fn_constructor.clone();
                     format!("({merge_constructor} \"{fn_name}\" {p1} {p2} ({to_ast} {fv}))",)
                 }
                 Justification::Proof(existing_proof) => existing_proof.clone(),
             };
 
             let proof_var = self.fresh_var();
-            // add a proof for the constructor if needed
-            let term_proof = if func_type.subtype == FunctionSubtype::Constructor {
+            let mut proof_code = format!("(let {proof_var} {proof})");
+
+            // term_proof for `fv` (its self-equality / existence proof).
+            if func_type.subtype == FunctionSubtype::Constructor {
                 let term_proof_constructor = self.term_proof_name(func_type.output.name());
-                format!("(set ({term_proof_constructor} {fv}) {proof_var})")
+                proof_code.push_str(&format!(
+                    "\n(set ({term_proof_constructor} {fv}) {proof_var})"
+                ));
+            }
+
+            // Derive the view proof. `proof_var` proves `fv = (name orig_args)`.
+            // Apply congruence for each canonicalized eq-sort child (rewriting
+            // `orig_arg_i` to `leader_i` via its `pair-second` proof) to obtain
+            // `fv = (name canon_args)`, which is exactly the proposition the view
+            // row `(View canon_args fv)` asserts.
+            let view_proof_var = if any_arg_canonicalized {
+                let congr_constructor = self.proof_names().congr_constructor.clone();
+                let mut current = proof_var.clone();
+                for (i, child_pf) in canon_arg_proofs.iter().enumerate() {
+                    if let Some(child_pf) = child_pf {
+                        let next = self.fresh_var();
+                        proof_code.push_str(&format!(
+                            "\n(let {next} ({congr_constructor} {current} {i} {child_pf}))"
+                        ));
+                        current = next;
+                    }
+                }
+                current
             } else {
-                "".to_string()
+                proof_var.clone()
             };
 
-            (
-                format!(
-                    "(let {proof_var} {proof})
-                     {term_proof}"
-                ),
-                proof_var,
-            )
+            (proof_code, view_proof_var, proof_var)
         } else {
-            ("".to_string(), "()".to_string())
+            ("".to_string(), "()".to_string(), "()".to_string())
         };
 
         res.push(proof_str);
         res.push(self.update_view(&func_type.name, &args_with_fv, &view_proof_var));
 
-        // add to uf table to initialize eclass for constructors
+        // add to uf table to initialize eclass for constructors. The self-row
+        // asserts `fv = fv`, so it uses `self_proof_var`, not the
+        // (possibly congruence-derived) view proof.
+        //
+        // No `@UF_Sortf` index seed is needed: a freshly-created constructor is
+        // its own canonical leader, and any later same-action use of `fv` is
+        // detected as "fresh" (see `args_fresh`) and skips the canon lookup.
+        // The `uf_function_index` ruleset later mirrors the self-row into the
+        // index during the rebuild schedule.
         if func_type.subtype == FunctionSubtype::Constructor {
             res.push(self.union(
                 func_type.output.name(),
                 &fv,
                 &fv,
-                &Justification::Proof(view_proof_var),
+                &Justification::Proof(self_proof_var),
             ));
         }
 
@@ -1148,6 +1259,23 @@ impl<'a> ProofInstrumentor<'a> {
         (query, pf_var)
     }
 
+    /// Whether `expr` evaluates (in an action) to a constructor term created in
+    /// THIS action — i.e. a `ResolvedCall::Func` constructor that is not a
+    /// global. Such a term is freshly hash-consed, is its own canonical UF
+    /// leader, and has no `@UF_Sortf` index entry yet (the index ruleset only
+    /// runs in the rebuild schedule), so proof-mode canon-at-creation must skip
+    /// looking it up. Globals/vars/literals/primitives are NOT fresh: they refer
+    /// to terms from a prior cycle that do have an index entry.
+    fn expr_is_fresh_constructor(&self, expr: &ResolvedExpr) -> bool {
+        match expr {
+            ResolvedExpr::Call(_, ResolvedCall::Func(func_type), _) => {
+                func_type.subtype == FunctionSubtype::Constructor
+                    && !self.egraph.type_info.is_global(&func_type.name)
+            }
+            _ => false,
+        }
+    }
+
     // Add to view and term tables, returning a variable for the created term.
     fn instrument_action_expr(
         &mut self,
@@ -1158,10 +1286,21 @@ impl<'a> ProofInstrumentor<'a> {
         match expr {
             ResolvedExpr::Lit(_, lit) => format!("{lit}"),
             ResolvedExpr::Var(_, resolved_var) => resolved_var.name.clone(),
-            ResolvedExpr::Call(_, resolved_call, args) => {
-                let args = args
+            ResolvedExpr::Call(_, resolved_call, arg_exprs) => {
+                let args = arg_exprs
                     .iter()
                     .map(|arg| self.instrument_action_expr(arg, res, proof))
+                    .collect::<Vec<_>>();
+                // An arg is "fresh" (already its own canonical leader) iff it is
+                // itself a constructor call created in this same action. Such
+                // args have no `@UF_Sortf` index entry yet (the index ruleset
+                // only runs in the rebuild schedule), so canon-at-creation must
+                // NOT look them up — they need no canonicalization. Body-bound
+                // vars / globals / literals were created in a prior cycle and DO
+                // have an index entry.
+                let args_fresh = arg_exprs
+                    .iter()
+                    .map(|arg| self.expr_is_fresh_constructor(arg))
                     .collect::<Vec<_>>();
                 match resolved_call {
                     ResolvedCall::Func(func_type) => {
@@ -1175,7 +1314,8 @@ impl<'a> ProofInstrumentor<'a> {
                                 "Found a function lookup in actions, should have been prevented by typechecking"
                             );
                         }
-                        let (add_code, fv) = self.add_term_and_view(func_type, &args, proof);
+                        let (add_code, fv) =
+                            self.add_term_and_view(func_type, &args, &args_fresh, proof);
                         res.extend(add_code);
 
                         fv
