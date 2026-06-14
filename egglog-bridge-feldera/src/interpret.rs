@@ -344,8 +344,29 @@ fn fused_bindings(
             };
             plans.push((*idx, plan));
         }
+        // δuf-driven rebuild (`FELDERA_DELTA_REBUILD`): the TRANSIENT body funcs
+        // are the identity-on-miss `@UF_Sf` flat-index funcs (the canonicalize-
+        // at-creation encoding's frozen UF index), collected ONLY from the
+        // CANONICALIZE (`@rebuild_rule`) rules' bodies — exactly flowlog's
+        // `rule_category(..) == "canonicalize"` gate. Restricting to rebuild
+        // rules is load-bearing: a USER rewrite rule's instrumented body ALSO
+        // reads `@UF_Sf` (canonicalize-at-creation lookups), so scanning every
+        // rule would wrongly tag the user ruleset transient and split it (its
+        // δview-driven matches would be dropped). The rebuild join `view ⋈
+        // @UF_Sf` is driven from δuf alone (sub-step B); the δview⋈uf derivative
+        // is dropped (empty by the eclass fix). Always computed; `FusedJoin`
+        // ignores it unless the flag is set.
+        let transient_funcs: HashSet<FunctionId> = atom_rules
+            .iter()
+            .filter(|(_, rule)| rule.name.contains("rebuild_rule"))
+            .flat_map(|(_, rule)| rule.body.iter())
+            .filter_map(|op| match op {
+                BodyOp::Atom(a) if eg.info(a.func).identity_on_miss => Some(a.func),
+                _ => None,
+            })
+            .collect();
         let engine = eg.prim_engine();
-        let fj = dbsp_join::FusedJoin::build(&plans, &engine)?;
+        let fj = dbsp_join::FusedJoin::build(&plans, &engine, &transient_funcs)?;
         eg.fused.insert(key.clone(), fj);
     }
 
