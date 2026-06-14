@@ -452,6 +452,105 @@ pub(crate) fn compile_rule(
     })
 }
 
+/// Detect a relational rebuild rule and, if so, return the body
+/// index of its single VIEW atom (the eq-sort function view being
+/// canonicalized).
+///
+/// A rebuild rule (ruleset `rebuilding<N>`, name `@rebuild_rule<N>`)
+/// has a body of exactly one VIEW Func atom plus one flat-UF-index
+/// lookup (`@UF_Sf`, `identity_on_miss=true`) per eq-sort column.
+/// The VIEW atom is the unique non-`identity_on_miss` Func atom. We
+/// require that shape so the delta decomposition only ever applies
+/// to the rules it was derived for.
+///
+/// Returns `Some(view_idx)` only when the `DUCK_DELTA_REBUILD` flag
+/// is set; otherwise `None` so the default path is byte-identical.
+fn delta_rebuild_view_idx(
+    rule: &Rule,
+    func_atom_indices: &[usize],
+    functions: &HashMap<String, FunctionInfo>,
+) -> Option<usize> {
+    if std::env::var("DUCK_DELTA_REBUILD").is_err() {
+        return None;
+    }
+    if !rule
+        .name
+        .trim_start_matches('@')
+        .starts_with("rebuild_rule")
+    {
+        return None;
+    }
+    // Among the (non-demoted) Func atoms, exactly one must be a
+    // non-identity_on_miss VIEW atom and the rest identity_on_miss
+    // UF lookups.
+    let mut view_idx: Option<usize> = None;
+    for &i in func_atom_indices {
+        let Atom::Func { name, .. } = &rule.body[i] else {
+            continue;
+        };
+        let ident = functions
+            .get(name)
+            .map(|info| info.identity_on_miss)
+            .unwrap_or(false);
+        if !ident {
+            if view_idx.is_some() {
+                // More than one VIEW atom — not the expected shape.
+                return None;
+            }
+            view_idx = Some(i);
+        }
+    }
+    view_idx
+}
+
+/// Like `ts_predicates_for_focus`, but for the delta-rebuild
+/// decomposition of a δUF focus branch: the VIEW atom (`view_idx`)
+/// is treated as "old" up to the CURRENT epoch (`ts < ?2`) rather
+/// than the rule's last-run watermark (`ts < ?1`).
+///
+/// Rationale: Δ(view⋈uf) = [δview × uf_old ≡ ∅] + [view_all × δuf].
+/// The dedicated δview branch is provably empty under the always-on
+/// eclass-fix (rows are born canonical w.r.t. the pre-iteration UF),
+/// so it is dropped; to still catch view rows born THIS epoch whose
+/// child was re-pointed by a union that ALSO landed this epoch, the
+/// δUF foci must join against ALL view rows (incl. just-integrated
+/// δview), i.e. `view.ts < ?2`. The UF-atom frontier predicates are
+/// unchanged.
+fn ts_predicates_for_delta_uf_focus(
+    atoms: &[Atom],
+    focus_idx: usize,
+    view_idx: usize,
+    demote: &[bool],
+) -> Vec<String> {
+    let mut parts = Vec::new();
+    for (i, atom) in atoms.iter().enumerate() {
+        if !matches!(atom, Atom::Func { .. }) {
+            continue;
+        }
+        if demote.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        if i == view_idx {
+            // Mark the new view rows as old for the δuf join.
+            parts.push(format!("t{i}.ts < ?2"));
+            continue;
+        }
+        match i.cmp(&focus_idx) {
+            std::cmp::Ordering::Equal => {
+                parts.push(format!("t{i}.ts >= ?1"));
+                parts.push(format!("t{i}.ts < ?2"));
+            }
+            std::cmp::Ordering::Less => {
+                parts.push(format!("t{i}.ts < ?1"));
+            }
+            std::cmp::Ordering::Greater => {
+                parts.push(format!("t{i}.ts < ?2"));
+            }
+        }
+    }
+    parts
+}
+
 /// Compile all seminaive variants of `rule` into a single
 /// `CompiledVariant` by UNION-ALL-ing the per-focus branches.
 ///
@@ -584,6 +683,26 @@ fn compile_fused_variant(
         vec![format_where(&parts)]
     } else if func_atom_indices.is_empty() {
         vec![where_clause.clone()]
+    } else if let Some(view_idx) = delta_rebuild_view_idx(rule, func_atom_indices, functions) {
+        // DUCK_DELTA_REBUILD: relational rebuild rule. Decompose
+        // Δ(view⋈uf) = [δview × uf_old ≡ ∅, DROP] + [view_all × δuf,
+        // KEEP]. So: (1) drop the VIEW-FOCUS branch, (2) in the δUF
+        // foci, widen the VIEW atom's frontier from `< ?1` to `< ?2`
+        // so the join sees ALL view rows (incl. ones integrated this
+        // epoch). The rebuild action is idempotent (Insert canonical
+        // + Delete stale), so a row matching multiple δUF foci is
+        // harmless — no dedup needed.
+        func_atom_indices
+            .iter()
+            .filter(|&&focus| focus != view_idx)
+            .map(|&focus| {
+                let mut parts = base_where_parts.clone();
+                parts.extend(ts_predicates_for_delta_uf_focus(
+                    &rule.body, focus, view_idx, demote,
+                ));
+                format_where(&parts)
+            })
+            .collect()
     } else {
         func_atom_indices
             .iter()
