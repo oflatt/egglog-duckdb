@@ -57,6 +57,7 @@ mod external_func;
 pub mod interpret;
 mod rule_builder;
 pub mod subprocess;
+mod uf;
 
 use base_values::base_values_as_pool_mut;
 use compile::{pack_row, row_col, unpack_row, BodyOp, HeadOp, MergeMode, Row, RuleIr, Slot};
@@ -201,6 +202,35 @@ pub struct EGraph {
     /// Per-ruleset, per-function last-fed row snapshot `Rc`, for computing the
     /// signed delta fed into the FUSED join's shared inputs (the fused `fed`).
     pub(crate) dd_fused_fed: HashMap<Vec<usize>, HashMap<FunctionId, std::rc::Rc<HashSet<Row>>>>,
+    /// `--native-uf --flowlog`: drive PR #782's UF-backed-table encoding through
+    /// FlowLog's fast HOST-PASS rebuild (instead of the onchange-driven rebuild
+    /// rules that would run on the DD dataflow and regress the ~2.1× win).
+    ///
+    /// The #782 term encoder emits a UF-backed `:impl displaced-union-find`
+    /// function `@UF_Sf (S) S` per eq-sort (via [`Backend::add_uf_function`])
+    /// plus a `@UFChange_S` onchange relation and `@rebuild_rule*` /
+    /// `@uf_change_drain_rule*` maintenance rules. When this is on we honour the
+    /// `add_uf_function` request (a real `UfTable` + find-or-self canon-prim),
+    /// route union writes `(set (@UF_Sf lhs) rhs)` into the in-core UF, suppress
+    /// the maintenance rules by name, and re-canonicalize view rows host-side.
+    /// Must be enabled (via [`EGraph::enable_native_uf`]) before any UF function
+    /// is registered. Pure backend interception — the encoder is unchanged.
+    pub(crate) native_uf_enabled: bool,
+    /// Per-eq-sort native union-find, keyed by the [`FunctionId`] of the
+    /// `@UF_Sf` UF-backed function (the [`Backend::add_uf_function`] handle).
+    /// Reads (`find_ro`) and union ingestion both go through this. Single-
+    /// threaded host, so a plain `UfTable` (no `Arc<Mutex>`) suffices.
+    pub(crate) native_ufs: HashMap<FunctionId, uf::UfTable>,
+    /// Maps the `@canon_S` find-or-self primitive's [`ExternalFunctionId`]
+    /// (returned by [`Backend::add_uf_function`] and bound by the frontend to
+    /// the canon-prim name) to its UF function id. A `BodyOp::Prim` / `HeadOp::
+    /// Call` on this id is answered host-side from the matching [`native_ufs`]
+    /// entry (`find_ro`) instead of through the `Database` external func.
+    pub(crate) native_uf_canon_prim: HashMap<ExternalFunctionId, FunctionId>,
+    /// Every id ever ingested into a native UF (per `@UF_Sf` function), so the
+    /// iteration-boundary drain can bound its displaced-set bookkeeping without
+    /// exposing the `UfTable`'s internal node map.
+    pub(crate) native_uf_members: HashMap<FunctionId, HashSet<u32>>,
 }
 
 impl Default for EGraph {
@@ -262,7 +292,48 @@ impl EGraph {
             dd_native_fed: HashMap::new(),
             dd_fused: HashMap::new(),
             dd_fused_fed: HashMap::new(),
+            native_uf_enabled: false,
+            native_ufs: HashMap::new(),
+            native_uf_canon_prim: HashMap::new(),
+            native_uf_members: HashMap::new(),
         }
+    }
+
+    /// Turn on the native union-find path (`--native-uf --flowlog`). Must be
+    /// called before any UF function is registered: [`Backend::add_uf_function`]
+    /// checks this flag to decide whether to honour the PR #782 UF-backed-table
+    /// request (a real in-core [`uf::UfTable`] + find-or-self canon-prim) or to
+    /// bail (the default). Mirrors the DuckDB backend's `enable_native_uf`.
+    pub fn enable_native_uf(&mut self) {
+        self.native_uf_enabled = true;
+    }
+
+    /// Read-only native-UF find for the `@UF_Sf` function `uf_func`. Returns the
+    /// class leader of `x` (or `x` itself if `x` has never been unioned /
+    /// `uf_func` is not a native UF). Single hash lookup (eager-flatten UF).
+    pub(crate) fn native_uf_find(&self, uf_func: FunctionId, x: u32) -> u32 {
+        match self.native_ufs.get(&uf_func) {
+            Some(uf) => uf.find_ro(x as i64) as u32,
+            None => x,
+        }
+    }
+
+    /// Apply all queued unions to every native UF (called once per `run_rules`
+    /// after head writes land). After this, every UF is flat: `find_ro` is O(1)
+    /// and consistent with the union assertions ingested this iteration.
+    /// Returns the total number of ids whose canonical changed (the "real
+    /// change" signal the outer saturate loop needs, since the relational UF's
+    /// `@UF_S` / flat-index churn is no longer produced).
+    pub(crate) fn native_uf_drain_all(&mut self) -> usize {
+        for uf in self.native_ufs.values_mut() {
+            uf.drain_pending();
+        }
+        let mut displaced = 0;
+        for uf in self.native_ufs.values_mut() {
+            displaced += uf.displaced_len();
+            let _ = uf.drain_displaced();
+        }
+        displaced
     }
 
     pub(crate) fn info(&self, f: FunctionId) -> &RelationInfo {
@@ -474,11 +545,54 @@ impl Backend for EGraph {
 
     fn add_uf_function(
         &mut self,
-        _name: String,
+        name: String,
         _onchange: Option<FunctionId>,
-        _proof: Option<egglog_backend_trait::UfProofConfig>,
+        proof: Option<egglog_backend_trait::UfProofConfig>,
     ) -> Result<(FunctionId, ExternalFunctionId)> {
-        anyhow::bail!("the FlowLog backend does not support `:impl displaced-union-find` functions")
+        // Only the `--native-uf --flowlog` path supports PR #782's UF-backed
+        // function. With the flag off the relational UF encoding is used (no
+        // `add_uf_function` calls), so a bail here is unreachable in practice.
+        if !self.native_uf_enabled {
+            anyhow::bail!(
+                "the FlowLog backend only supports `:impl displaced-union-find` \
+                 functions under `--native-uf` (it drives PR #782's UF-backed \
+                 encoding through a host-pass rebuild)"
+            );
+        }
+        // Proof mode is a later step (TERM mode only for now): a provenance-
+        // tracking UF would need the `@UFChange_S` proof column composed in a
+        // leader-change callback, which the host-pass rebuild does not run.
+        if proof.is_some() {
+            anyhow::bail!(
+                "the FlowLog backend does not yet support proof-mode native-UF \
+                 functions (`--native-uf` is TERM mode only on FlowLog)"
+            );
+        }
+
+        // Register the UF function as a real relation: schema `(S) S` (arity 2,
+        // output column, `Min` merge — the union-find leader). The mirror is
+        // never populated by writes (union `set`s are intercepted into the
+        // in-core UF), but the relation must exist so its FunctionId resolves in
+        // `info` / `lookup_id` (the extractor's `find_canonical` reads it).
+        let id = FunctionId::new(self.relations.len() as u32);
+        self.relations.push(RelationInfo {
+            name,
+            arity: 2,
+            has_output: true,
+            merge: MergeMode::Min,
+            identity_on_miss: false,
+        });
+        self.mirror.insert(id, std::rc::Rc::new(HashSet::new()));
+        self.native_ufs.insert(id, uf::UfTable::new());
+        self.native_uf_members.insert(id, HashSet::new());
+
+        // The find-or-self canon-prim. A real, freeable `ExternalFunctionId`,
+        // but the interpreter intercepts calls to it (see `native_uf_canon_prim`)
+        // and answers `find_ro` from the in-core UF — the registered stub is
+        // never actually invoked through the `Database`.
+        let canon = self.register_external_func(Box::new(external_func::CanonStub));
+        self.native_uf_canon_prim.insert(canon, id);
+        Ok((id, canon))
     }
 
     fn table_size(&self, table: FunctionId) -> usize {
@@ -522,6 +636,17 @@ impl Backend for EGraph {
     // -- direct access ------------------------------------------------------
 
     fn lookup_id(&self, func: FunctionId, key: &[Value]) -> Option<Value> {
+        // Native-UF find route: the `@UF_Sf` function's rows are not
+        // materialized (unions live in the in-core UF), so a mirror scan would
+        // always miss. Answer from the UF instead: `find_ro(x)` is the class
+        // leader, or `x` itself when unrecorded. This is the extractor's
+        // `find_canonical` path (`backend.lookup_id`).
+        if let Some(uf) = self.native_ufs.get(&func) {
+            if key.len() == 1 {
+                return Some(Value::new(uf.find_ro(key[0].rep() as i64) as u32));
+            }
+            return None;
+        }
         let info = self.info(func);
         if !info.has_output {
             return None;

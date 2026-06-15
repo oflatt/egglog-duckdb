@@ -554,8 +554,24 @@ impl EGraph {
     /// subprocess compiled from the rule's `.dl`) when DD routing is enabled
     /// (`EGGLOG_FLOWLOG_DD=1`). Proof mode is not wired.
     pub fn with_flowlog_backend() -> anyhow::Result<Self> {
-        let backend: Box<dyn egglog_backend_trait::Backend> =
-            Box::new(egglog_bridge_flowlog::EGraph::new_interpret());
+        Self::with_flowlog_backend_config(FlowlogBackendConfig::default())
+    }
+
+    /// [`EGraph::with_flowlog_backend`] with explicit knobs. The only knob is
+    /// [`FlowlogBackendConfig::native_uf`] (`--native-uf --flowlog`): the
+    /// FlowLog backend drives PR #782's UF-backed-table encoding through its
+    /// fast HOST-PASS rebuild (the in-process `UfTable` answers finds and
+    /// ingests unions; the onchange-driven `@rebuild_rule*` /
+    /// `@uf_change_drain_rule*` maintenance rules are intercepted/dropped). The
+    /// caller must ALSO enable the encoding via [`EGraph::with_native_uf`] so
+    /// the term encoder emits the `:impl displaced-union-find` program this
+    /// backend interception expects.
+    pub fn with_flowlog_backend_config(config: FlowlogBackendConfig) -> anyhow::Result<Self> {
+        let mut db = egglog_bridge_flowlog::EGraph::new_interpret();
+        if config.native_uf {
+            db.enable_native_uf();
+        }
+        let backend: Box<dyn egglog_backend_trait::Backend> = Box::new(db);
         let mut eg = Self::with_backend(backend);
 
         // Canonicalize-at-creation is always-on for all term-encoding backends
@@ -567,6 +583,18 @@ impl EGraph {
         eg.proof_state.original_typechecking = Some(Box::new(typechecker));
         Ok(eg)
     }
+}
+
+/// Knobs for [`EGraph::with_flowlog_backend_config`]. Mirrors
+/// [`DuckBackendConfig`] (FlowLog has no proof mode yet, so only `native_uf`).
+#[derive(Clone, Default, Debug)]
+pub struct FlowlogBackendConfig {
+    /// `--native-uf --flowlog`: drive PR #782's UF-backed encoding through the
+    /// FlowLog backend's in-process `UfTable` + host-pass rebuild (finds and
+    /// union ingestion in-core; the onchange-driven maintenance rules
+    /// intercepted/dropped). Must be paired with [`EGraph::with_native_uf`] (the
+    /// encoding). Experimental; off by default.
+    pub native_uf: bool,
 }
 
 struct ResolvedNCommands {

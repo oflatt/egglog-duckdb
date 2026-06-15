@@ -101,15 +101,17 @@ struct Args {
     #[clap(long = "flowlog")]
     flowlog_backend: bool,
     /// Use a native union-find data structure for the term-encoding UF
-    /// function on the default native bridge backend, instead of the
-    /// relational `@UF_S` parent table + singleparent/path_compress/
-    /// uf_function_index maintenance rulesets. Emits PR #782's
-    /// `:impl displaced-union-find` UF-backed function plus an onchange
-    /// relation driving the rebuild. Term-encoding only; not compatible
-    /// with `--duckdb`/`--feldera`/`--flowlog`. Supports `--proofs` on the
-    /// native bridge (provenance-tracking UF; leader-change callback composes
-    /// the onchange proof). Off by default; the relational encoding is
-    /// unchanged when off.
+    /// function instead of the relational `@UF_S` parent table +
+    /// singleparent/path_compress/uf_function_index maintenance rulesets.
+    /// Emits PR #782's `:impl displaced-union-find` UF-backed function plus an
+    /// onchange relation driving the rebuild. Runs on the default native bridge
+    /// AND on `--flowlog` (where the FlowLog backend honours the UF-backed
+    /// encoding but drives its fast HOST-PASS rebuild, preserving the ~2.1×
+    /// win). Term-encoding only; not compatible with `--duckdb` (use
+    /// `--duck-native-uf`) or `--feldera`. Supports `--proofs` on the native
+    /// bridge (provenance-tracking UF; leader-change callback composes the
+    /// onchange proof) — but `--native-uf --flowlog` is TERM mode only. Off by
+    /// default; the relational encoding is unchanged when off.
     #[clap(long = "native-uf")]
     native_uf: bool,
 }
@@ -136,12 +138,21 @@ pub fn cli(mut egraph: EGraph) {
         std::process::exit(1);
     }
 
-    // The native-UF encoding mode applies to the default native bridge only.
-    // It requires term encoding and is incompatible with the experimental
-    // backends. Proof mode is supported on the native bridge: the UF function
-    // is provenance-tracking and the leader-change callback composes proofs.
-    if args.native_uf && (args.duckdb_backend || args.feldera_backend || args.flowlog_backend) {
-        log::error!("--native-uf cannot be combined with --duckdb/--feldera/--flowlog");
+    // The native-UF encoding mode (PR #782's `:impl displaced-union-find`
+    // UF-backed function) runs on the native bridge AND the FlowLog backend
+    // (`--flowlog`): FlowLog honours the UF-backed encoding but drives its fast
+    // HOST-PASS rebuild instead of the onchange-driven rebuild rules. It is
+    // still incompatible with DuckDB (which has its own `--duck-native-uf`) and
+    // Feldera (no native-UF path yet).
+    if args.native_uf && (args.duckdb_backend || args.feldera_backend) {
+        log::error!(
+            "--native-uf cannot be combined with --duckdb/--feldera (use --duck-native-uf for DuckDB)"
+        );
+        std::process::exit(1);
+    }
+    // Native-UF on FlowLog is TERM mode only (proofs are a later step).
+    if args.native_uf && args.flowlog_backend && args.proofs {
+        log::error!("--native-uf --flowlog is TERM mode only; --proofs is not yet supported");
         std::process::exit(1);
     }
 
@@ -288,12 +299,22 @@ pub fn cli(mut egraph: EGraph) {
                 let mut backend_eg = if args.feldera_backend {
                     egglog::EGraph::with_feldera_backend()
                 } else {
-                    egglog::EGraph::with_flowlog_backend()
+                    // `--native-uf --flowlog`: enable the FlowLog backend's
+                    // in-process UF host-pass (`enable_native_uf`) here, and the
+                    // matching #782 encoding (`with_native_uf`) below — both are
+                    // needed (the encoding emits the program; the backend
+                    // interception runs it through the host-pass rebuild).
+                    egglog::EGraph::with_flowlog_backend_config(egglog::FlowlogBackendConfig {
+                        native_uf: args.native_uf,
+                    })
                 }
                 .unwrap_or_else(|err| {
                     log::error!("failed to start experimental backend: {err}");
                     std::process::exit(1);
                 });
+                if args.native_uf && args.flowlog_backend {
+                    backend_eg = backend_eg.with_native_uf();
+                }
                 backend_eg.parser = std::mem::take(&mut egraph.parser);
                 backend_eg.fact_directory.clone_from(&args.fact_directory);
                 backend_eg.ensure_no_reserved_symbols(false);
