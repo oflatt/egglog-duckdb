@@ -45,7 +45,7 @@ pub use table_spec::{
     ColumnId, Constraint, MutationBuffer, Offset, Rebuilder, Row, Table, TableChange, TableSpec,
     TableVersion, WrappedTable,
 };
-pub use uf::DisplacedTable;
+pub use uf::{DisplacedTable, LeaderChange};
 
 use egglog_numeric_id as numeric_id;
 use egglog_union_find as union_find;

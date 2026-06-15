@@ -941,52 +941,62 @@ impl EGraph {
             .collect::<Result<Vec<_>, _>>()?;
         let output = get_sort(&decl.schema.output)?;
 
-        let can_subsume = match decl.subtype {
-            FunctionSubtype::Constructor => true,
-            // View tables (functions with term_constructor) need subsumption support
-            FunctionSubtype::Custom => decl.term_constructor.is_some(),
-        };
-
         use egglog_bridge::{DefaultVal, MergeFn};
-        // Canonicalize-at-creation: the flat UF-index functions (`@UF_Sf`) are
-        // declared with identity-on-miss lookup semantics so the encoder can
-        // emit `find_UFold` lookups (lookup-or-self against the frozen UF_old
-        // table) at constructor-creation time. Detected by name against the
-        // encoder's `uf_function` map. Always-on for term-encoding backends, but
-        // skipped in PROOF mode (where the encoder emits no `find_UFold` lookup,
-        // so the Identity default would be inert at best and a behavior change at
-        // worst — proof mode stays baseline).
-        let is_uf_index = self.proof_state.canon_at_creation
-            && !self.proof_state.proofs_enabled
-            && self
-                .proof_state
-                .uf_function
-                .values()
-                .any(|n| n == &*decl.name);
-        let backend_id = self.backend.add_table(egglog_bridge::FunctionConfig {
-            schema: input
-                .iter()
-                .chain([&output])
-                .map(|sort| sort.column_ty(&*self.backend))
-                .collect(),
-            default: if is_uf_index {
-                DefaultVal::Identity
-            } else {
-                match decl.subtype {
-                    FunctionSubtype::Constructor => DefaultVal::FreshId,
-                    FunctionSubtype::Custom => DefaultVal::Fail,
-                }
-            },
-            merge: match decl.subtype {
-                FunctionSubtype::Constructor => MergeFn::UnionId,
-                FunctionSubtype::Custom => match &decl.merge {
-                    None => MergeFn::AssertEq,
-                    Some(expr) => self.translate_expr_to_mergefn(expr)?,
-                },
-            },
-            name: decl.name.to_string(),
-            can_subsume,
-        });
+        let (backend_id, can_subsume) = match &decl.impl_kind {
+            FunctionImpl::Default => {
+                let can_subsume = match decl.subtype {
+                    FunctionSubtype::Constructor => true,
+                    // View tables (functions with term_constructor) need subsumption support
+                    FunctionSubtype::Custom => decl.term_constructor.is_some(),
+                };
+
+                // Canonicalize-at-creation: the flat UF-index functions
+                // (`@UF_Sf`) are declared with identity-on-miss lookup semantics
+                // so the encoder can emit `find_UFold` lookups (lookup-or-self
+                // against the frozen UF_old table) at constructor-creation time.
+                // Detected by name against the encoder's `uf_function` map.
+                // Always-on for term-encoding backends, but skipped in PROOF mode
+                // (where the encoder emits no `find_UFold` lookup, so the
+                // Identity default would be inert at best and a behavior change
+                // at worst — proof mode stays baseline).
+                let is_uf_index = self.proof_state.canon_at_creation
+                    && !self.proof_state.proofs_enabled
+                    && self
+                        .proof_state
+                        .uf_function
+                        .values()
+                        .any(|n| n == &*decl.name);
+                let backend_id = self.backend.add_table(egglog_bridge::FunctionConfig {
+                    schema: input
+                        .iter()
+                        .chain([&output])
+                        .map(|sort| sort.column_ty(&*self.backend))
+                        .collect(),
+                    default: if is_uf_index {
+                        DefaultVal::Identity
+                    } else {
+                        match decl.subtype {
+                            FunctionSubtype::Constructor => DefaultVal::FreshId,
+                            FunctionSubtype::Custom => DefaultVal::Fail,
+                        }
+                    },
+                    merge: match decl.subtype {
+                        FunctionSubtype::Constructor => MergeFn::UnionId,
+                        FunctionSubtype::Custom => match &decl.merge {
+                            None => MergeFn::AssertEq,
+                            Some(expr) => self.translate_expr_to_mergefn(expr)?,
+                        },
+                    },
+                    name: decl.name.to_string(),
+                    can_subsume,
+                });
+                (backend_id, can_subsume)
+            }
+            FunctionImpl::DisplacedUnionFind {
+                onchange,
+                canon_prim,
+            } => self.declare_uf_function(decl, onchange.as_deref(), canon_prim.as_deref())?,
+        };
 
         let function = Function {
             decl: decl.clone(),
@@ -1004,6 +1014,60 @@ impl EGraph {
         }
 
         Ok(())
+    }
+
+    /// Build the backend table for a `:impl displaced-union-find` function.
+    ///
+    /// Registers a union-find-backed function on the backend. The optional
+    /// `:onchange` relation receives a row each time a leader changes (built as
+    /// a `TableAction` insert in the `on_leader_change` callback), and the
+    /// optional `:canon-prim` placeholder primitive is rebound to the returned
+    /// canonicalizer external function.
+    fn declare_uf_function(
+        &mut self,
+        decl: &ResolvedFunctionDecl,
+        onchange: Option<&str>,
+        canon_prim: Option<&str>,
+    ) -> Result<(egglog_bridge::FunctionId, bool), Error> {
+        let onchange_backend_id = match onchange {
+            Some(onchange) => {
+                let onchange_func = self.functions.get(onchange).ok_or_else(|| {
+                    Error::TypeError(TypeError::UnboundFunction(
+                        onchange.to_owned(),
+                        decl.span.clone(),
+                    ))
+                })?;
+                Some(onchange_func.backend_id)
+            }
+            None => None,
+        };
+        let (backend_id, canon_prim_id) = self
+            .backend
+            .add_uf_function(decl.name.to_string(), onchange_backend_id)
+            .map_err(|err| Error::BackendError(err.to_string()))?;
+
+        match canon_prim {
+            Some(canon_prim) => {
+                let old = self
+                    .type_info
+                    .replace_primitive_external_id(canon_prim, canon_prim_id)
+                    .ok_or_else(|| {
+                        Error::TypeError(TypeError::Unbound(
+                            canon_prim.to_owned(),
+                            decl.span.clone(),
+                        ))
+                    })?;
+                for old_id in old {
+                    if old_id != canon_prim_id {
+                        self.backend.free_external_func(old_id);
+                    }
+                }
+            }
+            None => {
+                self.backend.free_external_func(canon_prim_id);
+            }
+        }
+        Ok((backend_id, false))
     }
 
     /// Extract rows of a table using the default cost model with name sym

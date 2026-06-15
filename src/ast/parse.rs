@@ -336,29 +336,63 @@ impl Parser {
             "function" => match tail {
                 [name, inputs, output, rest @ ..] => {
                     let mut merge = None;
+                    let mut merge_specified = false;
                     let mut hidden = false;
                     let mut let_binding = false;
                     let mut term_constructor = None;
                     let mut unextractable = false;
+                    let mut impl_kind = FunctionImpl::Default;
+                    let mut onchange = None;
+                    let mut canon_prim = None;
                     for (key, val) in self.parse_options(rest)? {
                         match (key, val) {
                             (":no-merge", []) => {
-                                if merge.is_some() {
+                                if merge_specified {
                                     return error!(
                                         span,
                                         "conflicting merge options: :no-merge and :merge cannot both be specified"
                                     );
                                 }
-                                merge = Some(None);
+                                merge = None;
+                                merge_specified = true;
                             }
                             (":merge", [e]) => {
-                                if merge.is_some() {
+                                if merge_specified {
                                     return error!(
                                         span,
                                         "conflicting merge options: :merge and :no-merge cannot both be specified"
                                     );
                                 }
-                                merge = Some(Some(self.parse_expr(e)?));
+                                merge = Some(self.parse_expr(e)?);
+                                merge_specified = true;
+                            }
+                            (":impl", [impl_name]) => {
+                                if impl_kind.is_uf() {
+                                    return error!(span, "impl option specified more than once");
+                                }
+                                let impl_name = impl_name.expect_atom("function implementation")?;
+                                if impl_name != "displaced-union-find" {
+                                    return error!(
+                                        span,
+                                        "unsupported function implementation {impl_name}"
+                                    );
+                                }
+                                impl_kind = FunctionImpl::DisplacedUnionFind {
+                                    onchange: None,
+                                    canon_prim: None,
+                                };
+                            }
+                            (":onchange", [rel]) => {
+                                if onchange.is_some() {
+                                    return error!(span, ":onchange specified more than once");
+                                }
+                                onchange = Some(rel.expect_atom("onchange relation")?);
+                            }
+                            (":canon-prim", [prim]) => {
+                                if canon_prim.is_some() {
+                                    return error!(span, ":canon-prim specified more than once");
+                                }
+                                canon_prim = Some(prim.expect_atom("canon-prim name")?);
                             }
                             (":internal-hidden", []) => hidden = true,
                             (":internal-let", []) => let_binding = true,
@@ -369,19 +403,40 @@ impl Parser {
                             _ => return error!(span, "could not parse function options"),
                         }
                     }
-                    let merge = match merge {
-                        Some(m) => m,
-                        None => {
-                            return error!(
-                                span,
-                                "functions are required to specify merge behaviour"
-                            );
+                    let impl_kind = match impl_kind {
+                        FunctionImpl::Default => {
+                            if onchange.is_some() || canon_prim.is_some() {
+                                return error!(
+                                    span,
+                                    ":onchange and :canon-prim require :impl displaced-union-find"
+                                );
+                            }
+                            if !merge_specified {
+                                return error!(
+                                    span,
+                                    "functions are required to specify merge behaviour"
+                                );
+                            }
+                            FunctionImpl::Default
+                        }
+                        FunctionImpl::DisplacedUnionFind { .. } => {
+                            if merge_specified {
+                                return error!(
+                                    span,
+                                    "displaced-union-find functions cannot specify merge behaviour"
+                                );
+                            }
+                            FunctionImpl::DisplacedUnionFind {
+                                onchange,
+                                canon_prim,
+                            }
                         }
                     };
                     vec![Command::Function {
                         name: name.expect_atom("function name")?,
                         schema: self.parse_schema(inputs, output)?,
                         merge,
+                        impl_kind,
                         hidden,
                         let_binding,
                         term_constructor,
@@ -392,7 +447,8 @@ impl Parser {
                 _ => {
                     let a = "(function <name> (<input sort>*) <output sort> :merge <expr>)";
                     let b = "(function <name> (<input sort>*) <output sort> :no-merge)";
-                    return error!(span, "usages:\n{a}\n{b}");
+                    let c = "(function <name> (<input sort>*) <output sort> :impl displaced-union-find (:onchange <relation>)? (:canon-prim <prim>)?)";
+                    return error!(span, "usages:\n{a}\n{b}\n{c}");
                 }
             },
             "constructor" => {

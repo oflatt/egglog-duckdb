@@ -677,6 +677,14 @@ impl Backend for EGraph {
         id
     }
 
+    fn add_uf_function(
+        &mut self,
+        _name: String,
+        _onchange: Option<FunctionId>,
+    ) -> anyhow::Result<(FunctionId, ExternalFunctionId)> {
+        anyhow::bail!("the DuckDB backend does not support `:impl displaced-union-find` functions")
+    }
+
     fn table_size(&self, table: FunctionId) -> usize {
         let name = self.name_for_function_id(table);
         self.count(name).expect("table_size: COUNT(*) query failed") as usize

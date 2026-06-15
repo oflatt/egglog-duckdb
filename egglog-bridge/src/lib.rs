@@ -18,8 +18,9 @@ use std::{
 
 use crate::core_relations::{
     BaseValue, BaseValues, ColumnId, Constraint, ContainerValue, ContainerValues, CounterId,
-    Database, DisplacedTable, ExecutionState, ExternalFunction, ExternalFunctionId, MergeVal,
-    Offset, PlanStrategy, SortedWritesTable, TableId, TaggedRowBuffer, Value, WrappedTable,
+    Database, DisplacedTable, ExecutionState, ExternalFunction, ExternalFunctionId, LeaderChange,
+    MergeVal, Offset, PlanStrategy, SortedWritesTable, TableId, TaggedRowBuffer, Value,
+    WrappedTable, make_external_func,
 };
 use crate::numeric_id::{DenseIdMap, DenseIdMapWithReuse, NumericId, define_id};
 use egglog_core_relations as core_relations;
@@ -137,6 +138,30 @@ pub struct EGraph {
 }
 
 pub type Result<T> = std::result::Result<T, anyhow::Error>;
+
+#[derive(Error, Debug)]
+pub enum FunctionConfigError {
+    #[error("Merge functions cannot call UF-backed function {0}")]
+    MergeUsesUf(String),
+    #[error("TableAction does not support UF-backed function {0}")]
+    TableActionUsesUf(String),
+}
+
+/// A callback that runs every time the leader of an equivalence class changes in
+/// a UF-backed function's union-find. See [`LeaderChange`] for the details
+/// passed.
+pub type LeaderChangeCallback =
+    Box<dyn Fn(&mut ExecutionState, LeaderChange) + Send + Sync + 'static>;
+
+/// Configuration for a UF-backed function (see [`EGraph::add_uf_function`]).
+pub struct UfFunctionConfig {
+    pub name: String,
+    pub on_leader_change: Option<LeaderChangeCallback>,
+    /// Tables the `on_leader_change` callback reads from.
+    pub read_deps: Vec<TableId>,
+    /// Tables the `on_leader_change` callback writes to.
+    pub write_deps: Vec<TableId>,
+}
 
 impl Default for EGraph {
     fn default() -> Self {
@@ -543,6 +568,8 @@ impl EGraph {
             default_val: default,
             can_subsume,
             name,
+            kind: FunctionKind::Table,
+            uf_rebuild_rule: None,
         });
         debug_assert_eq!(res, next_func_id);
         let incremental_rebuild_rules = self.incremental_rebuild_rules(res, &schema);
@@ -557,6 +584,97 @@ impl EGraph {
             .unwrap()
             .register_table(table_name, action);
         res
+    }
+
+    /// The backing [`TableId`] for a function. Used to register a UF-backed
+    /// function's `on_leader_change` callback as a write-dependency.
+    pub fn table_id(&self, table: FunctionId) -> TableId {
+        self.funcs[table].table
+    }
+
+    /// Register a UF-backed function in this EGraph.
+    ///
+    /// UF Functions record the series of "leader changes" in the e-graph, where
+    /// the leader is always 'up to date' with the latest value. It has two
+    /// columns: one key (the "displaced" value), mapping to its current leader.
+    /// Queries of such a function, coupled with semi-naive evaluation, allow for
+    /// rules to "listen" on 'leader changes' in the underlying union-find. This
+    /// makes it more efficient, if less convenient, than a standard
+    /// quadratic-sized equivalence relation.
+    ///
+    /// The returned external function canonicalizes its single argument against
+    /// the underlying union-find (find-or-self).
+    ///
+    /// Values in this union find are "coherent" with those of the underlying
+    /// e-graph union-find: rebuilding the e-graph also forwards global unions
+    /// into these union-finds. What makes these useful is that they can store
+    /// _more_ equalities that are themselves "visible" to egglog rules.
+    pub fn add_uf_function(
+        &mut self,
+        config: UfFunctionConfig,
+    ) -> Result<(FunctionId, ExternalFunctionId)> {
+        let UfFunctionConfig {
+            name,
+            on_leader_change,
+            read_deps,
+            write_deps,
+        } = config;
+        let mut table = DisplacedTable::default();
+        if let Some(callback) = on_leader_change {
+            table.set_leader_change_callback(move |state, change| callback(state, change));
+        }
+        let name: Arc<str> = name.into();
+        let table_id = self.db.add_table_named(
+            table,
+            name.clone(),
+            read_deps.iter().copied(),
+            write_deps.iter().copied(),
+        );
+        let canon =
+            self.register_external_func(Box::new(make_external_func(move |state, vals| {
+                let [val] = vals else {
+                    panic!("uf canonicalizer expected 1 value, got {vals:?}")
+                };
+                let table = state.get_table(table_id);
+                let canon = table
+                    .get_row_column(&[*val], ColumnId::new(1))
+                    .unwrap_or(*val);
+                Some(canon)
+            })));
+        let schema = vec![ColumnTy::Id, ColumnTy::Id];
+        let res = self.funcs.push(FunctionInfo {
+            table: table_id,
+            schema,
+            incremental_rebuild_rules: Vec::new(),
+            nonincremental_rebuild_rule: RuleId::new(!0),
+            default_val: DefaultVal::Fail,
+            can_subsume: false,
+            name,
+            kind: FunctionKind::Uf,
+            uf_rebuild_rule: None,
+        });
+        let uf_rebuild_rule = self.uf_rebuild_rule(res);
+        self.funcs[res].uf_rebuild_rule = Some(uf_rebuild_rule);
+        Ok((res, canon))
+    }
+
+    /// Build a rule that forwards global uf_table unions into a UF-backed table
+    /// so it stays consistent with the main union-find.
+    fn uf_rebuild_rule(&mut self, table: FunctionId) -> RuleId {
+        let uf_table = self.uf_table;
+        let mut rb = self.new_rule(&format!("uf rebuild {table:?}"), true);
+        let lhs: QueryEntry = rb.new_var(ColumnTy::Id).into();
+        let rhs: QueryEntry = rb.new_var(ColumnTy::Id).into();
+        rb.add_atom_with_timestamp_and_func(uf_table, None, None, &[lhs.clone(), rhs.clone()]);
+        rb.set(table, &[lhs, rhs]);
+        rb.build()
+    }
+
+    fn uf_rebuild_rules(&self) -> Vec<RuleId> {
+        self.funcs
+            .iter()
+            .filter_map(|(_, info)| info.uf_rebuild_rule)
+            .collect()
     }
 
     /// A handle to the live [`ActionRegistry`] for this EGraph.
@@ -611,11 +729,15 @@ impl EGraph {
     }
 
     fn rebuild(&mut self) -> Result<()> {
+        let uf_rules = self.uf_rebuild_rules();
         let do_parallel = rayon::current_num_threads() > 1;
         if self.db.get_table(self.uf_table).rebuilder(&[]).is_some() {
             // The UF implementation supports "native"  rebuilding.
             let mut tables = Vec::with_capacity(self.funcs.next_id().index());
             for (_, func) in self.funcs.iter() {
+                if func.is_uf() {
+                    continue;
+                }
                 tables.push(func.table);
             }
             loop {
@@ -660,8 +782,24 @@ impl EGraph {
                 let refreshed_rows = self
                     .db
                     .refresh_rows_for_values(&tables, &dirty_ids, next_ts);
+                // Forward any global e-graph unions into the UF-backed tables so
+                // they stay coherent with the main union-find.
+                let uf_rebuild = if uf_rules.is_empty() {
+                    false
+                } else {
+                    let uf_ts = self.next_ts();
+                    run_rules_impl(
+                        &mut self.db,
+                        &mut self.rules,
+                        &uf_rules,
+                        uf_ts,
+                        ReportLevel::TimeOnly,
+                    )?
+                    .changed
+                };
                 self.inc_ts();
-                if !table_rebuild && !refreshed_rows && !container_rebuild.changed() {
+                if !table_rebuild && !refreshed_rows && !container_rebuild.changed() && !uf_rebuild
+                {
                     break;
                 }
             }
@@ -681,6 +819,9 @@ impl EGraph {
             self.inc_ts();
             let ts = self.next_ts();
             for (_, info) in self.funcs.iter_mut() {
+                if info.is_uf() {
+                    continue;
+                }
                 let last_rebuilt_at = self.rules[info.nonincremental_rebuild_rule].last_run_at;
                 let table_size = self.db.estimate_size(info.table, None);
                 let uf_size = self.db.estimate_size(
@@ -727,6 +868,16 @@ impl EGraph {
                     })?;
                 }
             }
+            if !uf_rules.is_empty() {
+                changed |= run_rules_impl(
+                    &mut self.db,
+                    &mut self.rules,
+                    &uf_rules,
+                    ts,
+                    ReportLevel::TimeOnly,
+                )?
+                .changed;
+            }
         }
         log::info!("rebuild took {:?}", start.elapsed());
         Ok(())
@@ -738,6 +889,7 @@ impl EGraph {
     /// when the number of active threads is greater than 1.
     fn rebuild_parallel(&mut self) -> Result<()> {
         let start = Instant::now();
+        let uf_rules = self.uf_rebuild_rules();
         #[derive(Default)]
         struct RebuildState {
             nonincremental: Vec<FunctionId>,
@@ -761,6 +913,9 @@ impl EGraph {
             // First, figure out which functions will be rebuilt nonincrementally,
             // vs. incrementally. Group them together.
             for (func, info) in self.funcs.iter_mut() {
+                if info.is_uf() {
+                    continue;
+                }
                 let last_rebuilt_at = self.rules[info.nonincremental_rebuild_rule].last_run_at;
                 let table_size = self.db.estimate_size(info.table, None);
                 let uf_size = self.db.estimate_size(
@@ -810,6 +965,16 @@ impl EGraph {
                 )?
                 .changed;
                 scratch.clear();
+            }
+            if !uf_rules.is_empty() {
+                changed |= run_rules_impl(
+                    &mut self.db,
+                    &mut self.rules,
+                    &uf_rules,
+                    ts,
+                    ReportLevel::TimeOnly,
+                )?
+                .changed;
             }
         }
         log::info!("rebuild took {:?}", start.elapsed());
@@ -966,6 +1131,12 @@ struct CachedPlanInfo {
     atom_mapping: Vec<core_relations::AtomId>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FunctionKind {
+    Table,
+    Uf,
+}
+
 #[derive(Clone)]
 struct FunctionInfo {
     table: TableId,
@@ -975,11 +1146,17 @@ struct FunctionInfo {
     default_val: DefaultVal,
     can_subsume: bool,
     name: Arc<str>,
+    kind: FunctionKind,
+    uf_rebuild_rule: Option<RuleId>,
 }
 
 impl FunctionInfo {
     fn ret_ty(&self) -> ColumnTy {
         self.schema.last().copied().unwrap()
+    }
+
+    fn is_uf(&self) -> bool {
+        matches!(self.kind, FunctionKind::Uf)
     }
 }
 
@@ -1001,6 +1178,11 @@ fn merge_fn_fill_deps(
             write_deps.insert(egraph.uf_table);
         }
         Function(func, args) => {
+            assert!(
+                !egraph.funcs[*func].is_uf(),
+                "{}",
+                FunctionConfigError::MergeUsesUf(egraph.funcs[*func].name.to_string())
+            );
             read_deps.insert(egraph.funcs[*func].table);
             write_deps.insert(egraph.funcs[*func].table);
             args.iter()
@@ -1217,6 +1399,11 @@ impl TableAction {
     /// This requires access to the `egglog_bridge::EGraph`.
     pub fn new(egraph: &EGraph, func: FunctionId) -> TableAction {
         let func_info = &egraph.funcs[func];
+        assert!(
+            !func_info.is_uf(),
+            "{}",
+            FunctionConfigError::TableActionUsesUf(func_info.name.to_string())
+        );
         TableAction {
             table: func_info.table,
             table_math: SchemaMath {

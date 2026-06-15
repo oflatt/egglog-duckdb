@@ -268,6 +268,24 @@ pub trait Backend: Send + Sync {
     /// Wraps `egglog_bridge::EGraph::add_table`.
     fn add_table(&mut self, config: FunctionConfig) -> FunctionId;
 
+    /// Register a union-find-backed function (see upstream PR #782).
+    ///
+    /// The function has schema `(S) S` for an EqSort `S` and records leader
+    /// changes in the underlying union-find. When `onchange` is `Some(rel)`,
+    /// each leader change is recorded into the relation `rel` (5 columns:
+    /// `write_lhs write_rhs lhs_leader rhs_leader new_leader`, looked-up-or-
+    /// inserted to mint a fresh id, since relations are constructor-backed).
+    /// Returns the function's handle and the [`ExternalFunctionId`] of the
+    /// canonicalizer primitive (find-or-self against the union-find).
+    ///
+    /// Wraps `egglog_bridge::EGraph::add_uf_function`. Backends that do not
+    /// support UF-backed functions (DuckDB, Feldera, FlowLog) return an error.
+    fn add_uf_function(
+        &mut self,
+        name: String,
+        onchange: Option<FunctionId>,
+    ) -> Result<(FunctionId, ExternalFunctionId)>;
+
     /// Number of rows currently in the given function's table.
     ///
     /// Wraps `egglog_bridge::EGraph::table_size`.

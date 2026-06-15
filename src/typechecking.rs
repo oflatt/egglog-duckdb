@@ -221,6 +221,38 @@ impl Debug for PrimitiveWithId {
     }
 }
 
+/// Placeholder primitive for a UF-backed function's `:canon-prim`.
+///
+/// Registered at typecheck time so the name can be referenced and typechecked
+/// (signature `(S S) -> S` so a call `(canon x)` resolves to one argument plus
+/// an output of the eqsort `S`). Its backend id is rebound to the real
+/// union-find canonicalizer external function at backend-build time
+/// (`declare_function`), so its `apply` is never actually invoked.
+#[derive(Clone)]
+struct UfCanonPrimitive {
+    name: String,
+    sort: ArcSort,
+}
+
+impl Primitive for UfCanonPrimitive {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn get_type_constraints(&self, span: &Span) -> Box<dyn TypeConstraint> {
+        constraint::AllEqualTypeConstraint::new(&self.name, span.clone())
+            .with_all_arguments_sort(self.sort.clone())
+            .with_exact_length(2)
+            .into_box()
+    }
+}
+
+impl PurePrim for UfCanonPrimitive {
+    fn apply<'a, 'db>(&self, _state: PureState<'a, 'db>, _args: &[Value]) -> Option<Value> {
+        panic!("uf canon primitive should be bound to an external function");
+    }
+}
+
 /// Stores resolved typechecking information.
 #[derive(Clone, Default)]
 pub struct TypeInfo {
@@ -481,6 +513,27 @@ impl EGraph {
                     self.type_info
                         .global_sorts
                         .insert(fdecl.name.clone(), output_sort.clone());
+                }
+                // Register the `:canon-prim` placeholder primitive (if any). Its
+                // signature is `(S S) -> S`; the backend rebinds its external id
+                // to the real union-find canonicalizer in `declare_function`.
+                if let FunctionImpl::DisplacedUnionFind {
+                    canon_prim: Some(canon_prim),
+                    ..
+                } = &resolved.impl_kind
+                {
+                    let Some(sort) = self.type_info.get_sort_by_name(&resolved.schema.output)
+                    else {
+                        return Err(TypeError::UndefinedSort(
+                            resolved.schema.output.clone(),
+                            resolved.span.clone(),
+                        ));
+                    };
+                    let prim = UfCanonPrimitive {
+                        name: canon_prim.clone(),
+                        sort: sort.clone(),
+                    };
+                    self.add_pure_primitive(prim, None);
                 }
                 ResolvedNCommand::Function(resolved)
             }
@@ -821,13 +874,80 @@ impl TypeInfo {
                 fdecl.span.clone(),
             ));
         }
+        // For UF-backed functions, the `:canon-prim` name (if any) must be
+        // fresh: it becomes a primitive placeholder, rebound at backend-build
+        // time to the union-find canonicalizer external function.
+        if let FunctionImpl::DisplacedUnionFind {
+            canon_prim: Some(canon_prim),
+            ..
+        } = &fdecl.impl_kind
+        {
+            if self.sorts.contains_key(canon_prim) {
+                return Err(TypeError::SortAlreadyBound(
+                    canon_prim.clone(),
+                    fdecl.span.clone(),
+                ));
+            }
+            if self.func_types.contains_key(canon_prim) {
+                return Err(TypeError::FunctionAlreadyBound(
+                    canon_prim.clone(),
+                    fdecl.span.clone(),
+                ));
+            }
+            if self.is_primitive(canon_prim) {
+                return Err(TypeError::PrimitiveAlreadyBound(
+                    canon_prim.clone(),
+                    fdecl.span.clone(),
+                ));
+            }
+        }
         let ftype = self.function_to_functype(fdecl)?;
-        if self.func_types.insert(fdecl.name.clone(), ftype).is_some() {
+        if self.func_types.contains_key(&fdecl.name) {
             return Err(TypeError::FunctionAlreadyBound(
                 fdecl.name.clone(),
                 fdecl.span.clone(),
             ));
         }
+        if let FunctionImpl::DisplacedUnionFind { onchange, .. } = &fdecl.impl_kind {
+            if fdecl.merge.is_some() {
+                return Err(TypeError::UfFunctionMerge(
+                    fdecl.name.clone(),
+                    fdecl.span.clone(),
+                ));
+            }
+            // Schema must be (S) S for an EqSort S.
+            if fdecl.schema.input.len() != 1
+                || ftype.input.len() != 1
+                || ftype.input[0].name() != ftype.output.name()
+                || !ftype.output.is_eq_sort()
+            {
+                return Err(TypeError::UfFunctionSchema(
+                    fdecl.name.clone(),
+                    fdecl.span.clone(),
+                ));
+            }
+            if let Some(onchange) = onchange {
+                let Some(rel_type) = self.func_types.get(onchange) else {
+                    return Err(TypeError::UnboundFunction(
+                        onchange.clone(),
+                        fdecl.span.clone(),
+                    ));
+                };
+                // `(relation R (S S S S S))` desugars to a constructor over a
+                // fresh sort; require 5 inputs all of the function's eqsort.
+                let out_name = ftype.output.name().to_owned();
+                let valid_schema = rel_type.input.len() == 5
+                    && rel_type.input.iter().all(|sort| sort.name() == out_name);
+                if !valid_schema {
+                    return Err(TypeError::UfOnChangeSchema(
+                        onchange.clone(),
+                        out_name,
+                        fdecl.span.clone(),
+                    ));
+                }
+            }
+        }
+        self.func_types.insert(fdecl.name.clone(), ftype);
         let mut bound_vars = IndexMap::default();
         let output_type = self.sorts.get(&fdecl.schema.output).unwrap();
         if fdecl.subtype == FunctionSubtype::Constructor && !output_type.is_eq_sort() {
@@ -842,6 +962,7 @@ impl TypeInfo {
         Ok(ResolvedFunctionDecl {
             name: fdecl.name.clone(),
             subtype: fdecl.subtype,
+            impl_kind: fdecl.impl_kind.clone(),
             schema: fdecl.schema.clone(),
             resolved_schema: ResolvedCall::Func(self.func_types.get(&fdecl.name).unwrap().clone()),
             merge: match &fdecl.merge {
@@ -1123,6 +1244,31 @@ impl TypeInfo {
         self.primitives.contains_key(sym) || self.reserved_primitives.contains(sym)
     }
 
+    /// Rebind the (single) primitive named `sym` so all of its per-context
+    /// backend entrypoints point at `new_id`. Returns the previous backend ids
+    /// (one per valid context) so the caller can free the now-unused
+    /// placeholder entrypoints, or `None` if there is not exactly one primitive
+    /// with that name. Used to rebind a `:canon-prim` placeholder to a UF
+    /// canonicalizer external function.
+    pub(crate) fn replace_primitive_external_id(
+        &mut self,
+        sym: &str,
+        new_id: ExternalFunctionId,
+    ) -> Option<Vec<ExternalFunctionId>> {
+        let prims = self.primitives.get_mut(sym)?;
+        if prims.len() != 1 {
+            return None;
+        }
+        let mut old = Vec::new();
+        for (_, slot) in prims[0].context_ids.iter_mut() {
+            if let Some(id) = *slot {
+                old.push(id);
+                *slot = Some(new_id);
+            }
+        }
+        Some(old)
+    }
+
     pub fn primitive_has_validator(&self, id: ExternalFunctionId) -> bool {
         self.primitives
             .values()
@@ -1207,6 +1353,14 @@ pub enum TypeError {
     AlreadyDefined(String, Span),
     #[error("{1}\nThe output type of constructor function {0} must be sort")]
     ConstructorOutputNotSort(String, Span),
+    #[error("{1}\nDisplaced-union-find function {0} cannot specify merge behaviour.")]
+    UfFunctionMerge(String, Span),
+    #[error("{1}\nDisplaced-union-find function {0} must have schema (S) S for an EqSort.")]
+    UfFunctionSchema(String, Span),
+    #[error("{2}\n:onchange relation {0} must have schema ({1} {1} {1} {1} {1}).")]
+    UfOnChangeSchema(String, String, Span),
+    #[error("{1}\nMerge expressions cannot call displaced-union-find function {0}.")]
+    UfFunctionInMerge(String, Span),
     #[error("{1}\nValue lookup of non-constructor function {0} in rule is disallowed.")]
     LookupInRuleDisallowed(String, Span),
     #[error("{1}\nCannot set constructor {0}. Use `union` instead or declare {0} as a function.")]

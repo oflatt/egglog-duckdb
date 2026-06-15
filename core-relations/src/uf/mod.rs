@@ -27,6 +27,31 @@ mod tests;
 
 type UnionFind = crate::union_find::UnionFind<Value>;
 
+/// A callback that runs every time a leader change takes effect. See the documentation for
+/// [`LeaderChange`] for the information that is provided.
+type LeaderChangeCallback = Arc<dyn Fn(&mut ExecutionState, LeaderChange) + Send + Sync>;
+
+/// Details for a leader change caused by a union.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LeaderChange {
+    /// The lhs value provided to the write.
+    pub write_lhs: Value,
+    /// The leader of the lhs equivalence class before the union.
+    pub lhs_leader: Value,
+    /// The rhs value provided to the write.
+    pub write_rhs: Value,
+    /// The leader of the rhs equivalence class before the union.
+    pub rhs_leader: Value,
+    /// The timestamp associated with the write that triggered the union.
+    pub ts: Value,
+}
+
+impl LeaderChange {
+    pub fn new_leader(&self) -> Value {
+        std::cmp::min(self.lhs_leader, self.rhs_leader)
+    }
+}
+
 /// A special table backed by a union-find used to efficiently implement
 /// egglog-style canonicaliztion.
 ///
@@ -57,6 +82,8 @@ pub struct DisplacedTable {
     changed: bool,
     lookup_table: HashMap<Value, RowId>,
     buffered_writes: Arc<SegQueue<RowBuffer>>,
+    /// Stored as Arc so DisplacedTable cloning preserves the callback.
+    on_leader_change: Option<LeaderChangeCallback>,
 }
 
 struct Canonicalizer<'a> {
@@ -203,6 +230,7 @@ impl Default for DisplacedTable {
             changed: false,
             lookup_table: HashMap::default(),
             buffered_writes: Arc::new(SegQueue::new()),
+            on_leader_change: None,
         }
     }
 }
@@ -215,6 +243,7 @@ impl Clone for DisplacedTable {
             changed: self.changed,
             lookup_table: self.lookup_table.clone(),
             buffered_writes: Default::default(),
+            on_leader_change: self.on_leader_change.clone(),
         }
     }
 }
@@ -443,10 +472,10 @@ impl Table for DisplacedTable {
         })
     }
 
-    fn merge(&mut self, _: &mut ExecutionState) -> TableChange {
+    fn merge(&mut self, exec_state: &mut ExecutionState) -> TableChange {
         while let Some(rowbuf) = self.buffered_writes.pop() {
             for row in rowbuf.iter() {
-                self.changed |= self.insert_impl(row).is_some();
+                self.changed |= self.insert_impl(row, exec_state).is_some();
             }
         }
         let changed = mem::take(&mut self.changed);
@@ -460,6 +489,28 @@ impl Table for DisplacedTable {
 }
 
 impl DisplacedTable {
+    /// Construct with a leader-change callback.
+    pub fn with_leader_change_callback<F>(callback: F) -> Self
+    where
+        F: Fn(&mut ExecutionState, LeaderChange) + Send + Sync + 'static,
+    {
+        Self {
+            on_leader_change: Some(Arc::new(callback)),
+            ..Self::default()
+        }
+    }
+
+    pub fn set_leader_change_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(&mut ExecutionState, LeaderChange) + Send + Sync + 'static,
+    {
+        self.on_leader_change = Some(Arc::new(callback));
+    }
+
+    pub fn clear_leader_change_callback(&mut self) {
+        self.on_leader_change = None;
+    }
+
     pub fn underlying_uf(&self) -> &UnionFind {
         &self.uf
     }
@@ -486,9 +537,15 @@ impl DisplacedTable {
         let vals = self.expand(row);
         eval_constraint(&vals, constraint)
     }
-    fn insert_impl(&mut self, row: &[Value]) -> Option<(Value, Value)> {
+    fn insert_impl(
+        &mut self,
+        row: &[Value],
+        exec_state: &mut ExecutionState,
+    ) -> Option<(Value, Value)> {
         assert_eq!(row.len(), 3, "attempt to insert a row with the wrong arity");
-        if self.uf.find(row[0]) == self.uf.find(row[1]) {
+        let lhs_leader = self.uf.find(row[0]);
+        let rhs_leader = self.uf.find(row[1]);
+        if lhs_leader == rhs_leader {
             return None;
         }
         let (parent, child) = self.uf.union(row[0], row[1]);
@@ -497,6 +554,18 @@ impl DisplacedTable {
         let _ = self.uf.find(parent);
         let _ = self.uf.find(child);
         let ts = row[2];
+        if let Some(callback) = &self.on_leader_change {
+            callback(
+                exec_state,
+                LeaderChange {
+                    write_lhs: row[0],
+                    lhs_leader,
+                    write_rhs: row[1],
+                    rhs_leader,
+                    ts,
+                },
+            );
+        }
         if let Some((_, highest)) = self.displaced.last() {
             assert!(
                 *highest <= ts,

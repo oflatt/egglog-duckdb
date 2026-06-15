@@ -766,6 +766,7 @@ pub fn add_function(
         name: name.to_owned(),
         schema,
         merge,
+        impl_kind: FunctionImpl::Default,
         hidden: false,
         let_binding: false,
         term_constructor: None,

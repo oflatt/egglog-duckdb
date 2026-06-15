@@ -274,6 +274,46 @@ impl Backend for EGraph {
         EGraph::add_table(self, config)
     }
 
+    fn add_uf_function(
+        &mut self,
+        name: String,
+        onchange: Option<FunctionId>,
+    ) -> Result<(FunctionId, ExternalFunctionId)> {
+        let mut on_leader_change: Option<crate::LeaderChangeCallback> = None;
+        let mut write_deps = Vec::new();
+        if let Some(onchange) = onchange {
+            write_deps.push(self.table_id(onchange));
+            // `(relation R (S S S S S))` desugars to a constructor over a fresh
+            // sort, so each leader change is recorded with `lookup_or_insert`
+            // (mint a fresh eclass id for the 5-input key).
+            let table_action = crate::TableAction::new(self, onchange);
+            on_leader_change = Some(Box::new(
+                move |state: &mut egglog_core_relations::ExecutionState,
+                      change: egglog_core_relations::LeaderChange| {
+                    table_action.lookup_or_insert(
+                        state,
+                        &[
+                            change.write_lhs,
+                            change.write_rhs,
+                            change.lhs_leader,
+                            change.rhs_leader,
+                            change.new_leader(),
+                        ],
+                    );
+                },
+            ));
+        }
+        EGraph::add_uf_function(
+            self,
+            crate::UfFunctionConfig {
+                name,
+                on_leader_change,
+                read_deps: Vec::new(),
+                write_deps,
+            },
+        )
+    }
+
     fn table_size(&self, table: FunctionId) -> usize {
         EGraph::table_size(self, table)
     }

@@ -472,6 +472,14 @@ impl Backend for EGraph {
         id
     }
 
+    fn add_uf_function(
+        &mut self,
+        _name: String,
+        _onchange: Option<FunctionId>,
+    ) -> Result<(FunctionId, ExternalFunctionId)> {
+        anyhow::bail!("the FlowLog backend does not support `:impl displaced-union-find` functions")
+    }
+
     fn table_size(&self, table: FunctionId) -> usize {
         self.mirror.get(&table).map(|s| s.len()).unwrap_or(0)
     }

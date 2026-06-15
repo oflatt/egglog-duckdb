@@ -140,6 +140,7 @@ where
                     schema: f.schema.clone(),
                     name: f.name.clone(),
                     merge: f.merge.clone(),
+                    impl_kind: f.impl_kind.clone(),
                     hidden: f.internal_hidden,
                     let_binding: f.internal_let,
                     term_constructor: f.term_constructor.clone(),
@@ -699,6 +700,7 @@ where
         name: String,
         schema: Schema,
         merge: Option<GenericExpr<Head, Leaf>>,
+        impl_kind: FunctionImpl,
         hidden: bool,
         let_binding: bool,
         term_constructor: Option<String>,
@@ -978,16 +980,33 @@ where
                 name,
                 schema,
                 merge,
+                impl_kind,
                 hidden,
                 let_binding,
                 term_constructor,
                 unextractable,
             } => {
                 write!(f, "(function {name} {schema}")?;
-                if let Some(merge) = &merge {
-                    write!(f, " :merge {merge}")?;
-                } else {
-                    write!(f, " :no-merge")?;
+                match impl_kind {
+                    FunctionImpl::Default => {
+                        if let Some(merge) = &merge {
+                            write!(f, " :merge {merge}")?;
+                        } else {
+                            write!(f, " :no-merge")?;
+                        }
+                    }
+                    FunctionImpl::DisplacedUnionFind {
+                        onchange,
+                        canon_prim,
+                    } => {
+                        write!(f, " :impl displaced-union-find")?;
+                        if let Some(onchange) = onchange {
+                            write!(f, " :onchange {onchange}")?;
+                        }
+                        if let Some(canon_prim) = canon_prim {
+                            write!(f, " :canon-prim {canon_prim}")?;
+                        }
+                    }
                 }
                 if *unextractable {
                     write!(f, " :unextractable")?;
@@ -1218,6 +1237,28 @@ where
 pub type FunctionDecl = GenericFunctionDecl<String, String>;
 pub(crate) type ResolvedFunctionDecl = GenericFunctionDecl<ResolvedCall, ResolvedVar>;
 
+/// How a function's backing table is implemented.
+///
+/// `Default` functions use the standard functional-dependency table. A
+/// `DisplacedUnionFind` function is backed by a union-find (see upstream PR
+/// #782): it has schema `(S) S` for an EqSort `S`, and records leader changes.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum FunctionImpl {
+    Default,
+    DisplacedUnionFind {
+        /// Relation to insert leader-change tuples into.
+        onchange: Option<String>,
+        /// Primitive that canonicalizes a value against the union-find.
+        canon_prim: Option<String>,
+    },
+}
+
+impl FunctionImpl {
+    pub fn is_uf(&self) -> bool {
+        matches!(self, FunctionImpl::DisplacedUnionFind { .. })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FunctionSubtype {
     Constructor,
@@ -1244,6 +1285,8 @@ where
 {
     pub name: String,
     pub subtype: FunctionSubtype,
+    /// How the backing table is implemented (default vs union-find backed).
+    pub impl_kind: FunctionImpl,
     /// Untyped schema
     pub schema: Schema,
     /// Resolved schema after typechecking is stored here, otherwise "".
@@ -1310,10 +1353,12 @@ impl FunctionDecl {
         name: String,
         schema: Schema,
         merge: Option<GenericExpr<String, String>>,
+        impl_kind: FunctionImpl,
     ) -> Self {
         Self {
             name,
             subtype: FunctionSubtype::Custom,
+            impl_kind,
             schema,
             resolved_schema: String::new(),
             merge,
@@ -1338,6 +1383,7 @@ impl FunctionDecl {
         Self {
             name,
             subtype: FunctionSubtype::Constructor,
+            impl_kind: FunctionImpl::Default,
             resolved_schema: String::new(),
             schema,
             merge: None,
@@ -1363,6 +1409,7 @@ where
         GenericFunctionDecl {
             name: self.name,
             subtype: self.subtype,
+            impl_kind: self.impl_kind,
             schema: self.schema,
             resolved_schema: self.resolved_schema,
             merge: self.merge.map(|expr| expr.visit_exprs(f)),
@@ -1691,6 +1738,7 @@ where
                 name,
                 schema,
                 merge,
+                impl_kind,
                 hidden,
                 let_binding,
                 term_constructor,
@@ -1703,6 +1751,16 @@ where
                     output: fun(schema.output),
                 },
                 merge,
+                impl_kind: match impl_kind {
+                    FunctionImpl::Default => FunctionImpl::Default,
+                    FunctionImpl::DisplacedUnionFind {
+                        onchange,
+                        canon_prim,
+                    } => FunctionImpl::DisplacedUnionFind {
+                        onchange: onchange.map(&mut *fun),
+                        canon_prim: canon_prim.map(&mut *fun),
+                    },
+                },
                 hidden,
                 let_binding,
                 term_constructor: term_constructor.map(&mut *fun),
@@ -1785,6 +1843,7 @@ where
                 name,
                 schema,
                 merge,
+                impl_kind,
                 hidden,
                 let_binding,
                 term_constructor,
@@ -1794,6 +1853,7 @@ where
                 name,
                 schema,
                 merge: merge.map(|e| e.visit_exprs(f)),
+                impl_kind,
                 hidden,
                 let_binding,
                 term_constructor,
@@ -1924,6 +1984,7 @@ where
                 name,
                 schema,
                 merge,
+                impl_kind,
                 hidden,
                 let_binding,
                 term_constructor,
@@ -1933,6 +1994,7 @@ where
                 name,
                 schema,
                 merge: merge.map(|expr| expr.map_symbols(head, leaf)),
+                impl_kind,
                 hidden,
                 let_binding,
                 term_constructor,

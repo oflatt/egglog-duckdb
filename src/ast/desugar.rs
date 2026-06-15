@@ -16,12 +16,13 @@ pub(crate) fn desugar_command(
             name,
             schema,
             merge,
+            impl_kind,
             hidden,
             let_binding,
             term_constructor,
             unextractable,
         } => {
-            let mut fdecl = FunctionDecl::function(span, name, schema, merge);
+            let mut fdecl = FunctionDecl::function(span, name, schema, merge, impl_kind);
             fdecl.internal_hidden = hidden;
             fdecl.internal_let = let_binding;
             fdecl.term_constructor = term_constructor;
