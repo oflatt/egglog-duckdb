@@ -622,6 +622,20 @@ impl<C: Cost + Ord + Eq + Clone + Debug> Extractor<C> {
     /// If no UF is registered for this sort, returns the original value.
     /// The UF table stores (value, canonical) pairs - one hop lookup.
     fn find_canonical(&self, egraph: &EGraph, value: Value, sort: &ArcSort) -> Value {
+        // Native-UF mode: the relational `@UF_S` parent table doesn't exist;
+        // the union-find lives in the `@UF_Sf` UF-backed function. A single-key
+        // lookup there returns the canonical leader (or no row if `value` is
+        // already canonical), matching the `@canon_S` primitive.
+        if egraph.proof_state.native_uf
+            && let Some(uf_function_name) = egraph.proof_state.uf_function.get(sort.name())
+            && let Some(uf_func) = egraph.functions.get(uf_function_name)
+        {
+            return egraph
+                .backend
+                .lookup_id(uf_func.backend_id, &[value])
+                .unwrap_or(value);
+        }
+
         // Check if there's a UF registered for this sort
         let Some(uf_name) = egraph.proof_state.uf_parent.get(sort.name()) else {
             return value;

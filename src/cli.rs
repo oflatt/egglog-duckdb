@@ -100,6 +100,16 @@ struct Args {
     /// Mutually exclusive with `--duckdb` and `--feldera`.
     #[clap(long = "flowlog")]
     flowlog_backend: bool,
+    /// Use a native union-find data structure for the term-encoding UF
+    /// function on the default native bridge backend, instead of the
+    /// relational `@UF_S` parent table + singleparent/path_compress/
+    /// uf_function_index maintenance rulesets. Emits PR #782's
+    /// `:impl displaced-union-find` UF-backed function plus an onchange
+    /// relation driving the rebuild. Term-encoding only; not compatible
+    /// with `--duckdb`/`--feldera`/`--flowlog` or `--proofs`. Off by
+    /// default; the relational encoding is unchanged when off.
+    #[clap(long = "native-uf")]
+    native_uf: bool,
 }
 
 /// Start a command-line interface for the E-graph.
@@ -124,8 +134,29 @@ pub fn cli(mut egraph: EGraph) {
         std::process::exit(1);
     }
 
-    if args.term_encoding {
+    // The native-UF encoding mode applies to the default native bridge only.
+    // It requires term encoding, is incompatible with the experimental
+    // backends, and is term-mode only (proofs come later).
+    if args.native_uf {
+        if args.duckdb_backend || args.feldera_backend || args.flowlog_backend {
+            log::error!("--native-uf cannot be combined with --duckdb/--feldera/--flowlog");
+            std::process::exit(1);
+        }
+        if args.proofs || args.proof_testing {
+            log::error!("--native-uf cannot be combined with --proofs/--proof-testing");
+            std::process::exit(1);
+        }
+    }
+
+    // `--native-uf` is a term-encoding-only mode, so it implies term
+    // encoding (enabling it here covers the case where `--term-encoding`
+    // was not also passed).
+    if args.term_encoding || args.native_uf {
         egraph = egraph.with_term_encoding_enabled();
+    }
+
+    if args.native_uf {
+        egraph = egraph.with_native_uf();
     }
 
     if args.proofs && !egraph.are_proofs_enabled() {
@@ -462,8 +493,8 @@ fn duck_perf_dump(duck: &egglog_bridge_duckdb::EGraph, wall_ns: u64) {
         other_ns as f64 / 1e9
     );
     eprintln!(
-        "{:>9} {:>9} {:>9} {:>6} {:>5}  {:<28} {}",
-        "total_s", "search_s", "apply_s", "%wall", "rules", "ruleset", "kind"
+        "{:>9} {:>9} {:>9} {:>6} {:>5}  {:<28} kind",
+        "total_s", "search_s", "apply_s", "%wall", "rules", "ruleset"
     );
     let mut cls: std::collections::HashMap<&'static str, (u64, u64)> =
         std::collections::HashMap::new();

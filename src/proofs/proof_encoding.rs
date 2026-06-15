@@ -32,6 +32,24 @@ pub(crate) struct EncodingState {
     /// RHS, so the generated rule must opt into `:unsafe-seminaive` (RHS
     /// function-table lookups). Reset per rule in `instrument_rule`.
     pub emitted_canon_lookup: bool,
+    /// Native-UF encoding mode (gated by `--native-uf`, term-encoding +
+    /// non-proof + native bridge only). When on, each eq-sort gets a
+    /// `:impl displaced-union-find` UF-backed function (reusing the
+    /// `@UF_Sf` name) plus an `@UFChange_S` onchange relation and a
+    /// `@canon_S` find-or-self primitive, instead of the relational
+    /// `@UF_S` parent table + singleparent/path_compress/uf_function_index
+    /// rulesets. Union goes through the UF function; canon lookups use the
+    /// `@canon_S` primitive (no `:unsafe-seminaive` needed); the
+    /// per-constructor rebuild is driven by the `@UFChange_S` onchange
+    /// relation. Default OFF; the relational path is byte-identical when
+    /// off (duckdb/feldera/flowlog still depend on it).
+    pub native_uf: bool,
+    /// Maps eq-sort name -> the `@canon_S` find-or-self primitive name
+    /// (only populated in native-UF mode).
+    pub canon_prim: HashMap<String, String>,
+    /// Maps eq-sort name -> the `@UFChange_S` onchange relation name
+    /// (only populated in native-UF mode).
+    pub uf_change_rel: HashMap<String, String>,
 }
 
 impl EncodingState {
@@ -51,6 +69,9 @@ impl EncodingState {
             // returns an `@UFPair_Sort` in proof mode, not a bare sort).
             canon_at_creation: true,
             emitted_canon_lookup: false,
+            native_uf: false,
+            canon_prim: HashMap::default(),
+            uf_change_rel: HashMap::default(),
         }
     }
 }
@@ -77,6 +98,15 @@ impl<'a> ProofInstrumentor<'a> {
         rhs: &str,
         justification: &Justification,
     ) -> String {
+        // Native-UF mode: union via the UF-backed function. `(set (@UF_Sf a) b)`
+        // calls the union-find's `union(a, b)`, which picks the min leader
+        // itself and records the leader change in the onchange relation. No
+        // proofs in this mode (gated to `!proofs_enabled`), so the
+        // justification is ignored.
+        if self.native_uf() {
+            let uf_function_name = self.uf_function_name(type_name);
+            return format!("(set ({uf_function_name} {lhs}) {rhs})");
+        }
         let uf_name = self.uf_name(type_name);
         let smaller = format!("(ordering-min {lhs} {rhs})");
         let larger = format!("(ordering-max {lhs} {rhs})");
@@ -111,6 +141,14 @@ impl<'a> ProofInstrumentor<'a> {
     /// Also, we have a rule that maintains the invariant that each term points to its
     /// canonical representative.
     fn declare_sort(&mut self, sort_name: &str) -> Vec<Command> {
+        // Native-UF mode: replace the relational `@UF_S` parent table +
+        // `@UF_Sf` flat index + the singleparent/path_compress/uf_function_index
+        // rulesets with a single `:impl displaced-union-find` UF-backed
+        // function (reusing the `@UF_Sf` name) plus its onchange relation and
+        // find-or-self primitive. Only ever set in non-proof term mode.
+        if self.native_uf() {
+            return self.declare_sort_native_uf(sort_name);
+        }
         let pname = self.uf_name(sort_name);
         let uf_function_name = self.uf_function_name(sort_name);
         let fresh_name = self.egraph.parser.symbol_gen.fresh("uf_update");
@@ -254,6 +292,36 @@ impl<'a> ProofInstrumentor<'a> {
             );
         }
 
+        self.parse_program(&code)
+    }
+
+    /// Native-UF variant of `declare_sort`. Emits PR #782's UF-backed
+    /// function instead of the relational union-find:
+    ///
+    ///   (relation @UFChange_S (S S S S S))
+    ///   (function @UF_Sf (S) S :impl displaced-union-find
+    ///                          :onchange @UFChange_S :canon-prim @canon_S)
+    ///
+    /// The `@UF_Sf` name is reused so existing references (canon-at-creation,
+    /// rebuild) resolve. `@canon_S` is the find-or-self primitive (rebound to
+    /// the union-find canonicalizer at backend-build time). `@UFChange_S`
+    /// receives `(write_lhs write_rhs lhs_leader rhs_leader new_leader)` on
+    /// each leader change.
+    ///
+    /// No singleparent / path_compress / uf_function_index rulesets are
+    /// needed — the native union-find maintains canonicality itself.
+    fn declare_sort_native_uf(&mut self, sort_name: &str) -> Vec<Command> {
+        let uf_function_name = self.uf_function_name(sort_name);
+        let canon_prim = self.canon_prim_name(sort_name);
+        let uf_change_rel = self.uf_change_rel_name(sort_name);
+
+        // The onchange relation desugars to a constructor over a fresh sort;
+        // its 5 inputs are all the eq-sort being declared.
+        let code = format!(
+            "(relation {uf_change_rel} ({sort_name} {sort_name} {sort_name} {sort_name} {sort_name}))
+             (function {uf_function_name} ({sort_name}) {sort_name} :impl displaced-union-find
+                       :onchange {uf_change_rel} :canon-prim {canon_prim} :internal-hidden)"
+        );
         self.parse_program(&code)
     }
 
@@ -569,6 +637,12 @@ impl<'a> ProofInstrumentor<'a> {
             return vec![];
         }
 
+        // Native-UF mode: drive the rebuild off the `@UFChange_S` onchange
+        // relation instead of joining the view against `@UF_Sf`.
+        if self.native_uf() {
+            return self.rebuilding_rules_native_uf(fdecl, &types);
+        }
+
         let view_name = self.view_name(&fdecl.name);
         let child = |i: usize| format!("c{i}_");
         let children_vec: Vec<String> = (0..types.len()).map(child).collect();
@@ -684,6 +758,119 @@ impl<'a> ProofInstrumentor<'a> {
             self.proof_names().rebuilding_ruleset_name
         );
         self.parse_program(&rule)
+    }
+
+    /// Native-UF variant of `rebuilding_rules`. The relational rebuild
+    /// joined every view row against `@UF_Sf` and re-canonicalized any row
+    /// whose child differed from its leader. Here we drive the rebuild off
+    /// the `@UFChange_S` onchange relation instead.
+    ///
+    /// On each leader change the union-find emits an onchange row
+    /// `(write_lhs write_rhs lhs_leader rhs_leader new_leader)`. With
+    /// union-by-min, the *displaced* id (the leader that stopped being
+    /// canonical) is `max(lhs_leader, rhs_leader)` and the surviving leader
+    /// is `new_leader = min(...)`. Because every view row is canonical at
+    /// insertion time (canon-at-creation) and stays canonical until one of
+    /// its ids is displaced, the only newly-stale id a view row can hold is
+    /// exactly that displaced id. Onchange rows are retained (a relation is
+    /// append-only), so across rebuild passes every stale view row
+    /// eventually matches some retained onchange row.
+    ///
+    /// For each eq-sort view column `j` we emit a rule that joins onchange
+    /// rows against view rows holding the displaced id in column `j`, then
+    /// re-canonicalizes *all* eq-sort columns via the `@canon_S` primitive
+    /// (full find — so chained unions collapse in one step) and
+    /// retracts the old row. This mirrors the relational rebuild's
+    /// retract-old / insert-canonical behavior bit-for-bit, while only
+    /// touching view rows that actually reference a changed class.
+    fn rebuilding_rules_native_uf(
+        &mut self,
+        fdecl: &ResolvedFunctionDecl,
+        types: &[ArcSort],
+    ) -> Vec<Command> {
+        let view_name = self.view_name(&fdecl.name);
+        let child = |i: usize| format!("c{i}_");
+        let children_vec: Vec<String> = (0..types.len()).map(child).collect();
+        let children = ListDisplay(&children_vec, " ").to_string();
+
+        // Canonicalized children: eq-sort columns wrapped in `@canon_S`,
+        // non-eq-sort columns left as-is. (For non-eq columns `@canon`
+        // isn't defined; they never change.)
+        let children_canon: Vec<String> = types
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| {
+                if ty.is_eq_sort() {
+                    let canon_prim = self.canon_prim_name(ty.name());
+                    format!("({canon_prim} {})", child(i))
+                } else {
+                    child(i)
+                }
+            })
+            .collect();
+        let updated_view = self.update_view(&fdecl.name, &children_canon, "()");
+
+        let rebuilding_ruleset = self.proof_names().rebuilding_ruleset_name.clone();
+
+        // Guard: only fire when the row is actually stale, i.e. some eq-sort
+        // child is non-canonical (`ci != (canon ci)`). Mirrors the relational
+        // rebuild's `(guard (or (bool-!= ci ci_leader) ...))`. Without it a row
+        // could be re-inserted unchanged, which never terminates.
+        let neq_exprs: Vec<String> = types
+            .iter()
+            .enumerate()
+            .filter(|(_, ty)| ty.is_eq_sort())
+            .map(|(i, ty)| {
+                let canon_prim = self.canon_prim_name(ty.name());
+                format!("(bool-!= {} ({canon_prim} {}))", child(i), child(i))
+            })
+            .collect();
+        let guard = format!("(guard (or {}))", neq_exprs.join(" "));
+
+        // The rebuild is driven by leader changes recorded in the `@UFChange_S`
+        // onchange relation. With union-by-min, an onchange row's displaced id
+        // (the leader that stopped being canonical) is one of its two stored
+        // leaders `lhs_leader` / `rhs_leader` (whichever is larger).
+        //
+        // For each eq-sort view column `j` we emit two rules: one equi-joining
+        // a view row's column `j` against the onchange `lhs_leader` column and
+        // one against the `rhs_leader` column. Equi-joining stored columns lets
+        // the query planner index the view by column `j` and probe it with the
+        // onchange leader (rather than scanning the whole onchange relation per
+        // view row, which a computed `(= cj (ordering-max ll rl))` join would
+        // force). The `(guard (or bool-!=))` then filters to rows that are
+        // actually stale — a column matching the *non*-displaced (still
+        // canonical) leader is rejected — so the union of the two rules
+        // canonicalizes exactly the rows referencing the displaced class.
+        //
+        // The action re-canonicalizes *all* eq-sort columns via the `@canon_S`
+        // primitive (full find, so chained unions collapse in one step) and
+        // retracts the old row, mirroring the relational rebuild's
+        // retract-old / insert-canonical behavior bit-for-bit and giving it a
+        // terminating fixpoint.
+        let mut rules = String::new();
+        for (j, ty) in types.iter().enumerate() {
+            if !ty.is_eq_sort() {
+                continue;
+            }
+            let uf_change_rel = self.uf_change_rel_name(ty.name());
+            let cj = child(j);
+            // Onchange row columns: (write_lhs write_rhs lhs_leader rhs_leader new_leader).
+            for leader_col in ["ll_", "rl_"] {
+                let rule_name = self.egraph.parser.symbol_gen.fresh("rebuild_rule");
+                rules.push_str(&format!(
+                    "(rule (({uf_change_rel} _wl_ _wr_ ll_ rl_ _nl_)
+                            ({view_name} {children})
+                            (= {cj} {leader_col})
+                            {guard})
+                           ({updated_view}
+                            (delete ({view_name} {children})))
+                            :ruleset {rebuilding_ruleset} :name \"{rule_name}\")\n"
+                ));
+            }
+        }
+
+        self.parse_program(&rules)
     }
 
     /// Instrument fact replaces terms with looking up
@@ -1033,11 +1220,20 @@ impl<'a> ProofInstrumentor<'a> {
                     };
                     match sort {
                         Some(s) if s.is_eq_sort() => {
-                            let uf_function_name = self.uf_function_name(s.name());
-                            // RHS function-table lookup => rule needs
-                            // :unsafe-seminaive (set in instrument_rule).
-                            self.egraph.proof_state.emitted_canon_lookup = true;
-                            format!("({uf_function_name} {a})")
+                            if self.native_uf() {
+                                // Native-UF mode: find-or-self via the
+                                // `@canon_S` primitive. A primitive call (not
+                                // a table lookup), so no :unsafe-seminaive is
+                                // needed — leave `emitted_canon_lookup` clear.
+                                let canon_prim = self.canon_prim_name(s.name());
+                                format!("({canon_prim} {a})")
+                            } else {
+                                let uf_function_name = self.uf_function_name(s.name());
+                                // RHS function-table lookup => rule needs
+                                // :unsafe-seminaive (set in instrument_rule).
+                                self.egraph.proof_state.emitted_canon_lookup = true;
+                                format!("({uf_function_name} {a})")
+                            }
                         }
                         _ => a.clone(),
                     }
@@ -1071,9 +1267,16 @@ impl<'a> ProofInstrumentor<'a> {
                 && !self.egraph.proof_state.proofs_enabled
                 && func_type.output.is_eq_sort()
             {
-                let uf_function_name = self.uf_function_name(func_type.output.name());
-                self.egraph.proof_state.emitted_canon_lookup = true;
-                a.push(format!("({uf_function_name} {fv})"));
+                if self.native_uf() {
+                    // Native-UF mode: find-or-self via the `@canon_S`
+                    // primitive (no :unsafe-seminaive needed).
+                    let canon_prim = self.canon_prim_name(func_type.output.name());
+                    a.push(format!("({canon_prim} {fv})"));
+                } else {
+                    let uf_function_name = self.uf_function_name(func_type.output.name());
+                    self.egraph.proof_state.emitted_canon_lookup = true;
+                    a.push(format!("({uf_function_name} {fv})"));
+                }
             } else {
                 a.push(fv.clone());
             }

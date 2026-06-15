@@ -113,6 +113,46 @@ impl ProofInstrumentor<'_> {
         }
     }
 
+    /// Returns the `@canon_S` find-or-self primitive name for `sort`
+    /// (native-UF mode only). The primitive is registered via the UF
+    /// function's `:canon-prim` annotation.
+    pub(crate) fn canon_prim_name(&mut self, sort: &str) -> String {
+        if let Some(name) = self.egraph.proof_state.canon_prim.get(sort) {
+            name.clone()
+        } else {
+            let fresh_name = self
+                .egraph
+                .parser
+                .symbol_gen
+                .fresh(&format!("canon_{sort}"));
+            self.egraph
+                .proof_state
+                .canon_prim
+                .insert(sort.to_string(), fresh_name.clone());
+            fresh_name
+        }
+    }
+
+    /// Returns the `@UFChange_S` onchange relation name for `sort`
+    /// (native-UF mode only). The relation receives a row each time a
+    /// leader changes: `(write_lhs write_rhs lhs_leader rhs_leader new_leader)`.
+    pub(crate) fn uf_change_rel_name(&mut self, sort: &str) -> String {
+        if let Some(name) = self.egraph.proof_state.uf_change_rel.get(sort) {
+            name.clone()
+        } else {
+            let fresh_name = self
+                .egraph
+                .parser
+                .symbol_gen
+                .fresh(&format!("UFChange_{sort}"));
+            self.egraph
+                .proof_state
+                .uf_change_rel
+                .insert(sort.to_string(), fresh_name.clone());
+            fresh_name
+        }
+    }
+
     /// Returns the name of the Pair sort used to bundle (leader, proof) in the UF function index.
     /// Only used in proof mode.
     pub(crate) fn uf_pair_sort_name(&mut self, sort: &str) -> String {
@@ -244,6 +284,13 @@ impl ProofInstrumentor<'_> {
 
     pub(crate) fn proofs_enabled(&self) -> bool {
         self.egraph.proof_state.proofs_enabled
+    }
+
+    /// True when the native-UF encoding mode is active. This mode is only
+    /// ever set in term-encoding, non-proof mode on the native bridge, so
+    /// callers can use it directly to switch encoding behavior.
+    pub(crate) fn native_uf(&self) -> bool {
+        self.egraph.proof_state.native_uf
     }
 
     /// Returns the proof output type: `Proof` when proofs are enabled, `Unit` otherwise.

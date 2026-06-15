@@ -1244,6 +1244,25 @@ impl TypeInfo {
         self.primitives.contains_key(sym) || self.reserved_primitives.contains(sym)
     }
 
+    /// Returns the current backend external id for the (single) primitive
+    /// named `sym` valid in `ctx`, if there is exactly one such primitive
+    /// registered. Used to refresh a `:canon-prim`'s id at rule-build time:
+    /// the placeholder id baked into a resolved rule at typecheck time is
+    /// rebound (via `replace_primitive_external_id`) once the UF function is
+    /// declared, but already-resolved rules still carry the stale id. This
+    /// lets `BackendRule::prim` pick up the rebound id.
+    pub(crate) fn current_primitive_external_id(
+        &self,
+        sym: &str,
+        ctx: Context,
+    ) -> Option<ExternalFunctionId> {
+        let prims = self.primitives.get(sym)?;
+        if prims.len() != 1 {
+            return None;
+        }
+        prims[0].context_ids[ctx]
+    }
+
     /// Rebind the (single) primitive named `sym` so all of its per-context
     /// backend entrypoints point at `new_id`. Returns the previous backend ids
     /// (one per valid context) so the caller can free the now-unused

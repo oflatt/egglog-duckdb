@@ -677,6 +677,16 @@ impl EGraph {
         self
     }
 
+    /// Enable the native-UF term-encoding mode on this e-graph (the
+    /// `--native-uf` flag). Emits PR #782's `:impl displaced-union-find`
+    /// UF-backed function instead of the relational union-find. Only valid
+    /// on the native bridge in term-encoding, non-proof mode (the CLI
+    /// enforces these preconditions). Default OFF.
+    pub(crate) fn with_native_uf(mut self) -> Self {
+        self.proof_state.native_uf = true;
+        self
+    }
+
     /// Enable proof generation on this e-graph.
     /// TODO proofs should be turned on during creation of the e-graph, not afterwards.
     /// This method is to support the current CLI implementation with egglog-experimental (https://github.com/egraphs-good/egglog/issues/768)
@@ -1156,11 +1166,25 @@ impl EGraph {
             Ok(CommandOutput::PrintFunctionSize(size))
         } else {
             // Print size of all non-hidden, non-let_binding functions
-            // For view tables, use the term_constructor name instead
+            // For view tables, use the term_constructor name instead.
+            // In native-UF mode the `@UFChange_S` onchange relation is a
+            // (visible) constructor; filter it out so the print-size output
+            // matches the relational encoding (whose UF tables are all
+            // `:internal-hidden`).
+            let uf_change_rels: HashSet<&str> = self
+                .proof_state
+                .uf_change_rel
+                .values()
+                .map(|s| s.as_str())
+                .collect();
             let mut lens = self
                 .functions
                 .iter()
-                .filter(|(_, f)| !f.decl.internal_hidden && !f.decl.internal_let)
+                .filter(|(name, f)| {
+                    !f.decl.internal_hidden
+                        && !f.decl.internal_let
+                        && !uf_change_rels.contains(name.as_str())
+                })
                 .map(|(sym, f)| {
                     let name = f
                         .decl
@@ -2826,7 +2850,19 @@ impl<'a> BackendRule<'a> {
         // The typechecker has already checked that this primitive is
         // valid in `ctx`; pick the runtime id that stamps the same ctx
         // onto the state wrapper when invoked.
-        let resolved_id = prim.external_id(ctx);
+        //
+        // The baked `SpecializedPrimitive` captured its external ids at
+        // typecheck time. For a `:canon-prim` placeholder those ids are
+        // later rebound to the real union-find canonicalizer (in
+        // `declare_uf_function`) once the UF function is declared — but the
+        // already-resolved rule still carries the stale placeholder id. Refresh
+        // from the current `type_info` so the rebound id is used. This is a
+        // no-op for every other primitive (its `type_info` id is unchanged
+        // since typecheck).
+        let resolved_id = self
+            .type_info
+            .current_primitive_external_id(prim.name(), ctx)
+            .unwrap_or_else(|| prim.external_id(ctx));
 
         let mut qe_args = self.args(args);
 
