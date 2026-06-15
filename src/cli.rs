@@ -107,11 +107,14 @@ struct Args {
     /// onchange relation driving the rebuild. Runs on the default native bridge
     /// AND on `--flowlog` (where the FlowLog backend honours the UF-backed
     /// encoding but drives its fast HOST-PASS rebuild, preserving the ~2.1×
-    /// win). Term-encoding only; not compatible with `--duckdb` (use
-    /// `--duck-native-uf`) or `--feldera`. Supports `--proofs` on the native
-    /// bridge (provenance-tracking UF; leader-change callback composes the
-    /// onchange proof) — but `--native-uf --flowlog` is TERM mode only. Off by
-    /// default; the relational encoding is unchanged when off.
+    /// win). It also runs on `--duckdb`: the DuckDB backend honours the
+    /// UF-backed encoding but drives its fast SQL HOST-PASS rebuild via the find
+    /// UDF + demote pass (preserving the ~7-9% win over relational `--duckdb`).
+    /// Term-encoding only; not compatible with `--feldera`. Supports `--proofs`
+    /// on the native bridge (provenance-tracking UF; leader-change callback
+    /// composes the onchange proof) — but `--native-uf --flowlog` /
+    /// `--native-uf --duckdb` are TERM mode only. Off by default; the relational
+    /// encoding is unchanged when off.
     #[clap(long = "native-uf")]
     native_uf: bool,
 }
@@ -139,20 +142,20 @@ pub fn cli(mut egraph: EGraph) {
     }
 
     // The native-UF encoding mode (PR #782's `:impl displaced-union-find`
-    // UF-backed function) runs on the native bridge AND the FlowLog backend
-    // (`--flowlog`): FlowLog honours the UF-backed encoding but drives its fast
-    // HOST-PASS rebuild instead of the onchange-driven rebuild rules. It is
-    // still incompatible with DuckDB (which has its own `--duck-native-uf`) and
-    // Feldera (no native-UF path yet).
-    if args.native_uf && (args.duckdb_backend || args.feldera_backend) {
-        log::error!(
-            "--native-uf cannot be combined with --duckdb/--feldera (use --duck-native-uf for DuckDB)"
-        );
+    // UF-backed function) runs on the native bridge, the FlowLog backend
+    // (`--flowlog`), AND the DuckDB backend (`--duckdb`): both honour the
+    // UF-backed encoding but drive their fast HOST-PASS rebuild instead of the
+    // onchange-driven rebuild rules. It is still incompatible with Feldera (no
+    // native-UF path yet).
+    if args.native_uf && args.feldera_backend {
+        log::error!("--native-uf cannot be combined with --feldera (no native-UF path yet)");
         std::process::exit(1);
     }
-    // Native-UF on FlowLog is TERM mode only (proofs are a later step).
-    if args.native_uf && args.flowlog_backend && args.proofs {
-        log::error!("--native-uf --flowlog is TERM mode only; --proofs is not yet supported");
+    // Native-UF on FlowLog / DuckDB is TERM mode only (proofs are a later step).
+    if args.native_uf && (args.flowlog_backend || args.duckdb_backend) && args.proofs {
+        log::error!(
+            "--native-uf --flowlog / --native-uf --duckdb are TERM mode only; --proofs is not yet supported"
+        );
         std::process::exit(1);
     }
 
@@ -260,14 +263,24 @@ pub fn cli(mut egraph: EGraph) {
                     }
                     continue;
                 }
+                // `--native-uf --duckdb`: enable the DuckDB backend's in-process
+                // UF host-pass (`enable_native_uf`, via the config flag) AND the
+                // matching PR #782 encoding (`with_native_uf` below) — both are
+                // needed (the encoding emits the UF-backed program; the backend
+                // interception runs it through the SQL host-pass rebuild). The
+                // legacy `--duck-native-uf` flag drives the same backend
+                // interception on the *relational* (non-#782) encoding.
                 let mut duck_eg = egglog::EGraph::with_duckdb_backend(egglog::DuckBackendConfig {
-                    native_uf: args.duck_native_uf,
+                    native_uf: args.duck_native_uf || args.native_uf,
                     proofs: false,
                 })
                 .unwrap_or_else(|err| {
                     log::error!("failed to start DuckDB backend: {err}");
                     std::process::exit(1);
                 });
+                if args.native_uf {
+                    duck_eg = duck_eg.with_native_uf();
+                }
                 duck_eg.parser = std::mem::take(&mut egraph.parser);
                 duck_eg.fact_directory.clone_from(&args.fact_directory);
                 duck_eg.ensure_no_reserved_symbols(false);
@@ -283,9 +296,23 @@ pub fn cli(mut egraph: EGraph) {
                 {
                     duck_perf_dump(duck, duck_wall_ns);
                 }
-                if let Err(err) = duck_result {
-                    log::error!("{err}");
-                    std::process::exit(1);
+                match duck_result {
+                    Ok(msgs) => {
+                        // Print command output (`print-size`, `extract`, …) like
+                        // the flowlog/feldera paths below, so `--duckdb` is
+                        // observable from the CLI (it previously discarded msgs).
+                        if args.mode != RunMode::NoMessages {
+                            use std::io::Write;
+                            let mut out = io::stdout();
+                            for msg in msgs {
+                                let _ = write!(out, "{msg}");
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        log::error!("{err}");
+                        std::process::exit(1);
+                    }
                 }
                 continue;
             }

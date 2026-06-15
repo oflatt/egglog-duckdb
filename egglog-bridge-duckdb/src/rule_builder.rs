@@ -694,7 +694,14 @@ impl<'a> RuleBuilderOps for DuckRuleBuilderOps<'a> {
         };
         // Bug 3 fix (insert side): strip the trailing "output" entry
         // for relation inserts. Same reasoning as in `query_table`.
-        if self.is_relation(&name) && !args.is_empty() {
+        //
+        // `--native-uf --duckdb` exception: PR #782 writes a union as
+        // `(set (@UF_Sf lhs) rhs)`. We register `@UF_Sf` as an append-only
+        // 2-column relation (so distinct union pairs survive), but BOTH
+        // columns are meaningful (lhs, rhs) — stripping the trailing `rhs`
+        // would drop the union target. Keep both for native-UF functions.
+        if self.is_relation(&name) && !args.is_empty() && !self.egraph.is_native_uf_function(&name)
+        {
             args.pop();
         }
         self.rule.actions.push(Action::Insert { name, args });

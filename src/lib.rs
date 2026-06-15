@@ -1131,6 +1131,19 @@ impl EGraph {
                         self.backend.free_external_func(old_id);
                     }
                 }
+                // DuckDB side-channel: the canon-prim id is bound here (not via
+                // `register_per_context`, which never saw this placeholder
+                // rebind), so the duck rule-builder has no name for it and
+                // `query_prim` would panic ("no associated primitive name").
+                // Register the egglog name so `set_external_func_name` records
+                // the canon-prim -> find-UDF mapping the compile pre-pass needs.
+                if let Some(duck) = self
+                    .backend
+                    .as_any_mut()
+                    .downcast_mut::<egglog_bridge_duckdb::EGraph>()
+                {
+                    duck.set_external_func_name(canon_prim_id, canon_prim.to_owned());
+                }
             }
             None => {
                 self.backend.free_external_func(canon_prim_id);

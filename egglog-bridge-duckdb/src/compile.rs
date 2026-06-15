@@ -285,6 +285,7 @@ pub(crate) fn compile_rule(
     rule: &Rule,
     functions: &HashMap<String, FunctionInfo>,
     proofs_enabled: bool,
+    native_uf_gate_tables: &[String],
 ) -> Result<CompiledRule> {
     // Rewrite the rule before validation/compilation so any nested
     // eq-sort constructor calls in action positions become explicit
@@ -439,6 +440,29 @@ pub(crate) fn compile_rule(
             functions,
             &demote,
             Some(&gate_pname),
+            proofs_enabled,
+        )?);
+    }
+    // `--native-uf --duckdb` rebuild host-pass: the #782 rebuild rule was
+    // rewritten (in `EGraph::rewrite_native_uf_rule`) into a view scan +
+    // `@canon_S`-find guard, with no demotable `@UF_Sf` body atom, so the loop
+    // above emits no gated variant. The seminaive variant only sees view rows
+    // inserted this iteration; old rows go stale when a later union displaces
+    // one of their ids. Emit a gated full-scan variant per union table the
+    // rule reads (gated on that table's watermark — i.e. "a union landed since
+    // this rule last ran"), so stale old rows get re-canonicalized. This is the
+    // exact role the relational path's demote-table gated variant plays.
+    for gate in native_uf_gate_tables {
+        if demote_tables.iter().any(|n| n == gate) {
+            // Already gated via the demote path.
+            continue;
+        }
+        variants.push(compile_fused_variant(
+            rule,
+            &func_atom_indices,
+            functions,
+            &demote,
+            Some(gate),
             proofs_enabled,
         )?);
     }
@@ -1768,6 +1792,20 @@ fn prim_sql(op: &str, args: &[String], rule_name: &str) -> Result<String> {
         s if s.starts_with("bigrat-") => {
             let udf = format!("__egglog_{}", s.replace('-', "_"));
             Ok(format!("{udf}({})", args.join(", ")))
+        }
+        // `--native-uf --duckdb`: a PR #782 `@canon_S` find-or-self call the
+        // compile pre-pass (`EGraph::rewrite_native_uf_rule`) rewrote to its
+        // find UDF. The op-name after the prefix is the UDF name
+        // (`duck_uf_<sort>_find`). Emit `<udf>(arg)` — the in-core UF answer.
+        s if s.starts_with(crate::NATIVE_UF_FIND_PRIM_PREFIX) => {
+            if args.len() != 1 {
+                return Err(anyhow!(
+                    "rule {rule_name}: native-UF find prim `{op}` expects 1 arg, got {}",
+                    args.len()
+                ));
+            }
+            let udf = &s[crate::NATIVE_UF_FIND_PRIM_PREFIX.len()..];
+            Ok(format!("{udf}({})", args[0]))
         }
         _ => Err(anyhow!("rule {rule_name}: unknown primitive `{op}`")),
     }
