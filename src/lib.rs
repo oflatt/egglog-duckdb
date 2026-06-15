@@ -680,8 +680,8 @@ impl EGraph {
     /// Enable the native-UF term-encoding mode on this e-graph (the
     /// `--native-uf` flag). Emits PR #782's `:impl displaced-union-find`
     /// UF-backed function instead of the relational union-find. Only valid
-    /// on the native bridge in term-encoding, non-proof mode (the CLI
-    /// enforces these preconditions). Default OFF.
+    /// on the native bridge in term-encoding mode (the CLI enforces these
+    /// preconditions). Supports proof mode (provenance-tracking UF). Default OFF.
     pub(crate) fn with_native_uf(mut self) -> Self {
         self.proof_state.native_uf = true;
         self
@@ -1051,9 +1051,40 @@ impl EGraph {
             }
             None => None,
         };
+        // In proof mode, the UF function is provenance-tracking: the
+        // leader-change callback composes the onchange relation's proof column
+        // by interning `Trans`/`Sym` proof-constructor rows. Resolve their
+        // backend ids here so the callback can mint them.
+        let proof_config = if self.proof_state.proofs_enabled {
+            let trans_name = self.proof_state.proof_names.eq_trans_constructor.clone();
+            let sym_name = self.proof_state.proof_names.eq_sym_constructor.clone();
+            let trans = self
+                .functions
+                .get(&trans_name)
+                .ok_or_else(|| {
+                    Error::TypeError(TypeError::UnboundFunction(
+                        trans_name.clone(),
+                        decl.span.clone(),
+                    ))
+                })?
+                .backend_id;
+            let sym = self
+                .functions
+                .get(&sym_name)
+                .ok_or_else(|| {
+                    Error::TypeError(TypeError::UnboundFunction(
+                        sym_name.clone(),
+                        decl.span.clone(),
+                    ))
+                })?
+                .backend_id;
+            Some(egglog_backend_trait::UfProofConfig { trans, sym })
+        } else {
+            None
+        };
         let (backend_id, canon_prim_id) = self
             .backend
-            .add_uf_function(decl.name.to_string(), onchange_backend_id)
+            .add_uf_function(decl.name.to_string(), onchange_backend_id, proof_config)
             .map_err(|err| Error::BackendError(err.to_string()))?;
 
         match canon_prim {

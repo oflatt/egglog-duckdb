@@ -106,8 +106,10 @@ struct Args {
     /// uf_function_index maintenance rulesets. Emits PR #782's
     /// `:impl displaced-union-find` UF-backed function plus an onchange
     /// relation driving the rebuild. Term-encoding only; not compatible
-    /// with `--duckdb`/`--feldera`/`--flowlog` or `--proofs`. Off by
-    /// default; the relational encoding is unchanged when off.
+    /// with `--duckdb`/`--feldera`/`--flowlog`. Supports `--proofs` on the
+    /// native bridge (provenance-tracking UF; leader-change callback composes
+    /// the onchange proof). Off by default; the relational encoding is
+    /// unchanged when off.
     #[clap(long = "native-uf")]
     native_uf: bool,
 }
@@ -135,17 +137,12 @@ pub fn cli(mut egraph: EGraph) {
     }
 
     // The native-UF encoding mode applies to the default native bridge only.
-    // It requires term encoding, is incompatible with the experimental
-    // backends, and is term-mode only (proofs come later).
-    if args.native_uf {
-        if args.duckdb_backend || args.feldera_backend || args.flowlog_backend {
-            log::error!("--native-uf cannot be combined with --duckdb/--feldera/--flowlog");
-            std::process::exit(1);
-        }
-        if args.proofs || args.proof_testing {
-            log::error!("--native-uf cannot be combined with --proofs/--proof-testing");
-            std::process::exit(1);
-        }
+    // It requires term encoding and is incompatible with the experimental
+    // backends. Proof mode is supported on the native bridge: the UF function
+    // is provenance-tracking and the leader-change callback composes proofs.
+    if args.native_uf && (args.duckdb_backend || args.feldera_backend || args.flowlog_backend) {
+        log::error!("--native-uf cannot be combined with --duckdb/--feldera/--flowlog");
+        std::process::exit(1);
     }
 
     // `--native-uf` is a term-encoding-only mode, so it implies term

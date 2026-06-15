@@ -476,6 +476,7 @@ impl Backend for EGraph {
         &mut self,
         _name: String,
         _onchange: Option<FunctionId>,
+        _proof: Option<egglog_backend_trait::UfProofConfig>,
     ) -> Result<(FunctionId, ExternalFunctionId)> {
         anyhow::bail!("the FlowLog backend does not support `:impl displaced-union-find` functions")
     }

@@ -515,17 +515,24 @@ impl EGraph {
                         .insert(fdecl.name.clone(), output_sort.clone());
                 }
                 // Register the `:canon-prim` placeholder primitive (if any). Its
-                // signature is `(S S) -> S`; the backend rebinds its external id
-                // to the real union-find canonicalizer in `declare_function`.
+                // signature is `(S) -> S` for the function's eqsort S (the find-
+                // or-self canonicalizer); the backend rebinds its external id to
+                // the real union-find canonicalizer in `declare_function`. The
+                // eqsort is the function's first input (which is `S` in both the
+                // `(S) S` term-mode schema and the `(S S) Proof` proof-mode one).
                 if let FunctionImpl::DisplacedUnionFind {
                     canon_prim: Some(canon_prim),
                     ..
                 } = &resolved.impl_kind
                 {
-                    let Some(sort) = self.type_info.get_sort_by_name(&resolved.schema.output)
-                    else {
+                    let eqsort_name = resolved
+                        .schema
+                        .input
+                        .first()
+                        .unwrap_or(&resolved.schema.output);
+                    let Some(sort) = self.type_info.get_sort_by_name(eqsort_name) else {
                         return Err(TypeError::UndefinedSort(
-                            resolved.schema.output.clone(),
+                            eqsort_name.clone(),
                             resolved.span.clone(),
                         ));
                     };
@@ -915,12 +922,19 @@ impl TypeInfo {
                     fdecl.span.clone(),
                 ));
             }
-            // Schema must be (S) S for an EqSort S.
-            if fdecl.schema.input.len() != 1
-                || ftype.input.len() != 1
-                || ftype.input[0].name() != ftype.output.name()
-                || !ftype.output.is_eq_sort()
-            {
+            // Schema must be `(S) S` for an EqSort S (term mode), or
+            // `(S S) Proof` in proof mode: the two inputs are the eqsort being
+            // unioned and the output carries the per-edge proof. The eqsort is
+            // always `input[0]`.
+            let eqsort_name = ftype.input.first().map(|s| s.name().to_owned());
+            let term_schema = ftype.input.len() == 1
+                && ftype.input[0].name() == ftype.output.name()
+                && ftype.output.is_eq_sort();
+            let proof_schema = ftype.input.len() == 2
+                && ftype.input[0].name() == ftype.input[1].name()
+                && ftype.input[0].is_eq_sort()
+                && ftype.output.is_eq_sort();
+            if fdecl.schema.input.len() != ftype.input.len() || !(term_schema || proof_schema) {
                 return Err(TypeError::UfFunctionSchema(
                     fdecl.name.clone(),
                     fdecl.span.clone(),
@@ -934,10 +948,15 @@ impl TypeInfo {
                     ));
                 };
                 // `(relation R (S S S S S))` desugars to a constructor over a
-                // fresh sort; require 5 inputs all of the function's eqsort.
-                let out_name = ftype.output.name().to_owned();
-                let valid_schema = rel_type.input.len() == 5
-                    && rel_type.input.iter().all(|sort| sort.name() == out_name);
+                // fresh sort; require the first 5 inputs to be the function's
+                // eqsort. In proof mode the relation has a trailing 6th `Proof`
+                // column carrying the composed leader-change proof (any eq-sort),
+                // so allow 5 or 6 inputs where the first 5 match.
+                let out_name = eqsort_name.unwrap_or_else(|| ftype.output.name().to_owned());
+                let valid_schema = (rel_type.input.len() == 5 || rel_type.input.len() == 6)
+                    && rel_type.input[..5]
+                        .iter()
+                        .all(|sort| sort.name() == out_name);
                 if !valid_schema {
                     return Err(TypeError::UfOnChangeSchema(
                         onchange.clone(),

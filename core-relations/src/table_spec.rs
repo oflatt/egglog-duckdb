@@ -578,6 +578,13 @@ impl WrappedTable {
         }
     }
 
+    /// Downcast the underlying [`Table`] to a concrete type. Used to reach
+    /// table-specific APIs (e.g. [`crate::DisplacedTableWithProvenance::get_proof`])
+    /// from a callback that only has a [`WrappedTable`].
+    pub fn as_any(&self) -> &dyn Any {
+        self.inner.as_any()
+    }
+
     /// Starting at the given [`Offset`] into `subset`, scan up to `n` rows and
     /// write them to `out`. Return the next starting offset. If no offset is
     /// returned then the subset has been scanned completely.

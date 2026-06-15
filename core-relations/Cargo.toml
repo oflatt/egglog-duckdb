@@ -17,6 +17,7 @@ egglog-union-find = { workspace = true }
 egglog-reports = { workspace = true }
 hashbrown = { workspace = true }
 indexmap = { workspace = true }
+petgraph = { workspace = true }
 rustc-hash = { workspace = true }
 fixedbitset = { workspace = true }
 smallvec = { workspace = true }

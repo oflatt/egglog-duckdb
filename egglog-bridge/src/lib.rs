@@ -18,9 +18,9 @@ use std::{
 
 use crate::core_relations::{
     BaseValue, BaseValues, ColumnId, Constraint, ContainerValue, ContainerValues, CounterId,
-    Database, DisplacedTable, ExecutionState, ExternalFunction, ExternalFunctionId, LeaderChange,
-    MergeVal, Offset, PlanStrategy, SortedWritesTable, TableId, TaggedRowBuffer, Value,
-    WrappedTable, make_external_func,
+    Database, DisplacedTable, DisplacedTableWithProvenance, ExecutionState, ExternalFunction,
+    ExternalFunctionId, LeaderChange, MergeVal, Offset, PlanStrategy, ProofReason, ProofStep,
+    SortedWritesTable, TableId, TaggedRowBuffer, Value, WrappedTable, make_external_func,
 };
 use crate::numeric_id::{DenseIdMap, DenseIdMapWithReuse, NumericId, define_id};
 use egglog_core_relations as core_relations;
@@ -161,6 +161,27 @@ pub struct UfFunctionConfig {
     pub read_deps: Vec<TableId>,
     /// Tables the `on_leader_change` callback writes to.
     pub write_deps: Vec<TableId>,
+    /// When `Some(_)`, back the function with a [`DisplacedTableWithProvenance`]
+    /// (4-column writes carrying a per-edge proof) instead of the plain
+    /// [`DisplacedTable`] (3-column writes), and build the leader-change
+    /// callback internally so it can compose the onchange relation's proof
+    /// column via the provenance variant's `get_proof`. When set, `on_leader_change`
+    /// is ignored. Used by native-UF proof mode.
+    pub proof_wiring: Option<UfProofWiring>,
+}
+
+/// Proof-mode wiring for a UF-backed function. The leader-change callback uses
+/// these to compose a proof that `displaced_leader = new_leader` and write it
+/// into the onchange relation.
+#[derive(Copy, Clone)]
+pub struct UfProofWiring {
+    /// The onchange relation (now `(S S S S S Proof)`): the callback writes
+    /// `(write_lhs write_rhs lhs_leader rhs_leader new_leader proof)`.
+    pub onchange: FunctionId,
+    /// `Trans` proof constructor: `(Trans Proof Proof) -> Proof`.
+    pub trans: FunctionId,
+    /// `Sym` proof constructor: `(Sym Proof) -> Proof`.
+    pub sym: FunctionId,
 }
 
 impl Default for EGraph {
@@ -618,18 +639,78 @@ impl EGraph {
             on_leader_change,
             read_deps,
             write_deps,
+            proof_wiring,
         } = config;
-        let mut table = DisplacedTable::default();
-        if let Some(callback) = on_leader_change {
-            table.set_leader_change_callback(move |state, change| callback(state, change));
-        }
         let name: Arc<str> = name.into();
-        let table_id = self.db.add_table_named(
-            table,
-            name.clone(),
-            read_deps.iter().copied(),
-            write_deps.iter().copied(),
-        );
+        // In proof mode the function is backed by a `DisplacedTableWithProvenance`
+        // (4-column writes carrying a per-edge proof, exposing `get_proof`); in
+        // term mode the plain `DisplacedTable` (3-column writes) is used.
+        let table_id = if let Some(wiring) = proof_wiring {
+            // TableActions to intern the composed proof and write the onchange row.
+            let onchange_action = TableAction::new(self, wiring.onchange);
+            let trans_action = TableAction::new(self, wiring.trans);
+            let sym_action = TableAction::new(self, wiring.sym);
+            let onchange_tid = self.table_id(wiring.onchange);
+            let trans_tid = self.table_id(wiring.trans);
+            let sym_tid = self.table_id(wiring.sym);
+            // The leader-change callback both reads (hash-cons dedup via
+            // `predict_val`'s `get_row`) and writes (`stage_insert`) the onchange
+            // and Trans/Sym tables. They must therefore be both read- and
+            // write-dependencies: the write dep pre-allocates a mutation buffer
+            // (so writes don't touch the moved-out table info), and the read dep
+            // forces them into an earlier merge stratum (so they stay in the
+            // database — readable — while this UF table is merging). Without the
+            // read dep, the Trans/Sym tables (which are also written by ordinary
+            // proof rules) can be merged in the same stratum as the UF table and
+            // get moved out from under the callback's `get_row`.
+            let mut read_deps = read_deps;
+            read_deps.push(onchange_tid);
+            read_deps.push(trans_tid);
+            read_deps.push(sym_tid);
+            let mut write_deps = write_deps;
+            write_deps.push(onchange_tid);
+            write_deps.push(trans_tid);
+            write_deps.push(sym_tid);
+
+            // The provenance table reconstructs the proof path `displaced ->
+            // new_leader` itself (it can't be read back from the database during
+            // the table's own merge) and hands it to the callback, which folds
+            // it into a single `Proof` term and records the onchange row.
+            let table = DisplacedTableWithProvenance::with_leader_change_callback(
+                move |state: &mut ExecutionState, change: LeaderChange, steps: &[ProofStep]| {
+                    let new_leader = change.new_leader();
+                    let proof = compose_uf_proof(state, &trans_action, &sym_action, steps);
+                    onchange_action.lookup_or_insert(
+                        state,
+                        &[
+                            change.write_lhs,
+                            change.write_rhs,
+                            change.lhs_leader,
+                            change.rhs_leader,
+                            new_leader,
+                            proof,
+                        ],
+                    );
+                },
+            );
+            self.db.add_table_named(
+                table,
+                name.clone(),
+                read_deps.iter().copied(),
+                write_deps.iter().copied(),
+            )
+        } else {
+            let mut table = DisplacedTable::default();
+            if let Some(callback) = on_leader_change {
+                table.set_leader_change_callback(move |state, change| callback(state, change));
+            }
+            self.db.add_table_named(
+                table,
+                name.clone(),
+                read_deps.iter().copied(),
+                write_deps.iter().copied(),
+            )
+        };
         let canon =
             self.register_external_func(Box::new(make_external_func(move |state, vals| {
                 let [val] = vals else {
@@ -641,7 +722,15 @@ impl EGraph {
                     .unwrap_or(*val);
                 Some(canon)
             })));
-        let schema = vec![ColumnTy::Id, ColumnTy::Id];
+        // In proof mode the UF function is `(S S) Proof`: writes carry the
+        // per-edge proof as a third column (`set (@UF_Sf a b) proof` →
+        // `[a, b, proof, ts]`), which the provenance table consumes. In term
+        // mode it is the usual `(S) S` (writes `[a, b, ts]`).
+        let schema = if proof_wiring.is_some() {
+            vec![ColumnTy::Id, ColumnTy::Id, ColumnTy::Id]
+        } else {
+            vec![ColumnTy::Id, ColumnTy::Id]
+        };
         let res = self.funcs.push(FunctionInfo {
             table: table_id,
             schema,
@@ -662,11 +751,25 @@ impl EGraph {
     /// so it stays consistent with the main union-find.
     fn uf_rebuild_rule(&mut self, table: FunctionId) -> RuleId {
         let uf_table = self.uf_table;
+        // Proof-mode UF functions are `(S S) Proof` (3 columns): the set must
+        // supply a proof column. Forwarded global e-graph unions don't carry an
+        // egglog-level proof here (the term encoder routes unions through
+        // `(set @UF_Sf ...)` directly, so this rule is normally inert), so use a
+        // placeholder proof value.
+        let proof_col = self.funcs[table].schema.len() == 3;
         let mut rb = self.new_rule(&format!("uf rebuild {table:?}"), true);
         let lhs: QueryEntry = rb.new_var(ColumnTy::Id).into();
         let rhs: QueryEntry = rb.new_var(ColumnTy::Id).into();
         rb.add_atom_with_timestamp_and_func(uf_table, None, None, &[lhs.clone(), rhs.clone()]);
-        rb.set(table, &[lhs, rhs]);
+        if proof_col {
+            let placeholder = QueryEntry::Const {
+                val: Value::new(0),
+                ty: ColumnTy::Id,
+            };
+            rb.set(table, &[lhs, rhs, placeholder]);
+        } else {
+            rb.set(table, &[lhs, rhs]);
+        }
         rb.build()
     }
 
@@ -1539,6 +1642,40 @@ impl UnionAction {
         let ts = Value::from_usize(state.read_counter(self.timestamp));
         state.stage_insert(self.table, &[x, y, ts]);
     }
+}
+
+/// Compose a `Proof` term for a native-UF leader change from a reconstructed
+/// proof path (`steps`, produced by the union-find's provenance graph).
+///
+/// Folds the path into a single `Proof` value: each step contributes its
+/// per-edge proof (the value stored in the write's proof column), wrapped in
+/// `Sym` for a backward step, and consecutive steps are chained with `Trans`.
+/// The `Trans`/`Sym` constructor rows are minted/hash-consed via
+/// `TableAction::lookup_or_insert`, so the resulting proof is a real, interned
+/// term visible to egglog rules.
+fn compose_uf_proof(
+    state: &mut ExecutionState,
+    trans_action: &TableAction,
+    sym_action: &TableAction,
+    steps: &[ProofStep],
+) -> Value {
+    let mut acc: Option<Value> = None;
+    for step in steps {
+        // Each step's per-edge proof proves `write_lhs = write_rhs`.
+        let step_proof = match step.reason {
+            ProofReason::Forward(p) => p,
+            ProofReason::Backward(p) => sym_action
+                .lookup_or_insert(state, &[p])
+                .expect("Sym constructor lookup_or_insert failed"),
+        };
+        acc = Some(match acc {
+            None => step_proof,
+            Some(prev) => trans_action
+                .lookup_or_insert(state, &[prev, step_proof])
+                .expect("Trans constructor lookup_or_insert failed"),
+        });
+    }
+    acc.expect("get_proof returned an empty path for a real leader change")
 }
 
 fn run_rules_impl(

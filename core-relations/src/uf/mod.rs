@@ -8,11 +8,13 @@ use std::{
 
 use crate::numeric_id::{DenseIdMap, NumericId};
 use crossbeam_queue::SegQueue;
+use indexmap::IndexMap;
+use petgraph::{Direction, Graph, algo::dijkstra, graph::NodeIndex, visit::EdgeRef};
 
 use crate::{
     TableChange, TaggedRowBuffer,
     action::ExecutionState,
-    common::{HashMap, Value},
+    common::{HashMap, IndexSet, Value},
     offsets::{OffsetRange, RowId, Subset, SubsetRef},
     pool::with_pool_set,
     row_buffer::RowBuffer,
@@ -44,6 +46,10 @@ pub struct LeaderChange {
     pub rhs_leader: Value,
     /// The timestamp associated with the write that triggered the union.
     pub ts: Value,
+    /// The "proof" column carried by the write that triggered the union (the
+    /// per-edge proof in proof mode). For the plain [`DisplacedTable`] (no
+    /// provenance / 3-column writes) this is `Value::new(0)`.
+    pub write_proof: Value,
 }
 
 impl LeaderChange {
@@ -543,6 +549,28 @@ impl DisplacedTable {
         exec_state: &mut ExecutionState,
     ) -> Option<(Value, Value)> {
         assert_eq!(row.len(), 3, "attempt to insert a row with the wrong arity");
+        self.insert_impl_with_proof(row, Value::new(0), false, exec_state)
+            .map(|(parent, child, _change)| (parent, child))
+    }
+
+    /// Like [`Self::insert_impl`], but threads an explicit per-edge proof value
+    /// through to the [`LeaderChange`] callback. Used by
+    /// [`DisplacedTableWithProvenance`], where writes carry a proof column.
+    ///
+    /// When `defer_callback` is true, the leader-change callback is NOT fired
+    /// here. Instead the [`LeaderChange`] is returned alongside the
+    /// (parent, child) pair so the caller can fire it after recording any
+    /// additional state (e.g. the provenance proof graph) that the callback
+    /// needs to observe. When false the callback fires inline (the plain
+    /// `DisplacedTable` behavior).
+    fn insert_impl_with_proof(
+        &mut self,
+        row: &[Value],
+        write_proof: Value,
+        defer_callback: bool,
+        exec_state: &mut ExecutionState,
+    ) -> Option<(Value, Value, LeaderChange)> {
+        assert_eq!(row.len(), 3, "attempt to insert a row with the wrong arity");
         let lhs_leader = self.uf.find(row[0]);
         let rhs_leader = self.uf.find(row[1]);
         if lhs_leader == rhs_leader {
@@ -554,17 +582,16 @@ impl DisplacedTable {
         let _ = self.uf.find(parent);
         let _ = self.uf.find(child);
         let ts = row[2];
-        if let Some(callback) = &self.on_leader_change {
-            callback(
-                exec_state,
-                LeaderChange {
-                    write_lhs: row[0],
-                    lhs_leader,
-                    write_rhs: row[1],
-                    rhs_leader,
-                    ts,
-                },
-            );
+        let change = LeaderChange {
+            write_lhs: row[0],
+            lhs_leader,
+            write_rhs: row[1],
+            rhs_leader,
+            ts,
+            write_proof,
+        };
+        if !defer_callback && let Some(callback) = &self.on_leader_change {
+            callback(exec_state, change);
         }
         if let Some((_, highest)) = self.displaced.last() {
             assert!(
@@ -575,7 +602,429 @@ impl DisplacedTable {
         let next = RowId::from_usize(self.displaced.len());
         self.displaced.push((child, ts));
         self.lookup_table.insert(child, next);
-        Some((parent, child))
+        Some((parent, child, change))
+    }
+}
+
+/// A callback for [`DisplacedTableWithProvenance`] that, in addition to the
+/// [`LeaderChange`], receives the reconstructed proof path `displaced ->
+/// new_leader` (a sequence of [`ProofStep`]s). The path is computed *inside*
+/// the table's `insert_impl` (where `&self` is available), so the callback does
+/// not need to read the union-find table back through the database — which is
+/// unsafe during the table's own merge, since its table info is temporarily
+/// moved out of the database.
+type ProvenanceLeaderChangeCallback =
+    Arc<dyn Fn(&mut ExecutionState, LeaderChange, &[ProofStep]) + Send + Sync>;
+
+/// A variant of `DisplacedTable` that also stores "provenance" information that
+/// can be used to generate proofs of equality.
+///
+/// This table expects a fourth "proof" column, though the values it hands back
+/// _are not_ the proofs that come in and generally should not be used directly.
+/// To generate a proof that two values are equal, this table exports a separate
+/// `get_proof` method.
+#[derive(Clone, Default)]
+pub struct DisplacedTableWithProvenance {
+    base: DisplacedTable,
+    /// Added context for a given "displaced" row. We use this to store "proofs
+    /// that x = y".
+    ///
+    /// N.B. We currently only use the first proof that we find. The remaining
+    /// proofs are used for debugging. With some further refactoring we should
+    /// be able to remove this field entirely, as complete proof information is
+    /// now available through `proof_graph`.
+    context: HashMap<(Value, Value), IndexSet<Value>>,
+    proof_graph: Graph<Value, ProofEdge>,
+    node_map: HashMap<Value, NodeIndex>,
+    /// The value that was displaced, the value _immediately_ displacing it.
+    /// NB: this is different from the 'displaced' table in 'base', which holds
+    /// a timestamp.
+    displaced: Vec<(Value, Value)>,
+    buffered_writes: Arc<SegQueue<RowBuffer>>,
+    /// Callback fired on each leader change with the reconstructed proof path.
+    on_leader_change: Option<ProvenanceLeaderChangeCallback>,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+struct ProofEdge {
+    reason: ProofReason,
+    ts: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProofStep {
+    pub lhs: Value,
+    pub rhs: Value,
+    pub reason: ProofReason,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ProofReason {
+    /// The edge was added with `lhs` as the write's lhs and `rhs` as the
+    /// write's rhs. The wrapped value is the per-edge proof.
+    Forward(Value),
+    /// The reverse of a `Forward` edge. The wrapped value is the per-edge proof.
+    Backward(Value),
+}
+
+impl DisplacedTableWithProvenance {
+    fn expand(&self, row: RowId) -> [Value; 4] {
+        let [v1, v2, v3] = self.base.expand(row);
+        let (child, parent) = self.displaced[row.index()];
+        debug_assert_eq!(child, v1);
+        let proof = *self.context[&(child, parent)].get_index(0).unwrap();
+        [v1, v2, v3, proof]
+    }
+
+    fn eval(&self, constraint: &Constraint, row: RowId) -> bool {
+        eval_constraint(&self.expand(row), constraint)
+    }
+
+    /// Access the underlying union-find (find-or-self canonicalization).
+    pub fn underlying_uf(&self) -> &UnionFind {
+        self.base.underlying_uf()
+    }
+
+    /// Return the timestamp when `l` and `r` became equal.
+    ///
+    /// This is used to filter possible paths in the proof graph. The algorithm
+    /// we use here is a variant of the classic algorithm in "Proof-Producing
+    /// Congruence Closure" by Nieuwenhuis and Oliveras for reconstructing a
+    /// proof.
+    fn timestamp_when_equal(&self, l: Value, r: Value) -> Option<u32> {
+        if l == r {
+            return Some(0);
+        }
+        let mut l_proofs = IndexMap::new();
+        let mut r_proofs = IndexMap::new();
+        if self.base.uf.find_naive(l) != self.base.uf.find_naive(r) {
+            // The two values aren't equal.
+            return None;
+        }
+        let canon = self.base.uf.find_naive(l);
+
+        // General case: collect individual equality proofs that point from `l`
+        // (sim. `r`) and move towards canon. We stop early and don't always go
+        // to `canon`. To see why consider the following sequences of unions.
+        // For simplicity, we'll assume that the "leader" (or new canonical id)
+        // is always the second argument to `union`.
+        // * left:  A: union(0,2), B: union(2,4), C: union(4,6)
+        // * right: D: union(1,3), E: union(3,5), F: union(5,4), C: union(4,6)
+        // Where `l` `r` are 0 and 1, and their canonical value is `6`.
+        // A simple approach here would be to simply glue the proofs that `l=6`
+        // and `r=6` together, something like:
+        //
+        //    [A;B;C;rev(C);rev(F);rev(E);rev(D)]
+        //
+        // The code below avoids the redundant common suffix (i.e. `C;rev(C)`)
+        // and just uses A,B,D,E, and F.
+        //
+        // In addition to allowing us to generate smaller proofs, this sort of
+        // algorithm also ensures that we are returning the first proof of `l =
+        // r` that we learned about, which is important for avoiding cycles when
+        // reconstructing a proof.
+
+        // General case: create a proof  that l = canon, then compose it with
+        // the proof that r = canon, reversed.
+        for (mut cur, steps) in [(l, &mut l_proofs), (r, &mut r_proofs)] {
+            while cur != canon {
+                // Find where cur became non-canonical.
+                let row = *self.base.lookup_table.get(&cur).unwrap();
+                let (_, ts) = self.base.displaced[row.index()];
+                let (child, parent) = self.displaced[row.index()];
+                debug_assert_eq!(child, cur);
+                steps.insert(parent, ts);
+                cur = parent;
+            }
+        }
+
+        let mut l_end = None;
+        let mut r_start = None;
+
+        if let Some(i) = r_proofs.get_index_of(&l) {
+            r_start = Some(i);
+        } else {
+            for (i, (next_id, _)) in l_proofs.iter().enumerate() {
+                if *next_id == r {
+                    l_end = Some(i);
+                    break;
+                }
+                if let Some(j) = r_proofs.get_index_of(next_id) {
+                    l_end = Some(i);
+                    r_start = Some(j);
+                    break;
+                }
+            }
+        }
+        match (l_end, r_start) {
+            (None, Some(start)) => r_proofs.as_slice()[..=start]
+                .iter()
+                .map(|(_, ts)| ts.rep())
+                .max(),
+            (Some(end), None) => l_proofs.as_slice()[..=end]
+                .iter()
+                .map(|(_, ts)| ts.rep())
+                .max(),
+            (Some(end), Some(start)) => l_proofs.as_slice()[..=end]
+                .iter()
+                .map(|(_, ts)| ts.rep())
+                .chain(r_proofs.as_slice()[..=start].iter().map(|(_, ts)| ts.rep()))
+                .max(),
+            (None, None) => {
+                panic!(
+                    "did not find common id, despite the values being equivalent {l:?} / {r:?}, l_proofs={l_proofs:?}, r_proofs={r_proofs:?}"
+                )
+            }
+        }
+    }
+
+    /// A simple proof generation algorithm that searches for the shortest path
+    /// in the proof graph between `l` and `r`.
+    ///
+    /// The path in the graph is restricted to the timestamps at or before `l`
+    /// and `r` first became equal. This is to avoid cycles during proof
+    /// reconstruction.
+    pub fn get_proof(&self, l: Value, r: Value) -> Option<Vec<ProofStep>> {
+        let ts = self.timestamp_when_equal(l, r)?;
+        let start = self.node_map[&l];
+        let goal = self.node_map[&r];
+        let costs = dijkstra(&self.proof_graph, self.node_map[&l], Some(goal), |edge| {
+            if edge.weight().ts.rep() > ts {
+                // avoid edges added after the two became equal.
+                f64::INFINITY
+            } else {
+                1.0f64
+            }
+        });
+        // Reconstruct the proof steps from the cost map returned from petgraph.
+        // Start at the end and then work backwards along the shortest path.
+        let mut path = Vec::new();
+        let mut cur = goal;
+        while cur != start {
+            let (_, step, next) = self
+                .proof_graph
+                .edges_directed(cur, Direction::Incoming)
+                .filter_map(|edge| {
+                    let source = edge.source();
+                    let cost = costs.get(&source)?;
+                    let step = ProofStep {
+                        lhs: *self.proof_graph.node_weight(source).unwrap(),
+                        rhs: *self.proof_graph.node_weight(edge.target()).unwrap(),
+                        reason: edge.weight().reason,
+                    };
+                    Some((cost, step, source))
+                })
+                .fold(None, |acc, cur| {
+                    // Manually implement 'min' because we are using f64 for costs.
+                    // We should probably switch these edge costs over to NotNan
+                    // or a custom type.
+                    let Some(acc) = acc else {
+                        return Some(cur);
+                    };
+                    Some(if acc.0 > cur.0 { cur } else { acc })
+                })
+                .unwrap();
+            path.push(step);
+            cur = next;
+        }
+        path.reverse();
+        Some(path)
+    }
+    fn get_or_create_node(&mut self, val: Value) -> NodeIndex {
+        *self
+            .node_map
+            .entry(val)
+            .or_insert_with(|| self.proof_graph.add_node(val))
+    }
+
+    fn insert_impl(&mut self, row: &[Value], exec_state: &mut ExecutionState) {
+        // Writes are laid out `[lhs, rhs, proof, ts]`: this matches the row
+        // produced by a `(set (@UF_Sf a b) proof)` action on a 3-column
+        // (`(S S) Proof`) UF function, where `write_table_row` places the
+        // timestamp last. (Contrast the plain 3-column `DisplacedTable` write
+        // `[lhs, rhs, ts]`.)
+        let [a, b, reason, ts] = row else {
+            panic!("attempt to insert a row with the wrong arity ({row:?})");
+        };
+        // Defer the leader-change callback: we must record the new proof-graph
+        // edge first, so the callback's `get_proof(displaced, new_leader)` sees
+        // a complete graph (it needs the just-added edge to find the path).
+        match self.base.insert_impl_with_proof(
+            &[*a, *b, *ts],
+            *reason,
+            /*defer_callback=*/ true,
+            exec_state,
+        ) {
+            Some((parent, child, change)) => {
+                self.displaced.push((child, parent));
+                self.context
+                    .entry((child, parent))
+                    .or_default()
+                    .insert(*reason);
+                self.base.changed = true;
+
+                let a_node = self.get_or_create_node(*a);
+                let b_node = self.get_or_create_node(*b);
+                self.proof_graph.add_edge(
+                    a_node,
+                    b_node,
+                    ProofEdge {
+                        reason: ProofReason::Forward(*reason),
+                        ts: *ts,
+                    },
+                );
+                self.proof_graph.add_edge(
+                    b_node,
+                    a_node,
+                    ProofEdge {
+                        reason: ProofReason::Backward(*reason),
+                        ts: *ts,
+                    },
+                );
+
+                // Now that the proof graph is complete, reconstruct the path
+                // `displaced -> new_leader` and fire the callback. We compute the
+                // path here (with `&self` in hand) rather than in the callback,
+                // because during this table's own merge its table info is moved
+                // out of the database and cannot be read back via `get_table`.
+                if let Some(callback) = self.on_leader_change.clone() {
+                    let new_leader = change.new_leader();
+                    let displaced = std::cmp::max(change.lhs_leader, change.rhs_leader);
+                    let steps = self.get_proof(displaced, new_leader).unwrap_or_else(|| {
+                        panic!("no proof path between {displaced:?} and {new_leader:?}")
+                    });
+                    callback(exec_state, change, &steps);
+                }
+            }
+            None => {
+                self.context.entry((*a, *b)).or_default().insert(*reason);
+                // We don't register a change, even if we learned a new proof.
+                // We may want to change this behavior in order to search for
+                // smaller proofs.
+            }
+        }
+    }
+
+    /// Construct with a leader-change callback. The callback receives the
+    /// [`LeaderChange`] and the reconstructed proof path
+    /// `displaced -> new_leader` (see [`ProvenanceLeaderChangeCallback`]).
+    pub fn with_leader_change_callback<F>(callback: F) -> Self
+    where
+        F: Fn(&mut ExecutionState, LeaderChange, &[ProofStep]) + Send + Sync + 'static,
+    {
+        Self {
+            on_leader_change: Some(Arc::new(callback)),
+            ..Self::default()
+        }
+    }
+}
+
+impl Table for DisplacedTableWithProvenance {
+    fn refine_one(&self, mut subset: Subset, c: &Constraint) -> Subset {
+        subset.retain(|row| self.eval(c, row));
+        subset
+    }
+    fn scan_generic_bounded(
+        &self,
+        subset: SubsetRef,
+        start: Offset,
+        n: usize,
+        cs: &[Constraint],
+        mut f: impl FnMut(RowId, &[Value]),
+    ) -> Option<Offset>
+    where
+        Self: Sized,
+    {
+        if cs.is_empty() {
+            let start = start.index();
+            subset
+                .iter_bounded(start, start + n, |row| {
+                    f(row, self.expand(row).as_slice());
+                })
+                .map(Offset::from_usize)
+        } else {
+            let start = start.index();
+            subset
+                .iter_bounded(start, start + n, |row| {
+                    if cs.iter().all(|c| self.eval(c, row)) {
+                        f(row, self.expand(row).as_slice());
+                    }
+                })
+                .map(Offset::from_usize)
+        }
+    }
+
+    fn spec(&self) -> TableSpec {
+        TableSpec {
+            n_vals: 3,
+            ..self.base.spec()
+        }
+    }
+
+    fn rebuilder<'a>(&'a self, cols: &[ColumnId]) -> Option<Box<dyn Rebuilder + 'a>> {
+        self.base.rebuilder(cols)
+    }
+
+    fn merge(&mut self, exec_state: &mut ExecutionState) -> TableChange {
+        while let Some(rowbuf) = self.buffered_writes.pop() {
+            for row in rowbuf.iter() {
+                self.insert_impl(row, exec_state);
+            }
+        }
+
+        self.base.merge(exec_state)
+    }
+
+    fn get_row(&self, key: &[Value]) -> Option<Row> {
+        let mut inner = self.base.get_row(key)?;
+        let (child, parent) = self.displaced[inner.id.index()];
+        debug_assert_eq!(child, inner.vals[0]);
+        let proof = *self.context[&(child, parent)].get_index(0).unwrap();
+        inner.vals.push(proof);
+        Some(inner)
+    }
+
+    fn get_row_column(&self, key: &[Value], col: ColumnId) -> Option<Value> {
+        if col == ColumnId::new(3) {
+            let row = *self.base.lookup_table.get(&key[0])?;
+            Some(self.expand(row)[3])
+        } else {
+            self.base.get_row_column(key, col)
+        }
+    }
+
+    fn new_buffer(&self) -> Box<dyn MutationBuffer> {
+        Box::new(UfBuffer {
+            to_insert: ManuallyDrop::new(RowBuffer::new(4)),
+            buffered_writes: Arc::downgrade(&self.buffered_writes),
+        })
+    }
+
+    // Many of these methods just delgate to `base`:
+
+    fn dyn_clone(&self) -> Box<dyn Table> {
+        Box::new(self.clone())
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn clear(&mut self) {
+        self.base.clear()
+    }
+    fn all(&self) -> Subset {
+        self.base.all()
+    }
+    fn len(&self) -> usize {
+        self.base.len()
+    }
+    fn updates_since(&self, offset: Offset) -> Subset {
+        self.base.updates_since(offset)
+    }
+    fn version(&self) -> TableVersion {
+        self.base.version()
+    }
+    fn fast_subset(&self, c: &Constraint) -> Option<Subset> {
+        self.base.fast_subset(c)
     }
 }
 

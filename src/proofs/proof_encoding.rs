@@ -98,14 +98,49 @@ impl<'a> ProofInstrumentor<'a> {
         rhs: &str,
         justification: &Justification,
     ) -> String {
-        // Native-UF mode: union via the UF-backed function. `(set (@UF_Sf a) b)`
-        // calls the union-find's `union(a, b)`, which picks the min leader
-        // itself and records the leader change in the onchange relation. No
-        // proofs in this mode (gated to `!proofs_enabled`), so the
-        // justification is ignored.
+        // Native-UF mode: union via the UF-backed function. `(set (@UF_Sf a) b
+        // <edge_proof>)` calls the union-find's `union(a, b)`, which picks the
+        // min leader itself and records the leader change in the onchange
+        // relation. In proof mode the edge proof (a Proof term proving `a = b`)
+        // is carried in the write's proof column; the leader-change callback
+        // reconstructs and composes it into the onchange proof column. In term
+        // mode the proof column is Unit `()`.
         if self.native_uf() {
             let uf_function_name = self.uf_function_name(type_name);
-            return format!("(set ({uf_function_name} {lhs}) {rhs})");
+            let edge_proof = if self.egraph.proof_state.proofs_enabled {
+                let to_ast_constructor = self
+                    .proof_names()
+                    .sort_to_ast_constructor
+                    .get(type_name)
+                    .unwrap();
+                let rule_constructor = &self.proof_names().rule_constructor;
+                let fiat_constructor = &self.proof_names().fiat_constructor;
+                // Orientation: the edge proof proves `lhs = rhs` (the arguments
+                // exactly as passed to the UF write). `get_proof` then reorients
+                // per step (Sym for backward edges) when composing the onchange
+                // proof.
+                match justification {
+                    Justification::Rule(rule_name, proof_list) => format!(
+                        "({rule_constructor} \"{rule_name}\" {proof_list} ({to_ast_constructor} {lhs}) ({to_ast_constructor} {rhs}))"
+                    ),
+                    Justification::Fiat => format!(
+                        "({fiat_constructor} ({to_ast_constructor} {lhs}) ({to_ast_constructor} {rhs}))"
+                    ),
+                    Justification::Merge(_func_name, _proof1, _proof2) => panic!(
+                        "Merge functions do not include union actions, so proof should not be by merge"
+                    ),
+                    Justification::Proof(existing_proof) => existing_proof.clone(),
+                }
+            } else {
+                "()".to_string()
+            };
+            // Term mode: `@UF_Sf` is `(S) S` → `(set (@UF_Sf a) b)`.
+            // Proof mode: `@UF_Sf` is `(S S) Proof` → `(set (@UF_Sf a b) proof)`.
+            return if self.egraph.proof_state.proofs_enabled {
+                format!("(set ({uf_function_name} {lhs} {rhs}) {edge_proof})")
+            } else {
+                format!("(set ({uf_function_name} {lhs}) {rhs})")
+            };
         }
         let uf_name = self.uf_name(type_name);
         let smaller = format!("(ordering-min {lhs} {rhs})");
@@ -315,13 +350,39 @@ impl<'a> ProofInstrumentor<'a> {
         let canon_prim = self.canon_prim_name(sort_name);
         let uf_change_rel = self.uf_change_rel_name(sort_name);
 
-        // The onchange relation desugars to a constructor over a fresh sort;
-        // its 5 inputs are all the eq-sort being declared.
-        let code = format!(
-            "(relation {uf_change_rel} ({sort_name} {sort_name} {sort_name} {sort_name} {sort_name}))
-             (function {uf_function_name} ({sort_name}) {sort_name} :impl displaced-union-find
-                       :onchange {uf_change_rel} :canon-prim {canon_prim} :internal-hidden)"
-        );
+        // The onchange relation desugars to a constructor over a fresh sort. Its
+        // first 5 inputs are all the eq-sort being declared
+        // (write_lhs write_rhs lhs_leader rhs_leader new_leader). In PROOF mode
+        // it gains a trailing `Proof` column carrying the composed proof that
+        // `displaced_leader = new_leader` (filled by the leader-change callback).
+        //
+        // The UF function is `(S) S` in term mode, but `(S S) Proof` in proof
+        // mode: the union write carries the per-edge proof as the value column
+        // (`(set (@UF_Sf a b) proof)` → backend row `[a, b, proof, ts]`, which
+        // the provenance table consumes). `@UF_Sf` is never *read* as a function
+        // in proof mode (find goes through `@canon_S`, rebuild reads the onchange
+        // relation, canon-at-creation is disabled), so the schema change is safe.
+        let code = if self.egraph.proof_state.proofs_enabled {
+            let proof_type = self.proof_type_str().to_string();
+            // In proof mode we also need the per-sort `term_proof` function and
+            // the sort→AST constructor, exactly as the relational `declare_sort`
+            // emits them (they're consumed by `add_term_and_view`).
+            let term_proof_name = self.term_proof_name(sort_name);
+            let add_to_ast_code = self.add_to_ast(sort_name);
+            format!(
+                "{add_to_ast_code}
+                 (function {term_proof_name} ({sort_name}) {proof_type} :merge old :internal-hidden)
+                 (relation {uf_change_rel} ({sort_name} {sort_name} {sort_name} {sort_name} {sort_name} {proof_type}))
+                 (function {uf_function_name} ({sort_name} {sort_name}) {proof_type} :impl displaced-union-find
+                           :onchange {uf_change_rel} :canon-prim {canon_prim} :internal-hidden)"
+            )
+        } else {
+            format!(
+                "(relation {uf_change_rel} ({sort_name} {sort_name} {sort_name} {sort_name} {sort_name}))
+                 (function {uf_function_name} ({sort_name}) {sort_name} :impl displaced-union-find
+                           :onchange {uf_change_rel} :canon-prim {canon_prim} :internal-hidden)"
+            )
+        };
         self.parse_program(&code)
     }
 
@@ -788,6 +849,9 @@ impl<'a> ProofInstrumentor<'a> {
         fdecl: &ResolvedFunctionDecl,
         types: &[ArcSort],
     ) -> Vec<Command> {
+        if self.egraph.proof_state.proofs_enabled {
+            return self.rebuilding_rules_native_uf_proof(fdecl, types);
+        }
         let view_name = self.view_name(&fdecl.name);
         let child = |i: usize| format!("c{i}_");
         let children_vec: Vec<String> = (0..types.len()).map(child).collect();
@@ -864,6 +928,96 @@ impl<'a> ProofInstrumentor<'a> {
                             (= {cj} {leader_col})
                             {guard})
                            ({updated_view}
+                            (delete ({view_name} {children})))
+                            :ruleset {rebuilding_ruleset} :name \"{rule_name}\")\n"
+                ));
+            }
+        }
+
+        self.parse_program(&rules)
+    }
+
+    /// Proof-mode variant of [`Self::rebuilding_rules_native_uf`].
+    ///
+    /// The onchange relation now carries a trailing `Proof` column `pf_`
+    /// proving `displaced_leader = new_leader` (composed in the leader-change
+    /// callback). Where the term-mode rebuild canonicalizes *all* columns to
+    /// the current full leader in one firing (no proof to thread), the
+    /// proof-mode rebuild canonicalizes column `j` a single displacement step
+    /// to `new_leader` (`nl_`) using exactly that onchange proof, mirroring the
+    /// relational rebuild's per-column `pair-second` congruence proof — chains
+    /// of unions collapse across successive firings. Each firing:
+    ///   * rewrites column `j` from the displaced id to `nl_`,
+    ///   * threads `pf_` (proof `cj = nl_`) into the view's proof via `Congr`
+    ///     (child column) or `Trans(Sym(pf_), view_proof)` (representative
+    ///     column of a constructor), exactly as `rebuilding_rules` does for the
+    ///     relational `@UF_Sf` index,
+    ///   * retracts the stale row.
+    fn rebuilding_rules_native_uf_proof(
+        &mut self,
+        fdecl: &ResolvedFunctionDecl,
+        types: &[ArcSort],
+    ) -> Vec<Command> {
+        let view_name = self.view_name(&fdecl.name);
+        let child = |i: usize| format!("c{i}_");
+        let children_vec: Vec<String> = (0..types.len()).map(child).collect();
+        let children = ListDisplay(&children_vec, " ").to_string();
+        let rebuilding_ruleset = self.proof_names().rebuilding_ruleset_name.clone();
+        let eq_trans_constructor = self.proof_names().eq_trans_constructor.clone();
+        let congr_constructor = self.proof_names().congr_constructor.clone();
+        let sym_constructor = self.proof_names().eq_sym_constructor.clone();
+
+        let mut rules = String::new();
+        for (j, ty) in types.iter().enumerate() {
+            if !ty.is_eq_sort() {
+                continue;
+            }
+            let uf_change_rel = self.uf_change_rel_name(ty.name());
+            let cj = child(j);
+            // Onchange row columns: (write_lhs write_rhs lhs_leader rhs_leader
+            // new_leader proof). We equi-join the view's column `j` against the
+            // displaced leader (`ll_` or `rl_`), and read the new leader `nl_`
+            // and the composed proof `pf_`.
+            for leader_col in ["ll_", "rl_"] {
+                let rule_name = self.egraph.parser.symbol_gen.fresh("rebuild_rule");
+                // Build the updated children: column `j` becomes `nl_`, all
+                // others unchanged.
+                let children_updated: Vec<String> = (0..types.len())
+                    .map(|i| if i == j { "nl_".to_string() } else { child(i) })
+                    .collect();
+
+                // View proof query + variable.
+                let (query_view, view_prf) =
+                    self.query_view_and_get_proof(&fdecl.name, &children_vec);
+
+                // Compose the new view proof using `pf_` (proof `cj = nl_`).
+                let new_proof = self.fresh_var();
+                let proof_code = if fdecl.subtype == FunctionSubtype::Constructor
+                    && j == types.len() - 1
+                {
+                    // Representative column of a constructor: transitivity with
+                    // the symmetric onchange proof.
+                    format!(
+                        "(let {new_proof} ({eq_trans_constructor} ({sym_constructor} pf_) {view_prf}))"
+                    )
+                } else {
+                    // Child column: congruence at index `j`.
+                    format!("(let {new_proof} ({congr_constructor} {view_prf} {j} pf_))")
+                };
+
+                let updated_view = self.update_view(&fdecl.name, &children_updated, &new_proof);
+
+                // Guard: column `j` must actually be stale w.r.t. *this* leader
+                // change (`cj != nl_`); otherwise the onchange proof `pf_`
+                // (proving `displaced = nl_`) would not apply and the rewrite
+                // would be a no-op (non-terminating).
+                rules.push_str(&format!(
+                    "(rule (({uf_change_rel} _wl_ _wr_ ll_ rl_ nl_ pf_)
+                            {query_view}
+                            (= {cj} {leader_col})
+                            (guard (bool-!= {cj} nl_)))
+                           ({proof_code}
+                            {updated_view}
                             (delete ({view_name} {children})))
                             :ruleset {rebuilding_ruleset} :name \"{rule_name}\")\n"
                 ));

@@ -278,7 +278,28 @@ impl Backend for EGraph {
         &mut self,
         name: String,
         onchange: Option<FunctionId>,
+        proof: Option<egglog_backend_trait::UfProofConfig>,
     ) -> Result<(FunctionId, ExternalFunctionId)> {
+        // Proof mode: the bridge builds the proof-composition callback itself
+        // (it needs the UF table's own id to call `get_proof`). We just thread
+        // the onchange + Trans/Sym constructor ids through.
+        if let Some(proof) = proof {
+            let onchange = onchange.expect("native-UF proof mode requires an onchange relation");
+            return EGraph::add_uf_function(
+                self,
+                crate::UfFunctionConfig {
+                    name,
+                    on_leader_change: None,
+                    read_deps: Vec::new(),
+                    write_deps: Vec::new(),
+                    proof_wiring: Some(crate::UfProofWiring {
+                        onchange,
+                        trans: proof.trans,
+                        sym: proof.sym,
+                    }),
+                },
+            );
+        }
         let mut on_leader_change: Option<crate::LeaderChangeCallback> = None;
         let mut write_deps = Vec::new();
         if let Some(onchange) = onchange {
@@ -310,6 +331,7 @@ impl Backend for EGraph {
                 on_leader_change,
                 read_deps: Vec::new(),
                 write_deps,
+                proof_wiring: None,
             },
         )
     }

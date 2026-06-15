@@ -109,6 +109,24 @@ pub struct FunctionConfig {
     pub can_subsume: bool,
 }
 
+/// Proof-mode configuration for a UF-backed function (see
+/// [`Backend::add_uf_function`]).
+///
+/// When present, the UF function is backed by a provenance-tracking
+/// union-find: writes carry a per-edge proof column, and on each leader change
+/// the callback composes a proof that the displaced leader equals the new
+/// leader (reconstructed from the union-find's proof graph) and writes it into
+/// the onchange relation's trailing proof column. The composition interns
+/// `Trans` / `Sym` proof-constructor rows, so their backend [`FunctionId`]s are
+/// required here.
+#[derive(Copy, Clone)]
+pub struct UfProofConfig {
+    /// `Trans` proof constructor: `(Trans Proof Proof) -> Proof`.
+    pub trans: FunctionId,
+    /// `Sym` proof constructor: `(Sym Proof) -> Proof`.
+    pub sym: FunctionId,
+}
+
 /// How defaults are computed for the given function.
 #[derive(Copy, Clone)]
 pub enum DefaultVal {
@@ -278,12 +296,19 @@ pub trait Backend: Send + Sync {
     /// Returns the function's handle and the [`ExternalFunctionId`] of the
     /// canonicalizer primitive (find-or-self against the union-find).
     ///
+    /// When `proof` is `Some(_)`, the function is backed by a
+    /// provenance-tracking union-find: the onchange relation gains a trailing
+    /// proof column (so it is `(S S S S S Proof)`), and the leader-change
+    /// callback composes that proof from the union-find's proof graph (see
+    /// [`UfProofConfig`]).
+    ///
     /// Wraps `egglog_bridge::EGraph::add_uf_function`. Backends that do not
     /// support UF-backed functions (DuckDB, Feldera, FlowLog) return an error.
     fn add_uf_function(
         &mut self,
         name: String,
         onchange: Option<FunctionId>,
+        proof: Option<UfProofConfig>,
     ) -> Result<(FunctionId, ExternalFunctionId)>;
 
     /// Number of rows currently in the given function's table.
