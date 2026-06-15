@@ -305,22 +305,37 @@ impl Backend for EGraph {
         if let Some(onchange) = onchange {
             write_deps.push(self.table_id(onchange));
             // `(relation R (S S S S S))` desugars to a constructor over a fresh
-            // sort, so each leader change is recorded with `lookup_or_insert`
-            // (mint a fresh eclass id for the 5-input key).
+            // sort (schema = the N inputs + 1 minted output id), so each leader
+            // change is recorded with `lookup_or_insert` (mint a fresh eclass id
+            // for the input key).
+            //
+            // The onchange relation has either 5 or 6 input columns:
+            //   5: (write_lhs write_rhs lhs_leader rhs_leader new_leader)
+            //   6: the above + `displaced = max(lhs_leader, rhs_leader)`, the id
+            //      that stopped being canonical under union-by-min
+            //      (`new_leader = min`). The internal native-UF encoding uses
+            //      the 6-input form so its rebuild can equi-join view columns
+            //      against the *stored* displaced column with a single indexed
+            //      rule per column (a computed `(ordering-max ll rl)` join can't
+            //      be indexed). User-declared `:onchange` relations use the
+            //      5-input form. Match whichever arity the relation was declared
+            //      with (schema.len() counts inputs + the minted output).
+            let onchange_inputs = self.funcs[onchange].schema.len().saturating_sub(1);
             let table_action = crate::TableAction::new(self, onchange);
             on_leader_change = Some(Box::new(
                 move |state: &mut egglog_core_relations::ExecutionState,
                       change: egglog_core_relations::LeaderChange| {
-                    table_action.lookup_or_insert(
-                        state,
-                        &[
-                            change.write_lhs,
-                            change.write_rhs,
-                            change.lhs_leader,
-                            change.rhs_leader,
-                            change.new_leader(),
-                        ],
-                    );
+                    let mut row = vec![
+                        change.write_lhs,
+                        change.write_rhs,
+                        change.lhs_leader,
+                        change.rhs_leader,
+                        change.new_leader(),
+                    ];
+                    if onchange_inputs >= 6 {
+                        row.push(std::cmp::max(change.lhs_leader, change.rhs_leader));
+                    }
+                    table_action.lookup_or_insert(state, &row);
                 },
             ));
         }

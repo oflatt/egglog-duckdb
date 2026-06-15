@@ -50,6 +50,10 @@ pub(crate) struct EncodingState {
     /// Maps eq-sort name -> the `@UFChange_S` onchange relation name
     /// (only populated in native-UF mode).
     pub uf_change_rel: HashMap<String, String>,
+    /// Native-UF mode only: set of `@UFChange_S` relation names that already
+    /// have a drain rule emitted (a sort has one rebuild fn per constructor,
+    /// but only one drain rule should be emitted per onchange relation).
+    pub uf_change_drained: HashSet<String>,
 }
 
 impl EncodingState {
@@ -72,6 +76,7 @@ impl EncodingState {
             native_uf: false,
             canon_prim: HashMap::default(),
             uf_change_rel: HashMap::default(),
+            uf_change_drained: HashSet::default(),
         }
     }
 }
@@ -377,8 +382,16 @@ impl<'a> ProofInstrumentor<'a> {
                            :onchange {uf_change_rel} :canon-prim {canon_prim} :internal-hidden)"
             )
         } else {
+            // Term mode: the onchange relation gets a 6th `displaced` column
+            // (`= max(lhs_leader, rhs_leader)`, the id that stopped being
+            // canonical), written by the leader-change callback. The rebuild
+            // equi-joins a view column against this *stored* column with a
+            // single rule per column — half the rules of joining each of
+            // `lhs_leader`/`rhs_leader` separately, and far cheaper than a
+            // computed `(ordering-max ll rl)` join (which the planner cannot
+            // index, forcing a full onchange×view scan).
             format!(
-                "(relation {uf_change_rel} ({sort_name} {sort_name} {sort_name} {sort_name} {sort_name}))
+                "(relation {uf_change_rel} ({sort_name} {sort_name} {sort_name} {sort_name} {sort_name} {sort_name}))
                  (function {uf_function_name} ({sort_name}) {sort_name} :impl displaced-union-find
                            :onchange {uf_change_rel} :canon-prim {canon_prim} :internal-hidden)"
             )
@@ -892,20 +905,23 @@ impl<'a> ProofInstrumentor<'a> {
         let guard = format!("(guard (or {}))", neq_exprs.join(" "));
 
         // The rebuild is driven by leader changes recorded in the `@UFChange_S`
-        // onchange relation. With union-by-min, an onchange row's displaced id
-        // (the leader that stopped being canonical) is one of its two stored
-        // leaders `lhs_leader` / `rhs_leader` (whichever is larger).
+        // onchange relation. With union-by-min the surviving leader is
+        // `new_leader = min(lhs_leader, rhs_leader)`; the *displaced* id (the
+        // leader that stopped being canonical) is `max(lhs_leader, rhs_leader)`
+        // — exactly the id a stale view row can still be holding. The
+        // leader-change callback stores this displaced id as the onchange row's
+        // 6th column `disp_`.
         //
-        // For each eq-sort view column `j` we emit two rules: one equi-joining
-        // a view row's column `j` against the onchange `lhs_leader` column and
-        // one against the `rhs_leader` column. Equi-joining stored columns lets
-        // the query planner index the view by column `j` and probe it with the
-        // onchange leader (rather than scanning the whole onchange relation per
-        // view row, which a computed `(= cj (ordering-max ll rl))` join would
-        // force). The `(guard (or bool-!=))` then filters to rows that are
-        // actually stale — a column matching the *non*-displaced (still
-        // canonical) leader is rejected — so the union of the two rules
-        // canonicalizes exactly the rows referencing the displaced class.
+        // For each eq-sort view column `j` we emit ONE rule that equi-joins the
+        // view's column `j` against the *stored* displaced column. Equi-joining
+        // a stored column lets the query planner index the view by column `j`
+        // and probe it with `disp_`; a computed `(= cj (ordering-max ll rl))`
+        // join cannot be indexed and forces a full onchange×view scan (which
+        // was catastrophically slow). This halves the rebuild rules versus
+        // joining `lhs_leader` and `rhs_leader` separately — the extra rule
+        // there always searched the join on the *surviving* (non-displaced)
+        // leader only to be rejected by the guard. The `(guard (or bool-!=))`
+        // still filters to genuinely stale rows for termination.
         //
         // The action re-canonicalizes *all* eq-sort columns via the `@canon_S`
         // primitive (full find, so chained unions collapse in one step) and
@@ -919,17 +935,51 @@ impl<'a> ProofInstrumentor<'a> {
             }
             let uf_change_rel = self.uf_change_rel_name(ty.name());
             let cj = child(j);
-            // Onchange row columns: (write_lhs write_rhs lhs_leader rhs_leader new_leader).
-            for leader_col in ["ll_", "rl_"] {
-                let rule_name = self.egraph.parser.symbol_gen.fresh("rebuild_rule");
+            // Onchange row columns:
+            // (write_lhs write_rhs lhs_leader rhs_leader new_leader displaced).
+            let rule_name = self.egraph.parser.symbol_gen.fresh("rebuild_rule");
+            rules.push_str(&format!(
+                "(rule (({uf_change_rel} _wl_ _wr_ _ll_ _rl_ _nl_ disp_)
+                        ({view_name} {children})
+                        (= {cj} disp_)
+                        {guard})
+                       ({updated_view}
+                        (delete ({view_name} {children})))
+                        :ruleset {rebuilding_ruleset} :name \"{rule_name}\")\n"
+            ));
+
+            // Drain the onchange relation. `@UFChange_S` is a relation, so it is
+            // append-only — one row per leader change, retained forever. Without
+            // draining, seminaive re-joins every later iteration's *new* view
+            // rows against the entire accumulated onchange history
+            // (`δ@view ⋈ full@UFChange_S`), a super-linear blowup that dominated
+            // `--native-uf` rebuild time.
+            //
+            // The drain runs in its own `@uf_change_drain` ruleset, scheduled
+            // *after the rebuild saturates* (see `rebuild()`). It cannot run
+            // interleaved with `@rebuilding`: congruence in `@rebuilding` issues
+            // unions, whose leader-change callback writes the onchange relation
+            // via `lookup_or_insert`; deleting from that same relation in the
+            // same stratum corrupts its hash-cons index (panics in
+            // `predict_val`). At the rebuild fixpoint, every view row is
+            // canonical, so every onchange row has already been matched against
+            // all view rows referencing its displaced id and is dead weight;
+            // deleting them there is safe (no unconsumed row removed, no
+            // concurrent union) and keeps the relation from accumulating across
+            // the rebuild passes of successive `(run N)` iterations. One drain
+            // rule per onchange relation.
+            if self
+                .egraph
+                .proof_state
+                .uf_change_drained
+                .insert(uf_change_rel.clone())
+            {
+                let drain_name = self.egraph.parser.symbol_gen.fresh("uf_change_drain_rule");
+                let drain_ruleset = self.proof_names().uf_change_drain_ruleset_name.clone();
                 rules.push_str(&format!(
-                    "(rule (({uf_change_rel} _wl_ _wr_ ll_ rl_ _nl_)
-                            ({view_name} {children})
-                            (= {cj} {leader_col})
-                            {guard})
-                           ({updated_view}
-                            (delete ({view_name} {children})))
-                            :ruleset {rebuilding_ruleset} :name \"{rule_name}\")\n"
+                    "(rule (({uf_change_rel} wl_ wr_ ll_ rl_ nl_ disp_))
+                           ((delete ({uf_change_rel} wl_ wr_ ll_ rl_ nl_ disp_)))
+                            :ruleset {drain_ruleset} :name \"{drain_name}\")\n"
                 ));
             }
         }
@@ -1628,6 +1678,23 @@ impl<'a> ProofInstrumentor<'a> {
         let rebuilding_cleanup_ruleset = self.proof_names().rebuilding_cleanup_ruleset_name.clone();
         let rebuilding_ruleset = self.proof_names().rebuilding_ruleset_name.clone();
         let delete_ruleset = self.proof_names().delete_subsume_ruleset_name.clone();
+        // Native-UF mode: drain the append-only `@UFChange_S` onchange relation
+        // after the rebuild saturates (see `rebuilding_rules_native_uf`). The
+        // drain must run in its own stratum (a `(saturate ...)` step distinct
+        // from `@rebuilding`): congruence in `@rebuilding` issues unions whose
+        // leader-change callback writes the onchange relation, and deleting from
+        // it in the same merge corrupts its hash-cons index. Draining after the
+        // rebuild fixpoint is safe — every onchange row has been consumed (all
+        // view rows are canonical) — and stops the relation from accumulating
+        // across the rebuild passes of successive `(run N)` iterations. In
+        // relational mode the drain ruleset is empty, so the schedule is
+        // unchanged.
+        let drain_step = if self.native_uf() {
+            let drain_ruleset = self.proof_names().uf_change_drain_ruleset_name.clone();
+            format!("(saturate {drain_ruleset})")
+        } else {
+            String::new()
+        };
         self.parse_schedule(format!(
             "(seq
               (saturate
@@ -1636,6 +1703,7 @@ impl<'a> ProofInstrumentor<'a> {
                   (saturate {path_compress_ruleset})
                   (saturate {uf_function_index})
                   {rebuilding_ruleset})
+              {drain_step}
               {delete_ruleset})"
         ))
     }
