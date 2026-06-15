@@ -525,8 +525,25 @@ impl EGraph {
     /// rebuild rulesets, which the Feldera host interpreter runs faithfully (see
     /// `egglog-bridge-feldera`). Proof mode is not yet wired (Milestone 4).
     pub fn with_feldera_backend() -> anyhow::Result<Self> {
-        let backend: Box<dyn egglog_backend_trait::Backend> =
-            Box::new(egglog_bridge_feldera::EGraph::new());
+        Self::with_feldera_backend_config(FelderaBackendConfig::default())
+    }
+
+    /// [`EGraph::with_feldera_backend`] with explicit knobs. The only knob is
+    /// [`FelderaBackendConfig::native_uf`] (`--native-uf --feldera`): the Feldera
+    /// backend drives PR #782's UF-backed-table encoding through its fast
+    /// HOST-PASS rebuild (the in-process `UfTable` answers finds and ingests
+    /// unions; the onchange-driven `@rebuild_rule*` / `@uf_change_drain_rule*`
+    /// maintenance rules are intercepted/dropped, keeping the `view ⋈ @UF_Sf`
+    /// integral OUT of the DBSP circuit — the ~24% / transaction-count win). The
+    /// caller must ALSO enable the encoding via [`EGraph::with_native_uf`] so the
+    /// term encoder emits the `:impl displaced-union-find` program this backend
+    /// interception expects.
+    pub fn with_feldera_backend_config(config: FelderaBackendConfig) -> anyhow::Result<Self> {
+        let mut db = egglog_bridge_feldera::EGraph::new();
+        if config.native_uf {
+            db.enable_native_uf();
+        }
+        let backend: Box<dyn egglog_backend_trait::Backend> = Box::new(db);
         let mut eg = Self::with_backend(backend);
 
         // Term encoding requires a separate bridge-backed typechecker EGraph for
@@ -593,6 +610,19 @@ pub struct FlowlogBackendConfig {
     /// FlowLog backend's in-process `UfTable` + host-pass rebuild (finds and
     /// union ingestion in-core; the onchange-driven maintenance rules
     /// intercepted/dropped). Must be paired with [`EGraph::with_native_uf`] (the
+    /// encoding). Experimental; off by default.
+    pub native_uf: bool,
+}
+
+/// Knobs for [`EGraph::with_feldera_backend_config`]. Mirrors
+/// [`FlowlogBackendConfig`] (Feldera has no proof mode yet, so only `native_uf`).
+#[derive(Clone, Default, Debug)]
+pub struct FelderaBackendConfig {
+    /// `--native-uf --feldera`: drive PR #782's UF-backed encoding through the
+    /// Feldera backend's in-process `UfTable` + host-pass rebuild (finds and
+    /// union ingestion in-core; the onchange-driven maintenance rules
+    /// intercepted/dropped), keeping the `view ⋈ @UF_Sf` integral OUT of the
+    /// DBSP circuit. Must be paired with [`EGraph::with_native_uf`] (the
     /// encoding). Experimental; off by default.
     pub native_uf: bool,
 }

@@ -105,8 +105,31 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
     // Partition the ruleset into ATOM-LESS rules (fired once via the dedicated
     // helper) and ATOM-BEARING rules (joined on the FUSED per-ruleset circuit,
     // ONE transaction for the whole set — see `fused_bindings`).
+    //
+    // NATIVE UF (`--native-uf --feldera`): we drive PR #782's UF-backed encoding
+    // through Feldera's HOST-PASS rebuild. Two classes of maintenance rule are
+    // recognized by NAME (the feldera `RuleIr` carries no ruleset field, so we
+    // key off the `symbol_gen.fresh(prefix)` family the encoder emits):
+    //   * `@uf_change_drain_rule*` (the `@uf_change_drain` ruleset): DROPPED
+    //     entirely. The host-pass owns onchange consumption; the `@UFChange_S`
+    //     relation stays empty (the leader-change callback is never invoked on
+    //     Feldera), so the drain matches nothing anyway.
+    //   * `@rebuild_rule*` (`canonicalize`, the `@rebuilding` ruleset): taken
+    //     OUT of the fused DBSP circuit (its `view ⋈ @UF_Sf` arrangement is the
+    //     integral that regressed the relational fast-rebuild on DBSP — the
+    //     ~24% / transaction-count win) and run as a host find-pass
+    //     (`native_uf_rebuild_envs`), reading the in-core UF's O(1) `find_ro`.
+    let native_uf = eg.native_uf_enabled;
     let mut atom_rules: Vec<(usize, &RuleIr)> = Vec::new();
+    let mut rebuild_rules: Vec<(usize, &RuleIr)> = Vec::new();
     for (idx, rule) in &rules {
+        if native_uf && is_uf_drain_rule(&rule.name) {
+            continue;
+        }
+        if native_uf && is_uf_rebuild_rule(&rule.name) {
+            rebuild_rules.push((*idx, rule));
+            continue;
+        }
         let has_atoms = rule.body.iter().any(|op| matches!(op, BodyOp::Atom(_)));
         if has_atoms {
             atom_rules.push((*idx, rule));
@@ -129,6 +152,29 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
     // each rule's head over its bindings.
     let fused = fused_bindings(eg, &read, &atom_rules)?;
     for ((_idx, rule), envs) in atom_rules.iter().zip(fused) {
+        for mut env in envs {
+            apply_head(
+                eg,
+                &rule.head,
+                &mut env,
+                &mut writes,
+                &mut touched,
+                &mut lookup_index,
+            )?;
+        }
+    }
+
+    // NATIVE-UF rebuild host-pass: run each `@rebuild_rule*` against the
+    // start-of-call view rows, resolving each eq-sort column's leader via the
+    // in-core UF's `find_ro` instead of a DBSP `view ⋈ @UF_Sf` join, then apply
+    // the rule's head VERBATIM (its `@canon_S` calls re-canonicalize each column;
+    // the `set` re-inserts the canonical row; the `delete` retracts the stale
+    // one). Reads the native finds as of the START of this call — congruence's
+    // unions, intercepted below as suppressed `set @UF_Sf` writes, are not
+    // drained until after this pass, matching the relational semantics where the
+    // rebuild rule reads the pre-iteration UF index.
+    for (_idx, rule) in &rebuild_rules {
+        let envs = native_uf_rebuild_envs(eg, &read, rule)?;
         for mut env in envs {
             apply_head(
                 eg,
@@ -224,6 +270,20 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
         eg.prof_merge += t_merge.elapsed();
     }
 
+    // NATIVE-UF drain at the iteration boundary: apply this call's enqueued
+    // unions (from intercepted `(set (@UF_Sf lhs) rhs)` head actions) to every
+    // in-core UF. After this, every UF is flat, so the NEXT iteration's
+    // `find_ro` reads — and the host-pass rebuild — see fresh leaders. A union
+    // that actually merged two classes displaces ids; surface that as a real
+    // change so the outer saturate loop keeps iterating (the relational path's
+    // signal was `@UF_S` / flat-index churn, which we no longer produce).
+    if native_uf {
+        let displaced = eg.native_uf_drain_all();
+        if displaced > 0 {
+            changed = true;
+        }
+    }
+
     // `change_detect` is now folded incrementally into apply/merge (O(delta));
     // there is no separate full before/after compare to time.
     Ok(changed)
@@ -239,6 +299,10 @@ fn eval_body_prim(eg: &mut EGraph, op: &BodyOp, envs: Vec<Env>) -> Result<Vec<En
     let BodyOp::Prim { id, args, ret } = op else {
         unreachable!("atom-less body must contain only primitives");
     };
+    // Native-UF canon-prim interception: `@canon_S` is a find-or-self primitive
+    // bound to the in-core UF (see `native_uf_canon_prim`). Answer it host-side
+    // (`find_ro`) instead of through the `Database` stub.
+    let canon_uf = eg.native_uf_canon_prim.get(id).copied();
     let mut out = Vec::new();
     for env in envs {
         // Resolve args; an unbound arg means this primitive can't fire for this
@@ -248,7 +312,11 @@ fn eval_body_prim(eg: &mut EGraph, op: &BodyOp, envs: Vec<Env>) -> Result<Vec<En
             .map(|s| slot_lookup(s, &|v| env.get(&v).copied()).map(Value::new))
             .collect();
         let Some(argv) = resolved else { continue };
-        let result = eg.eval_prim_internal(*id, &argv);
+        let result = if let Some(uf_func) = canon_uf {
+            Some(Value::new(eg.native_uf_find(uf_func, argv[0].rep())))
+        } else {
+            eg.eval_prim_internal(*id, &argv)
+        };
         let Some(result) = result else {
             // Primitive failed (e.g. `!=` of equal args) — prune.
             continue;
@@ -491,6 +559,146 @@ fn fused_bindings(
     Ok(out)
 }
 
+/// True for PR #782's `@uf_change_drain_rule*` drain rules (the
+/// `@uf_change_drain` ruleset). Under `--native-uf` these are DROPPED: the
+/// host-pass rebuild owns onchange consumption, and the `@UFChange_S` relation
+/// they drain is never populated (the leader-change callback is never invoked
+/// on Feldera). Matched by the `symbol_gen.fresh(prefix)` name family (the
+/// feldera `RuleIr` carries no ruleset field, so we key off the rule NAME).
+fn is_uf_drain_rule(name: &str) -> bool {
+    name.contains("uf_change_drain")
+}
+
+/// True for PR #782's `@rebuild_rule*` canonicalization rules (the
+/// `@rebuilding` ruleset). Under `--native-uf` these are taken OUT of the fused
+/// DBSP circuit and run as a host find-pass (`native_uf_rebuild_envs`).
+fn is_uf_rebuild_rule(name: &str) -> bool {
+    name.contains("rebuild_rule")
+}
+
+/// Host-side native-UF rebuild for one PR #782 `@rebuild_rule*` (`canonicalize`)
+/// rule under `--native-uf --feldera`.
+///
+/// The relational rebuild rule is
+/// ```text
+/// (rule ((@UFChange_S _wl_ _wr_ _ll_ _rl_ _nl_ disp_)
+///        (@CView c0_ .. cn_)
+///        (= cj disp_)
+///        (guard (or (bool-!= ci (@canon_S ci)) ..)))
+///       ((@CView (@canon_S c0_) .. (@canon_S cn_) ())  ; canonicalized re-set
+///        (delete (@CView c0_ .. cn_))))                ; retract the stale row
+/// ```
+/// Under `--native-uf` the `@UFChange_S` onchange relation is empty (the host-
+/// pass owns onchange consumption; the leader-change callback never runs on
+/// Feldera), so the relational join produces nothing AND, crucially, the
+/// `view ⋈ @UF_Sf` arrangement that would otherwise be the integral on the
+/// fused DBSP circuit is never built. We instead DRIVE THE REBUILD FROM A VIEW
+/// SCAN: for every view row whose canonical form differs (some eq-sort column's
+/// `find_ro` leader differs from the stored value), we emit ONE binding env that
+/// binds the view's body vars. `apply_head` then runs the rule's head VERBATIM —
+/// its `@canon_S` calls re-canonicalize each eq-sort column from the in-core UF,
+/// the `set` re-inserts the canonical row, and the `delete` retracts the stale
+/// one — reproducing the relational rebuild's retract-old / insert-canonical
+/// writes bit-for-bit, but touching only changed rows (the `guard` filter,
+/// applied here as the changed-row test).
+///
+/// Recognition (matching FlowLog's converged pattern): #782 encodes the eq-sort
+/// columns via `@canon_S` PRIMITIVE calls in the head, not relational atoms. So:
+///   * the VIEW function is the one the head's `set` (`HeadOp::Set`) targets;
+///   * its body atom (same func) gives the var→column mapping;
+///   * each head `@canon_S` call (`HeadOp::Call` whose id is a native-UF canon
+///     prim) names an eq-sort body var and its UF function.
+fn native_uf_rebuild_envs(
+    eg: &EGraph,
+    read: &HashMap<FunctionId, std::rc::Rc<HashSet<Row>>>,
+    rule: &RuleIr,
+) -> Result<Vec<Env>> {
+    // The view is the function the head's `set` writes to. (There is exactly one
+    // such `set` in a `@rebuild_rule` — the canonicalized re-insert.)
+    let view_func = rule
+        .head
+        .iter()
+        .find_map(|op| match op {
+            HeadOp::Set { func, .. } => Some(*func),
+            _ => None,
+        })
+        .ok_or_else(|| anyhow!("native-UF rebuild: rule `{}` has no view `set`", rule.name))?;
+
+    // The view's body atom (same func) gives the var → column index mapping.
+    let view_atom = rule
+        .body
+        .iter()
+        .find_map(|op| match op {
+            BodyOp::Atom(a) if a.func == view_func => Some(a),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "native-UF rebuild: rule `{}` has no view body atom for the `set` target",
+                rule.name
+            )
+        })?;
+    // var -> column index in the view row (first occurrence wins, matching the
+    // join's binding order; the view's columns are distinct vars in practice).
+    let mut var_col: HashMap<u32, usize> = HashMap::new();
+    for (i, s) in view_atom.slots.iter().enumerate() {
+        if let Slot::Var(v) = s {
+            var_col.entry(*v).or_insert(i);
+        }
+    }
+
+    // Each head `@canon_S` call names an eq-sort body var (its single arg) and
+    // the UF function to canonicalize it against. Map view COLUMN -> UF func.
+    let mut col_uf: Vec<(usize, FunctionId)> = Vec::new();
+    for op in &rule.head {
+        if let HeadOp::Call { id, args, .. } = op {
+            if let Some(&uf_func) = eg.native_uf_canon_prim.get(id) {
+                let Some(Slot::Var(av)) = args.first() else {
+                    return Err(anyhow!(
+                        "native-UF rebuild: `@canon_S` call in rule `{}` has no var arg",
+                        rule.name
+                    ));
+                };
+                let ci = *var_col.get(av).ok_or_else(|| {
+                    anyhow!(
+                        "native-UF rebuild: `@canon_S` arg not a view column in rule `{}`",
+                        rule.name
+                    )
+                })?;
+                col_uf.push((ci, uf_func));
+            }
+        }
+    }
+
+    let Some(set) = read.get(&view_func) else {
+        return Ok(Vec::new());
+    };
+    let mut envs: Vec<Env> = Vec::new();
+    for row in set.iter() {
+        // The `guard (or (bool-!= ci (@canon_S ci)))`: keep only rows where some
+        // eq-sort column's leader differs from the stored value.
+        let mut changed = false;
+        for &(ci, uf_func) in &col_uf {
+            let cur = crate::compile::row_col(row, ci);
+            if eg.native_uf_find(uf_func, cur) != cur {
+                changed = true;
+                break;
+            }
+        }
+        if !changed {
+            continue;
+        }
+        // Bind every view body var to its column value; `apply_head` runs the
+        // head verbatim (its `@canon_S` calls compute the leaders).
+        let mut env: Env = Env::new();
+        for (&v, &ci) in &var_col {
+            env.insert(v, crate::compile::row_col(row, ci));
+        }
+        envs.push(env);
+    }
+    Ok(envs)
+}
+
 /// Execute the head ops for one binding, accumulating writes.
 fn apply_head(
     eg: &mut EGraph,
@@ -504,6 +712,25 @@ fn apply_head(
         match op {
             HeadOp::Set { func, slots } => {
                 let row = build_row(slots, env)?;
+                // Native-UF union ingestion: PR #782 writes a union as
+                // `(set (@UF_Sf lhs) rhs)` — a SET on the UF FUNCTION id, NOT on
+                // a relational parent. Route it into the in-core UF
+                // (`enqueue_union(lhs, rhs)`; the UF picks the min leader) and
+                // SUPPRESS the mirror write (the `@UF_Sf` table is never
+                // materialized — finds go through the UF). Drained at the
+                // iteration boundary.
+                if eg.native_ufs.contains_key(func) {
+                    debug_assert!(
+                        row.len() >= 2,
+                        "@UF_Sf union row must have at least (lhs, rhs)"
+                    );
+                    let a = crate::compile::row_col(&row, 0) as i64;
+                    let b = crate::compile::row_col(&row, 1) as i64;
+                    if let Some(uf) = eg.native_ufs.get_mut(func) {
+                        uf.enqueue_union(a, b);
+                    }
+                    continue;
+                }
                 touched.insert(*func);
                 writes.push(Write::Set(*func, row));
             }
@@ -534,7 +761,15 @@ fn apply_head(
                     .iter()
                     .map(|s| resolve(s, env).map(Value::new))
                     .collect::<Result<_>>()?;
-                let result = eg.eval_prim_internal(*id, &argv);
+                // Native-UF canon-prim interception (head side): `@canon_S` in a
+                // head action (e.g. canon-at-creation `(name (@canon_S a) ...)`,
+                // or the rebuild rule's `(set (@CView (@canon_S c0) ...))`) is
+                // answered host-side from the in-core UF (`find_ro`).
+                let result = if let Some(&uf_func) = eg.native_uf_canon_prim.get(id) {
+                    Some(Value::new(eg.native_uf_find(uf_func, argv[0].rep())))
+                } else {
+                    eg.eval_prim_internal(*id, &argv)
+                };
                 if let Some(v) = result {
                     env.insert(*ret, v.rep());
                 }

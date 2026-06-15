@@ -105,13 +105,14 @@ struct Args {
     /// singleparent/path_compress/uf_function_index maintenance rulesets.
     /// Emits PR #782's `:impl displaced-union-find` UF-backed function plus an
     /// onchange relation driving the rebuild. Runs on the default native bridge
-    /// AND on `--flowlog` (where the FlowLog backend honours the UF-backed
-    /// encoding but drives its fast HOST-PASS rebuild, preserving the ~2.1×
-    /// win). Term-encoding only; not compatible with `--duckdb` (use
-    /// `--duck-native-uf`) or `--feldera`. Supports `--proofs` on the native
+    /// AND on `--flowlog` / `--feldera` (where those backends honour the
+    /// UF-backed encoding but drive their fast HOST-PASS rebuild — Feldera
+    /// additionally keeps the `view ⋈ @UF_Sf` integral out of the DBSP circuit,
+    /// preserving the ~24% win). Term-encoding only; not compatible with
+    /// `--duckdb` (use `--duck-native-uf`). Supports `--proofs` on the native
     /// bridge (provenance-tracking UF; leader-change callback composes the
-    /// onchange proof) — but `--native-uf --flowlog` is TERM mode only. Off by
-    /// default; the relational encoding is unchanged when off.
+    /// onchange proof) — but `--native-uf --flowlog/--feldera` is TERM mode only.
+    /// Off by default; the relational encoding is unchanged when off.
     #[clap(long = "native-uf")]
     native_uf: bool,
 }
@@ -139,20 +140,23 @@ pub fn cli(mut egraph: EGraph) {
     }
 
     // The native-UF encoding mode (PR #782's `:impl displaced-union-find`
-    // UF-backed function) runs on the native bridge AND the FlowLog backend
-    // (`--flowlog`): FlowLog honours the UF-backed encoding but drives its fast
-    // HOST-PASS rebuild instead of the onchange-driven rebuild rules. It is
-    // still incompatible with DuckDB (which has its own `--duck-native-uf`) and
-    // Feldera (no native-UF path yet).
-    if args.native_uf && (args.duckdb_backend || args.feldera_backend) {
+    // UF-backed function) runs on the native bridge AND the FlowLog/Feldera
+    // backends (`--flowlog` / `--feldera`): both honour the UF-backed encoding
+    // but drive their fast HOST-PASS rebuild instead of the onchange-driven
+    // rebuild rules (Feldera additionally keeps the `view ⋈ @UF_Sf` integral out
+    // of the DBSP circuit). It is still incompatible with DuckDB (which has its
+    // own `--duck-native-uf`).
+    if args.native_uf && args.duckdb_backend {
         log::error!(
-            "--native-uf cannot be combined with --duckdb/--feldera (use --duck-native-uf for DuckDB)"
+            "--native-uf cannot be combined with --duckdb (use --duck-native-uf for DuckDB)"
         );
         std::process::exit(1);
     }
-    // Native-UF on FlowLog is TERM mode only (proofs are a later step).
-    if args.native_uf && args.flowlog_backend && args.proofs {
-        log::error!("--native-uf --flowlog is TERM mode only; --proofs is not yet supported");
+    // Native-UF on FlowLog / Feldera is TERM mode only (proofs are a later step).
+    if args.native_uf && (args.flowlog_backend || args.feldera_backend) && args.proofs {
+        log::error!(
+            "--native-uf --flowlog/--feldera is TERM mode only; --proofs is not yet supported"
+        );
         std::process::exit(1);
     }
 
@@ -297,7 +301,15 @@ pub fn cli(mut egraph: EGraph) {
             // backend and route the program through the shared frontend.
             if args.feldera_backend || args.flowlog_backend {
                 let mut backend_eg = if args.feldera_backend {
-                    egglog::EGraph::with_feldera_backend()
+                    // `--native-uf --feldera`: enable the Feldera backend's
+                    // in-process UF host-pass (`enable_native_uf`) here, and the
+                    // matching #782 encoding (`with_native_uf`) below — both are
+                    // needed (the encoding emits the program; the backend
+                    // interception runs it through the host-pass rebuild, keeping
+                    // the `view ⋈ @UF_Sf` integral out of the DBSP circuit).
+                    egglog::EGraph::with_feldera_backend_config(egglog::FelderaBackendConfig {
+                        native_uf: args.native_uf,
+                    })
                 } else {
                     // `--native-uf --flowlog`: enable the FlowLog backend's
                     // in-process UF host-pass (`enable_native_uf`) here, and the
@@ -312,7 +324,7 @@ pub fn cli(mut egraph: EGraph) {
                     log::error!("failed to start experimental backend: {err}");
                     std::process::exit(1);
                 });
-                if args.native_uf && args.flowlog_backend {
+                if args.native_uf && (args.flowlog_backend || args.feldera_backend) {
                     backend_eg = backend_eg.with_native_uf();
                 }
                 backend_eg.parser = std::mem::take(&mut egraph.parser);
