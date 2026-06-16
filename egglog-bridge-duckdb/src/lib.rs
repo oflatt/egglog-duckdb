@@ -1104,12 +1104,16 @@ impl VScalar for BigratToF64Scalar {
 ///      generated from the `"parent"` prefix).
 ///   - `uf_function_index` — mirrors raw pname into the function-
 ///      form UF table; superseded by the native UF + UDF.
+///   - `uf_change_drain` — PR #782's `@uf_change_drain_rule*` drain of the
+///      `@UFChange_S` onchange relation (the `--native-uf` encoding). DuckDB
+///      never populates that relation (no leader-change callback), so the
+///      drain has nothing to delete; skip it (the host-pass owns the rebuild).
 fn is_uf_maintenance_ruleset(ruleset: &str) -> bool {
     matches!(
         ruleset
             .trim_end_matches(|c: char| c.is_ascii_digit())
             .trim_start_matches('@'),
-        "uf_function_index" | "parent" | "single_parent"
+        "uf_function_index" | "parent" | "single_parent" | "uf_change_drain"
     )
 }
 
@@ -1136,6 +1140,36 @@ fn is_rebuilding_ruleset(ruleset: &str) -> bool {
         .trim_end_matches(|c: char| c.is_ascii_digit())
         .trim_start_matches('@')
         == "rebuilding"
+}
+
+/// Strip a rule name down to its family prefix: drop the leading `@`, a
+/// trailing `#<idx>` seminaive-instance suffix, then trailing digits. E.g.
+/// `@rebuild_rule12#5` -> `rebuild_rule`. The duck backend's trait surface
+/// never sees the egglog RULESET name (`new_rule` takes only a `desc`), so
+/// PR #782 maintenance/rebuild rules must be recognized by NAME instead.
+fn rule_family(rule_name: &str) -> &str {
+    rule_name
+        .trim_start_matches('@')
+        .split('#')
+        .next()
+        .unwrap_or(rule_name)
+        .trim_end_matches(|c: char| c.is_ascii_digit())
+}
+
+/// True for PR #782's `@rebuild_rule<N>` canonicalization rules (the
+/// `@rebuilding` ruleset). Recognized by NAME (the ruleset isn't available on
+/// the duck trait surface). Under `--native-uf` these are rewritten into the
+/// SQL host-pass form (`EGraph::rewrite_native_uf_rule`).
+fn is_rebuild_rule_name(rule_name: &str) -> bool {
+    rule_family(rule_name) == "rebuild_rule"
+}
+
+/// True for PR #782's `@uf_change_drain_rule<N>` drain rules (the
+/// `@uf_change_drain` ruleset). Recognized by NAME. Under `--native-uf` these
+/// are DROPPED at compile time: DuckDB never populates the `@UFChange_S`
+/// relation they drain (no leader-change callback), so they have nothing to do.
+fn is_uf_change_drain_rule_name(rule_name: &str) -> bool {
+    rule_family(rule_name) == "uf_change_drain_rule"
 }
 
 /// Sanitize a function name for use as a DuckDB UDF identifier.
@@ -1834,6 +1868,37 @@ pub struct EGraph {
     /// last full-scan reset). Only maintained when `adaptive_rebuild`
     /// is on. Reset to empty after any full-scan gated variant runs.
     adaptive_changed_ids: std::collections::HashSet<i64>,
+    /// `--native-uf --duckdb` only: maps the PR #782 `@canon_S`
+    /// find-or-self primitive's [`ExternalFunctionId`] (returned by
+    /// [`Backend::add_uf_function`]) to the find UDF name
+    /// (`duck_uf_<sort>_find`) of its UF function. The frontend rebinds the
+    /// primitive name to this id via `rename_prim`/`set_external_func_name`;
+    /// when that happens we copy the mapping into `native_uf_canon_prim_udf`
+    /// keyed by the egglog primitive NAME (which is what shows up as
+    /// `Term::Prim(name, …)` in the compiled rule IR).
+    native_uf_canon_id_udf: HashMap<egglog_backend_trait::ExternalFunctionId, String>,
+    /// `--native-uf --duckdb` only: maps a PR #782 `@canon_S` find-or-self
+    /// primitive's egglog NAME to its find UDF name. The compile pre-pass
+    /// (`compile::rewrite_canon_prims`) rewrites every `Term::Prim(canon_name,
+    /// [x])` into a UDF-call prim so `prim_sql` emits `duck_uf_<sort>_find(x)`
+    /// (the SQL host-pass find), replacing the structural relational heuristic.
+    native_uf_canon_prim_udf: HashMap<String, String>,
+    /// `--native-uf --duckdb` only: maps a native-UF find UDF name
+    /// (`duck_uf_<sort>_find`) back to the `@UF_Sf` union table it reads. The
+    /// `@UF_Sf` table is where unions land (and whose watermark advances when a
+    /// union does), so the rebuild host-pass compiles a gated full-scan variant
+    /// keyed on it: when a union landed since the rule last ran, re-scan ALL
+    /// view rows and re-canonicalize the stale ones (the seminaive variant only
+    /// sees newly-inserted view rows; old rows go stale when a later union
+    /// displaces one of their ids).
+    native_uf_udf_to_table: HashMap<String, String>,
+    /// `--native-uf --duckdb` only: names of PR #782's `@UFChange_S` onchange
+    /// relations (one per eq-sort). DuckDB never runs the leader-change
+    /// callback that would populate them, so the rebuild rule's join against
+    /// them produces nothing; the compile pre-pass strips the onchange body
+    /// atom (and the filters it bound) so the rebuild drives off a view scan +
+    /// `@canon_S`-find guard (the SQL host-pass rebuild).
+    native_uf_onchange: std::collections::HashSet<String>,
     /// Ids displaced by the most recent `sync_native_ufs` (the
     /// "recent delta"). The adaptive mode decision compares THIS
     /// against `theta * id_space`, not the full accumulated set:
@@ -1910,6 +1975,51 @@ pub(crate) struct DeltaVariant {
 /// executing the delta-restricted gated variant. Kept distinct from
 /// any real table name so a stray substitution is obvious.
 pub(crate) const UF_CHANGED_PLACEHOLDER: &str = "__UF_CHANGED__";
+
+/// Synthetic `Term::Prim` op-name prefix the `--native-uf --duckdb` compile
+/// pre-pass ([`EGraph::rewrite_native_uf_rule`]) uses to mark a PR #782
+/// `@canon_S` find-or-self call rewritten to its find UDF. The rest of the
+/// op-name is the UDF name (`duck_uf_<sort>_find`); `compile::prim_sql` emits
+/// `<udf>(arg)`. A prefix that no real egglog primitive uses, so a stray match
+/// is impossible.
+pub(crate) const NATIVE_UF_FIND_PRIM_PREFIX: &str = "__duck_uf_find:";
+
+/// Apply `f` to every variable name referenced anywhere in `t` (recursing
+/// through `Prim`/`FuncCall` args). Used by the native-UF rebuild host-pass
+/// rewrite to find filters that dangle after the onchange atom is stripped.
+fn term_for_each_var(t: &Term, f: &mut impl FnMut(&str)) {
+    match t {
+        Term::Var(v) => f(v),
+        Term::Lit(_) => {}
+        Term::Prim(_, args) | Term::FuncCall { args, .. } => {
+            for a in args {
+                term_for_each_var(a, f);
+            }
+        }
+    }
+}
+
+/// Apply `f` to every native-UF find UDF name embedded in a rewritten
+/// `Term::Prim("__duck_uf_find:<udf>", …)` op (recursing through args). Used to
+/// compute the rebuild host-pass gate tables. See [`NATIVE_UF_FIND_PRIM_PREFIX`].
+fn term_for_each_find_udf(t: &Term, f: &mut impl FnMut(&str)) {
+    match t {
+        Term::Var(_) | Term::Lit(_) => {}
+        Term::Prim(op, args) => {
+            if let Some(udf) = op.strip_prefix(NATIVE_UF_FIND_PRIM_PREFIX) {
+                f(udf);
+            }
+            for a in args {
+                term_for_each_find_udf(a, f);
+            }
+        }
+        Term::FuncCall { args, .. } => {
+            for a in args {
+                term_for_each_find_udf(a, f);
+            }
+        }
+    }
+}
 
 /// One rule action paired with the table it writes to (so the
 /// watermark tracker can bump that table's high-water-mark after a
@@ -1992,6 +2102,10 @@ impl EGraph {
             adaptive_debug: std::env::var("DUCK_ADAPTIVE_DEBUG").is_ok(),
             adaptive_changed_ids: std::collections::HashSet::new(),
             adaptive_recent_displaced: 0,
+            native_uf_canon_id_udf: HashMap::new(),
+            native_uf_canon_prim_udf: HashMap::new(),
+            native_uf_udf_to_table: HashMap::new(),
+            native_uf_onchange: std::collections::HashSet::new(),
         })
     }
 
@@ -2001,6 +2115,228 @@ impl EGraph {
     /// to decide whether to also spin up a `UfTable` + UDF.
     pub fn enable_native_uf(&mut self) {
         self.native_uf_enabled = true;
+    }
+
+    /// True iff `name` is a registered native union-find function (`@UF_Sf`,
+    /// registered via [`Backend::add_uf_function`] on the `--native-uf --duckdb`
+    /// path). Used by the rule builder to keep both columns of a union write
+    /// `(set (@UF_Sf lhs) rhs)` instead of stripping the trailing relation
+    /// "output" entry.
+    pub(crate) fn is_native_uf_function(&self, name: &str) -> bool {
+        self.native_ufs.contains_key(name)
+    }
+
+    /// `--native-uf --duckdb` compile pre-pass. Rewrites a PR #782 rule into
+    /// the SQL host-pass form before [`compile::compile_rule`]:
+    ///
+    /// 1. **Canon-prim -> find UDF.** Every `Term::Prim(@canon_S, [x])` (the
+    ///    find-or-self primitive bound to a UF function) becomes
+    ///    `Term::Prim("__duck_uf_find:<udf>", [x])`, which `compile::prim_sql`
+    ///    emits as `duck_uf_<sort>_find(x)` — the in-core UF answer. This is the
+    ///    EXPLICIT replacement for the relational structural demote heuristic.
+    ///
+    /// 2. **Rebuild host-pass.** A `@rebuild_rule` (in the `@rebuilding`
+    ///    ruleset) joins the always-empty `@UFChange_S` onchange relation
+    ///    against the view and filters `(= cj disp_)`. DuckDB never populates
+    ///    `@UFChange_S` (no leader-change callback), so the join yields nothing.
+    ///    We STRIP the onchange body atom and every Filter/Bind that references
+    ///    a variable the onchange atom (uniquely) bound, leaving a view scan +
+    ///    `(guard (or (bool-!= ci (@canon_S ci)) ...))` — i.e. re-canonicalize
+    ///    every stale view row via the find UDF, exactly the relational
+    ///    rebuild's host-pass.
+    fn rewrite_native_uf_rule(&self, mut rule: Rule) -> Rule {
+        // (2) Strip onchange atoms (rebuild host-pass) FIRST, so the canon
+        // rewrite in (1) doesn't touch the dropped filters. Recognized by NAME
+        // (`@rebuild_rule*`) — the duck trait surface drops the egglog ruleset.
+        if is_rebuild_rule_name(&rule.name) {
+            // Vars bound by an onchange (`@UFChange_S`) body atom.
+            let mut onchange_vars: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            // Vars bound by any *other* Func atom (the view).
+            let mut other_func_vars: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for atom in &rule.body {
+                if let Atom::Func { name, args } = atom {
+                    let is_onchange = self.native_uf_onchange.contains(name);
+                    for t in args {
+                        if let Term::Var(v) = t {
+                            if is_onchange {
+                                onchange_vars.insert(v.clone());
+                            } else {
+                                other_func_vars.insert(v.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            // A var is "onchange-only" if no surviving Func atom binds it.
+            let onchange_only: std::collections::HashSet<String> = onchange_vars
+                .into_iter()
+                .filter(|v| !other_func_vars.contains(v))
+                .collect();
+            let refs_onchange_only = |t: &Term| -> bool {
+                let mut found = false;
+                term_for_each_var(t, &mut |v| {
+                    if onchange_only.contains(v) {
+                        found = true;
+                    }
+                });
+                found
+            };
+            rule.body.retain(|atom| match atom {
+                // Drop the onchange relation atom itself.
+                Atom::Func { name, .. } => !self.native_uf_onchange.contains(name),
+                // Drop filters/binds that reference an onchange-only var
+                // (e.g. `(= cj disp_)`), which are now dangling.
+                Atom::Filter(t) => !refs_onchange_only(t),
+                Atom::Bind { var, expr } => {
+                    !onchange_only.contains(var) && !refs_onchange_only(expr)
+                }
+            });
+        }
+
+        // (1) Canon-prim -> find UDF, across all body atoms and actions.
+        if !self.native_uf_canon_prim_udf.is_empty() {
+            for atom in &mut rule.body {
+                match atom {
+                    Atom::Func { args, .. } => {
+                        for t in args.iter_mut() {
+                            self.rewrite_canon_in_term(t);
+                        }
+                    }
+                    Atom::Filter(t) => self.rewrite_canon_in_term(t),
+                    Atom::Bind { expr, .. } => self.rewrite_canon_in_term(expr),
+                }
+            }
+            for action in &mut rule.actions {
+                match action {
+                    Action::Insert { args, .. } | Action::LetCtor { args, .. } => {
+                        for t in args.iter_mut() {
+                            self.rewrite_canon_in_term(t);
+                        }
+                    }
+                    Action::Delete { key_args, .. } => {
+                        for t in key_args.iter_mut() {
+                            self.rewrite_canon_in_term(t);
+                        }
+                    }
+                    Action::LetExpr { expr, .. } => self.rewrite_canon_in_term(expr),
+                    Action::Panic { .. } => {}
+                }
+            }
+        }
+        rule
+    }
+
+    /// Rewrite `Term::Prim(@canon_S, [x])` -> `Term::Prim("__duck_uf_find:<udf>",
+    /// [x])` in place, recursing into nested prim/func-call args. See
+    /// [`Self::rewrite_native_uf_rule`].
+    fn rewrite_canon_in_term(&self, t: &mut Term) {
+        match t {
+            Term::Prim(op, args) => {
+                for a in args.iter_mut() {
+                    self.rewrite_canon_in_term(a);
+                }
+                if let Some(udf) = self.native_uf_canon_prim_udf.get(op) {
+                    *op = format!("{NATIVE_UF_FIND_PRIM_PREFIX}{udf}");
+                }
+            }
+            Term::FuncCall { args, .. } => {
+                for a in args.iter_mut() {
+                    self.rewrite_canon_in_term(a);
+                }
+            }
+            Term::Var(_) | Term::Lit(_) => {}
+        }
+    }
+
+    /// Distinct `@UF_Sf` union tables whose find UDF the (already canon-prim-
+    /// rewritten) rule references. Used to gate the rebuild host-pass full-scan
+    /// variant. See [`Self::rewrite_native_uf_rule`] / `compile::compile_rule`.
+    fn native_uf_rule_gate_tables(&self, rule: &Rule) -> Vec<String> {
+        let mut udfs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut collect = |t: &Term| {
+            term_for_each_find_udf(t, &mut |udf| {
+                udfs.insert(udf.to_string());
+            });
+        };
+        for atom in &rule.body {
+            match atom {
+                Atom::Func { args, .. } => args.iter().for_each(&mut collect),
+                Atom::Filter(t) => collect(t),
+                Atom::Bind { expr, .. } => collect(expr),
+            }
+        }
+        for action in &rule.actions {
+            match action {
+                Action::Insert { args, .. } | Action::LetCtor { args, .. } => {
+                    args.iter().for_each(&mut collect)
+                }
+                Action::Delete { key_args, .. } => key_args.iter().for_each(&mut collect),
+                Action::LetExpr { expr, .. } => collect(expr),
+                Action::Panic { .. } => {}
+            }
+        }
+        let mut tables: Vec<String> = Vec::new();
+        for udf in udfs {
+            if let Some(t) = self.native_uf_udf_to_table.get(&udf) {
+                if !tables.contains(t) {
+                    tables.push(t.clone());
+                }
+            }
+        }
+        tables
+    }
+
+    /// Register PR #782's UF-backed `:impl displaced-union-find` function
+    /// `name` (`@UF_Sf`) on the `--native-uf --duckdb` path, returning its find
+    /// UDF name (`duck_uf_<sort>_find`).
+    ///
+    /// Unlike the relational path (which spins the native UF up lazily in
+    /// `declare` when it sees a `:merge ordering-min` function paired with a
+    /// `@UF_S` parent table), the #782 path is driven by an *explicit*
+    /// [`Backend::add_uf_function`] call. There is no separate parent table:
+    /// `name` itself is both the union-write target and the sync-scan source.
+    /// We register it as an append-only 2-column relation `(S S)` so each
+    /// `(set (@UF_Sf lhs) rhs)` lands as a `(lhs, rhs, ts)` row (PK over both
+    /// columns, `ON CONFLICT DO NOTHING` — distinct union pairs survive; a
+    /// function's `lhs`-only PK would drop a second union of the same lhs).
+    /// `sync_native_ufs` scans new rows into the in-core [`UfTable`] and the
+    /// find UDF answers `@canon_S`/extraction finds.
+    pub(crate) fn register_native_uf_function(&mut self, name: &str) -> Result<String> {
+        if self.functions.contains_key(name) {
+            return Err(anyhow!("native UF {name}: already registered"));
+        }
+        // Append-only 2-column relation (both columns eq-sort ids -> BIGINT).
+        self.declare(
+            name,
+            FunctionInfo {
+                cols: vec![ColumnTy::I64, ColumnTy::I64],
+                inputs_len: 2,
+                merge: None,
+                eq_sort_ctor: false,
+                native_uf_udf: None,
+                eq_sort_pname: None,
+                identity_on_miss: false,
+            },
+        )?;
+        let uf = Arc::new(Mutex::new(UfTable::new()));
+        let udf_name = format!("duck_uf_{}_find", sanitize_for_udf(name));
+        self.conn
+            .register_scalar_function_with_state::<UfFindScalar>(&udf_name, &uf)
+            .map_err(|e| anyhow!("failed to register UF UDF {udf_name}: {e}"))?;
+        self.native_ufs.insert(name.to_string(), uf);
+        self.native_uf_udf_to_table
+            .insert(udf_name.clone(), name.to_string());
+        // The scan source is the function itself (no separate `@UF_S` parent).
+        self.native_uf_pname
+            .insert(name.to_string(), name.to_string());
+        // Tag the function so the watermark-substitution in `add_rule` maps it
+        // to its own pname (a no-op) rather than leaving the gate stuck at 0.
+        if let Some(info) = self.functions.get_mut(name) {
+            info.native_uf_udf = Some(udf_name.clone());
+        }
+        Ok(udf_name)
     }
 
     /// Mark this `EGraph` as running a proof-tracking term encoding.
@@ -2052,6 +2388,13 @@ impl EGraph {
         name: String,
     ) {
         self.backend_external_funcs.set_name(id, name.clone());
+        // `--native-uf --duckdb`: the frontend rebinds the PR #782 `@canon_S`
+        // find-or-self primitive name to the canon-prim id returned by
+        // `add_uf_function`. Record `canon-name -> find UDF` so the compile
+        // pre-pass can rewrite `Term::Prim(canon-name, [x])` into a UDF call.
+        if let Some(udf) = self.native_uf_canon_id_udf.get(&id).cloned() {
+            self.native_uf_canon_prim_udf.insert(name.clone(), udf);
+        }
         self.register_builtin_prim_udf(&name);
     }
 
@@ -3210,7 +3553,42 @@ impl EGraph {
         if self.native_uf_enabled && is_uf_maintenance_ruleset(&rule.ruleset) {
             return Ok(());
         }
-        let mut compiled = compile::compile_rule(&rule, &self.functions, self.proofs_enabled)?;
+        // `--native-uf --duckdb`: DROP the `@uf_change_drain_rule*` rules — they
+        // delete from the always-empty `@UFChange_S` onchange relation (DuckDB
+        // runs no leader-change callback), so they have nothing to do. The duck
+        // trait surface never sees the egglog ruleset, so recognize by NAME.
+        if self.native_uf_enabled && is_uf_change_drain_rule_name(&rule.name) {
+            return Ok(());
+        }
+        // `--native-uf --duckdb` (PR #782 encoding): rewrite the rule into its
+        // SQL host-pass form — canon-prim calls become find-UDF calls, and the
+        // rebuild rule's always-empty `@UFChange_S` join is stripped to a view
+        // scan. No-op for the relational `--duck-native-uf` path (no canon
+        // prims / onchange relations registered).
+        let rule = if self.native_uf_enabled {
+            self.rewrite_native_uf_rule(rule)
+        } else {
+            rule
+        };
+        // Gate tables for the native-UF rebuild host-pass: the distinct `@UF_Sf`
+        // union tables whose find UDF the (rewritten) rule references. The
+        // rebuild rule needs a gated full-scan variant per such table so stale
+        // OLD view rows are re-canonicalized when a union lands (the seminaive
+        // variant only catches newly-inserted rows). Only for rebuild rules;
+        // empty otherwise (so non-rebuild rules and the relational path are
+        // unaffected).
+        let native_uf_gate_tables: Vec<String> =
+            if self.native_uf_enabled && is_rebuild_rule_name(&rule.name) {
+                self.native_uf_rule_gate_tables(&rule)
+            } else {
+                Vec::new()
+            };
+        let mut compiled = compile::compile_rule(
+            &rule,
+            &self.functions,
+            self.proofs_enabled,
+            &native_uf_gate_tables,
+        )?;
         // Body tables = distinct Atom::Func names. The watermark gate
         // reads this set to decide whether the rule has anything new
         // to look at on a given iteration.
@@ -3246,6 +3624,18 @@ impl EGraph {
                 if !bt.iter().any(|n| n == &effective) {
                     bt.push(effective);
                 }
+            }
+        }
+        // `--native-uf --duckdb` rebuild host-pass: the rewritten rebuild rule
+        // has no `@UF_Sf` body atom (the `@UFChange_S` join was stripped), so
+        // its body_tables would be just the view — and the rule-level watermark
+        // gate would SKIP the whole rule (incl. the gated full-scan variant)
+        // when only a union landed (which doesn't touch the view). Add the
+        // union tables to body_tables so a union advances the gate and the
+        // rebuild re-fires to re-canonicalize stale OLD view rows.
+        for gate in &native_uf_gate_tables {
+            if !bt.iter().any(|n| n == gate) {
+                bt.push(gate.clone());
             }
         }
         compiled.body_tables = bt;

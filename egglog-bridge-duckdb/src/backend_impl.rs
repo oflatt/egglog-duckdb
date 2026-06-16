@@ -80,6 +80,7 @@ use egglog_backend_trait::{
 use egglog_numeric_id::NumericId;
 
 use crate::base_values::DuckdbBaseValuePool;
+use crate::external_func;
 use crate::{ColumnTy as DuckColumnTy, EGraph, Literal, MergeMode, q};
 
 // ---------------------------------------------------------------------------
@@ -679,11 +680,63 @@ impl Backend for EGraph {
 
     fn add_uf_function(
         &mut self,
-        _name: String,
-        _onchange: Option<FunctionId>,
-        _proof: Option<egglog_backend_trait::UfProofConfig>,
+        name: String,
+        onchange: Option<FunctionId>,
+        proof: Option<egglog_backend_trait::UfProofConfig>,
     ) -> anyhow::Result<(FunctionId, ExternalFunctionId)> {
-        anyhow::bail!("the DuckDB backend does not support `:impl displaced-union-find` functions")
+        // PR #782's UF-backed `:impl displaced-union-find` function is honoured
+        // only on the `--native-uf --duckdb` path. With the flag off, the
+        // relational UF encoding is used (no `add_uf_function` calls), so the
+        // bail is unreachable in practice. The DuckDB backend reuses its SQL
+        // host-pass rebuild (the `sync_native_ufs` scan + the find UDF + the
+        // rebuild-rule demote) but rewires recognition onto this explicit call.
+        if !self.native_uf_enabled {
+            anyhow::bail!(
+                "the DuckDB backend only supports `:impl displaced-union-find` functions \
+                 under `--native-uf` (it drives PR #782's UF-backed encoding through a \
+                 SQL host-pass rebuild)"
+            );
+        }
+        // Proof mode is TERM mode only for now (the provenance-tracking UF would
+        // need the `@UFChange_S` proof column composed in a leader-change
+        // callback, which the SQL host-pass rebuild does not run).
+        if proof.is_some() {
+            anyhow::bail!(
+                "the DuckDB backend does not yet support proof-mode native-UF functions \
+                 (`--native-uf` is TERM mode only on DuckDB)"
+            );
+        }
+
+        // Register `@UF_Sf` as an append-only 2-column relation `(S S)` (both
+        // columns PK -> distinct union pairs preserved, ON CONFLICT DO NOTHING),
+        // not a function: #782 writes a union as `(set (@UF_Sf lhs) rhs)`, and a
+        // function's input PK would dedupe on `lhs` and silently drop a second
+        // union of the same lhs to a different rhs. Each union assertion lands
+        // as a `(lhs, rhs, ts)` row; `sync_native_ufs` scans new rows into the
+        // in-core UF. Spin up the matching `UfTable` + find UDF.
+        let udf_name = self.register_native_uf_function(&name)?;
+
+        // Record the onchange relation name so the rebuild-rule host-pass
+        // rewrite can recognize and STRIP the (always-empty) `@UFChange_S` body
+        // atom: DuckDB never runs the leader-change callback, so the relational
+        // join `@UFChange_S ⋈ view` would produce nothing. Stripping it leaves a
+        // view scan + `@canon_S`-find guard — the SQL host-pass rebuild.
+        if let Some(oc) = onchange {
+            let oc_name = self.name_for_function_id(oc).to_string();
+            self.native_uf_onchange.insert(oc_name);
+        }
+
+        // The find-or-self canon-prim. A real, freeable `ExternalFunctionId`;
+        // the compile pre-pass (`compile::rewrite_canon_prims`) rewrites
+        // `Term::Prim(<canon-name>, [x])` into a UDF call (`<udf_name>(x)`) once
+        // the frontend rebinds the primitive name to this id (recorded in
+        // `set_external_func_name`). The registered stub is never invoked.
+        let canon = self.register_external_func(Box::new(external_func::CanonStub));
+        self.native_uf_canon_id_udf.insert(canon, udf_name);
+
+        let id = FunctionId::new(self.backend_function_names.len() as u32);
+        self.backend_function_names.push(name);
+        Ok((id, canon))
     }
 
     fn table_size(&self, table: FunctionId) -> usize {
