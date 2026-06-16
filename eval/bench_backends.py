@@ -1,46 +1,70 @@
 #!/usr/bin/env python3
-"""Benchmark egglog across the cross product of {backend} x {encoding}.
+"""Benchmark egglog across the backend-encoding treatment matrix.
 
-Backends:  bridge (default in-memory), duckdb (`--duckdb`),
-           feldera (`--feldera`), flowlog (`--flowlog`).
-Encodings: normal, term-encoding (`--term-encoding`), proofs (`--proofs`).
+This drives the `egglog-experimental` CLI: it registers the experimental sorts
+and commands then dispatches to `egglog::cli`, so it carries the full backend /
+encoding surface -- the `--native-uf` flag, the backend selectors (`--duckdb`,
+`--feldera`, `--flowlog`), and the fast-rebuild env vars exercised by the
+matrix. Its `src/main.rs` also pre-builds the duckdb-backed egraph in native-UF
+mode when `--native-uf` (or `--duck-native-uf`) is set, so `--native-uf
+--duckdb` actually engages native-UF rather than emitting UF-backed functions
+against a relational backend.
 
-For every (benchmark file, backend, encoding) cell we run the egglog CLI as a
-subprocess `--runs` times (after `--warmup` discarded runs) and record the
-wall-clock timings. Cells that error (non-zero exit, timeout) are recorded in
-an `errors` table instead. Results are written to a JSON database that
-`eval-live` renders interactively (`--serve`).
+Treatment axes
+--------------
+* backend  : bridge (default in-memory), duckdb (`--duckdb`),
+             feldera (`--feldera`), flowlog (`--flowlog`).
+* encoding : normal, term-encoding (`--term-encoding`), proofs (`--proofs`).
+* native-UF: `--native-uf` -- the host-pass union-find encoding. Only meaningful
+             on term/proof cells (the relational-UF encoding it replaces only
+             exists under term encoding).
+* fast-rebuild: the relational-deltaUF rebuild optimisation, gated per backend
+             by env (`DUCK_DELTA_REBUILD` / `FELDERA_DELTA_REBUILD` /
+             `FLOWLOG_DELTA_REBUILD`). Valid only on relational-UF cells; it is
+             mutually exclusive with `--native-uf` (where the rebuild is the
+             host-pass, not the relational deltaUF rule).
 
-bridge is the only backend with a meaningful "normal" (non-term-encoded) mode;
-it is kept as a baseline. duckdb, feldera, and flowlog are term-encoding-only:
-their backend flag already implies the term encoding, so for them we run two
-cells, term-encoding and proofs (proofs = proof-instrumented term encoding).
-The degenerate "normal" cell for those backends is the same engine as
-term-encoding and is therefore skipped (not double-run).
+The reference / oracle cell is **bridge-normal** (in-memory bridge, no term
+encoding). Every other cell's correctness is judged against it by tuple-count
+parity (see below).
+
+Metrics captured per cell
+-------------------------
+* wall-clock: the timed subprocess elapsed (median/mean of `--runs`).
+* peak RSS  : maximum resident set size in BYTES, via macOS `/usr/bin/time -l`.
+* per-phase : a per-ruleset rebuild/canonicalize/congruence bucket profile.
+              bridge uses `--save-report` (RunReport JSON); duckdb uses
+              DUCK_PERF_DUMP; feldera uses FELDERA_PROFILE; flowlog uses
+              FLOWLOG_DD_RULESET_PROF.
+* parity    : tuple-count parity vs the bridge-normal oracle (deterministic
+              `(print-size)` per-function counts; NOT extraction, which has
+              benign tie-breaking covered by the Rust tests).
+
+For every cell we run the egglog CLI as a subprocess `--runs` times (after
+`--warmup` discarded runs). Cells that error (non-zero exit, timeout) are
+recorded in an `errors` table instead. Files that error on the oracle itself
+are skipped entirely (not all `tests/` files are benchmarkable). Results are
+written to a JSON database that `eval-live` renders interactively (`--serve`).
 
 Usage:
-    python3 eval/bench_backends.py tests/           # benchmark every .egg under tests/
-    python3 eval/bench_backends.py --serve          # also open the eval-live viewer
-    python3 eval/bench_backends.py path/to/dir      # benchmark every .egg under a dir
-    python3 eval/bench_backends.py tests/ --runs 5 --warmup 1 --timeout 600
-    python3 eval/bench_backends.py tests/ --paper    # accurate sequential timing (paper)
-    python3 eval/bench_backends.py tests/ --parallel # fast contended coverage sweep
-    python3 eval/bench_backends.py --justserve      # skip benchmarking, view existing results
+    python3 eval/bench_backends.py tests/ --paper            # full matrix (sequential)
+    python3 eval/bench_backends.py tests/ --paper --limit 5  # small pilot
+    python3 eval/bench_backends.py --serve                   # open the eval-live viewer
+    python3 eval/bench_backends.py --justserve               # view existing results
 
-Scheduling: by default cells run sequentially. `--paper` forces strictly
-sequential, uncontended execution for accurate paper-quality timings (and
-overrides --parallel/--jobs). `--parallel`/`--jobs N` run cells concurrently
-across a process pool for FAST COVERAGE only -- contended wall-times are
-inflated and must not be cited. results.json records the `timing_mode`.
+Mode: `--paper` forces strictly SEQUENTIAL, uncontended execution for accurate
+paper-quality timings/RSS, and is the default/intended mode. There is NO
+parallel mode -- contended wall-times and RSS would be meaningless.
 """
 
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
+import tempfile
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 WORKSPACE = Path(__file__).resolve().parents[1]
@@ -61,13 +85,33 @@ ENCODINGS = [
     ("proofs", ["--proofs"]),
 ]
 
+# The reference / oracle condition: every other cell's tuple counts are diffed
+# against this cell's counts (per benchmark) for parity.
+ORACLE_CONDITION = "bridge-normal"
+
+# Per-backend env var that turns on the relational-deltaUF fast-rebuild.
+FAST_REBUILD_ENV = {
+    "bridge": None,  # no relational-deltaUF fast-rebuild knob on the bridge
+    "duckdb": "DUCK_DELTA_REBUILD",
+    "feldera": "FELDERA_DELTA_REBUILD",
+    "flowlog": "FLOWLOG_DELTA_REBUILD",
+}
+
+# Per-backend env var that turns on the per-ruleset / per-phase profile dump.
+PROFILE_ENV = {
+    "duckdb": "DUCK_PERF_DUMP",
+    "feldera": "FELDERA_PROFILE",
+    "flowlog": "FLOWLOG_DD_RULESET_PROF",
+}
+
 
 def conditions():
-    """The cross product backends x encodings, as
-    (condition, backend, encoding, flags) tuples, with degenerate cells
-    skipped:
+    """Enumerate the VALID cells of the treatment matrix as
+    (condition, backend, encoding, flags, native_uf, fast_rebuild) tuples.
 
-    * bridge      -> normal, term-encoding, proofs  (full baseline)
+    Base cells (backend x encoding), degenerate ones skipped:
+
+    * bridge      -> normal, term-encoding, proofs  (normal = the oracle)
     * term-only   -> term-encoding, proofs
 
     For a term-only backend the "normal" cell is identical to its
@@ -75,6 +119,21 @@ def conditions():
     we skip "normal" rather than double-run it. Its "term-encoding" cell needs
     no `--term-encoding` flag (that would be redundant / can panic the
     backend); "proofs" adds `--proofs` for proof-instrumented term encoding.
+
+    On top of the base cells we add two treatment axes, skipping degenerate
+    combinations:
+
+    * native-UF (`--native-uf`): only on term/proof cells (the relational-UF
+      encoding it replaces only exists under term encoding). Never on the
+      bridge-normal oracle.
+    * fast-rebuild (relational-deltaUF, per-backend env): only on relational-UF
+      cells (i.e. NOT native-UF) of backends that have the knob, and never on
+      the bridge (no relational fast-rebuild knob there). Mutually exclusive
+      with native-UF.
+
+    The condition label carries the extra axes: a "+nuf" suffix for native-UF
+    and "+fastrb" for fast-rebuild. The bare base label is the relational-UF
+    encoding with rebuild OFF.
     """
     for backend, bflags, term_only in BACKENDS:
         for encoding, eflags in ENCODINGS:
@@ -83,10 +142,38 @@ def conditions():
                 continue
             if term_only and encoding == "term-encoding":
                 # Backend flag already implies term encoding; don't re-pass it.
-                flags = list(bflags)
+                base_flags = list(bflags)
             else:
-                flags = bflags + eflags
-            yield (f"{backend}-{encoding}", backend, encoding, flags)
+                base_flags = bflags + eflags
+            base_label = f"{backend}-{encoding}"
+
+            # A term/proof cell exercises the union-find encoding, so the
+            # native-UF and fast-rebuild axes apply to it. The bridge-normal
+            # oracle (and any other non-term cell) has no UF axes.
+            term_like = encoding in ("term-encoding", "proofs")
+
+            # 1) Base cell: relational-UF, rebuild OFF (the oracle is here).
+            yield (base_label, backend, encoding, list(base_flags), False, False)
+
+            if not term_like:
+                continue
+
+            # 2) native-UF cell (host-pass rebuild). No fast-rebuild env (the
+            #    host-pass IS the rebuild). Adds the --native-uf flag.
+            #    `--native-uf` supports `--proofs` only on the native bridge; on
+            #    the dataflow/SQL backends it is TERM mode only, so skip the
+            #    degenerate +nuf-on-proofs cell there.
+            nuf_ok = (encoding == "term-encoding") or (backend == "bridge")
+            if nuf_ok:
+                yield (f"{base_label}+nuf", backend, encoding,
+                       base_flags + ["--native-uf"], True, False)
+
+            # 3) fast-rebuild cell (relational-deltaUF), only where the backend
+            #    has the env knob (not the bridge). Relational-UF (no
+            #    --native-uf), env set in run_once.
+            if FAST_REBUILD_ENV.get(backend):
+                yield (f"{base_label}+fastrb", backend, encoding,
+                       list(base_flags), False, True)
 
 
 class BenchDB:
@@ -100,14 +187,33 @@ class BenchDB:
         # "parallel-Njobs" (fast coverage, contended -> inflated wall-times).
         self.timing_mode = timing_mode
 
-    def add_timing(self, benchmark, backend, mode, condition, timing_list):
-        self.timings.append({
+    def add_timing(self, benchmark, backend, mode, condition, timing_list,
+                   rss=None, phases=None, parity=None, parity_diff=None,
+                   sizes=None):
+        row = {
             "benchmark": benchmark,
             "backend": backend,
             "mode": mode,
             "condition": condition,
             "timing_list": timing_list,
-        })
+        }
+        # Peak resident set size in BYTES (max across timed runs), via
+        # `/usr/bin/time -l`.
+        if rss is not None:
+            row["rss"] = rss
+        # Per-phase rebuild/canonicalize/congruence bucket seconds (and the raw
+        # per-source profile under "raw").
+        if phases is not None:
+            row["phases"] = phases
+        # Tuple-count parity vs the bridge-normal oracle.
+        if parity is not None:
+            row["parity"] = parity
+        if parity_diff:
+            row["parity_diff"] = parity_diff
+        # The captured per-function (Name, size) counts (sorted list of pairs).
+        if sizes is not None:
+            row["sizes"] = sizes
+        self.timings.append(row)
 
     def add_error(self, benchmark, backend, mode, condition, error):
         self.errors.append({
@@ -126,15 +232,24 @@ class BenchDB:
         Path(path).write_text(json.dumps(self.to_dict(), indent=2))
 
 
-def build_egglog(release: bool) -> Path:
-    """Build the egglog-experimental CLI and return its path. We use the
-    experimental binary (a strict CLI superset of plain egglog) so the
-    Herbie dumps' scheduler / multi-extract forms parse, while mainline
-    benchmarks still run unchanged."""
+def build_egglog(build: bool, release: bool) -> Path:
+    """Build and return the `egglog-experimental` CLI binary. The matrix drives
+    egglog-experimental (NOT mainline egglog): it registers the experimental
+    surface then dispatches to `egglog::cli`, so it carries `--native-uf` + the
+    backend flags + the fast-rebuild env vars, and its `src/main.rs` pre-builds
+    the duckdb egraph in native-UF mode for `--native-uf --duckdb`.
+
+    There is no prebuilt experimental binary -- it must be compiled fresh at the
+    current commit (which includes the main.rs `--native-uf` fix). We run
+    exactly ONE serial `cargo build -p egglog-experimental` and use the freshly
+    built `target/{release,debug}/egglog-experimental`. (`build` is accepted for
+    backwards compatibility but the build always happens.)"""
+    del build  # build is unconditional: no prebuilt experimental binary exists.
     profile = ["--release"] if release else []
     print(f"Building egglog-experimental ({'release' if release else 'debug'})...", flush=True)
     subprocess.run(
-        ["cargo", "build", *profile, "-p", "egglog-experimental", "--bin", "egglog-experimental"],
+        ["cargo", "build", *profile,
+         "-p", "egglog-experimental", "--bin", "egglog-experimental"],
         cwd=WORKSPACE, check=True,
     )
     target = "release" if release else "debug"
@@ -159,10 +274,26 @@ def find_benchmarks(path: Path) -> list[Path]:
     return sorted(path.rglob("*.egg"))
 
 
+# --- Per-phase profile: bucket per-ruleset/per-class times into a uniform
+# {rebuild, canonicalize, congruence, other} schema across backends. ---
+
+def _phase_bucket(name: str) -> str:
+    """Map a ruleset/class name to one of the uniform phase buckets."""
+    n = name.lower()
+    if "rebuild" in n:
+        return "rebuild"
+    if "congruence" in n:
+        return "congruence"
+    # UF maintenance / canonicalization rulesets.
+    if any(k in n for k in ("canon", "uf", "single_parent", "singleparent",
+                            "path_compress", "maintenance", "demote")):
+        return "canonicalize"
+    return "other"
+
+
 def parse_duck_phases(stderr: str):
-    """Parse the `--- by class ---` block emitted by the duckdb backend's
-    DUCK_PERF_DUMP into {phase: {"search": s, "apply": s}}. Returns {} if
-    the block is absent (non-duckdb backend, or env flag unset)."""
+    """Parse the `--- by class ---` block from the duckdb DUCK_PERF_DUMP into
+    {class: {"search": s, "apply": s}}. Returns {} if absent."""
     phases = {}
     in_block = False
     for line in stderr.splitlines():
@@ -172,13 +303,10 @@ def parse_duck_phases(stderr: str):
         if not in_block:
             continue
         # Format: "    1.364s  search   1.151s  apply   0.212s   42.0%wall  rebuild"
-        toks = line.replace("s", " ").split()
-        # Expect: <total> search <search> apply <apply> <pct>%wall <kind>
         if "search" in line and "apply" in line and line.strip():
             parts = line.split()
             try:
                 kind = parts[-1]
-                # values are at fixed positions: [0]=total, [2]=search, [4]=apply
                 search = float(parts[2].rstrip("s"))
                 apply_ = float(parts[4].rstrip("s"))
                 phases[kind] = {"search": search, "apply": apply_}
@@ -189,109 +317,341 @@ def parse_duck_phases(stderr: str):
     return phases
 
 
+def parse_bridge_report(report_path: Path):
+    """Load a bridge `--save-report` RunReport JSON and reduce it to per-ruleset
+    {search_and_apply, merge, rebuild} seconds. Returns {} on any failure."""
+    try:
+        rep = json.loads(report_path.read_text())
+    except (OSError, ValueError):
+        return {}
+
+    def dur(d):
+        return d.get("secs", 0) + d.get("nanos", 0) / 1e9 if d else 0.0
+
+    sa = rep.get("search_and_apply_time_per_ruleset", {})
+    mg = rep.get("merge_time_per_ruleset", {})
+    rb = rep.get("rebuild_time_per_ruleset", {})
+    out = {}
+    for rs in set(sa) | set(mg) | set(rb):
+        out[rs] = {"search_and_apply": dur(sa.get(rs)),
+                   "merge": dur(mg.get(rs)), "rebuild": dur(rb.get(rs))}
+    return out
+
+
+def parse_flowlog_prof(stderr: str):
+    """Parse the FLOWLOG_DD_RULESET_PROF per-ruleset table into
+    {ruleset: total_seconds}. Returns {} if absent."""
+    phases = {}
+    in_table = False
+    for line in stderr.splitlines():
+        if line.startswith("ruleset") and "total" in line and "%dd" in line:
+            in_table = True
+            continue
+        if not in_table:
+            continue
+        if line.startswith("[FLOWLOG_DD_RULESET_PROF]") or not line.strip():
+            in_table = False
+            continue
+        # "canonicalize                     25    0.023s  32.9% ..."
+        parts = line.split()
+        if len(parts) >= 3:
+            try:
+                total = float(parts[2].rstrip("s"))
+                phases[parts[0]] = total
+            except ValueError:
+                in_table = False
+    return phases
+
+
+def parse_feldera_prof(stderr: str):
+    """Parse the feldera FELDERA_PROFILE `[PROF]` lines into coarse phase
+    seconds. Feldera has no per-ruleset rebuild/canonicalize/congruence split,
+    so we report what it does expose (circuit_step / read_clone / fed_diff) and
+    leave the bucketed split as a TODO. Returns {} if absent."""
+    phases = {}
+    for line in stderr.splitlines():
+        if not line.startswith("[PROF]"):
+            continue
+        for key in ("circuit_step", "read_clone", "fed_diff", "step(transaction)",
+                    "feed", "read(consolidate)"):
+            m = re.search(re.escape(key) + r"=([0-9.]+)s", line)
+            if m:
+                phases[key.replace("(transaction)", "").replace("(consolidate)", "")] = \
+                    float(m.group(1))
+    # TODO(feldera per-phase): expose a per-ruleset rebuild/canonicalize/
+    # congruence split from the DBSP circuit; FELDERA_PROFILE is circuit-global.
+    return phases
+
+
+def bucket_phases(backend: str, raw: dict) -> dict:
+    """Fold a backend's raw per-source profile into the uniform
+    {rebuild, canonicalize, congruence, other} seconds schema, plus keep the
+    raw map under "raw" for drill-down. Returns {} if there is nothing."""
+    if not raw:
+        return {}
+    buckets = {"rebuild": 0.0, "canonicalize": 0.0, "congruence": 0.0, "other": 0.0}
+    if backend == "duckdb":
+        # {class: {"search", "apply"}} -> bucket by class name (search+apply).
+        for cls, st in raw.items():
+            buckets[_phase_bucket(cls)] += st.get("search", 0) + st.get("apply", 0)
+    elif backend == "bridge":
+        # {ruleset: {search_and_apply, merge, rebuild}} -> rebuild explicit;
+        # search_and_apply+merge bucketed by ruleset name.
+        for rs, st in raw.items():
+            buckets["rebuild"] += st.get("rebuild", 0)
+            other = st.get("search_and_apply", 0) + st.get("merge", 0)
+            b = _phase_bucket(rs)
+            buckets[b if b != "rebuild" else "other"] += other
+    elif backend == "flowlog":
+        # {ruleset: total_seconds} -> bucket by ruleset name.
+        for rs, total in raw.items():
+            buckets[_phase_bucket(rs)] += total
+    elif backend == "feldera":
+        # No per-ruleset split; circuit_step is the closest to "apply" work.
+        buckets["other"] = sum(raw.values())
+    buckets = {k: round(v, 6) for k, v in buckets.items() if v}
+    if not buckets:
+        return {}
+    buckets["raw"] = raw
+    return buckets
+
+
+# --- Correctness: per-function tuple-count parity vs the bridge-normal oracle.
+
+_SIZE_RE = re.compile(r"\(([A-Za-z_@][\w\-]*)\s+(\d+)\)")
+
+
+def parse_sizes(text: str):
+    """Extract per-function `(Name N)` tuple counts from a print-size block
+    (which can be on stdout or stderr; we feed both). Returns a sorted list of
+    [name, count] pairs (deterministic, so two cells' sets diff cleanly)."""
+    sizes = {}
+    for m in _SIZE_RE.finditer(text):
+        sizes[m.group(1)] = int(m.group(2))
+    return sorted([name, n] for name, n in sizes.items())
+
+
 def run_once(binary: Path, flags: list[str], bench: Path, timeout: float,
-             capture_phases: bool = False):
-    """Run one invocation. Returns (elapsed_seconds, None) on success or
-    (None, error_message) on failure/timeout. When `capture_phases` is set
-    (duckdb backend), enables DUCK_PERF_DUMP and returns
-    (elapsed, None, phases) instead."""
-    cmd = [str(binary), *flags, str(bench)]
-    env = None
-    if capture_phases:
-        import os
-        env = dict(os.environ, DUCK_PERF_DUMP="1")
+             env_extra: dict | None = None, capture_phases_for: str | None = None):
+    """Run one egglog invocation wrapped in `/usr/bin/time -l` for peak RSS.
+
+    Returns a dict {elapsed, rss, stdout, stderr, phases} on success, or
+    {error: msg} on failure/timeout. `env_extra` adds env vars (fast-rebuild /
+    profile flags). `capture_phases_for` is the backend whose per-phase profile
+    to parse from stderr (and, for bridge, the `--save-report` file)."""
+    env = dict(os.environ, **(env_extra or {}))
+
+    report_file = None
+    cmd_flags = list(flags)
+    if capture_phases_for == "bridge":
+        report_file = tempfile.NamedTemporaryFile(
+            suffix=".report.json", delete=False)
+        report_file.close()
+        cmd_flags += ["--save-report", report_file.name]
+
+    # Wrap with macOS `/usr/bin/time -l` for peak RSS (bytes). It prints the
+    # resource summary to ITS stderr, which we separate from the program's.
+    cmd = ["/usr/bin/time", "-l", str(binary), *cmd_flags, str(bench)]
     start = time.perf_counter()
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
                               env=env)
     except subprocess.TimeoutExpired:
-        return (None, f"timeout after {timeout}s", {}) if capture_phases \
-            else (None, f"timeout after {timeout}s")
+        if report_file:
+            os.unlink(report_file.name)
+        return {"error": f"timeout after {timeout}s"}
     elapsed = time.perf_counter() - start
+
+    # `/usr/bin/time -l` appends its resource block to stderr. Split it off so
+    # the program's own stderr (and parity output) stays clean.
+    prog_stderr, rss = _split_time_block(proc.stderr or "")
+
     if proc.returncode != 0:
-        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        if report_file:
+            os.unlink(report_file.name)
+        tail = (prog_stderr or proc.stdout or "").strip().splitlines()
         msg = tail[-1] if tail else f"exit code {proc.returncode}"
-        return (None, f"exit {proc.returncode}: {msg}", {}) if capture_phases \
-            else (None, f"exit {proc.returncode}: {msg}")
-    if capture_phases:
-        return elapsed, None, parse_duck_phases(proc.stderr or "")
-    return elapsed, None
+        return {"error": f"exit {proc.returncode}: {msg}"}
+
+    phases_raw = {}
+    if capture_phases_for == "duckdb":
+        phases_raw = parse_duck_phases(prog_stderr)
+    elif capture_phases_for == "flowlog":
+        phases_raw = parse_flowlog_prof(prog_stderr)
+    elif capture_phases_for == "feldera":
+        phases_raw = parse_feldera_prof(prog_stderr)
+    elif capture_phases_for == "bridge" and report_file:
+        phases_raw = parse_bridge_report(Path(report_file.name))
+        os.unlink(report_file.name)
+
+    return {"elapsed": elapsed, "rss": rss,
+            "stdout": proc.stdout or "", "stderr": prog_stderr,
+            "phases_raw": phases_raw}
 
 
-def bench_cell(binary, bench, rel, condition, backend, mode, flags, warmup, runs, timeout):
-    """Run one (benchmark, backend, encoding) cell: `warmup` discarded runs
-    followed by `runs` timed runs. Returns a result dict that the main process
-    folds into the DB. Pure (no shared state) so it is safe to run in a worker
-    process; a failing cell returns an error result rather than raising, so one
-    cell's failure never kills the pool."""
-    # Capture per-phase timing (search vs apply, by ruleset class) for the
-    # duckdb backend, which emits a DUCK_PERF_DUMP breakdown on stderr.
-    capture = backend == "duckdb"
+_TIME_RSS_RE = re.compile(r"^\s*(\d+)\s+maximum resident set size", re.M)
+# The `/usr/bin/time -l` resource block starts with a "<real> <user> <sys>" line.
+_TIME_HEADER_RE = re.compile(r"^\s*[\d.]+ real\s+[\d.]+ user\s+[\d.]+ sys", re.M)
 
-    # Warm-up runs (discarded): pay one-time costs (page cache, etc.).
+
+def _split_time_block(stderr: str):
+    """Separate the trailing `/usr/bin/time -l` resource block from the
+    program's own stderr. Returns (program_stderr, rss_bytes_or_None)."""
+    rss = None
+    m = _TIME_RSS_RE.search(stderr)
+    if m:
+        rss = int(m.group(1))
+    # Drop everything from the resource header line onward.
+    h = _TIME_HEADER_RE.search(stderr)
+    prog = stderr[:h.start()] if h else stderr
+    return prog, rss
+
+
+def measure_sizes(binary, bench, flags, env_extra, timeout):
+    """Run the cell ONCE with `(print-size)` appended to capture per-function
+    tuple counts (for parity). Returns (sizes_list, None) or (None, error)."""
+    src = bench.read_text()
+    tmp = tempfile.NamedTemporaryFile(
+        suffix=".egg", delete=False, mode="w", dir=str(bench.parent))
+    try:
+        tmp.write(src)
+        tmp.write("\n(print-size)\n")
+        tmp.close()
+        out = run_once(binary, flags, Path(tmp.name), timeout, env_extra=env_extra)
+        if "error" in out:
+            return None, out["error"]
+        # print-size output can land on stdout or stderr depending on backend;
+        # parse BOTH.
+        sizes = parse_sizes(out["stdout"] + "\n" + out["stderr"])
+        return sizes, None
+    finally:
+        os.unlink(tmp.name)
+
+
+def bench_cell(binary, bench, rel, condition, backend, mode, flags,
+               native_uf, fast_rebuild, warmup, runs, timeout):
+    """Run one matrix cell: `warmup` discarded runs, `runs` timed runs (each
+    wrapped for peak RSS + per-phase profile), and one extra `(print-size)` run
+    for tuple-count parity. Returns a result dict folded into the DB. A failing
+    cell returns an error result rather than raising."""
+    # Assemble the cell's env. `rebuild_env` is the treatment-relevant env
+    # (fast-rebuild knob) that MUST be present for both the timed runs and the
+    # parity run. `prof_env` adds the per-phase profile dump, which is enabled
+    # ONLY for the timed runs -- the profile block pollutes stderr that the
+    # `(print-size)` parity run scrapes (e.g. duckdb's per-rule dump can emit a
+    # stray `(Const 2)`), so the parity run must run profile-free.
+    rebuild_env = {}
+    if fast_rebuild:
+        knob = FAST_REBUILD_ENV.get(backend)
+        if knob:
+            rebuild_env[knob] = "1"
+    env_extra = dict(rebuild_env)
+    prof_env = PROFILE_ENV.get(backend)
+    if prof_env:
+        env_extra[prof_env] = "1"
+
+    # Warm-up runs (discarded): pay one-time costs (page cache, etc.). Warm the
+    # treatment's actual rebuild path; skip the profile dump (warmup is untimed).
     for _ in range(warmup):
-        run_once(binary, flags, bench, timeout)
+        run_once(binary, flags, bench, timeout, env_extra=rebuild_env)
 
     timings = []
+    rss_vals = []
     phase_runs = []
     for _ in range(runs):
-        out = run_once(binary, flags, bench, timeout, capture_phases=capture)
-        if capture:
-            elapsed, err, phases = out
-        else:
-            elapsed, err = out
-            phases = None
-        if err is not None:
+        out = run_once(binary, flags, bench, timeout, env_extra=env_extra,
+                       capture_phases_for=backend)
+        if "error" in out:
             return {"benchmark": rel, "backend": backend, "mode": mode,
-                    "condition": condition, "error": err}
-        timings.append(round(elapsed, 6))
-        if phases:
-            phase_runs.append(phases)
+                    "condition": condition, "error": out["error"]}
+        timings.append(round(out["elapsed"], 6))
+        if out.get("rss"):
+            rss_vals.append(out["rss"])
+        if out.get("phases_raw"):
+            phase_runs.append(out["phases_raw"])
 
     result = {"benchmark": rel, "backend": backend, "mode": mode,
               "condition": condition, "timing_list": timings}
+    if rss_vals:
+        # Peak RSS = max observed across timed runs (bytes).
+        result["rss"] = max(rss_vals)
+
     if phase_runs:
-        # Median across runs, per phase, for search and apply seconds.
-        kinds = set().union(*[set(p) for p in phase_runs])
-        agg = {}
-        for k in kinds:
-            for field in ("search", "apply"):
-                vals = sorted(p[k][field] for p in phase_runs if k in p)
-                if vals:
-                    agg.setdefault(k, {})[field] = vals[len(vals) // 2]
-        result["duck_phases"] = agg
+        # Bucket the median run's raw profile into the uniform schema.
+        mid = phase_runs[len(phase_runs) // 2]
+        buckets = bucket_phases(backend, mid)
+        if buckets:
+            result["phases"] = buckets
+
+    # Tuple-count parity: one extra run with `(print-size)` appended. Use the
+    # profile-free env (the fast-rebuild knob still applies; the profile dump
+    # does NOT, so it can't pollute the scraped size output).
+    sizes, size_err = measure_sizes(binary, bench, flags, rebuild_env, timeout)
+    if size_err is None and sizes is not None:
+        result["sizes"] = sizes
     return result
 
 
-def _bench_cell_worker(task):
-    """Picklable entry point for ProcessPoolExecutor workers. `task` is the
-    tuple of positional args for `bench_cell`."""
-    return bench_cell(*task)
-
-
-def apply_cell_result(result, db):
-    """Fold a cell result (from `bench_cell`) into the DB and log it."""
+def apply_cell_result(result, db, oracle_sizes):
+    """Fold a cell result into the DB and log it. `oracle_sizes` is
+    {benchmark: sorted [name, count] list} for the bridge-normal reference; a
+    cell's parity is its size-set vs its file's oracle entry."""
     rel = result["benchmark"]
     backend = result["backend"]
     mode = result["mode"]
     condition = result["condition"]
     if "error" in result:
         db.add_error(rel, backend, mode, condition, result["error"])
-        print(f"    {rel}: {condition:24} ERROR: {result['error']}", flush=True)
+        print(f"    {rel}: {condition:28} ERROR: {result['error']}", flush=True)
         return
+
     timings = result["timing_list"]
-    db.add_timing(rel, backend, mode, condition, timings)
+    rss = result.get("rss")
+    phases = result.get("phases")
+    sizes = result.get("sizes")
+
+    # Correctness: diff this cell's tuple counts against the oracle's.
+    parity = None
+    parity_diff = None
+    oracle = oracle_sizes.get(rel)
+    if sizes is not None and oracle is not None:
+        parity = (sizes == oracle)
+        if not parity:
+            parity_diff = _size_diff(oracle, sizes)
+    elif condition == ORACLE_CONDITION and sizes is not None:
+        # The oracle is trivially parity-with-itself.
+        parity = True
+
+    db.add_timing(rel, backend, mode, condition, timings,
+                  rss=rss, phases=phases, parity=parity,
+                  parity_diff=parity_diff, sizes=sizes)
+
     mean = sum(timings) / len(timings)
-    print(f"    {rel}: {condition:24} mean {mean:8.3f}s  (runs: {timings})", flush=True)
-    phases = result.get("duck_phases")
+    rss_mb = f"{rss / 1e6:7.1f}MB" if rss else "      ?MB"
+    par = "" if parity is None else (" parity=OK" if parity else " parity=MISMATCH")
+    print(f"    {rel}: {condition:28} mean {mean:8.3f}s  rss {rss_mb}{par}",
+          flush=True)
     if phases:
-        # Per-phase median search/apply seconds (duckdb DUCK_PERF_DUMP).
-        order = sorted(phases, key=lambda k: -(phases[k].get("search", 0)
-                                               + phases[k].get("apply", 0)))
-        parts = [f"{k}={phases[k].get('search', 0) + phases[k].get('apply', 0):.3f}s"
-                 f"(s{phases[k].get('search', 0):.3f}/a{phases[k].get('apply', 0):.3f})"
-                 for k in order]
-        print(f"      phases: {'  '.join(parts)}", flush=True)
+        parts = [f"{k}={phases[k]:.3f}s" for k in
+                 ("rebuild", "canonicalize", "congruence", "other")
+                 if k in phases]
+        if parts:
+            print(f"      phases: {'  '.join(parts)}", flush=True)
+    if parity_diff:
+        print(f"      parity diff: {parity_diff}", flush=True)
+
+
+def _size_diff(oracle, cell):
+    """Human-readable diff of two sorted [name, count] size-sets."""
+    od = dict(oracle)
+    cd = dict(cell)
+    diffs = []
+    for name in sorted(set(od) | set(cd)):
+        o = od.get(name)
+        c = cd.get(name)
+        if o != c:
+            diffs.append(f"{name}: oracle={o} cell={c}")
+    return "; ".join(diffs)
 
 
 def serve_results(results_path: Path, port: int):
@@ -358,27 +718,20 @@ def main():
     parser.add_argument("--timeout", type=float, default=300.0,
                         help="per-run timeout in seconds (default 300)")
     parser.add_argument("--limit", type=int, default=None,
-                        help="benchmark at most N files (sample large corpora like the Herbie dumps)")
+                        help="benchmark at most N files (small pilot / sampling)")
     parser.add_argument("--output", default=str(WORKSPACE / "eval" / "results.json"),
                         help="results JSON path")
     parser.add_argument("--debug", action="store_true",
                         help="use the debug build instead of release")
-    parser.add_argument("--parallel", action="store_true",
-                        help="run benchmark cells CONCURRENTLY via a process pool. "
-                             "FAST COVERAGE only (which cells run vs error) -- "
-                             "concurrent processes contend for CPU so per-cell "
-                             "wall-times are INFLATED and NOT paper-quality. "
-                             "Ignored when --paper is given.")
-    parser.add_argument("--jobs", type=int, default=None,
-                        help="number of concurrent worker processes (implies "
-                             "--parallel). Default when --parallel is given: "
-                             "min(8, cpu_count-1). Keep modest -- concurrent "
-                             "egglog/duckdb/feldera/flowlog processes can OOM.")
+    parser.add_argument("--build", action="store_true",
+                        help="accepted for backwards compatibility; the "
+                             "egglog-experimental binary is always built fresh "
+                             "(ONE serial `cargo build -p egglog-experimental`) "
+                             "since there is no prebuilt experimental binary.")
     parser.add_argument("--paper", action="store_true",
-                        help="PAPER MODE: force strictly SEQUENTIAL execution "
-                             "(parallelism OFF) for accurate, uncontended "
-                             "timings. Overrides --parallel/--jobs and ensures "
-                             "warmup>=1. Paper numbers must use this mode.")
+                        help="PAPER MODE (default behaviour): strictly SEQUENTIAL, "
+                             "uncontended execution for accurate timings/RSS. There "
+                             "is no parallel mode.")
     parser.add_argument("--serve", action="store_true", help="open the eval-live viewer after running")
     parser.add_argument("--justserve", action="store_true", help="skip benchmarking; just serve results")
     parser.add_argument("--port", type=int, default=8080)
@@ -388,26 +741,13 @@ def main():
         serve_results(Path(args.output), args.port)
         return
 
-    # Resolve scheduling mode. --paper forces strictly sequential (accurate,
-    # uncontended timing) and overrides --parallel/--jobs. Otherwise --jobs
-    # implies --parallel; --parallel with no --jobs uses a sensible cap.
-    if args.paper:
-        jobs = 1
-        timing_mode = "paper-sequential"
-        # Paper mode wants at least one warm-up to absorb one-time costs.
-        if args.warmup < 1:
-            args.warmup = 1
-    elif args.parallel or args.jobs is not None:
-        if args.jobs is not None:
-            jobs = max(1, args.jobs)
-        else:
-            jobs = max(1, min(8, (os.cpu_count() or 1) - 1))
-        timing_mode = f"parallel-{jobs}jobs" if jobs > 1 else "sequential"
-    else:
-        jobs = 1
-        timing_mode = "sequential"
+    # Strictly sequential, always (paper-quality timing + RSS). There is no
+    # parallel mode -- contended wall-times/RSS would be meaningless.
+    timing_mode = "paper-sequential"
+    if args.warmup < 1:
+        args.warmup = 1
 
-    binary = build_egglog(release=not args.debug)
+    binary = build_egglog(build=args.build, release=not args.debug)
 
     bench_path = Path(args.path) if args.path else (WORKSPACE / "tests")
     if not bench_path.is_absolute():
@@ -419,11 +759,10 @@ def main():
         benchmarks = benchmarks[:args.limit]
 
     conds = list(conditions())
-    sched = "PAPER (sequential)" if args.paper else (
-        f"parallel ({jobs} jobs)" if jobs > 1 else "sequential")
     print(f"\n{len(benchmarks)} benchmark(s) x {len(conds)} condition(s), "
           f"{args.runs} run(s) each (warmup {args.warmup}, timeout {args.timeout}s)\n"
-          f"timing mode: {timing_mode}  [{sched}]\n")
+          f"timing mode: {timing_mode}  [PAPER (sequential)]\n"
+          f"oracle / reference: {ORACLE_CONDITION}\n")
 
     db = BenchDB(timing_mode=timing_mode)
 
@@ -431,46 +770,49 @@ def main():
         return (str(bench.relative_to(WORKSPACE))
                 if str(bench).startswith(str(WORKSPACE)) else str(bench))
 
-    # Build the full task list: one task per (benchmark, condition) cell. Each
-    # task is fully self-contained so it can run in a worker process.
-    tasks = []
+    # The oracle cell (bridge-normal): its tuple counts are the parity
+    # reference for every other cell of the same file. Files that ERROR on the
+    # oracle itself are not benchmarkable, so we skip them entirely (the whole
+    # matrix for that file).
+    oracle_cond = next(c for c in conds if c[0] == ORACLE_CONDITION)
+
+    runnable = []        # benchmarks whose oracle ran cleanly
+    oracle_sizes = {}    # {rel: sorted [name, count] list}
+    print("Establishing the bridge-normal oracle per file ...", flush=True)
     for bench in benchmarks:
         rel = rel_of(bench)
-        for condition, backend, mode, flags in conds:
-            tasks.append((binary, bench, rel, condition, backend, mode, flags,
-                          args.warmup, args.runs, args.timeout))
+        _, backend, mode, flags, _nuf, _fr = oracle_cond
+        sizes, err = measure_sizes(binary, bench, flags, {}, args.timeout)
+        if err is not None or sizes is None:
+            print(f"    SKIP {rel}: oracle errored ({err})", flush=True)
+            db.add_error(rel, backend, mode, ORACLE_CONDITION,
+                         f"oracle skip: {err}")
+            continue
+        oracle_sizes[rel] = sizes
+        runnable.append(bench)
+    db.save_json(args.output)
+    print(f"  {len(runnable)}/{len(benchmarks)} files benchmarkable "
+          f"(oracle ran)\n", flush=True)
 
-    if jobs > 1:
-        # FAST COVERAGE: schedule all cells across a process pool. Per-cell
-        # logic (warmup + timed runs) is unchanged; only cross-cell scheduling
-        # differs. Results are collected as they complete and folded into the
-        # DB in the main process, so a failing cell can't kill the pool.
-        done = 0
-        total = len(tasks)
-        with ProcessPoolExecutor(max_workers=jobs) as pool:
-            futures = {pool.submit(_bench_cell_worker, t): t for t in tasks}
-            for fut in as_completed(futures):
-                done += 1
-                try:
-                    result = fut.result()
-                except Exception as exc:  # noqa: BLE001 - keep the pool alive
-                    t = futures[fut]
-                    result = {"benchmark": t[2], "backend": t[4], "mode": t[5],
-                              "condition": t[3], "error": f"worker crashed: {exc}"}
-                print(f"[{done}/{total}]", flush=True)
-                apply_cell_result(result, db)
-                db.save_json(args.output)  # incremental
-    else:
-        # SEQUENTIAL: one process at a time (paper-quality / default).
-        last_rel = None
-        for i, t in enumerate(tasks, 1):
-            rel = t[2]
-            if rel != last_rel:
-                print(f"[{i}/{len(tasks)}] {rel}", flush=True)
-                last_rel = rel
-            result = bench_cell(*t)
-            apply_cell_result(result, db)
-            db.save_json(args.output)  # incremental: write after each cell
+    # Build the full task list over runnable files: one task per cell.
+    tasks = []
+    for bench in runnable:
+        rel = rel_of(bench)
+        for condition, backend, mode, flags, native_uf, fast_rebuild in conds:
+            tasks.append((binary, bench, rel, condition, backend, mode, flags,
+                          native_uf, fast_rebuild, args.warmup, args.runs,
+                          args.timeout))
+
+    # SEQUENTIAL: one process at a time (paper-quality).
+    last_rel = None
+    for i, t in enumerate(tasks, 1):
+        rel = t[2]
+        if rel != last_rel:
+            print(f"[{i}/{len(tasks)}] {rel}", flush=True)
+            last_rel = rel
+        result = bench_cell(*t)
+        apply_cell_result(result, db, oracle_sizes)
+        db.save_json(args.output)  # incremental: write after each cell
 
     print(f"\nResults written to {args.output}  (timing_mode: {timing_mode})")
     if args.serve:

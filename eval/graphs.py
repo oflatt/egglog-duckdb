@@ -142,6 +142,166 @@ def mean_time_table(data):
     return rows
 
 
+# --- Peak memory (RSS) ------------------------------------------------------
+
+def _by_bench_cond_field(data, field, transform=lambda x: x):
+    """{benchmark: {condition: transform(row[field])}} for rows that carry
+    `field`."""
+    from collections import defaultdict
+    out = defaultdict(dict)
+    for row in data.get("timings", []):
+        if field in row and row[field] is not None:
+            out[row["benchmark"]][row["condition"]] = transform(row[field])
+    return out
+
+
+def peak_memory_grouped(data):
+    """Grouped bar chart: per benchmark, one bar per condition (peak RSS, MB)."""
+    import matplotlib.pyplot as plt
+
+    by_bench = _by_bench_cond_field(data, "rss", lambda b: b / 1e6)
+    conds = _all_conditions(data)
+    benches = sorted(by_bench.keys())
+    n = len(conds)
+
+    fig, ax = plt.subplots(figsize=(max(8, len(benches) * 1.6), 5))
+    width = 0.8 / max(n, 1)
+    for j, cond in enumerate(conds):
+        xs = [i + j * width for i in range(len(benches))]
+        ys = [by_bench[b].get(cond, 0) for b in benches]
+        ax.bar(xs, ys, width=width, label=cond)
+    ax.set_xticks([i + 0.4 - width / 2 for i in range(len(benches))])
+    ax.set_xticklabels([b.split("/")[-1] for b in benches], rotation=30, ha="right")
+    ax.set_ylabel("peak RSS (MB)")
+    ax.set_title("Peak memory per benchmark by condition")
+    ax.legend(fontsize=8)
+    plt.tight_layout()
+    return fig
+
+
+def peak_memory_table(data):
+    """Pivot: one row per benchmark, a column per condition (peak RSS, MB)."""
+    by_bench = _by_bench_cond_field(data, "rss", lambda b: b / 1e6)
+    conds = _all_conditions(data)
+    rows = []
+    for bench in sorted(by_bench.keys()):
+        row = {"benchmark": bench}
+        for cond in conds:
+            v = by_bench[bench].get(cond)
+            row[f"{cond} (MB)"] = round(v, 1) if v is not None else ""
+        rows.append(row)
+    return rows
+
+
+# --- Correctness / parity ---------------------------------------------------
+
+def parity_table(data):
+    """Pivot: one row per benchmark, a column per condition. Each cell is the
+    tuple-count parity vs the bridge-normal oracle: OK / MISMATCH / (blank if
+    the cell errored or has no parity result)."""
+    from collections import defaultdict
+    by_bench = defaultdict(dict)
+    for row in data.get("timings", []):
+        p = row.get("parity")
+        if p is None:
+            continue
+        by_bench[row["benchmark"]][row["condition"]] = "OK" if p else "MISMATCH"
+    conds = _all_conditions(data)
+    rows = []
+    for bench in sorted(by_bench.keys()):
+        row = {"benchmark": bench}
+        for cond in conds:
+            row[cond] = by_bench[bench].get(cond, "")
+        rows.append(row)
+    return rows
+
+
+def parity_summary(data):
+    """One row per condition: how many benchmarks matched / mismatched the
+    bridge-normal oracle (tuple-count parity)."""
+    from collections import defaultdict
+    ok = defaultdict(int)
+    bad = defaultdict(int)
+    bad_files = defaultdict(list)
+    for row in data.get("timings", []):
+        p = row.get("parity")
+        if p is None:
+            continue
+        if p:
+            ok[row["condition"]] += 1
+        else:
+            bad[row["condition"]] += 1
+            bad_files[row["condition"]].append(row["benchmark"].split("/")[-1])
+    rows = []
+    for cond in _all_conditions(data):
+        if cond not in ok and cond not in bad:
+            continue
+        rows.append({
+            "condition": cond,
+            "parity OK": ok.get(cond, 0),
+            "MISMATCH": bad.get(cond, 0),
+            "mismatched files": ", ".join(sorted(bad_files.get(cond, []))[:8]),
+        })
+    return rows
+
+
+# --- Per-phase profile (rebuild / canonicalize / congruence) ----------------
+
+_PHASE_BUCKETS = ("rebuild", "canonicalize", "congruence", "other")
+
+
+def phase_breakdown_table(data):
+    """One row per (benchmark, condition) that has a per-phase profile, with a
+    column per bucket (seconds) plus the bucket totals."""
+    rows = []
+    for row in data.get("timings", []):
+        phases = row.get("phases")
+        if not phases:
+            continue
+        r = {"benchmark": row["benchmark"], "condition": row["condition"]}
+        for b in _PHASE_BUCKETS:
+            v = phases.get(b)
+            r[b] = round(v, 4) if v else ""
+        rows.append(r)
+    return rows
+
+
+def phase_stacked(data):
+    """Stacked bar: per (benchmark, condition) with a profile, stack the
+    rebuild/canonicalize/congruence/other bucket seconds. One bar per cell."""
+    import matplotlib.pyplot as plt
+
+    cells = []
+    for row in data.get("timings", []):
+        phases = row.get("phases")
+        if not phases:
+            continue
+        label = f"{row['benchmark'].split('/')[-1]}\n{row['condition']}"
+        cells.append((label, phases))
+    if not cells:
+        fig, ax = plt.subplots(figsize=(6, 2))
+        ax.text(0.5, 0.5, "no per-phase profiles captured", ha="center")
+        ax.axis("off")
+        return fig
+
+    fig, ax = plt.subplots(figsize=(max(8, len(cells) * 0.6), 5))
+    xs = range(len(cells))
+    bottoms = [0.0] * len(cells)
+    colors = {"rebuild": "#d9534f", "canonicalize": "#5bc0de",
+              "congruence": "#5cb85c", "other": "#bbbbbb"}
+    for b in _PHASE_BUCKETS:
+        ys = [c[1].get(b, 0) or 0 for c in cells]
+        ax.bar(xs, ys, bottom=bottoms, label=b, color=colors[b])
+        bottoms = [a + y for a, y in zip(bottoms, ys)]
+    ax.set_xticks(list(xs))
+    ax.set_xticklabels([c[0] for c in cells], rotation=75, ha="right", fontsize=6)
+    ax.set_ylabel("phase time (s)")
+    ax.set_title("Per-phase bucket breakdown (rebuild / canonicalize / congruence)")
+    ax.legend(fontsize=8)
+    plt.tight_layout()
+    return fig
+
+
 def mean_time_filter(filtered_rows, data):
     keep = {r["benchmark"] for r in filtered_rows}
     return {
@@ -174,8 +334,14 @@ def speedup_vs_bridge_normal(data):
 
 reg = eval_live.Registry()
 reg.graph("Mean time per benchmark", mean_time_grouped)
+reg.graph("Peak memory per benchmark", peak_memory_grouped)
 reg.graph("Geomean by condition", geomean_by_condition)
 reg.graph("Completion CDF (performance profile)", completion_cdf)
+reg.graph("Per-phase breakdown (stacked)", phase_stacked)
 reg.table("Mean time (s) per condition", mean_time_table, filter_source=mean_time_filter)
+reg.table("Peak RSS (MB) per condition", peak_memory_table)
+reg.table("Correctness: parity vs bridge-normal", parity_table)
+reg.table("Parity summary by condition", parity_summary)
+reg.table("Per-phase buckets (s)", phase_breakdown_table)
 reg.table("Slowdown vs bridge-normal", speedup_vs_bridge_normal)
 eval_live.registry = reg

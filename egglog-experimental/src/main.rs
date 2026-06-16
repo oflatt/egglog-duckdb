@@ -10,7 +10,13 @@ fn main() {
     // both sides) short-circuits its own rebuild.
     let argv: Vec<String> = std::env::args().collect();
     let want_duckdb = argv.iter().any(|a| a == "--duckdb");
-    let want_native_uf = argv.iter().any(|a| a == "--duck-native-uf");
+    // Honor both the duckdb-specific `--duck-native-uf` and the unified
+    // `--native-uf` (PR #782) so the duckdb egraph is built in native-UF mode
+    // when either is set — otherwise the `--native-uf` encoding would emit
+    // UF-backed functions against a relational duckdb backend.
+    let want_native_uf = argv
+        .iter()
+        .any(|a| a == "--duck-native-uf" || a == "--native-uf");
     // `--proof-testing` implies proofs — the desugar pass rewrites
     // `(check ...)` into `(prove-exists ...)` which needs the proof
     // encoding active. Without this, cli.rs's `args.proof_testing`
