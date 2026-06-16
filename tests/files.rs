@@ -31,6 +31,19 @@ struct Run {
     /// (including per-function tuple counts). Gated behind
     /// `EGGLOG_TEST_FLOWLOG=1` so it never perturbs the default test run.
     flowlog: bool,
+    /// Run the program in PR #782's `--native-uf` term-mode encoding: the
+    /// eq-sort union-find is lowered to the `:impl displaced-union-find`
+    /// UF-backed function rather than the relational union-find. This
+    /// dimension is orthogonal to the backend dimension: when set, the
+    /// reference/native-bridge run enables `EGraph::with_native_uf()`, and
+    /// each backend treatment (duckdb/feldera/flowlog) additionally enables
+    /// its own in-process UF host-pass via the backend config's `native_uf`
+    /// flag. Native UF must be bit-exact with the reference, so every
+    /// native-uf treatment is diffed against the SAME shared snapshot. Term
+    /// mode only: never combined with `proofs`/`proof_testing`. Gated behind
+    /// `EGGLOG_TEST_NATIVE_UF=1` (plus the per-backend `EGGLOG_TEST_FLOWLOG` /
+    /// `EGGLOG_TEST_FELDERA` gates) so it never perturbs the default run.
+    native_uf: bool,
     threads: usize,
 }
 
@@ -118,6 +131,7 @@ impl Run {
                 duckdb: false,
                 feldera: false,
                 flowlog: false,
+                native_uf: false,
                 threads: self.threads,
             };
             let proof_check_prog = if self.proof_testing {
@@ -165,6 +179,12 @@ impl Run {
             EGraph::new_with_proofs().with_proof_testing()
         } else if self.proofs {
             EGraph::new_with_proofs()
+        } else if self.native_uf {
+            // Native bridge in PR #782's `--native-uf` term mode: term
+            // encoding (implied by native UF) plus the UF-backed
+            // `:impl displaced-union-find` encoding. Term mode only — never
+            // combined with proofs (`generate_tests` enforces this).
+            EGraph::new_with_term_encoding().with_native_uf()
         } else if self.term_encoding {
             EGraph::new_with_term_encoding()
         } else {
@@ -202,8 +222,19 @@ impl Run {
         // counts via the appended `(print-size)`. This is Milestone 3's
         // end-to-end check.
         if self.feldera {
-            let mut egraph = EGraph::with_feldera_backend()
-                .unwrap_or_else(|e| panic!("EGraph::with_feldera_backend init failed: {e}"));
+            // `native_uf` drives PR #782's UF-backed encoding through the
+            // Feldera backend's in-process host-pass: the config flag enables
+            // the backend interception, and `with_native_uf()` makes the term
+            // encoder emit the `:impl displaced-union-find` program the
+            // interception expects. Both are required (see lib.rs). Term mode
+            // only — never combined with proofs here.
+            let mut egraph = EGraph::with_feldera_backend_config(FelderaBackendConfig {
+                native_uf: self.native_uf,
+            })
+            .unwrap_or_else(|e| panic!("EGraph::with_feldera_backend init failed: {e}"));
+            if self.native_uf {
+                egraph = egraph.with_native_uf();
+            }
             egraph.ensure_no_reserved_symbols(false);
             return match egraph.parse_and_run_program(filename, &program) {
                 Ok(msgs) => {
@@ -233,8 +264,17 @@ impl Run {
         // snapshot — including per-function tuple counts via the
         // appended `(print-size)`.
         if self.flowlog {
-            let mut egraph = EGraph::with_flowlog_backend()
-                .unwrap_or_else(|e| panic!("EGraph::with_flowlog_backend init failed: {e}"));
+            // `native_uf`: as for feldera, the config flag enables the FlowLog
+            // backend's in-process UF host-pass and `with_native_uf()` makes
+            // the encoder emit the matching `:impl displaced-union-find`
+            // program. Both required. Term mode only.
+            let mut egraph = EGraph::with_flowlog_backend_config(FlowlogBackendConfig {
+                native_uf: self.native_uf,
+            })
+            .unwrap_or_else(|e| panic!("EGraph::with_flowlog_backend init failed: {e}"));
+            if self.native_uf {
+                egraph = egraph.with_native_uf();
+            }
             egraph.ensure_no_reserved_symbols(false);
             return match egraph.parse_and_run_program(filename, &program) {
                 Ok(msgs) => {
@@ -283,12 +323,21 @@ impl Run {
             // pair type. Until native UF learns to return Pair
             // values in proof mode, keep them apart in tests.
             let want_proofs = self.proofs || self.proof_testing;
+            // `native_uf` (term mode only — `generate_tests` never pairs it
+            // with proofs) drives PR #782's UF-backed encoding through the
+            // DuckDB backend: the config flag enables the SQL host-pass
+            // interception, and `with_native_uf()` below makes the encoder
+            // emit the matching `:impl displaced-union-find` program. Both are
+            // required (see lib.rs / cli.rs).
             let config = DuckBackendConfig {
                 proofs: want_proofs,
-                native_uf: false,
+                native_uf: self.native_uf,
             };
             let mut egraph = EGraph::with_duckdb_backend(config)
                 .unwrap_or_else(|e| panic!("EGraph::with_duckdb_backend init failed: {e}"));
+            if self.native_uf {
+                egraph = egraph.with_native_uf();
+            }
             // proof_testing is a desugar-pass flag (read at
             // `desugar.rs:164` to rewrite `(check ...)` → `(prove
             // ...)`), and the desugar pass is shared by both
@@ -443,6 +492,9 @@ impl Run {
                 if self.0.flowlog {
                     write!(f, "_flowlog")?;
                 }
+                if self.0.native_uf {
+                    write!(f, "_native_uf")?;
+                }
 
                 if self.0.threads > 1 {
                     write!(f, "_{}threads", self.0.threads)?;
@@ -523,6 +575,7 @@ fn generate_tests(glob: &str) -> Vec<Trial> {
             duckdb: false,
             feldera: false,
             flowlog: false,
+            native_uf: false,
             threads: 1,
         };
         let should_fail = run.should_fail();
@@ -617,6 +670,55 @@ fn generate_tests(glob: &str) -> Vec<Trial> {
         if duckdb_supported && std::env::var("EGGLOG_TEST_FLOWLOG").is_ok() {
             push_trial(Run {
                 flowlog: true,
+                ..run.clone()
+            });
+        }
+
+        // native-UF treatments (PR #782 `--native-uf`, TERM mode only): run
+        // the UF-backed-table encoding on each backend and confirm it is
+        // bit-exact with the reference via the SAME shared snapshot. Native UF
+        // is a correctness-preserving optimization, so any divergence here is
+        // a real bug. All of these are gated behind `EGGLOG_TEST_NATIVE_UF=1`
+        // (the per-backend ones additionally behind their existing
+        // `EGGLOG_TEST_FELDERA` / `EGGLOG_TEST_FLOWLOG` gates) so they never
+        // perturb the default `cargo test` run. Never combined with
+        // proofs/proof_testing (native UF + proofs is not yet wired — see the
+        // duckdb branch in `test_program`).
+        let native_uf_enabled = std::env::var("EGGLOG_TEST_NATIVE_UF").is_ok();
+
+        // native bridge + native UF: same support gate as the `term_encoding`
+        // treatment (term mode, must support the encoder). Diffed against the
+        // shared snapshot — must match the reference bit-exactly.
+        if native_uf_enabled && !should_fail && !requires_proofs && supports_proofs {
+            push_trial(Run {
+                native_uf: true,
+                ..run.clone()
+            });
+        }
+
+        // duckdb + native UF: same supportability gate as plain duckdb.
+        if native_uf_enabled && duckdb_supported {
+            push_trial(Run {
+                duckdb: true,
+                native_uf: true,
+                ..run.clone()
+            });
+        }
+
+        // feldera + native UF: gated by the feldera env var as well.
+        if native_uf_enabled && duckdb_supported && std::env::var("EGGLOG_TEST_FELDERA").is_ok() {
+            push_trial(Run {
+                feldera: true,
+                native_uf: true,
+                ..run.clone()
+            });
+        }
+
+        // flowlog + native UF: gated by the flowlog env var as well.
+        if native_uf_enabled && duckdb_supported && std::env::var("EGGLOG_TEST_FLOWLOG").is_ok() {
+            push_trial(Run {
+                flowlog: true,
+                native_uf: true,
                 ..run.clone()
             });
         }

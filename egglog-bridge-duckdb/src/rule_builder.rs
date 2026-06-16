@@ -814,12 +814,26 @@ impl<'a> RuleBuilderOps for DuckRuleBuilderOps<'a> {
             .add_rule(rule)
             .map_err(|e| anyhow!("DuckRuleBuilderOps::build: add_rule failed: {e}"))?;
 
-        // Allocate a trait-level RuleId pointing at the compiled
-        // rule's index in `egraph.rules`. `Backend::run_rules(&[ids])`
-        // resolves each id back to that index and runs just that
-        // specific rule.
+        // `add_rule` can DROP a rule without compiling it (returns
+        // `Ok(())` but doesn't push to `egraph.rules`): under
+        // `--native-uf` the UF-maintenance rulesets and the
+        // `@uf_change_drain_rule*` rules are skipped (see
+        // `EGraph::add_rule`). In that case `rule_idx` (captured
+        // *before* `add_rule`) does NOT name this rule — it names the
+        // slot the *next* compiled rule will occupy. Pointing this
+        // RuleId at `rule_idx` would alias the next real rule, so
+        // running the dropped rule's ruleset would spuriously fire
+        // that real rule (e.g. a user rule firing during a rebuild
+        // pass). Detect the drop by checking whether `rules` grew and
+        // allocate a `None` slot (a true no-op, like the empty-action
+        // case above) instead.
         let id = egraph.backend_rule_indices.len() as u32;
-        egraph.backend_rule_indices.push(Some(rule_idx));
+        let slot = if egraph.rules.len() > rule_idx {
+            Some(rule_idx)
+        } else {
+            None
+        };
+        egraph.backend_rule_indices.push(slot);
         Ok(RuleId::new(id))
     }
 

@@ -740,7 +740,12 @@ impl EGraph {
     /// UF-backed function instead of the relational union-find. Only valid
     /// on the native bridge in term-encoding mode (the CLI enforces these
     /// preconditions). Supports proof mode (provenance-tracking UF). Default OFF.
-    pub(crate) fn with_native_uf(mut self) -> Self {
+    ///
+    /// Public so the snapshot harness (`tests/files.rs`) can build the
+    /// native-UF treatments: it pairs this encoding with each backend's
+    /// `native_uf` config flag (the host-pass interception) and checks the
+    /// result is bit-exact with the reference via the shared snapshot.
+    pub fn with_native_uf(mut self) -> Self {
         self.proof_state.native_uf = true;
         self
     }
