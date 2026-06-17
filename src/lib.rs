@@ -484,6 +484,9 @@ impl EGraph {
         if config.native_uf {
             db.enable_native_uf();
         }
+        if config.fast_rebuild {
+            db.enable_fast_rebuild();
+        }
         if config.proofs {
             // Switch the eq-sort constructor hash-cons to the bare term
             // table so each application keeps its own id; reusing the
@@ -543,6 +546,9 @@ impl EGraph {
         if config.native_uf {
             db.enable_native_uf();
         }
+        if config.fast_rebuild {
+            db.enable_fast_rebuild();
+        }
         let backend: Box<dyn egglog_backend_trait::Backend> = Box::new(db);
         let mut eg = Self::with_backend(backend);
 
@@ -588,6 +594,9 @@ impl EGraph {
         if config.native_uf {
             db.enable_native_uf();
         }
+        if config.fast_rebuild {
+            db.enable_fast_rebuild();
+        }
         let backend: Box<dyn egglog_backend_trait::Backend> = Box::new(db);
         let mut eg = Self::with_backend(backend);
 
@@ -612,6 +621,13 @@ pub struct FlowlogBackendConfig {
     /// intercepted/dropped). Must be paired with [`EGraph::with_native_uf`] (the
     /// encoding). Experimental; off by default.
     pub native_uf: bool,
+    /// `--fast-rebuild`: engage the FlowLog backend's RELATIONAL δuf fast-rebuild
+    /// (`enable_fast_rebuild`), dropping the always-empty `δview ⋈ uf_old` rebuild
+    /// term. Only meaningful WITHOUT [`native_uf`](Self::native_uf): under
+    /// native-UF the host-side `view ⋈ δuf` delta rebuild is already the default,
+    /// so this flag is a no-op there. (Also reachable via the
+    /// `FLOWLOG_DELTA_REBUILD` env var.) Experimental; off by default.
+    pub fast_rebuild: bool,
 }
 
 /// Knobs for [`EGraph::with_feldera_backend_config`]. Mirrors
@@ -625,6 +641,13 @@ pub struct FelderaBackendConfig {
     /// DBSP circuit. Must be paired with [`EGraph::with_native_uf`] (the
     /// encoding). Experimental; off by default.
     pub native_uf: bool,
+    /// `--fast-rebuild`: engage the Feldera backend's RELATIONAL δuf fast-rebuild
+    /// (`enable_fast_rebuild`), dropping the always-empty `δview ⋈ uf_old` rebuild
+    /// term. Only meaningful WITHOUT [`native_uf`](Self::native_uf): under
+    /// native-UF the host-side `view ⋈ δuf` delta rebuild is already the default,
+    /// so this flag is a no-op there. (Also reachable via the
+    /// `FELDERA_DELTA_REBUILD` env var.) Experimental; off by default.
+    pub fast_rebuild: bool,
 }
 
 struct ResolvedNCommands {

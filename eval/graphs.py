@@ -28,16 +28,36 @@ def _all_conditions(data):
     return sorted(conds)
 
 
+# Per-benchmark grouped charts become unreadable AND blow past matplotlib's
+# 65536px canvas limit past a few dozen benchmarks (the full tests/ corpus is
+# ~170). Focus each wide chart on the N largest entries; the full data lives in
+# the tables and results.json.
+_MAX_BARS = 40
+_MAX_FIG_WIDTH_IN = 300  # 300in * 150dpi = 45000px, safely under the 65536 cap
+
+
+def _top_keys(value_by_cond, limit=_MAX_BARS):
+    """The `limit` keys with the largest max-across-conditions value, ordered by
+    that value (largest first). Returns all (sorted) when there are <= limit."""
+    return sorted(value_by_cond.keys(),
+                  key=lambda k: max(value_by_cond[k].values(), default=0),
+                  reverse=True)[:limit]
+
+
+def _fig_width(n_bars, per_bar):
+    return min(max(8, n_bars * per_bar), _MAX_FIG_WIDTH_IN)
+
+
 def mean_time_grouped(data):
     """Grouped bar chart: per benchmark, one bar per condition (mean time)."""
     import matplotlib.pyplot as plt
 
     by_bench = _by_bench_cond(data)
     conds = _all_conditions(data)
-    benches = sorted(by_bench.keys())
+    benches = _top_keys(by_bench)
     n = len(conds)
 
-    fig, ax = plt.subplots(figsize=(max(8, len(benches) * 1.6), 5))
+    fig, ax = plt.subplots(figsize=(_fig_width(len(benches), 1.6), 5))
     width = 0.8 / max(n, 1)
     for j, cond in enumerate(conds):
         xs = [i + j * width for i in range(len(benches))]
@@ -46,7 +66,8 @@ def mean_time_grouped(data):
     ax.set_xticks([i + 0.4 - width / 2 for i in range(len(benches))])
     ax.set_xticklabels([b.split("/")[-1] for b in benches], rotation=30, ha="right")
     ax.set_ylabel("mean wall-clock (s)")
-    ax.set_title("Mean time per benchmark by condition")
+    extra = f" (top {len(benches)} of {len(by_bench)})" if len(by_bench) > len(benches) else ""
+    ax.set_title("Mean time per benchmark by condition" + extra)
     ax.legend(fontsize=8)
     plt.tight_layout()
     return fig
@@ -161,10 +182,10 @@ def peak_memory_grouped(data):
 
     by_bench = _by_bench_cond_field(data, "rss", lambda b: b / 1e6)
     conds = _all_conditions(data)
-    benches = sorted(by_bench.keys())
+    benches = _top_keys(by_bench)
     n = len(conds)
 
-    fig, ax = plt.subplots(figsize=(max(8, len(benches) * 1.6), 5))
+    fig, ax = plt.subplots(figsize=(_fig_width(len(benches), 1.6), 5))
     width = 0.8 / max(n, 1)
     for j, cond in enumerate(conds):
         xs = [i + j * width for i in range(len(benches))]
@@ -173,7 +194,8 @@ def peak_memory_grouped(data):
     ax.set_xticks([i + 0.4 - width / 2 for i in range(len(benches))])
     ax.set_xticklabels([b.split("/")[-1] for b in benches], rotation=30, ha="right")
     ax.set_ylabel("peak RSS (MB)")
-    ax.set_title("Peak memory per benchmark by condition")
+    extra = f" (top {len(benches)} of {len(by_bench)})" if len(by_bench) > len(benches) else ""
+    ax.set_title("Peak memory per benchmark by condition" + extra)
     ax.legend(fontsize=8)
     plt.tight_layout()
     return fig
@@ -284,7 +306,11 @@ def phase_stacked(data):
         ax.axis("off")
         return fig
 
-    fig, ax = plt.subplots(figsize=(max(8, len(cells) * 0.6), 5))
+    n_cells = len(cells)
+    cells.sort(key=lambda c: sum(c[1].get(b, 0) or 0 for b in _PHASE_BUCKETS),
+               reverse=True)
+    cells = cells[:_MAX_BARS]
+    fig, ax = plt.subplots(figsize=(_fig_width(len(cells), 0.6), 5))
     xs = range(len(cells))
     bottoms = [0.0] * len(cells)
     colors = {"rebuild": "#d9534f", "canonicalize": "#5bc0de",
@@ -296,7 +322,8 @@ def phase_stacked(data):
     ax.set_xticks(list(xs))
     ax.set_xticklabels([c[0] for c in cells], rotation=75, ha="right", fontsize=6)
     ax.set_ylabel("phase time (s)")
-    ax.set_title("Per-phase bucket breakdown (rebuild / canonicalize / congruence)")
+    extra = f" (top {len(cells)} of {n_cells})" if n_cells > len(cells) else ""
+    ax.set_title("Per-phase bucket breakdown (rebuild / canonicalize / congruence)" + extra)
     ax.legend(fontsize=8)
     plt.tight_layout()
     return fig
@@ -332,16 +359,25 @@ def speedup_vs_bridge_normal(data):
     return rows
 
 
+def skipped_table(data):
+    """Files excluded up front (not benchmarked) and why -- e.g. unsupported by
+    the term encoding. Kept out of the errors table so that table shows only
+    real backend failures on supported files."""
+    return [{"benchmark": s.get("benchmark"), "reason": s.get("reason")}
+            for s in data.get("skipped", [])]
+
+
 reg = eval_live.Registry()
 reg.graph("Mean time per benchmark", mean_time_grouped)
 reg.graph("Peak memory per benchmark", peak_memory_grouped)
 reg.graph("Geomean by condition", geomean_by_condition)
 reg.graph("Completion CDF (performance profile)", completion_cdf)
 reg.graph("Per-phase breakdown (stacked)", phase_stacked)
+# Only the mean-time computed table is registered, to keep the viewer
+# uncluttered. The other table fns (peak_memory_table, parity_table,
+# parity_summary, phase_breakdown_table, speedup_vs_bridge_normal,
+# skipped_table) stay DEFINED but UNregistered -- their data still lives in the
+# raw timings/errors/skipped tables and results.json. Re-add a reg.table(...)
+# line to bring any back. (Note: this also governs what --render writes.)
 reg.table("Mean time (s) per condition", mean_time_table, filter_source=mean_time_filter)
-reg.table("Peak RSS (MB) per condition", peak_memory_table)
-reg.table("Correctness: parity vs bridge-normal", parity_table)
-reg.table("Parity summary by condition", parity_summary)
-reg.table("Per-phase buckets (s)", phase_breakdown_table)
-reg.table("Slowdown vs bridge-normal", speedup_vs_bridge_normal)
 eval_live.registry = reg

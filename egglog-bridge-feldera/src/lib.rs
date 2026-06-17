@@ -324,6 +324,40 @@ pub struct EGraph {
     /// Call` on this id is answered host-side from the matching [`native_ufs`]
     /// entry (`find_ro`) instead of through the `Database` external func.
     pub(crate) native_uf_canon_prim: HashMap<ExternalFunctionId, FunctionId>,
+    /// `--fast-rebuild` (RELATIONAL, without `--native-uf`): drive the fused DBSP
+    /// circuit's two-substep δuf rebuild that drops the always-empty
+    /// `δview ⋈ uf_old` term. OR'd with the `FELDERA_DELTA_REBUILD` env var at
+    /// circuit-build time. No-op under native-UF (the rebuild rules are taken out
+    /// of the DBSP circuit and the host-side `view ⋈ δuf` delta runs by default).
+    /// Off by default.
+    pub(crate) fast_rebuild: bool,
+    /// Reverse index for the native-UF delta rebuild: per VIEW function (the
+    /// function a `@rebuild_rule*` re-inserts into), maps an eq-sort column
+    /// *value* to the set of view rows that hold that value in some eq-sort
+    /// column. Lets the rebuild pass enumerate "rows touching displaced id `v`"
+    /// without scanning every row. Maintained at the centralized mirror-apply
+    /// block in `interpret::run_iteration` (the only place view rows change
+    /// during saturation), so when the next iteration's rebuild reads it the
+    /// index matches that iteration's start-of-call snapshot. Empty unless
+    /// `native_uf_enabled` is on. Keyed by `u32` (the stored rep), values are
+    /// full rows so the rebuild can rebind every view column.
+    pub(crate) native_uf_rev_index: HashMap<FunctionId, HashMap<u32, HashSet<Row>>>,
+    /// The set of eq-sort column indices per VIEW function (which columns are
+    /// UF-canonicalized, derived once from the `@rebuild_rule*` `col_uf`
+    /// mapping). Tells the index maintainer which columns of a written/removed
+    /// row to index. Populated on the first native-UF rebuild pass per view.
+    pub(crate) native_uf_view_cols: HashMap<FunctionId, Vec<usize>>,
+    /// Native-UF delta rebuild: the carried δuf — ids displaced since the rebuild
+    /// pass last consumed this UF func (the `@UF_Sf` function id), ACCUMULATED
+    /// across iterations. `native_uf_drain_all` APPENDS each round's
+    /// newly-displaced ids here at the end of every `run_rules` call (drain runs
+    /// AFTER the rebuild pass); a LATER iteration's rebuild pass consumes and
+    /// clears it (`native_uf_take_displaced`). Accumulation is load-bearing: the
+    /// union and the rebuild ruleset that canonicalizes over it are SEPARATE
+    /// `run_rules` calls, so an overwrite-with-empty would lose a displaced set
+    /// before the rebuild ever read it (issue: merge-during-rebuild). Carrying it
+    /// across the boundary also lets a merge-triggered cascade converge.
+    pub(crate) native_uf_prev_displaced: HashMap<FunctionId, Vec<i64>>,
 }
 
 impl Default for EGraph {
@@ -370,6 +404,10 @@ impl EGraph {
             native_uf_enabled: false,
             native_ufs: HashMap::new(),
             native_uf_canon_prim: HashMap::new(),
+            fast_rebuild: false,
+            native_uf_rev_index: HashMap::new(),
+            native_uf_view_cols: HashMap::new(),
+            native_uf_prev_displaced: HashMap::new(),
         }
     }
 
@@ -380,6 +418,17 @@ impl EGraph {
     /// bail (the default). Mirrors the DuckDB / FlowLog backends' `enable_native_uf`.
     pub fn enable_native_uf(&mut self) {
         self.native_uf_enabled = true;
+    }
+
+    /// Turn on the RELATIONAL δuf fast-rebuild (`--fast-rebuild`): the fused DBSP
+    /// circuit's two-substep split that drops the always-empty `δview ⋈ uf_old`
+    /// rebuild term (sound under canonicalize-at-creation). Only meaningful
+    /// WITHOUT native UF — under native-UF the rebuild rules are taken out of the
+    /// DBSP circuit entirely and the host-side `view ⋈ δuf` delta rebuild runs by
+    /// default, so this flag is a no-op there. Equivalent to the
+    /// `FELDERA_DELTA_REBUILD` env var. May be called any time before `run_rules`.
+    pub fn enable_fast_rebuild(&mut self) {
+        self.fast_rebuild = true;
     }
 
     /// Read-only native-UF find for the `@UF_Sf` function `uf_func`. Returns the
@@ -403,11 +452,44 @@ impl EGraph {
             uf.drain_pending();
         }
         let mut displaced = 0;
-        for uf in self.native_ufs.values_mut() {
+        // Under native-UF the rebuild is ALWAYS the delta path (`view ⋈ δuf`),
+        // so stash this round's displaced ids per UF func for a LATER iteration's
+        // rebuild to consume (the δuf carried across the boundary).
+        //
+        // ACCUMULATE rather than overwrite: a union does not necessarily land in
+        // the same `run_rules` call that runs the rebuild ruleset over it. The
+        // frontend schedules the user ruleset and the `@rebuilding` ruleset as
+        // SEPARATE `run_rules` calls, and `native_uf_drain_all` runs at the end of
+        // EVERY call — so an overwrite would clobber a still-unconsumed displaced
+        // set with an empty Vec the very next (union-free) iteration, before the
+        // rebuild pass ever read it (issue: merge-during-rebuild). We instead
+        // append each round's newly-displaced ids to the per-UF stash and let the
+        // rebuild pass DRAIN it on consumption (`native_uf_take_displaced`), so the
+        // δuf survives intervening iterations and a cascade converges across calls.
+        let stash = self.native_uf_enabled;
+        for (&func, uf) in self.native_ufs.iter_mut() {
             displaced += uf.displaced_len();
-            let _ = uf.drain_displaced();
+            let drained = uf.drain_displaced();
+            if stash && !drained.is_empty() {
+                self.native_uf_prev_displaced
+                    .entry(func)
+                    .or_default()
+                    .extend(drained);
+            }
         }
         displaced
+    }
+
+    /// Take (and clear) the carried displaced-id set for UF `func` — the δuf the
+    /// native-UF rebuild pass consumes for one `@rebuild_rule*` view. Accumulated
+    /// by [`native_uf_drain_all`] across however many iterations separate the
+    /// union from the rebuild ruleset's `run_rules` call; cleared here on
+    /// consumption so each displaced id drives exactly one rebuild scan. Returns
+    /// an empty slice when nothing is pending.
+    pub(crate) fn native_uf_take_displaced(&mut self, func: FunctionId) -> Vec<i64> {
+        self.native_uf_prev_displaced
+            .remove(&func)
+            .unwrap_or_default()
     }
 
     /// Diagnostics: `(dbsp_rule_runs, host_rule_runs)` — the number of rule
@@ -487,7 +569,80 @@ impl EGraph {
 
     /// Insert a single row into the Rust mirror.
     fn mirror_insert(&mut self, f: FunctionId, row: Row) {
+        self.native_uf_index_insert(f, &row);
         std::rc::Rc::make_mut(self.mirror.entry(f).or_default()).insert(row);
+    }
+
+    /// `fast_rebuild` reverse-index maintenance: record that `row` (of view
+    /// function `f`) holds each of its eq-sort column values, so the rebuild
+    /// pass can find it from a displaced id. No-op unless `fast_rebuild` is on
+    /// and `f` is a recognized view (its eq-sort columns are known). Idempotent
+    /// (a `HashSet` of rows per value). Cheap: a few inserts per row.
+    pub(crate) fn native_uf_index_insert(&mut self, f: FunctionId, row: &Row) {
+        if !self.native_uf_enabled {
+            return;
+        }
+        let Some(cols) = self.native_uf_view_cols.get(&f) else {
+            return;
+        };
+        let cols: Vec<usize> = cols.clone();
+        let entry = self.native_uf_rev_index.entry(f).or_default();
+        for ci in cols {
+            if ci < row.len() {
+                let v = row[ci];
+                entry.entry(v).or_default().insert(row.clone());
+            }
+        }
+    }
+
+    /// `fast_rebuild` reverse-index maintenance: drop `row` (of view `f`) from
+    /// every eq-sort-value bucket it was registered under. Mirror of
+    /// [`native_uf_index_insert`]; call BEFORE the row leaves the mirror.
+    pub(crate) fn native_uf_index_remove(&mut self, f: FunctionId, row: &Row) {
+        if !self.native_uf_enabled {
+            return;
+        }
+        let Some(cols) = self.native_uf_view_cols.get(&f) else {
+            return;
+        };
+        let Some(entry) = self.native_uf_rev_index.get_mut(&f) else {
+            return;
+        };
+        for &ci in cols {
+            if ci < row.len() {
+                let v = row[ci];
+                if let Some(bucket) = entry.get_mut(&v) {
+                    bucket.remove(row);
+                    if bucket.is_empty() {
+                        entry.remove(&v);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `fast_rebuild`: register view function `f`'s eq-sort columns and build its
+    /// reverse index from the current mirror, ONCE. Called at the start of each
+    /// `run_iteration` for every `@rebuild_rule*`'s view (idempotent after the
+    /// first call). Seeding from the mirror here captures rows that entered the
+    /// mirror outside the per-iteration apply block (base facts / `add_term` /
+    /// seed inserts) — after this the index is maintained incrementally at every
+    /// mirror write, so it always reflects the live mirror.
+    pub(crate) fn native_uf_seed_view_index(&mut self, f: FunctionId, eq_cols: &[usize]) {
+        if !self.native_uf_enabled {
+            return;
+        }
+        if self.native_uf_view_cols.contains_key(&f) {
+            return;
+        }
+        self.native_uf_view_cols.insert(f, eq_cols.to_vec());
+        let rows: Vec<Row> = match self.mirror.get(&f) {
+            Some(set) => set.iter().cloned().collect(),
+            None => Vec::new(),
+        };
+        for row in rows {
+            self.native_uf_index_insert(f, &row);
+        }
     }
 
     /// Resolve a function's merge mode (for FD-conflict resolution).
@@ -615,8 +770,17 @@ impl EGraph {
         for r in &drop_rows {
             set.remove(r);
         }
-        for r in new_rows {
-            set.insert(r);
+        for r in &new_rows {
+            set.insert(r.clone());
+        }
+        // Keep the `fast_rebuild` reverse index consistent with the merge's
+        // retract-losers / insert-winner edits (no-op unless `fast_rebuild` is
+        // on and `f` is a view).
+        for r in &drop_rows {
+            self.native_uf_index_remove(f, r);
+        }
+        for r in &new_rows {
+            self.native_uf_index_insert(f, r);
         }
         true
     }
@@ -938,6 +1102,9 @@ impl Backend for EGraph {
         if let Some(set) = self.mirror.get_mut(&func) {
             std::rc::Rc::make_mut(set).clear();
         }
+        // Drop the cleared function's `fast_rebuild` reverse-index entry too, so
+        // it is re-seeded from the (now-empty) mirror on the next iteration.
+        self.native_uf_rev_index.remove(&func);
         // No per-rule `seen` to forget: each persistent rule's circuit will
         // diff the now-cleared mirror against its last-fed view at the next
         // `run_rules`, naturally retracting the dropped rows from its integral

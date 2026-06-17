@@ -286,6 +286,7 @@ pub(crate) fn compile_rule(
     functions: &HashMap<String, FunctionInfo>,
     proofs_enabled: bool,
     native_uf_gate_tables: &[String],
+    delta_rebuild: bool,
 ) -> Result<CompiledRule> {
     // Rewrite the rule before validation/compilation so any nested
     // eq-sort constructor calls in action positions become explicit
@@ -405,6 +406,7 @@ pub(crate) fn compile_rule(
         &demote,
         None,
         proofs_enabled,
+        delta_rebuild,
     )?];
     // For each distinct table referenced by a demoted atom, emit
     // one gated "UF-changed" recovery variant: scan the body with
@@ -441,6 +443,7 @@ pub(crate) fn compile_rule(
             &demote,
             Some(&gate_pname),
             proofs_enabled,
+            delta_rebuild,
         )?);
     }
     // `--native-uf --duckdb` rebuild host-pass: the #782 rebuild rule was
@@ -464,6 +467,7 @@ pub(crate) fn compile_rule(
             &demote,
             Some(gate),
             proofs_enabled,
+            delta_rebuild,
         )?);
     }
     Ok(CompiledRule {
@@ -487,14 +491,16 @@ pub(crate) fn compile_rule(
 /// require that shape so the delta decomposition only ever applies
 /// to the rules it was derived for.
 ///
-/// Returns `Some(view_idx)` only when the `DUCK_DELTA_REBUILD` flag
-/// is set; otherwise `None` so the default path is byte-identical.
+/// Returns `Some(view_idx)` only when the relational δuf fast-rebuild
+/// is engaged (`delta_rebuild`, i.e. `--fast-rebuild` without
+/// `--native-uf`); otherwise `None` so the default path is byte-identical.
 fn delta_rebuild_view_idx(
     rule: &Rule,
     func_atom_indices: &[usize],
     functions: &HashMap<String, FunctionInfo>,
+    delta_rebuild: bool,
 ) -> Option<usize> {
-    if std::env::var("DUCK_DELTA_REBUILD").is_err() {
+    if !delta_rebuild {
         return None;
     }
     if !rule
@@ -590,6 +596,7 @@ fn compile_fused_variant(
     demote: &[bool],
     gate_table: Option<&str>,
     proofs_enabled: bool,
+    delta_rebuild: bool,
 ) -> Result<CompiledVariant> {
     // 1) Build the body's FROM/WHERE and a binding for body vars.
     let (from, base_where_parts, mut binding) =
@@ -707,8 +714,10 @@ fn compile_fused_variant(
         vec![format_where(&parts)]
     } else if func_atom_indices.is_empty() {
         vec![where_clause.clone()]
-    } else if let Some(view_idx) = delta_rebuild_view_idx(rule, func_atom_indices, functions) {
-        // DUCK_DELTA_REBUILD: relational rebuild rule. Decompose
+    } else if let Some(view_idx) =
+        delta_rebuild_view_idx(rule, func_atom_indices, functions, delta_rebuild)
+    {
+        // `--fast-rebuild` (relational, no native-uf): rebuild rule. Decompose
         // Δ(view⋈uf) = [δview × uf_old ≡ ∅, DROP] + [view_all × δuf,
         // KEEP]. So: (1) drop the VIEW-FOCUS branch, (2) in the δUF
         // foci, widen the VIEW atom's frontier from `< ?1` to `< ?2`

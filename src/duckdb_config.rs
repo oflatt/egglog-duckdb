@@ -20,6 +20,13 @@ pub struct DuckBackendConfig {
     /// instead of a JOIN. Skips the singleparent / path_compress /
     /// uf_function_index rulesets at run time. Experimental.
     pub native_uf: bool,
+    /// `--fast-rebuild`: engage the DuckDB backend's RELATIONAL δuf fast-rebuild
+    /// (`enable_fast_rebuild`), which drops the always-empty `δview ⋈ uf_old`
+    /// rebuild term (sound under canonicalize-at-creation). Only meaningful
+    /// WITHOUT [`native_uf`](Self::native_uf): under native-UF the adaptive
+    /// `__UF_CHANGED__`-driven delta rebuild is already the default, so this flag
+    /// is a no-op there. Experimental; off by default.
+    pub fast_rebuild: bool,
     /// Run the encoder in proof-tracking mode. The term-encoded
     /// program then threads explicit proofs through every union and
     /// rewrite, exercising a different control-flow path through the

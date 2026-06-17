@@ -230,6 +230,7 @@ impl Run {
             // only — never combined with proofs here.
             let mut egraph = EGraph::with_feldera_backend_config(FelderaBackendConfig {
                 native_uf: self.native_uf,
+                fast_rebuild: false,
             })
             .unwrap_or_else(|e| panic!("EGraph::with_feldera_backend init failed: {e}"));
             if self.native_uf {
@@ -270,6 +271,7 @@ impl Run {
             // program. Both required. Term mode only.
             let mut egraph = EGraph::with_flowlog_backend_config(FlowlogBackendConfig {
                 native_uf: self.native_uf,
+                fast_rebuild: false,
             })
             .unwrap_or_else(|e| panic!("EGraph::with_flowlog_backend init failed: {e}"));
             if self.native_uf {
@@ -332,6 +334,7 @@ impl Run {
             let config = DuckBackendConfig {
                 proofs: want_proofs,
                 native_uf: self.native_uf,
+                fast_rebuild: false,
             };
             let mut egraph = EGraph::with_duckdb_backend(config)
                 .unwrap_or_else(|e| panic!("EGraph::with_duckdb_backend init failed: {e}"));

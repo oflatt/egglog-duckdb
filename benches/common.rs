@@ -27,6 +27,7 @@ pub fn run_example_duckdb(filename: &str, program: &str) {
     let config = egglog::DuckBackendConfig {
         proofs: false,
         native_uf: false,
+        fast_rebuild: false,
     };
     let mut egraph =
         EGraph::with_duckdb_backend(config).expect("EGraph::with_duckdb_backend init failed");

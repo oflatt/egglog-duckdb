@@ -712,7 +712,10 @@ impl<'a> ProofInstrumentor<'a> {
         }
 
         // Native-UF mode: drive the rebuild off the `@UFChange_S` onchange
-        // relation instead of joining the view against `@UF_Sf`.
+        // relation (the delta path). Native-UF provides the leader-change
+        // deltas, so the rebuild always scopes to `view ⋈ δuf`. Under
+        // canon-at-creation there is no `δview ⋈ uf_old` term, so a full
+        // re-scan is never needed; this is always the onchange-delta rebuild.
         if self.native_uf() {
             return self.rebuilding_rules_native_uf(fdecl, &types);
         }

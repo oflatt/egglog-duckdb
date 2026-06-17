@@ -17,6 +17,10 @@ fn main() {
     let want_native_uf = argv
         .iter()
         .any(|a| a == "--duck-native-uf" || a == "--native-uf");
+    // `--fast-rebuild` engages the duckdb backend's delta-scoped rebuild; the
+    // pre-built duckdb egraph must carry it so the flag survives cli.rs's
+    // short-circuit (mirror `want_native_uf`).
+    let want_fast_rebuild = argv.iter().any(|a| a == "--fast-rebuild");
     // `--proof-testing` implies proofs — the desugar pass rewrites
     // `(check ...)` into `(prove-exists ...)` which needs the proof
     // encoding active. Without this, cli.rs's `args.proof_testing`
@@ -29,6 +33,7 @@ fn main() {
     let egraph = if want_duckdb {
         egglog_experimental::new_experimental_egraph_duckdb(egglog::DuckBackendConfig {
             native_uf: want_native_uf,
+            fast_rebuild: want_fast_rebuild,
             proofs: want_proofs,
         })
         .expect("failed to start DuckDB-backed experimental egraph")

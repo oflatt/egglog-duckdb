@@ -82,7 +82,7 @@ fn add_ns(c: &AtomicU64, d: std::time::Duration) {
 /// transactions — it is NEVER zeroed (the bug in flowlog's old `step_transient`).
 /// This ports `dd_native.rs::step_delta_rebuild` to DBSP's transaction model:
 /// each sub-step is a separate `transaction()` tick feeding a delta subset.
-fn delta_rebuild_enabled() -> bool {
+pub(crate) fn delta_rebuild_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FELDERA_DELTA_REBUILD").is_some())
@@ -1490,6 +1490,10 @@ pub struct FusedJoinImpl<R: Row> {
     /// runs the original symmetric single-transaction path. Restricted to funcs
     /// this circuit actually has an input for.
     transient_funcs: HashSet<FunctionId>,
+    /// `--fast-rebuild` (relational): when set, the δuf-driven rebuild two-substep
+    /// split is engaged (drop the empty `δview⋈uf_old` term). Set from the
+    /// backend config flag OR the `FELDERA_DELTA_REBUILD` env var at build time.
+    delta_rebuild: bool,
 }
 
 /// A fused body join for a whole ruleset, width-dispatched: the row carried
@@ -1513,6 +1517,7 @@ impl FusedJoin {
         plans: &[(usize, JoinPlan)],
         engine: &PrimEngine,
         transient_funcs: &HashSet<FunctionId>,
+        delta_rebuild: bool,
     ) -> Result<FusedJoin> {
         let needed = plans
             .iter()
@@ -1528,9 +1533,24 @@ impl FusedJoin {
             needed
         };
         Ok(match pick_width(needed) {
-            8 => FusedJoin::W8(FusedJoinImpl::build(plans, engine, transient_funcs)?),
-            16 => FusedJoin::W16(FusedJoinImpl::build(plans, engine, transient_funcs)?),
-            _ => FusedJoin::W32(FusedJoinImpl::build(plans, engine, transient_funcs)?),
+            8 => FusedJoin::W8(FusedJoinImpl::build(
+                plans,
+                engine,
+                transient_funcs,
+                delta_rebuild,
+            )?),
+            16 => FusedJoin::W16(FusedJoinImpl::build(
+                plans,
+                engine,
+                transient_funcs,
+                delta_rebuild,
+            )?),
+            _ => FusedJoin::W32(FusedJoinImpl::build(
+                plans,
+                engine,
+                transient_funcs,
+                delta_rebuild,
+            )?),
         })
     }
 
@@ -1576,6 +1596,7 @@ impl<R: Row> FusedJoinImpl<R> {
         plans: &[(usize, JoinPlan)],
         engine: &PrimEngine,
         transient_funcs: &HashSet<FunctionId>,
+        delta_rebuild: bool,
     ) -> Result<FusedJoinImpl<R>> {
         // Snapshot the per-rule plan data the circuit closure needs (owned, so
         // the `move` closure is `'static`).
@@ -1712,6 +1733,7 @@ impl<R: Row> FusedJoinImpl<R> {
             inputs,
             rules,
             transient_funcs,
+            delta_rebuild,
         })
     }
 
@@ -1734,10 +1756,12 @@ impl<R: Row> FusedJoinImpl<R> {
         deltas: &HashMap<FunctionId, Vec<(Vec<u32>, ZWeight)>>,
     ) -> Result<Vec<Vec<(Vec<u32>, ZWeight)>>> {
         // δuf-driven rebuild: when this ruleset reads a transient (`@UF_Sf`) func
-        // and the flag is set, run the two-substep split that drops the (empty,
-        // by the eclass fix) `δview⋈uf` rebuild derivative. Otherwise the original
-        // symmetric single-transaction path (no behavior change).
-        if !self.transient_funcs.is_empty() && delta_rebuild_enabled() {
+        // and the relational fast-rebuild is enabled (config `--fast-rebuild` OR
+        // the `FELDERA_DELTA_REBUILD` env var, captured at build time into
+        // `self.delta_rebuild`), run the two-substep split that drops the (empty,
+        // by the eclass fix) `δview⋈uf_old` rebuild derivative. Otherwise the
+        // original symmetric single-transaction path (no behavior change).
+        if !self.transient_funcs.is_empty() && self.delta_rebuild {
             return self.step_delta_rebuild(deltas);
         }
         self.step_symmetric(deltas)

@@ -155,20 +155,34 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
             }
         }
     }
+    // Native-UF delta-rebuild index maintenance only kicks in when the view
+    // func's reverse index is already built (a no-op otherwise), so capture the
+    // removed rows for index updates only then — avoids a clone when native-UF
+    // is off.
+    let track_index = eg.native_uf_enabled;
     for (f, (keylen, keys)) in removes_by_func {
+        let mut removed: Vec<Row> = Vec::new();
         if let Some(set) = eg.mirror.get_mut(&f) {
             let before_len = set.len();
             std::rc::Rc::make_mut(set).retain(|row| {
                 let k: Box<[u32]> = (0..keylen).map(|i| row_col(row, i)).collect();
-                !keys.contains(&k)
+                let keep = !keys.contains(&k);
+                if !keep && track_index {
+                    removed.push(row.clone());
+                }
+                keep
             });
             changed |= set.len() != before_len;
+        }
+        for row in &removed {
+            eg.index_remove_row(f, row);
         }
     }
     let mut touched_keys: HashMap<FunctionId, HashSet<Vec<u32>>> = HashMap::new();
     for (f, row) in sets {
         let inputs_len = eg.info(f).arity.saturating_sub(1);
         let key: Vec<u32> = (0..inputs_len).map(|i| row_col(&row, i)).collect();
+        eg.index_insert_row(f, &row);
         let inserted = std::rc::Rc::make_mut(eg.mirror.entry(f).or_default()).insert(row);
         changed |= inserted;
         touched_keys.entry(f).or_default().insert(key);
@@ -378,7 +392,13 @@ fn fused_bindings(
                 }
             }
         }
-        let fused = dd_native::FusedDdJoin::build(&plans, &transient_funcs)?;
+        // RELATIONAL fast-rebuild (`--fast-rebuild` without `--native-uf`):
+        // engage the δUF-driven substep split (drop the empty `δview⋈uf_old`
+        // term) when the backend config flag OR the `FLOWLOG_DELTA_REBUILD` env
+        // var is set. (Under native-UF the rebuild rules run host-side, not on
+        // the DD join, so this is a no-op there.)
+        let delta_rebuild = eg.fast_rebuild || dd_native::delta_rebuild_enabled();
+        let fused = dd_native::FusedDdJoin::build(&plans, &transient_funcs, delta_rebuild)?;
         eg.dd_fused.insert(key.clone(), fused);
     }
 
@@ -612,7 +632,7 @@ fn fused_bindings(
 ///   * each head `@canon_S` call (`HeadOp::Call` whose id is a native-UF canon
 ///     prim) names an eq-sort body var and its UF function.
 fn native_uf_rebuild_envs(
-    eg: &EGraph,
+    eg: &mut EGraph,
     read: &HashMap<FunctionId, std::rc::Rc<HashSet<Row>>>,
     rule: &RuleIr,
 ) -> Result<Vec<Env>> {
@@ -676,30 +696,113 @@ fn native_uf_rebuild_envs(
     let Some(set) = read.get(&view_func) else {
         return Ok(Vec::new());
     };
+
+    // NATIVE-UF DELTA REBUILD (always on under native-UF): scope the scan to
+    // view rows touching a previous-round displaced id (the host-side
+    // `view ⋈ δuf`), instead of scanning every view row. The index is built on
+    // the FIRST rebuild for this view func (a one-time full scan that seeds it
+    // — the correctness fallback for the first iteration) and maintained
+    // incrementally thereafter (see `index_insert_row` / `index_remove_row`).
+    // When the index is already built we look up only the displaced ids' rows;
+    // the per-row `find != cur` guard below stays the exactness check, so an
+    // over-inclusive candidate set is still bit-exact.
+    let use_scoped = eg.native_uf_enabled;
+    if use_scoped {
+        // Cache this view func's eq-sort columns so the index hooks know which
+        // columns to track (set together with the index entry below).
+        eg.native_uf_view_cols.insert(view_func, col_uf.clone());
+
+        let index_built = eg.native_uf_rev_index.contains_key(&view_func);
+        if !index_built {
+            // First rebuild for this func: full scan over the snapshot, building
+            // the reverse index as we go (so subsequent rounds can scope).
+            let mut index: HashMap<u32, HashSet<Row>> = HashMap::new();
+            let mut envs: Vec<Env> = Vec::new();
+            for row in set.iter() {
+                for &(ci, _uf) in &col_uf {
+                    if let Some(&v) = row.get(ci) {
+                        index.entry(v).or_default().insert(row.clone());
+                    }
+                }
+                if row_needs_rebuild(eg, row, &col_uf) {
+                    envs.push(bind_view_env(row, &var_col));
+                }
+            }
+            eg.native_uf_rev_index.insert(view_func, index);
+            return Ok(envs);
+        }
+
+        // Index is built: gather the candidate rows for the displaced ids of
+        // every UF func this view canonicalizes against (the previous round's
+        // displaced set, stashed by `native_uf_drain_all`). Clone the rows out
+        // so the immutable index borrow drops before the guard pass.
+        let mut uf_funcs: Vec<FunctionId> = col_uf.iter().map(|&(_, uf)| uf).collect();
+        uf_funcs.sort();
+        uf_funcs.dedup();
+        let mut candidates: HashSet<Row> = HashSet::new();
+        if let Some(index) = eg.native_uf_rev_index.get(&view_func) {
+            for uf in &uf_funcs {
+                if let Some(disp) = eg.native_uf_displaced_prev.get(uf) {
+                    for &d in disp {
+                        if let Some(rows) = index.get(&(d as u32)) {
+                            for row in rows {
+                                candidates.insert(row.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Mark that a rebuild scan consumed the displaced sets THIS iteration.
+        // ONE UF func backs MANY view funcs (every function with a column of
+        // that eq-sort), and the encoder emits one `@rebuild_rule` per view —
+        // all fused into THIS `run_iteration`. So the displaced sets must NOT be
+        // cleared here (that would starve the views processed after this one);
+        // instead `native_uf_drain_all` clears them once, at the iteration
+        // boundary, after every rebuild rule in this call has consumed them.
+        eg.native_uf_rebuild_ran = true;
+        let mut envs: Vec<Env> = Vec::new();
+        for row in &candidates {
+            if row_needs_rebuild(eg, row, &col_uf) {
+                envs.push(bind_view_env(row, &var_col));
+            }
+        }
+        return Ok(envs);
+    }
+
     let mut envs: Vec<Env> = Vec::new();
     for row in set.iter() {
         // The `guard (or (bool-!= ci (@canon_S ci)))`: keep only rows where some
         // eq-sort column's leader differs from the stored value.
-        let mut changed = false;
-        for &(ci, uf_func) in &col_uf {
-            let cur = row_col(row, ci);
-            if eg.native_uf_find(uf_func, cur) != cur {
-                changed = true;
-                break;
-            }
+        if row_needs_rebuild(eg, row, &col_uf) {
+            envs.push(bind_view_env(row, &var_col));
         }
-        if !changed {
-            continue;
-        }
-        // Bind every view body var to its column value; `apply_head` runs the
-        // head verbatim (its `@canon_S` calls compute the leaders).
-        let mut env: Env = Env::new();
-        for (&v, &ci) in &var_col {
-            env.insert(v, row_col(row, ci));
-        }
-        envs.push(env);
     }
     Ok(envs)
+}
+
+/// The `@rebuild_rule` guard `(or (bool-!= ci (@canon_S ci)))`: true iff some
+/// eq-sort column's stored value is NOT its current UF leader (so the row is
+/// stale and must be re-canonicalized). The exactness check under both the
+/// full-scan and the `--fast-rebuild` scoped paths.
+fn row_needs_rebuild(eg: &EGraph, row: &Row, col_uf: &[(usize, FunctionId)]) -> bool {
+    for &(ci, uf_func) in col_uf {
+        let cur = row_col(row, ci);
+        if eg.native_uf_find(uf_func, cur) != cur {
+            return true;
+        }
+    }
+    false
+}
+
+/// Bind every view body var to its column value. `apply_head` then runs the
+/// `@rebuild_rule` head verbatim (its `@canon_S` calls compute the leaders).
+fn bind_view_env(row: &Row, var_col: &HashMap<u32, usize>) -> Env {
+    let mut env: Env = Env::new();
+    for (&v, &ci) in var_col {
+        env.insert(v, row_col(row, ci));
+    }
+    env
 }
 
 /// Evaluate a primitive body op over each binding env, returning the new list of
@@ -899,6 +1002,7 @@ fn lookup_or_create(
     let mut full: Vec<u32> = key.iter().map(|v| v.rep()).collect();
     full.push(id);
     let row: Row = full.into_boxed_slice();
+    eg.index_insert_row(func, &row);
     std::rc::Rc::make_mut(eg.mirror.entry(func).or_default()).insert(row);
     Value::new(id)
 }

@@ -156,7 +156,7 @@ fn trace_enabled() -> bool {
 /// emitted — sound iff new view rows are canonical (the eclass fix), which makes
 /// that term empty. Unlike the old transient path it does NOT zero the UF
 /// arrangement; it just doesn't let δview drive rebuild output.
-fn delta_rebuild_enabled() -> bool {
+pub(crate) fn delta_rebuild_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOWLOG_DELTA_REBUILD").is_some())
@@ -719,6 +719,10 @@ pub struct FusedDdJoin {
     /// ONLY `view_all ⋈ δuf`. Empty unless the flag is on and a rule in this
     /// ruleset reads such a relation; then `step` runs the symmetric path.
     transient_funcs: HashSet<FunctionId>,
+    /// `--fast-rebuild` (relational): when set, the δUF-driven rebuild substep
+    /// split is engaged (drop the empty `δview⋈uf_old` term). Set from the
+    /// backend config flag OR the `FLOWLOG_DELTA_REBUILD` env var at build time.
+    delta_rebuild: bool,
 }
 
 /// One rule's lowering inside a [`FusedDdJoin`]: its rule index (for routing
@@ -747,6 +751,7 @@ impl FusedDdJoin {
     pub fn build(
         plans: &[(usize, JoinPlan)],
         transient_funcs: &HashSet<FunctionId>,
+        delta_rebuild: bool,
     ) -> Result<FusedDdJoin> {
         let alloc = Allocator::Thread(Thread::default());
         let mut worker = Worker::new(
@@ -960,6 +965,7 @@ impl FusedDdJoin {
             rules,
             epoch: 0,
             transient_funcs,
+            delta_rebuild,
         })
     }
 
@@ -992,7 +998,7 @@ impl FusedDdJoin {
         // surviving rewrites at math N=7), NOT `view_all ⋈ δuf` (≈37); dropping
         // the former collapses the fixpoint (1165/1330 → 86/74). Retained behind
         // the opt-in for the negative-result record + further investigation.
-        if !self.transient_funcs.is_empty() && delta_rebuild_enabled() {
+        if !self.transient_funcs.is_empty() && self.delta_rebuild {
             return self.step_delta_rebuild(deltas);
         }
         if self.transient_funcs.is_empty() || std::env::var_os("FLOWLOG_ENABLE_PHASE2").is_none() {

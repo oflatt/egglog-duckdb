@@ -1846,16 +1846,22 @@ pub struct EGraph {
     /// just before each existence-check query so the UDF returns a
     /// consistent answer for that query.
     table_sizes: Arc<Mutex<HashMap<String, i64>>>,
-    /// Adaptive rebuild (gated behind `DUCK_ADAPTIVE_REBUILD=1`).
-    /// When on, the runner accumulates the set of ids whose canonical
-    /// changed (drained from the native UFs) across iterations and,
-    /// per rebuild iteration, chooses between a delta-restricted
-    /// gated scan (semijoin against this set) and the full-scan gated
-    /// variant. Full scans re-canonicalize *all* rows, so the set is
-    /// reset to empty immediately after one runs — keeping the
-    /// semijoin set bounded by `theta * |id-space|`. See
-    /// `PERF_NOTE_adaptive.md`.
-    adaptive_rebuild: bool,
+    /// `--fast-rebuild`: drive the backend's delta-scoped rebuild instead of
+    /// re-scanning every view row each iteration. Set by
+    /// [`enable_fast_rebuild`](Self::enable_fast_rebuild) (from
+    /// `DuckBackendConfig::fast_rebuild`), or via the legacy
+    /// `DUCK_ADAPTIVE_REBUILD` / `DUCK_DELTA_REBUILD` env vars (back-compat).
+    ///
+    /// Which path it engages depends on whether the native UF is on:
+    /// - WITH `--native-uf` ([`native_uf_enabled`](Self::native_uf_enabled)):
+    ///   the ADAPTIVE native rebuild ([`adaptive_rebuild`](Self::adaptive_rebuild)
+    ///   is `true`). The runner accumulates the set of ids whose canonical
+    ///   changed (drained from the native UFs) across iterations and, per
+    ///   rebuild iteration, chooses between a delta-restricted gated scan
+    ///   (semijoin against `__UF_CHANGED__`) and the full-scan gated variant.
+    /// - WITHOUT `--native-uf`: the RELATIONAL δuf fast-rebuild (compile.rs's
+    ///   `delta_rebuild_view_idx` decomposition — keep only `view ⋈ δuf`).
+    fast_rebuild: bool,
     /// Switch-over fraction theta: when the accumulated changed-set
     /// size exceeds `theta * |UF id-space|`, run the full scan and
     /// reset; otherwise run the delta semijoin and accumulate.
@@ -2093,7 +2099,13 @@ impl EGraph {
             backend_external_funcs: external_func::DuckdbExternalFuncRegistry::default(),
             registered_builtin_udfs: std::collections::HashSet::new(),
             table_sizes: Arc::new(Mutex::new(HashMap::new())),
-            adaptive_rebuild: std::env::var("DUCK_ADAPTIVE_REBUILD").is_ok(),
+            // Back-compat: either env var still turns the flag on. The flag is
+            // the real interface (set via `enable_fast_rebuild`); `native_uf_enabled`
+            // (set later) decides whether it routes to the adaptive native path
+            // or the relational δuf path. `DUCK_ADAPTIVE_REBUILD` was the
+            // native-path env, `DUCK_DELTA_REBUILD` the relational-path env.
+            fast_rebuild: std::env::var("DUCK_ADAPTIVE_REBUILD").is_ok()
+                || std::env::var("DUCK_DELTA_REBUILD").is_ok(),
             adaptive_theta: std::env::var("DUCK_ADAPTIVE_THETA")
                 .ok()
                 .and_then(|s| s.parse::<f64>().ok())
@@ -2115,6 +2127,29 @@ impl EGraph {
     /// to decide whether to also spin up a `UfTable` + UDF.
     pub fn enable_native_uf(&mut self) {
         self.native_uf_enabled = true;
+    }
+
+    /// Turn on the `--fast-rebuild` delta-scoped rebuild. With `--native-uf`
+    /// this engages the adaptive native rebuild (see
+    /// [`adaptive_rebuild`](Self::adaptive_rebuild)); without it, the relational
+    /// δuf fast-rebuild. Order-independent w.r.t. [`enable_native_uf`](Self::enable_native_uf):
+    /// the routing is decided at run time from both flags.
+    pub fn enable_fast_rebuild(&mut self) {
+        self.fast_rebuild = true;
+    }
+
+    /// True iff the ADAPTIVE native rebuild is engaged. This is the DEFAULT
+    /// under the native UF (`--native-uf`): native-UF provides the displaced-id
+    /// deltas, so the rebuild always scopes to `view ⋈ δuf`. The adaptive path
+    /// accumulates the displaced-id set and chooses per-iteration between the
+    /// `__UF_CHANGED__` delta semijoin and a full scan (the full-scan fallback
+    /// preserves correctness when the changed set isn't small). `--fast-rebuild`
+    /// is a no-op under native-UF (the onchange/delta rebuild has no
+    /// `δview ⋈ uf_old` term). Without the native UF, `--fast-rebuild` instead
+    /// drives the relational δuf path (compile-time, see `delta_rebuild_view_idx`),
+    /// which is unrelated to this gate.
+    fn adaptive_rebuild(&self) -> bool {
+        self.native_uf_enabled
     }
 
     /// True iff `name` is a registered native union-find function (`@UF_Sf`,
@@ -2279,10 +2314,10 @@ impl EGraph {
         }
         let mut tables: Vec<String> = Vec::new();
         for udf in udfs {
-            if let Some(t) = self.native_uf_udf_to_table.get(&udf) {
-                if !tables.contains(t) {
-                    tables.push(t.clone());
-                }
+            if let Some(t) = self.native_uf_udf_to_table.get(&udf)
+                && !tables.contains(t)
+            {
+                tables.push(t.clone());
             }
         }
         tables
@@ -2894,7 +2929,7 @@ impl EGraph {
             let mut rows = stmt.query([])?;
             let mut max_ts_seen = last_synced;
             let mut count: u64 = 0;
-            let accumulate = self.adaptive_rebuild;
+            let accumulate = self.adaptive_rebuild();
             {
                 let mut uf = uf_arc.lock().unwrap();
                 while let Some(row) = rows.next()? {
@@ -2923,7 +2958,7 @@ impl EGraph {
             self.native_uf_unions_synced = self.native_uf_unions_synced.wrapping_add(count);
             self.last_uf_sync_ts.insert(uf_name, max_ts_seen);
         }
-        if self.adaptive_rebuild {
+        if self.adaptive_rebuild() {
             self.adaptive_recent_displaced = total_displaced;
         }
         Ok(total_displaced)
@@ -2995,7 +3030,7 @@ impl EGraph {
     /// accumulated delta is fully consumed and can be safely dropped,
     /// which bounds the set below `theta * id_space` going forward.
     fn adaptive_gate_mode(&mut self) -> Result<GateMode> {
-        if !self.adaptive_rebuild {
+        if !self.adaptive_rebuild() {
             return Ok(GateMode::FullScan);
         }
         let changed = self.adaptive_changed_ids.len();
@@ -3085,7 +3120,7 @@ impl EGraph {
         // default; the accumulated set is kept complete and the mode
         // decision keys off the recent (per-sync) churn instead. The
         // env override is retained for experimentation only.
-        if self.adaptive_rebuild && std::env::var("DUCK_RESET_AFTER_FULLSCAN").is_ok() {
+        if self.adaptive_rebuild() && std::env::var("DUCK_RESET_AFTER_FULLSCAN").is_ok() {
             self.adaptive_changed_ids.clear();
         }
     }
@@ -3583,11 +3618,19 @@ impl EGraph {
             } else {
                 Vec::new()
             };
+        // Relational δuf fast-rebuild engages only WITHOUT the native UF:
+        // `--fast-rebuild --native-uf` routes to the adaptive native path
+        // (`adaptive_rebuild()`), never this relational decomposition. (The
+        // legacy `DUCK_DELTA_REBUILD` env folds into `self.fast_rebuild`; gating
+        // on `!native_uf_enabled` here is also what prevents the broken
+        // `DUCK_DELTA_REBUILD` + native-uf combination.)
+        let delta_rebuild = self.fast_rebuild && !self.native_uf_enabled;
         let mut compiled = compile::compile_rule(
             &rule,
             &self.functions,
             self.proofs_enabled,
             &native_uf_gate_tables,
+            delta_rebuild,
         )?;
         // Body tables = distinct Atom::Func names. The watermark gate
         // reads this set to decide whether the rule has anything new

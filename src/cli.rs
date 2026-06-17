@@ -116,6 +116,18 @@ struct Args {
     /// Off by default; the relational encoding is unchanged when off.
     #[clap(long = "native-uf")]
     native_uf: bool,
+    /// Enable each dataflow backend's RELATIONAL δuf fast-rebuild: drop the
+    /// always-empty `δview ⋈ uf_old` rebuild term (sound under
+    /// canonicalize-at-creation). This is the relational (non-native-uf) path
+    /// — on `--flowlog` / `--feldera` / `--duckdb` WITHOUT `--native-uf` it
+    /// engages the backend's δuf fast-rebuild (the `enable_fast_rebuild()`
+    /// hook, also reachable via the `FELDERA_DELTA_REBUILD` /
+    /// `DUCK_DELTA_REBUILD` / `FLOWLOG_DELTA_REBUILD` env vars). With
+    /// `--native-uf` it is a no-op: native-UF already drives the `view ⋈ δuf`
+    /// onchange-delta rebuild, which has no `δview ⋈ uf_old` term to drop.
+    /// Bit-exact with the full rebuild; off by default.
+    #[clap(long = "fast-rebuild")]
+    fast_rebuild: bool,
 }
 
 /// Start a command-line interface for the E-graph.
@@ -160,13 +172,25 @@ pub fn cli(mut egraph: EGraph) {
     // `--native-uf` is a term-encoding-only mode, so it implies term
     // encoding (enabling it here covers the case where `--term-encoding`
     // was not also passed).
-    if args.term_encoding || args.native_uf {
+    //
+    // Skip this when the caller already handed us a duckdb-backed egraph
+    // (egglog-experimental's `main` pre-builds one so its commands /
+    // primitives survive). `with_duckdb_backend` already provisions term
+    // encoding (a bridge-backed typechecker) without cloning the backend,
+    // whereas `with_term_encoding_enabled` clones `self` — and the duckdb
+    // backend's `clone_boxed` is unimplemented, so cloning it panics.
+    if (args.term_encoding || args.native_uf) && !egraph.has_duckdb_backend() {
         egraph = egraph.with_term_encoding_enabled();
     }
 
     if args.native_uf {
         egraph = egraph.with_native_uf();
     }
+
+    // `--fast-rebuild` is the RELATIONAL fast-rebuild: it is wired into each
+    // backend's config (`config.fast_rebuild` → `enable_fast_rebuild()`) below,
+    // NOT into the term/proof encoding. The native-UF encoding always uses the
+    // onchange-delta rebuild, so the flag does not touch the encoding state.
 
     if args.proofs && !egraph.are_proofs_enabled() {
         egraph = egraph.with_proofs_enabled();
@@ -255,9 +279,24 @@ pub fn cli(mut egraph: EGraph) {
                     {
                         duck_perf_dump(duck, _duck_wall_ns);
                     }
-                    if let Err(err) = result {
-                        log::error!("{err}");
-                        std::process::exit(1);
+                    match result {
+                        Ok(msgs) => {
+                            // Print command output (`print-size`, `extract`, …)
+                            // like the fresh-duckdb / flowlog / feldera paths,
+                            // so the pre-built (egglog-experimental) duckdb
+                            // egraph is observable from the CLI too.
+                            if args.mode != RunMode::NoMessages {
+                                use std::io::Write;
+                                let mut out = io::stdout();
+                                for msg in msgs {
+                                    let _ = write!(out, "{msg}");
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            log::error!("{err}");
+                            std::process::exit(1);
+                        }
                     }
                     continue;
                 }
@@ -270,6 +309,7 @@ pub fn cli(mut egraph: EGraph) {
                 // interception on the *relational* (non-#782) encoding.
                 let mut duck_eg = egglog::EGraph::with_duckdb_backend(egglog::DuckBackendConfig {
                     native_uf: args.duck_native_uf || args.native_uf,
+                    fast_rebuild: args.fast_rebuild,
                     proofs: false,
                 })
                 .unwrap_or_else(|err| {
@@ -330,6 +370,7 @@ pub fn cli(mut egraph: EGraph) {
                     // the `view ⋈ @UF_Sf` integral out of the DBSP circuit).
                     egglog::EGraph::with_feldera_backend_config(egglog::FelderaBackendConfig {
                         native_uf: args.native_uf,
+                        fast_rebuild: args.fast_rebuild,
                     })
                 } else {
                     // `--native-uf --flowlog`: enable the FlowLog backend's
@@ -339,6 +380,7 @@ pub fn cli(mut egraph: EGraph) {
                     // interception runs it through the host-pass rebuild).
                     egglog::EGraph::with_flowlog_backend_config(egglog::FlowlogBackendConfig {
                         native_uf: args.native_uf,
+                        fast_rebuild: args.fast_rebuild,
                     })
                 }
                 .unwrap_or_else(|err| {
