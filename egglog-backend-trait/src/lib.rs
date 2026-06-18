@@ -829,6 +829,20 @@ pub trait RuleBuilderOps {
     /// forwards it to its `RuleBuilder`.
     fn set_no_decomp(&mut self, _no_decomp: bool) {}
 
+    /// Exclude the given function's table from being a seminaive delta focus
+    /// for this rule: the rule never fires on *new* rows of this table joined
+    /// against *old* rows of the others. Used by the term-encoding
+    /// fast-rebuild (`--fast-rebuild` on the native bridge) to drop the
+    /// always-empty `δview ⋈ uf_old` variant of the `view ⋈ @UF_Sf` rebuild
+    /// rule (excludes the view table), keeping only `view ⋈ δuf`. Bit-exact
+    /// with the full rebuild under canonicalize-at-creation.
+    ///
+    /// Default no-op: the dataflow/SQL backends implement their own
+    /// fast-rebuild (`enable_fast_rebuild()`) and never receive these encoding
+    /// rebuild rules in fast-rebuild mode; only the bridge forwards this to its
+    /// `RuleBuilder`.
+    fn set_focus_exclude_table(&mut self, _func: FunctionId) {}
+
     /// Finalize the rule. Returns the registered [`RuleId`].
     ///
     /// Wraps `RuleBuilder::build`. The DuckDB impl hands the accumulated

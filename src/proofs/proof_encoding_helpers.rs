@@ -300,6 +300,14 @@ impl ProofInstrumentor<'_> {
         self.egraph.proof_state.native_uf
     }
 
+    /// True when the fast-rebuild encoding mode is active (`--fast-rebuild` on
+    /// the native bridge). Drops the always-empty `δview ⋈ uf_old` rebuild term
+    /// (see `EncodingState::fast_rebuild`). Bit-exact under
+    /// canonicalize-at-creation; never set in proof mode.
+    pub(crate) fn fast_rebuild(&self) -> bool {
+        self.egraph.proof_state.fast_rebuild
+    }
+
     /// Returns the proof output type: `Proof` when proofs are enabled, `Unit` otherwise.
     pub(crate) fn proof_type_str(&self) -> &str {
         if self.proofs_enabled() {

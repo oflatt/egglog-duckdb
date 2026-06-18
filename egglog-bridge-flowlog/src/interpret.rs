@@ -80,6 +80,11 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
     // call advances it, the O(1) signal that a new term row was created.
     let next_id_at_start = eg.next_id;
 
+    // Reset the per-iteration δview buffer (hash-consed view rows created this
+    // call, accumulated by `lookup_or_create` for the full native-UF rebuild's
+    // `δview ⋈ uf_old` probe). No-op unless native-UF full rebuild is active.
+    eg.native_uf_delta_view.clear();
+
     let mut writes: Vec<Write> = Vec::new();
     let mut touched: HashSet<FunctionId> = HashSet::new();
     // Iteration-scoped `key -> output` index for `lookup_or_create` (eq-sort
@@ -100,7 +105,15 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
     //   * `@rebuild_rule*` (`canonicalize`, the `@rebuilding` ruleset): NOT
     //     dropped here — it is intercepted host-side in `fused_bindings`
     //     (`native_uf_rebuild_envs`) so it never drives the DD dataflow.
-    let drop_rule = |name: &str| -> bool { eg.native_uf_enabled && is_uf_drain_rule(name) };
+    //   * `@rebuild_dview_probe*` (the encoding's `δview ⋈ uf_old` probe, emitted
+    //     for the bridge's FULL native-UF rebuild): DROPPED entirely. Its body
+    //     carries the impure `@canon_S` guard prim, which the DD dataflow cannot
+    //     host. FlowLog mirrors that δview probe HOST-SIDE (`probe_delta_view_
+    //     row`, gated on `native_uf && !fast_rebuild` via the backend config), so
+    //     the engine must never see this rule.
+    let drop_rule = |name: &str| -> bool {
+        eg.native_uf_enabled && (is_uf_drain_rule(name) || is_uf_dview_probe_rule(name))
+    };
     let rules: Vec<(usize, RuleIr)> = rule_idxs
         .iter()
         .filter_map(|&i| eg.rules.get(i).and_then(|r| r.clone()).map(|r| (i, r)))
@@ -179,12 +192,23 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
         }
     }
     let mut touched_keys: HashMap<FunctionId, HashSet<Vec<u32>>> = HashMap::new();
+    // δview for the FULL native-UF rebuild (`--native-uf` without
+    // `--fast-rebuild`): the VIEW rows genuinely inserted THIS iteration via a
+    // `set`. They are the new rows the relational rebuild's `δview ⋈ uf_old`
+    // seminaive term probes against the UF. Collected only when that probe will
+    // actually run (native-UF, full rebuild).
+    let collect_delta_view = eg.native_uf_enabled && !eg.fast_rebuild;
+    let mut set_delta_view_rows: Vec<(FunctionId, Row)> = Vec::new();
     for (f, row) in sets {
         let inputs_len = eg.info(f).arity.saturating_sub(1);
         let key: Vec<u32> = (0..inputs_len).map(|i| row_col(&row, i)).collect();
         eg.index_insert_row(f, &row);
-        let inserted = std::rc::Rc::make_mut(eg.mirror.entry(f).or_default()).insert(row);
+        let inserted = std::rc::Rc::make_mut(eg.mirror.entry(f).or_default()).insert(row.clone());
         changed |= inserted;
+        // δview: record genuinely-new VIEW rows for the full-rebuild probe.
+        if collect_delta_view && inserted && eg.native_uf_view_cols.contains_key(&f) {
+            set_delta_view_rows.push((f, row));
+        }
         touched_keys.entry(f).or_default().insert(key);
     }
 
@@ -194,6 +218,55 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
     for &f in &touched {
         let keys = touched_keys.get(&f).unwrap_or(&empty_keys);
         changed |= eg.resolve_merge(f, keys);
+    }
+
+    // FULL NATIVE-UF REBUILD (`--native-uf` without `--fast-rebuild`): run the
+    // relational rebuild's `δview ⋈ uf_old` seminaive term as a host probe.
+    //
+    // The relational rebuild join `view ⋈ uf` has two seminaive derivatives:
+    //   * `view ⋈ δuf`  — the REAL work, already done above by
+    //     `native_uf_rebuild_envs` (the reverse-index scan over displaced ids);
+    //   * `δview ⋈ uf_old` — canonicalize the NEW view rows added this iteration
+    //     against the (pre-drain) UF. It is EMPTY under canonicalize-at-creation
+    //     (new rows are born canonical, so every find returns the stored value),
+    //     but the relational backend still PAYS to probe each new row's find.
+    //
+    // `--fast-rebuild` is exactly the optimization that DROPS this empty term; so
+    // under `--native-uf` alone (full rebuild) we run it to mirror the relational
+    // cost, and under `--native-uf --fast-rebuild` we skip it (the delta-only
+    // behaviour). The probe reads `native_uf_find` (uf_old: the drain that would
+    // advance the UF runs below, after this), runs the same per-row find /
+    // `@canon`-staleness check the rebuild rule's guard applies, and discards the
+    // (always-`None`) result — it changes nothing, it is pure wasted work,
+    // exactly as on the relational side.
+    if eg.native_uf_enabled && !eg.fast_rebuild {
+        // δview = the `set`-inserted new view rows (collected above) PLUS the
+        // hash-consed constructor rows (`lookup_or_create`, the bulk on an eqsat
+        // workload), drained from the per-iteration buffer.
+        let hashconsed = std::mem::take(&mut eg.native_uf_delta_view);
+        let mut probed = 0usize;
+        let mut stale = 0usize;
+        for (f, row) in set_delta_view_rows.iter().chain(hashconsed.iter()) {
+            // `native_uf_view_cols` is populated by `native_uf_rebuild_envs` the
+            // first time a view func is canonicalized; only those funcs carry
+            // eq-sort columns the rebuild probes (others have an empty / absent
+            // entry and contribute no find work, exactly as relational).
+            if let Some(col_uf) = eg.native_uf_view_cols.get(f).cloned() {
+                if probe_delta_view_row(eg, row, &col_uf) {
+                    stale += 1;
+                }
+                probed += 1;
+            }
+        }
+        // Keep the probe observable to the optimizer (the finds above are
+        // otherwise dead since `stale` is 0 under canon-at-creation).
+        std::hint::black_box(stale);
+        // Env-gated diagnostic: confirm the `δview ⋈ uf_old` probe actually
+        // visits the new view rows (off in normal runs; `eprintln!` intended).
+        #[allow(clippy::disallowed_macros)]
+        if std::env::var("FLOWLOG_DEBUG_DVIEW").is_ok() && probed > 0 {
+            eprintln!("[DVIEW] probed={probed} new view rows");
+        }
     }
 
     // Native-UF drain at the iteration boundary: apply this call's enqueued
@@ -268,6 +341,16 @@ pub(crate) fn rule_category(name: &str) -> &'static str {
 /// on FlowLog). Matched by the `fresh()`-suffixed name's stable prefix.
 pub(crate) fn is_uf_drain_rule(name: &str) -> bool {
     rule_category(name) == "uf_change_drain"
+}
+
+/// True for the encoding's `@rebuild_dview_probe*` rule (the FULL native-UF
+/// rebuild's `δview ⋈ uf_old` probe term, emitted for the bridge). Its body has
+/// the impure `@canon_S` guard prim, which the DD dataflow cannot host; under
+/// `--native-uf` FlowLog mirrors this probe host-side (`probe_delta_view_row`)
+/// and DROPS the rule from the engine path. (It is NOT a `@rebuild_rule*`, so
+/// `rule_category` classifies it as `<user>` — match it explicitly by name.)
+pub(crate) fn is_uf_dview_probe_rule(name: &str) -> bool {
+    name.contains("rebuild_dview_probe")
 }
 
 /// True for PR #782's `@rebuild_rule*` canonicalization rules (the
@@ -795,6 +878,38 @@ fn row_needs_rebuild(eg: &EGraph, row: &Row, col_uf: &[(usize, FunctionId)]) -> 
     false
 }
 
+/// The `δview ⋈ uf_old` seminaive probe over ONE new view row, for the FULL
+/// native-UF rebuild (`--native-uf` without `--fast-rebuild`).
+///
+/// Mirrors the per-row cost the relational rebuild's `δview ⋈ uf_old` term pays
+/// on a brand-new view row: that join canonicalizes EVERY eq-sort column (the
+/// head re-`set`s `(@CView (@canon c0) .. (@canon cn))`, so all of them are
+/// computed — no short-circuit) and materializes the candidate canonical tuple,
+/// which the rebuild rule's `(guard (or (bool-!= ci (@canon ci))))` then rejects
+/// because a new row is born canonical (every `find` returns the stored value).
+/// The result is discarded — it is the wasted work `--fast-rebuild` drops, kept
+/// here so `--native-uf` alone is the full rebuild. Returns whether the candidate
+/// differed (always `false` under canon-at-creation), so the caller / optimizer
+/// cannot elide the finds.
+fn probe_delta_view_row(eg: &EGraph, row: &Row, col_uf: &[(usize, FunctionId)]) -> bool {
+    // Materialize the candidate canonicalized row: copy the row, then overwrite
+    // each eq-sort column with its `find` leader (exactly the tuple the head
+    // `(set (@CView (@canon c0) ..))` would build before the guard rejects it).
+    let mut candidate: Vec<u32> = row.to_vec();
+    let mut differs = false;
+    for &(ci, uf_func) in col_uf {
+        let cur = row_col(row, ci);
+        let leader = eg.native_uf_find(uf_func, cur);
+        if ci < candidate.len() {
+            candidate[ci] = leader;
+        }
+        differs |= leader != cur;
+    }
+    // `differs` is `false` under canon-at-creation; returning it (rather than
+    // discarding) keeps the find loop observable so it is not optimized away.
+    differs && !candidate.is_empty()
+}
+
 /// Bind every view body var to its column value. `apply_head` then runs the
 /// `@rebuild_rule` head verbatim (its `@canon_S` calls compute the leaders).
 fn bind_view_env(row: &Row, var_col: &HashMap<u32, usize>) -> Env {
@@ -1003,6 +1118,14 @@ fn lookup_or_create(
     full.push(id);
     let row: Row = full.into_boxed_slice();
     eg.index_insert_row(func, &row);
+    // δview (full native-UF rebuild only): a hash-consed VIEW row is a new row
+    // this iteration, so the `δview ⋈ uf_old` probe must visit it. Constructor
+    // creation in a rewrite head is a `lookup_or_create`, NOT a `set`, so this is
+    // the dominant source of δview on an eqsat workload. Skipped under
+    // fast-rebuild / relational mode (the probe never runs there).
+    if eg.native_uf_enabled && !eg.fast_rebuild && eg.native_uf_view_cols.contains_key(&func) {
+        eg.native_uf_delta_view.push((func, row.clone()));
+    }
     std::rc::Rc::make_mut(eg.mirror.entry(func).or_default()).insert(row);
     Value::new(id)
 }

@@ -187,10 +187,17 @@ pub fn cli(mut egraph: EGraph) {
         egraph = egraph.with_native_uf();
     }
 
-    // `--fast-rebuild` is the RELATIONAL fast-rebuild: it is wired into each
-    // backend's config (`config.fast_rebuild` → `enable_fast_rebuild()`) below,
-    // NOT into the term/proof encoding. The native-UF encoding always uses the
-    // onchange-delta rebuild, so the flag does not touch the encoding state.
+    // `--fast-rebuild` on the dataflow/SQL backends is wired into each backend's
+    // config (`config.fast_rebuild` → `enable_fast_rebuild()`) below. On the
+    // NATIVE BRIDGE (no `--duckdb`/`--feldera`/`--flowlog`) there is no separate
+    // host-pass rebuild, so the flag instead drives the encoding-level drop of
+    // the always-empty `δview ⋈ uf_old` term: relationally the rebuild rule's
+    // view atom is excluded from delta-focus; under `--native-uf` the δview
+    // probe rule is dropped (leaving `view ⋈ δuf`). Bit-exact with the full
+    // rebuild under canonicalize-at-creation.
+    if args.fast_rebuild && !args.duckdb_backend && !args.feldera_backend && !args.flowlog_backend {
+        egraph = egraph.with_fast_rebuild();
+    }
 
     if args.proofs && !egraph.are_proofs_enabled() {
         egraph = egraph.with_proofs_enabled();

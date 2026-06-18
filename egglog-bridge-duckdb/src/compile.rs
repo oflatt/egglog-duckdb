@@ -287,6 +287,7 @@ pub(crate) fn compile_rule(
     proofs_enabled: bool,
     native_uf_gate_tables: &[String],
     delta_rebuild: bool,
+    native_uf_drop_delta_view: bool,
 ) -> Result<CompiledRule> {
     // Rewrite the rule before validation/compilation so any nested
     // eq-sort constructor calls in action positions become explicit
@@ -399,15 +400,34 @@ pub(crate) fn compile_rule(
     // exactly one "first new" atom), so no dedup is needed. Cuts
     // the per-iter statement count by ~K× without changing the
     // total join work.
-    let mut variants = vec![compile_fused_variant(
-        rule,
-        &func_atom_indices,
-        functions,
-        &demote,
-        None,
-        proofs_enabled,
-        delta_rebuild,
-    )?];
+    //
+    // `--native-uf --fast-rebuild`: DROP this non-gated seminaive
+    // variant when it is the native-UF rebuild host-pass's δview-focus
+    // branch (process NEW view rows this iteration through the find
+    // UDF — `ts ∈ [?1,?2)`). It mirrors the relational `+fastrb`'s
+    // δview-drop (`delta_rebuild_view_idx`): Δ(view⋈uf) =
+    // [δview × uf_old ≡ ∅, DROP] + [view_all × δuf, KEEP]. The δuf
+    // term is the gated `__UF_CHANGED__` semijoin emitted below, which
+    // re-canonicalizes every stale row, so dropping the always-empty
+    // δview probe is bit-exact and saves the per-iteration scan. Only
+    // rebuild rules carry a non-empty `native_uf_gate_tables`, so this
+    // never touches user rules. Under `--native-uf` WITHOUT
+    // `--fast-rebuild` (the +nuf full-rebuild cell), the δview-focus
+    // branch is KEPT (it costs the probe, the point of the +nuf vs
+    // +nuf+fastrb distinction).
+    let drop_native_uf_view_focus = native_uf_drop_delta_view && !native_uf_gate_tables.is_empty();
+    let mut variants: Vec<CompiledVariant> = Vec::new();
+    if !drop_native_uf_view_focus {
+        variants.push(compile_fused_variant(
+            rule,
+            &func_atom_indices,
+            functions,
+            &demote,
+            None,
+            proofs_enabled,
+            delta_rebuild,
+        )?);
+    }
     // For each distinct table referenced by a demoted atom, emit
     // one gated "UF-changed" recovery variant: scan the body with
     // no `>= ?1` lower bound, look up canonical roots via UDF,

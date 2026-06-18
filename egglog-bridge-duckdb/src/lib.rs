@@ -1846,21 +1846,26 @@ pub struct EGraph {
     /// just before each existence-check query so the UDF returns a
     /// consistent answer for that query.
     table_sizes: Arc<Mutex<HashMap<String, i64>>>,
-    /// `--fast-rebuild`: drive the backend's delta-scoped rebuild instead of
-    /// re-scanning every view row each iteration. Set by
+    /// `--fast-rebuild`: DROP the always-empty `δview ⋈ uf_old` term of the
+    /// rebuild seminaive derivative (the new-view-rows probe; empty under
+    /// canonicalize-at-creation), keeping only `view ⋈ δuf`. Set by
     /// [`enable_fast_rebuild`](Self::enable_fast_rebuild) (from
     /// `DuckBackendConfig::fast_rebuild`), or via the legacy
     /// `DUCK_ADAPTIVE_REBUILD` / `DUCK_DELTA_REBUILD` env vars (back-compat).
     ///
-    /// Which path it engages depends on whether the native UF is on:
-    /// - WITH `--native-uf` ([`native_uf_enabled`](Self::native_uf_enabled)):
-    ///   the ADAPTIVE native rebuild ([`adaptive_rebuild`](Self::adaptive_rebuild)
-    ///   is `true`). The runner accumulates the set of ids whose canonical
-    ///   changed (drained from the native UFs) across iterations and, per
-    ///   rebuild iteration, chooses between a delta-restricted gated scan
-    ///   (semijoin against `__UF_CHANGED__`) and the full-scan gated variant.
+    /// This term-drop is ORTHOGONAL to whether the native UF is on:
     /// - WITHOUT `--native-uf`: the RELATIONAL δuf fast-rebuild (compile.rs's
-    ///   `delta_rebuild_view_idx` decomposition — keep only `view ⋈ δuf`).
+    ///   `delta_rebuild_view_idx` decomposition — drop the VIEW-focus branch of
+    ///   the relational `view ⋈ @UF_Sf` rebuild rule).
+    /// - WITH `--native-uf` ([`native_uf_enabled`](Self::native_uf_enabled)):
+    ///   drop the rebuild host-pass's δview-focus seminaive branch (see
+    ///   `native_uf_drop_delta_view` in `add_rule`). The native-UF
+    ///   `__UF_CHANGED__` adaptive delta scan is a SEPARATE mechanism, engaged by
+    ///   `--native-uf` alone ([`adaptive_rebuild`](Self::adaptive_rebuild)); it
+    ///   accumulates the set of ids whose canonical changed (drained from the
+    ///   native UFs) and per rebuild iteration chooses between the
+    ///   `__UF_CHANGED__` semijoin and the full-scan gated variant regardless of
+    ///   `--fast-rebuild`.
     fast_rebuild: bool,
     /// Switch-over fraction theta: when the accumulated changed-set
     /// size exceeds `theta * |UF id-space|`, run the full scan and
@@ -2140,14 +2145,18 @@ impl EGraph {
 
     /// True iff the ADAPTIVE native rebuild is engaged. This is the DEFAULT
     /// under the native UF (`--native-uf`): native-UF provides the displaced-id
-    /// deltas, so the rebuild always scopes to `view ⋈ δuf`. The adaptive path
-    /// accumulates the displaced-id set and chooses per-iteration between the
+    /// deltas, so the gated rebuild variant scopes to `view ⋈ δuf`. The adaptive
+    /// path accumulates the displaced-id set and chooses per-iteration between the
     /// `__UF_CHANGED__` delta semijoin and a full scan (the full-scan fallback
-    /// preserves correctness when the changed set isn't small). `--fast-rebuild`
-    /// is a no-op under native-UF (the onchange/delta rebuild has no
-    /// `δview ⋈ uf_old` term). Without the native UF, `--fast-rebuild` instead
-    /// drives the relational δuf path (compile-time, see `delta_rebuild_view_idx`),
-    /// which is unrelated to this gate.
+    /// preserves correctness when the changed set isn't small).
+    ///
+    /// `--fast-rebuild` is ORTHOGONAL to this gate. Under native-UF it DROPS the
+    /// rebuild rule's δview-focus seminaive branch (the new-view-rows probe,
+    /// empty under canon-at-creation; see `native_uf_drop_delta_view` in
+    /// `add_rule` / `compile::compile_rule`), so `--native-uf` (full rebuild,
+    /// keeps the δview probe) and `--native-uf --fast-rebuild` (drops it) are
+    /// distinct. Without the native UF, `--fast-rebuild` instead drives the
+    /// relational δuf path (compile-time, see `delta_rebuild_view_idx`).
     fn adaptive_rebuild(&self) -> bool {
         self.native_uf_enabled
     }
@@ -3625,12 +3634,24 @@ impl EGraph {
         // on `!native_uf_enabled` here is also what prevents the broken
         // `DUCK_DELTA_REBUILD` + native-uf combination.)
         let delta_rebuild = self.fast_rebuild && !self.native_uf_enabled;
+        // `--native-uf --fast-rebuild`: drop the rebuild host-pass's δview-focus
+        // seminaive branch (process this iteration's NEW view rows through the
+        // find UDF — empty under canon-at-creation but it costs to probe). The
+        // gated `__UF_CHANGED__` `view ⋈ δuf` semijoin then does all the rebuild
+        // work, mirroring the relational `+fastrb` δview-drop. WITHOUT
+        // `--fast-rebuild` (plain `--native-uf` = +nuf), the δview branch is
+        // KEPT, so +nuf (full) and +nuf+fastrb (dropped) are distinct, matching
+        // plain vs +fastrb on the relational side. `compile_rule` further gates
+        // this on `native_uf_gate_tables` being non-empty (rebuild rules only),
+        // so user rules are unaffected.
+        let native_uf_drop_delta_view = self.native_uf_enabled && self.fast_rebuild;
         let mut compiled = compile::compile_rule(
             &rule,
             &self.functions,
             self.proofs_enabled,
             &native_uf_gate_tables,
             delta_rebuild,
+            native_uf_drop_delta_view,
         )?;
         // Body tables = distinct Atom::Func names. The watermark gate
         // reads this set to decide whether the rule has anything new

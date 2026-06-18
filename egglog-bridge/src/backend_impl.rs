@@ -159,6 +159,10 @@ impl<'a> RuleBuilderOps for BridgeRuleBuilderOps<'a> {
         self.inner.set_no_decomp(no_decomp);
     }
 
+    fn set_focus_exclude_table(&mut self, func: FunctionId) {
+        self.inner.set_focus_exclude_table(func);
+    }
+
     fn build(self: Box<Self>) -> Result<RuleId> {
         Ok(self.inner.build())
     }

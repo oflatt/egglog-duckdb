@@ -96,6 +96,15 @@ pub(crate) struct Query {
     /// If set, execute a single rule (rather than O(atoms.len()) rules) during
     /// seminaive, with the given atom as the focus.
     sole_focus: Option<usize>,
+    /// Tables whose atoms must NOT be used as a seminaive delta focus. During
+    /// seminaive expansion (`add_rules_from_cached`), the per-atom focus loop
+    /// skips any atom on one of these tables, so the rule never matches *new*
+    /// rows of that table against *old* rows of the others. Used by the
+    /// term-encoding fast-rebuild (`--fast-rebuild`): the rebuild join is
+    /// `view ⋈ @UF_Sf` and excluding the view table drops the always-empty
+    /// `δview ⋈ uf_old` variant, keeping only `view ⋈ δuf`. Empty by default
+    /// (no atoms excluded; ordinary full seminaive).
+    focus_exclude: HashSet<TableId>,
     seminaive: bool,
     plan_strategy: PlanStrategy,
     /// If `true`, skip tree-decomposition during query planning. See
@@ -127,6 +136,7 @@ impl EGraph {
                 rule_id,
                 seminaive,
                 sole_focus: None,
+                focus_exclude: Default::default(),
                 vars: Default::default(),
                 atoms: Default::default(),
                 add_rule: Default::default(),
@@ -173,6 +183,18 @@ impl RuleBuilder<'_> {
     /// `:no-decomp` rule option or the egglog `--no-decomp` CLI flag.
     pub fn set_no_decomp(&mut self, no_decomp: bool) {
         self.query.no_decomp = no_decomp;
+    }
+
+    /// Exclude the given function's table from being a seminaive delta focus
+    /// for this rule. During seminaive expansion the per-atom focus loop will
+    /// skip any atom on this table, so the rule never fires on *new* rows of
+    /// this table joined against *old* rows of the others. Used by the
+    /// term-encoding fast-rebuild to drop the always-empty `δview ⋈ uf_old`
+    /// variant of the `view ⋈ @UF_Sf` rebuild rule (excludes the view table),
+    /// leaving only `view ⋈ δuf`. May be called for several tables.
+    pub fn set_focus_exclude_table(&mut self, func: FunctionId) {
+        let table = self.egraph.funcs[func].table;
+        self.query.focus_exclude.insert(table);
     }
 
     /// Get the canonical value of an id in the union-find. An internal-only
@@ -816,6 +838,12 @@ impl Query {
         let mut constraints: Vec<(core_relations::AtomId, Constraint)> =
             Vec::with_capacity(self.atoms.len());
         'outer: for focus_atom in 0..self.atoms.len() {
+            // Fast-rebuild: skip generating the variant that focuses (delta)
+            // this atom's table. Excluding the rebuild view drops the
+            // always-empty `δview ⋈ uf_old` seminaive term (see `focus_exclude`).
+            if self.focus_exclude.contains(&self.atoms[focus_atom].0) {
+                continue;
+            }
             constraints.clear();
             // start with the focus atom since `add_rule_from_cached_plan` will apply the
             // constraints in order, and the focus atom may have an empty delta, which
@@ -831,9 +859,21 @@ impl Query {
                     },
                 ))
             }
-            for (i, (_, _, schema_info)) in self.atoms[0..focus_atom].iter().enumerate() {
+            for (i, (table, _, schema_info)) in self.atoms[0..focus_atom].iter().enumerate() {
                 if mid_ts == Timestamp::new(0) {
                     continue 'outer;
+                }
+                // Fast-rebuild: a focus-excluded atom (the rebuild view) must see
+                // ALL rows in every remaining variant, not just `ts < mid_ts`.
+                // Dropping the `δview` focus removed the term that covered view
+                // rows born THIS iteration; to stay sound the surviving
+                // `view ⋈ δuf` term must join δuf against the FULL view (old +
+                // just-inserted), mirroring duckdb's `t_view.ts < ?2` boundary.
+                // Without this, a view atom positioned before the focus would be
+                // pinned to old rows and miss new ones whose child was re-pointed
+                // by a union this same iteration.
+                if self.focus_exclude.contains(table) {
+                    continue;
                 }
                 let ts_col = ColumnId::from_usize(schema_info.ts_col());
                 constraints.push((

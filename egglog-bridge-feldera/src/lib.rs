@@ -358,6 +358,15 @@ pub struct EGraph {
     /// before the rebuild ever read it (issue: merge-during-rebuild). Carrying it
     /// across the boundary also lets a merge-triggered cascade converge.
     pub(crate) native_uf_prev_displaced: HashMap<FunctionId, Vec<i64>>,
+    /// δview for the FULL native-UF rebuild (`--native-uf` without
+    /// `--fast-rebuild`): VIEW rows created by `lookup_or_create` (eq-sort
+    /// constructor hash-cons) THIS iteration. They are the bulk of the new view
+    /// rows on an eqsat workload (a rewrite head `(Add b a)` is a `HeadOp::Lookup`,
+    /// not a `set`), so they must be probed by the `δview ⋈ uf_old` seminaive term
+    /// alongside the `set`-inserted rows. Pushed in `lookup_or_create`, drained by
+    /// the full-rebuild probe at the end of `run_iteration`. Empty (and never
+    /// pushed) under fast-rebuild / relational mode.
+    pub(crate) native_uf_delta_view: Vec<(FunctionId, Row)>,
 }
 
 impl Default for EGraph {
@@ -408,6 +417,7 @@ impl EGraph {
             native_uf_rev_index: HashMap::new(),
             native_uf_view_cols: HashMap::new(),
             native_uf_prev_displaced: HashMap::new(),
+            native_uf_delta_view: Vec::new(),
         }
     }
 

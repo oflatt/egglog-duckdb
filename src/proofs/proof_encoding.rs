@@ -54,6 +54,23 @@ pub(crate) struct EncodingState {
     /// have a drain rule emitted (a sort has one rebuild fn per constructor,
     /// but only one drain rule should be emitted per onchange relation).
     pub uf_change_drained: HashSet<String>,
+    /// Fast-rebuild encoding mode (`--fast-rebuild`, native-bridge only). When
+    /// on, the relational rebuild rule drops the always-empty `δview ⋈ uf_old`
+    /// seminaive variant (the view atom is excluded from being a delta focus),
+    /// and the native-UF rebuild drops the (also empty) δview probe rule —
+    /// keeping only the `view ⋈ δuf` term. Bit-exact with the full rebuild
+    /// (the dropped term is empty under canonicalize-at-creation); the
+    /// difference is the saved δview scan. The dataflow/SQL backends implement
+    /// their own fast-rebuild via `enable_fast_rebuild()`; this flag drives
+    /// only the bridge's encoding-level drop. Default OFF.
+    pub fast_rebuild: bool,
+    /// Maps a generated relational-rebuild rule's name -> the view function
+    /// name whose atom must be excluded from seminaive delta-focus (drops the
+    /// `δview ⋈ uf_old` term). Populated by `rebuilding_rules` when
+    /// `fast_rebuild` is on; consumed in `EGraph::add_rule`, which resolves the
+    /// view name to its backend `FunctionId` and calls
+    /// `RuleBuilderOps::set_focus_exclude_table`.
+    pub rebuild_view_exclude: HashMap<String, String>,
 }
 
 impl EncodingState {
@@ -77,6 +94,8 @@ impl EncodingState {
             canon_prim: HashMap::default(),
             uf_change_rel: HashMap::default(),
             uf_change_drained: HashSet::default(),
+            fast_rebuild: false,
+            rebuild_view_exclude: HashMap::default(),
         }
     }
 }
@@ -820,6 +839,24 @@ impl<'a> ProofInstrumentor<'a> {
 
         let updated_view = self.update_view(&fdecl.name, &children_updated, &pf_var);
 
+        // `--fast-rebuild` (term mode only): drop the always-empty
+        // `δview ⋈ uf_old` seminaive variant of this rule. The rebuild join is
+        // `view ⋈ @UF_Sf`; its seminaive derivative is `view⋈δuf` (the real
+        // re-canonicalization work) plus `δview⋈uf_old` (re-checking view rows
+        // born this iteration against the unchanged UF). Under
+        // canonicalize-at-creation new view rows are already canonical, so the
+        // δview term is empty — but seminaive still pays to scan δview each
+        // iteration. We record this rule's view function so `add_rule` can
+        // exclude the view atom from being a delta focus (bridge
+        // `RuleBuilderOps::set_focus_exclude_table`), keeping only `view⋈δuf`.
+        // Bit-exact with the full rebuild; never in proof mode.
+        if self.fast_rebuild() && !self.egraph.proof_state.proofs_enabled {
+            self.egraph
+                .proof_state
+                .rebuild_view_exclude
+                .insert(fresh_name.clone(), view_name.clone());
+        }
+
         // Make a single rule that updates the view when any child's leader differs.
         let rule = format!(
             "(rule ({query_view}
@@ -985,6 +1022,30 @@ impl<'a> ProofInstrumentor<'a> {
                             :ruleset {drain_ruleset} :name \"{drain_name}\")\n"
                 ));
             }
+        }
+
+        // FULL native-UF rebuild (`--native-uf` WITHOUT `--fast-rebuild`): also
+        // emit the `δview ⋈ uf_old` probe so `+nuf` does the same total work as
+        // the relational FULL rebuild (both seminaive terms), differing only in
+        // UF *storage*. The onchange rules above are the `view ⋈ δuf` term (the
+        // real re-canonicalization). The relational FULL rebuild additionally
+        // pays a `δview ⋈ uf_old` term: re-checking view rows born THIS
+        // iteration against the (unchanged) UF. Under canonicalize-at-creation
+        // those rows are already canonical, so the term is empty — but it costs
+        // a δview scan each iteration. We mirror that cost here with a rule
+        // whose only table atom is the view, so seminaive runs it on δview only;
+        // the `@canon_S` guard finds no stale row (empty result), exactly like
+        // the relational δview term. `--fast-rebuild` drops this probe, leaving
+        // only `view ⋈ δuf` (`+nuf+fastrb`). Bit-exact either way.
+        if !self.fast_rebuild() {
+            let probe_name = self.egraph.parser.symbol_gen.fresh("rebuild_dview_probe");
+            rules.push_str(&format!(
+                "(rule (({view_name} {children})
+                        {guard})
+                       ({updated_view}
+                        (delete ({view_name} {children})))
+                        :ruleset {rebuilding_ruleset} :name \"{probe_name}\")\n"
+            ));
         }
 
         self.parse_program(&rules)

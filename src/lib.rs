@@ -773,6 +773,23 @@ impl EGraph {
         self
     }
 
+    /// Enable the fast-rebuild encoding mode on this e-graph (the
+    /// `--fast-rebuild` flag) for the native bridge. Drops the always-empty
+    /// `δview ⋈ uf_old` rebuild term: relationally, the rebuild rule's view
+    /// atom is excluded from being a seminaive delta-focus; under `--native-uf`
+    /// the (equally empty) δview probe rule is dropped, leaving only
+    /// `view ⋈ δuf`. Bit-exact with the full rebuild under canonicalize-at-
+    /// creation; the difference is the saved per-iteration δview scan.
+    ///
+    /// The dataflow/SQL backends (`--feldera`/`--flowlog`/`--duckdb`) implement
+    /// their own fast-rebuild via each backend's `enable_fast_rebuild()`; this
+    /// method drives only the bridge's encoding-level term drop. Term-encoding
+    /// only. Default OFF.
+    pub fn with_fast_rebuild(mut self) -> Self {
+        self.proof_state.fast_rebuild = true;
+        self
+    }
+
     /// Enable proof generation on this e-graph.
     /// TODO proofs should be turned on during creation of the e-graph, not afterwards.
     /// This method is to support the current CLI implementation with egglog-experimental (https://github.com/egraphs-good/egglog/issues/768)
@@ -1517,6 +1534,19 @@ impl EGraph {
         // the single-bag fast path.
         let no_decomp = self.no_decomp || rule.no_decomp;
 
+        // Fast-rebuild (`--fast-rebuild`, term mode): if this is a relational
+        // rebuild rule whose view atom must be excluded from seminaive
+        // delta-focus, resolve the recorded view function to its backend table
+        // id now (before the `&mut self.backend` borrow) so we can pass it to
+        // the rule builder below. Dropping the view focus drops the
+        // always-empty `δview ⋈ uf_old` term, leaving only `view ⋈ δuf`.
+        let focus_exclude_id = self
+            .proof_state
+            .rebuild_view_exclude
+            .get(&rule.name)
+            .and_then(|view_name| self.functions.get(view_name))
+            .map(|f| f.backend_id);
+
         let rule_id = {
             // Construct the trait-routed rule builder. The lifetime
             // separately borrows `&mut self.backend` for the builder
@@ -1530,6 +1560,9 @@ impl EGraph {
             let backend_ptr: *const dyn egglog_backend_trait::Backend = &*self.backend;
             let mut rb = self.backend.new_rule(&rule.name, seminaive);
             rb.set_no_decomp(no_decomp);
+            if let Some(view_id) = focus_exclude_id {
+                rb.set_focus_exclude_table(view_id);
+            }
             let mut translator = BackendRule::new(
                 rb,
                 // SAFETY: the rule builder's internal `&mut Backend`
