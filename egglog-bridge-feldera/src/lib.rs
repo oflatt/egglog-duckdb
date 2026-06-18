@@ -324,13 +324,55 @@ pub struct EGraph {
     /// Call` on this id is answered host-side from the matching [`native_ufs`]
     /// entry (`find_ro`) instead of through the `Database` external func.
     pub(crate) native_uf_canon_prim: HashMap<ExternalFunctionId, FunctionId>,
-    /// `--fast-rebuild` (RELATIONAL, without `--native-uf`): drive the fused DBSP
-    /// circuit's two-substep δuf rebuild that drops the always-empty
-    /// `δview ⋈ uf_old` term. OR'd with the `FELDERA_DELTA_REBUILD` env var at
-    /// circuit-build time. No-op under native-UF (the rebuild rules are taken out
-    /// of the DBSP circuit and the host-side `view ⋈ δuf` delta runs by default).
+    /// The `--fast-rebuild` axis. Two distinct roles depending on `--native-uf`:
+    ///   * RELATIONAL (without `--native-uf`): drive the fused DBSP circuit's
+    ///     two-substep δuf rebuild that drops the always-empty `δview ⋈ uf_old`
+    ///     term. OR'd with the `FELDERA_DELTA_REBUILD` env var at circuit-build
+    ///     time.
+    ///   * NATIVE-UF: select the CUSTOM rebuild (the off-circuit host-pass
+    ///     reverse-index δuf scan, `interpret::native_uf_rebuild_envs`) instead of
+    ///     the PURE-ENGINE rebuild (the on-circuit relational `view ⋈ @DispΔ`
+    ///     join). The host `UfTable` is shared by both — only the REBUILD differs,
+    ///     and the reverse-index maintenance is gated to the custom path (zero
+    ///     cost on the pure path).
+    ///
     /// Off by default.
     pub(crate) fast_rebuild: bool,
+    /// PURE-ENGINE rebuild (`--native-uf`, no `--fast-rebuild`): per `@UF_Sf`
+    /// function, the [`FunctionId`] of a synthetic arity-1 "displaced ids"
+    /// relation `@DispΔ`. The PURE-ENGINE rebuild feeds it each iteration (with
+    /// the previous round's displaced ids, before the read snapshot) and joins
+    /// the view against it ON the DBSP circuit (`view ⋈ @DispΔ`); the CUSTOM
+    /// (`--fast-rebuild`) path leaves it empty.
+    ///
+    /// It is the native analog of the relational `@UF_Sf` flat-index relation the
+    /// plain-`--feldera` rebuild joins the view against: instead of routing the
+    /// rebuild to a host pass, we feed this relation's mirror — at the start of
+    /// each `run_iteration`, before the read snapshot — with the previous round's
+    /// displaced ids ([`native_uf_prev_displaced`]), and rewrite each
+    /// `@rebuild_rule` to join the view's eq-sort column against it (the empty
+    /// `@UFChange_S` onchange atom AND the impure `@canon_S` body guard prim are
+    /// stripped — the surviving `view ⋈ @DispΔ` join is a PURE RELATIONAL join the
+    /// persistent DBSP engine accepts, runs seminaive on the fed δ, and integrates
+    /// per transaction). The `@canon_S` HEAD calls stay native (host-side in
+    /// `apply_head`), so the JOIN moves onto DBSP while the O(1) find stays
+    /// in-core. Registered in [`Backend::add_uf_function`].
+    pub(crate) native_uf_disp_rel: HashMap<FunctionId, FunctionId>,
+    /// PURE-ENGINE rebuild: cache of the DD-rewritten `@rebuild_rule` IR, keyed by
+    /// rule index — the onchange atom + the `@canon_S` body guard prim stripped
+    /// and a `@DispΔ(eqsort_col)` atom appended, so the rule lowers to
+    /// `view ⋈ @DispΔ` on the fused DBSP circuit. Built lazily the first time a
+    /// rebuild rule is routed (the source IR never changes).
+    pub(crate) native_uf_rebuild_dd_ir: HashMap<usize, RuleIr>,
+    /// PURE-ENGINE rebuild: set in `run_iteration` when this call's `@rebuilding`
+    /// ruleset consumed [`native_uf_prev_displaced`] (the on-circuit
+    /// `view ⋈ @DispΔ` join consumed the fed `@DispΔ` rows). The
+    /// iteration-boundary drain reads it to RESET `native_uf_prev_displaced`
+    /// exactly once per rebuild round, so the next round carries only ids
+    /// displaced AFTER this rebuild (one UF backs many views, all fused into the
+    /// one rebuild `run_iteration`). Cleared each drain. Only used on the pure
+    /// path (the custom path drains via `native_uf_take_displaced` instead).
+    pub(crate) native_uf_rebuild_ran: bool,
     /// Reverse index for the native-UF delta rebuild: per VIEW function (the
     /// function a `@rebuild_rule*` re-inserts into), maps an eq-sort column
     /// *value* to the set of view rows that hold that value in some eq-sort
@@ -358,15 +400,6 @@ pub struct EGraph {
     /// before the rebuild ever read it (issue: merge-during-rebuild). Carrying it
     /// across the boundary also lets a merge-triggered cascade converge.
     pub(crate) native_uf_prev_displaced: HashMap<FunctionId, Vec<i64>>,
-    /// δview for the FULL native-UF rebuild (`--native-uf` without
-    /// `--fast-rebuild`): VIEW rows created by `lookup_or_create` (eq-sort
-    /// constructor hash-cons) THIS iteration. They are the bulk of the new view
-    /// rows on an eqsat workload (a rewrite head `(Add b a)` is a `HeadOp::Lookup`,
-    /// not a `set`), so they must be probed by the `δview ⋈ uf_old` seminaive term
-    /// alongside the `set`-inserted rows. Pushed in `lookup_or_create`, drained by
-    /// the full-rebuild probe at the end of `run_iteration`. Empty (and never
-    /// pushed) under fast-rebuild / relational mode.
-    pub(crate) native_uf_delta_view: Vec<(FunctionId, Row)>,
 }
 
 impl Default for EGraph {
@@ -414,10 +447,12 @@ impl EGraph {
             native_ufs: HashMap::new(),
             native_uf_canon_prim: HashMap::new(),
             fast_rebuild: false,
+            native_uf_disp_rel: HashMap::new(),
+            native_uf_rebuild_dd_ir: HashMap::new(),
+            native_uf_rebuild_ran: false,
             native_uf_rev_index: HashMap::new(),
             native_uf_view_cols: HashMap::new(),
             native_uf_prev_displaced: HashMap::new(),
-            native_uf_delta_view: Vec::new(),
         }
     }
 
@@ -430,13 +465,16 @@ impl EGraph {
         self.native_uf_enabled = true;
     }
 
-    /// Turn on the RELATIONAL δuf fast-rebuild (`--fast-rebuild`): the fused DBSP
-    /// circuit's two-substep split that drops the always-empty `δview ⋈ uf_old`
-    /// rebuild term (sound under canonicalize-at-creation). Only meaningful
-    /// WITHOUT native UF — under native-UF the rebuild rules are taken out of the
-    /// DBSP circuit entirely and the host-side `view ⋈ δuf` delta rebuild runs by
-    /// default, so this flag is a no-op there. Equivalent to the
-    /// `FELDERA_DELTA_REBUILD` env var. May be called any time before `run_rules`.
+    /// Turn on `--fast-rebuild`. Two roles depending on `--native-uf`:
+    ///   * RELATIONAL (no native UF): the fused DBSP circuit's two-substep split
+    ///     that drops the always-empty `δview ⋈ uf_old` rebuild term (sound under
+    ///     canonicalize-at-creation). Equivalent to the `FELDERA_DELTA_REBUILD`
+    ///     env var.
+    ///   * NATIVE-UF: select the CUSTOM rebuild (the off-circuit host-pass
+    ///     reverse-index δuf scan) over the PURE-ENGINE rebuild (the on-circuit
+    ///     `view ⋈ @DispΔ` DBSP join). The host `UfTable` is shared by both.
+    ///
+    /// May be called any time before `run_rules`.
     pub fn enable_fast_rebuild(&mut self) {
         self.fast_rebuild = true;
     }
@@ -462,9 +500,25 @@ impl EGraph {
             uf.drain_pending();
         }
         let mut displaced = 0;
-        // Under native-UF the rebuild is ALWAYS the delta path (`view ⋈ δuf`),
-        // so stash this round's displaced ids per UF func for a LATER iteration's
-        // rebuild to consume (the δuf carried across the boundary).
+        // PURE-ENGINE rebuild only: if the `@rebuilding` ruleset ran earlier in
+        // THIS `run_iteration` (so the on-circuit `view ⋈ @DispΔ` join consumed
+        // the fed `@DispΔ` rows — `native_uf_prev_displaced`), RESET them now.
+        // Every view sharing each UF has had its chance (the encoder emits one
+        // `@rebuild_rule` per view, all fused into the one rebuild call), so the
+        // next round should carry only ids displaced AFTER this rebuild — the
+        // per-round reset that bounds the `@DispΔ` relation. The rebuild itself
+        // enqueues no unions, so this clear precedes appending this call's
+        // (typically empty) displaced ids. (The CUSTOM host-pass path drains via
+        // `native_uf_take_displaced` instead and never sets `native_uf_rebuild_ran`,
+        // so this reset is a no-op there.)
+        if self.native_uf_enabled && self.native_uf_rebuild_ran {
+            self.native_uf_prev_displaced.clear();
+            self.native_uf_rebuild_ran = false;
+        }
+        // Under native-UF the rebuild is ALWAYS the delta path (`view ⋈ δuf` on
+        // the custom host pass / `view ⋈ @DispΔ` on the pure circuit), so stash
+        // this round's displaced ids per UF func for a LATER iteration's rebuild
+        // to consume (the δuf carried across the boundary).
         //
         // ACCUMULATE rather than overwrite: a union does not necessarily land in
         // the same `run_rules` call that runs the rebuild ruleset over it. The
@@ -474,8 +528,9 @@ impl EGraph {
         // set with an empty Vec the very next (union-free) iteration, before the
         // rebuild pass ever read it (issue: merge-during-rebuild). We instead
         // append each round's newly-displaced ids to the per-UF stash and let the
-        // rebuild pass DRAIN it on consumption (`native_uf_take_displaced`), so the
-        // δuf survives intervening iterations and a cascade converges across calls.
+        // rebuild pass DRAIN it on consumption (the CUSTOM path's
+        // `native_uf_take_displaced`, or the PURE path's per-round reset above), so
+        // the δuf survives intervening iterations and a cascade converges.
         let stash = self.native_uf_enabled;
         for (&func, uf) in self.native_ufs.iter_mut() {
             displaced += uf.displaced_len();
@@ -978,6 +1033,28 @@ impl Backend for EGraph {
         self.mirror.insert(id, std::rc::Rc::new(HashSet::new()));
         self.native_ufs.insert(id, uf::UfTable::new());
 
+        // Synthetic arity-1 "displaced ids" relation `@DispΔ` for the PURE-ENGINE
+        // rebuild (the native analog of the relational `@UF_Sf` flat index the
+        // plain-`--feldera` rebuild joins against). On the PURE-ENGINE path it is
+        // fed each iteration — before the read snapshot — with the previous
+        // round's displaced ids, and the rewritten `@rebuild_rule` joins the
+        // view's eq-sort column against it on the fused DBSP circuit
+        // (`view ⋈ @DispΔ`). On the CUSTOM (`--fast-rebuild`) path it stays empty.
+        // Registered unconditionally (harmless when unused): a plain arity-1
+        // relation (whole-row key), never read back through the trait.
+        let disp_id = FunctionId::new(self.relations.len() as u32);
+        self.relations.push(RelationInfo {
+            name: format!("@Disp\u{0394}_{}", id.rep()),
+            arity: 1,
+            schema: vec![ColumnTy::Id],
+            has_output: false,
+            merge: MergeMode::Relation,
+            identity_on_miss: false,
+        });
+        self.mirror
+            .insert(disp_id, std::rc::Rc::new(HashSet::new()));
+        self.native_uf_disp_rel.insert(id, disp_id);
+
         // The find-or-self canon-prim. A real, freeable `ExternalFunctionId`,
         // but the interpreter intercepts calls to it (see `native_uf_canon_prim`)
         // and answers `find_ro` from the in-core UF — the registered stub is
@@ -1158,6 +1235,9 @@ impl Backend for EGraph {
             self.persistent.remove(&i);
             self.fed.remove(&i);
             self.atomless_fired.remove(&i);
+            // Drop any cached PURE-ENGINE DBSP-rewritten `@rebuild_rule` IR for
+            // this index, so a reused rule index never reuses a stale rewrite.
+            self.native_uf_rebuild_dd_ir.remove(&i);
             // Drop any FUSED circuit whose ruleset includes this freed rule, so
             // a reused index never reuses a stale fused circuit.
             self.fused.retain(|key, _| !key.contains(&i));
