@@ -62,6 +62,39 @@ enum Write {
 /// guards the engine keeps off-circuit), then apply head actions. Writes +
 /// FD-merge are applied so results are bit-exact.
 pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
+    // The native-UF `+fastrb` axis selects between TWO rebuild implementations
+    // (the host UfTable is shared; only the REBUILD differs):
+    //
+    //   * PURE-ENGINE rebuild (`--native-uf`, NO `--fast-rebuild`): the DD-engine
+    //     `view ⋈ @DispΔ(δdisplaced)` join. `sync_displaced_relations` feeds the
+    //     `@DispΔ` relation, `rebuild_rule_dd_ir` rewrites each `@rebuild_rule` to
+    //     join it, and the join runs on the fused DD worker — no host pass, no
+    //     reverse index.
+    //   * CUSTOM rebuild (`--native-uf --fast-rebuild`): the off-engine host-pass
+    //     reverse-index scan (`native_uf_rebuild_envs`), δuf-only (the
+    //     `δview ⋈ uf_old` probe dropped). No `@DispΔ` rules injected, no DD-engine
+    //     rebuild; the reverse index + supporting state are maintained ONLY here.
+    let native_pure = eg.native_uf_enabled && !eg.fast_rebuild;
+    let native_custom = eg.native_uf_enabled && eg.fast_rebuild;
+
+    // PURE-ENGINE rebuild only — feed the synthetic `@DispΔ` displaced-ids
+    // relations BEFORE the read snapshot, so this iteration's fused DD worker
+    // sees the previous round's displaced ids as the δ that drives
+    // `view ⋈ δdisplaced` re-canonicalization. Each `@DispΔ` relation's mirror
+    // is set to EXACTLY the current `native_uf_displaced_prev[uf]` (cleared
+    // otherwise), so the fused `fed`-diff yields: this round's ids as +1, last
+    // round's as -1. Positive-weight bindings re-canonicalize the matching view
+    // rows (the `@canon_S` guard rejects already-canonical rows host-side, so an
+    // over-inclusive feed is still bit-exact); negative weights are ignored
+    // (heads are monotone-fire). The join runs on the DD engine — keeping
+    // seminaive incrementality (no full view re-scan). The O(1) find stays
+    // native (host-side `@canon_S`). Must precede the `read` snapshot: `read`
+    // shares the mirror `Rc`, so a later mutation copy-on-writes away from it.
+    // (On the custom host-pass path the `@DispΔ` relations stay empty.)
+    if native_pure {
+        sync_displaced_relations(eg);
+    }
+
     // Snapshot the read view: rules match against the pre-iteration mirror.
     //
     // The snapshot shares each function's row set by `Rc` rather than
@@ -80,11 +113,6 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
     // call advances it, the O(1) signal that a new term row was created.
     let next_id_at_start = eg.next_id;
 
-    // Reset the per-iteration δview buffer (hash-consed view rows created this
-    // call, accumulated by `lookup_or_create` for the full native-UF rebuild's
-    // `δview ⋈ uf_old` probe). No-op unless native-UF full rebuild is active.
-    eg.native_uf_delta_view.clear();
-
     let mut writes: Vec<Write> = Vec::new();
     let mut touched: HashSet<FunctionId> = HashSet::new();
     // Iteration-scoped `key -> output` index for `lookup_or_create` (eq-sort
@@ -92,33 +120,56 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
     // one iteration are O(1) instead of rescanning the growing mirror each time.
     let mut lookup_index: HashMap<FunctionId, HashMap<Box<[u32]>, u32>> = HashMap::new();
 
-    // Under `--native-uf --flowlog` we drive PR #782's UF-backed encoding
-    // through FlowLog's HOST-PASS rebuild. Two classes of maintenance rule are
-    // suppressed by NAME (mirroring the committed `flowlog-native-uf` pattern,
-    // but matching #782's names — see `is_uf_drain_rule` / the `canonicalize`
-    // interception in `fused_bindings`):
+    // Under `--native-uf --flowlog` we drive PR #782's UF-backed encoding through
+    // ONE of two rebuild implementations, selected by `--fast-rebuild`. The
+    // maintenance rules are handled per path:
     //
     //   * `@uf_change_drain_rule*` (the `@uf_change_drain` ruleset): DROPPED
-    //     entirely. The host-pass owns onchange consumption; the `@UFChange_S`
-    //     relation stays empty (the leader-change callback is never invoked on
-    //     FlowLog), so the drain matches nothing anyway.
-    //   * `@rebuild_rule*` (`canonicalize`, the `@rebuilding` ruleset): NOT
-    //     dropped here — it is intercepted host-side in `fused_bindings`
-    //     (`native_uf_rebuild_envs`) so it never drives the DD dataflow.
-    //   * `@rebuild_dview_probe*` (the encoding's `δview ⋈ uf_old` probe, emitted
-    //     for the bridge's FULL native-UF rebuild): DROPPED entirely. Its body
-    //     carries the impure `@canon_S` guard prim, which the DD dataflow cannot
-    //     host. FlowLog mirrors that δview probe HOST-SIDE (`probe_delta_view_
-    //     row`, gated on `native_uf && !fast_rebuild` via the backend config), so
-    //     the engine must never see this rule.
+    //     entirely on BOTH paths. The `@UFChange_S` onchange relation is never
+    //     populated (the leader-change callback is never invoked on FlowLog —
+    //     unions route into the in-core UF instead), so its drain matches nothing.
+    //   * `@rebuild_rule*` (`canonicalize`, the `@rebuilding` ruleset):
+    //       - PURE-ENGINE (`!fast_rebuild`): rewritten to the DD-engine form
+    //         (`rebuild_rule_dd_ir`: the empty `@UFChange_S` onchange atom replaced
+    //         by a `@DispΔ(eqsort_col)` atom) so it lowers to `view ⋈ δdisplaced`
+    //         and runs on the fused DD worker — seminaive on the fed displaced δ.
+    //       - CUSTOM (`fast_rebuild`): intercepted host-side in `fused_bindings`
+    //         (`native_uf_rebuild_envs`, the reverse-index δuf scan) so it never
+    //         drives the DD dataflow — see the interception there.
+    //   * `@rebuild_dview_probe*` (the FULL native-UF rebuild's `δview ⋈ uf_old`
+    //     probe): run on DD under PURE-ENGINE (it is a pure view-scan body with the
+    //     `@canon_S` guard, which the DD dataflow runs directly); DROPPED under
+    //     CUSTOM (δuf-only — the optimisation that elides this
+    //     empty-under-canon-at-creation δview term). The encoder emits this rule
+    //     for EVERY backend (its `fast_rebuild` flag is bridge-only), so the
+    //     +nuf / +nuf+fastrb distinction is the backend's job here.
     let drop_rule = |name: &str| -> bool {
-        eg.native_uf_enabled && (is_uf_drain_rule(name) || is_uf_dview_probe_rule(name))
+        eg.native_uf_enabled
+            && (is_uf_drain_rule(name) || (eg.fast_rebuild && is_uf_dview_probe_rule(name)))
     };
-    let rules: Vec<(usize, RuleIr)> = rule_idxs
+    let mut rules: Vec<(usize, RuleIr)> = rule_idxs
         .iter()
         .filter_map(|&i| eg.rules.get(i).and_then(|r| r.clone()).map(|r| (i, r)))
         .filter(|(_, r)| !drop_rule(&r.name))
         .collect();
+    // PURE-ENGINE only: rewrite each `@rebuild_rule` to the DD-engine form (strip
+    // the empty `@UFChange_S` onchange atom, append a `@DispΔ(eqsort_col)` atom)
+    // so it lowers to `view ⋈ δdisplaced` on the fused worker. Cached per rule idx
+    // (the source IR never changes). Done HERE, before `fused_bindings`, so the
+    // rewritten body flows through planning, the fused-join build key, and the
+    // delta machinery uniformly. On the CUSTOM path the rule is left intact and
+    // intercepted host-side instead (`native_uf_rebuild_envs` in `fused_bindings`).
+    if native_pure {
+        for (idx, rule) in rules.iter_mut() {
+            if is_uf_rebuild_rule(&rule.name) {
+                *rule = rebuild_rule_dd_ir(eg, *idx, rule);
+                // Mark that the `@rebuilding` ruleset ran this iteration (the DD
+                // `view ⋈ δdisplaced` join consumes the fed displaced ids), so
+                // the iteration-boundary drain resets `native_uf_displaced_prev`.
+                eg.native_uf_rebuild_ran = true;
+            }
+        }
+    }
 
     // Compute every rule's binding envs FIRST (so the whole atom-bearing ruleset
     // runs on ONE fused DD worker in a single epoch — `fused_bindings`), THEN
@@ -168,11 +219,12 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
             }
         }
     }
-    // Native-UF delta-rebuild index maintenance only kicks in when the view
-    // func's reverse index is already built (a no-op otherwise), so capture the
-    // removed rows for index updates only then — avoids a clone when native-UF
-    // is off.
-    let track_index = eg.native_uf_enabled;
+    // CUSTOM rebuild only: maintain the per-view reverse index as rows leave /
+    // enter the mirror, so `native_uf_rebuild_envs` can scope its scan to the
+    // displaced ids. The index hooks no-op unless a view func's index is built,
+    // so capture the removed rows for index updates only on the custom path —
+    // avoids a clone on the pure-engine path (and when native-UF is off).
+    let track_index = native_custom;
     for (f, (keylen, keys)) in removes_by_func {
         let mut removed: Vec<Row> = Vec::new();
         if let Some(set) = eg.mirror.get_mut(&f) {
@@ -187,28 +239,21 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
             });
             changed |= set.len() != before_len;
         }
-        for row in &removed {
-            eg.index_remove_row(f, row);
+        if track_index {
+            for row in &removed {
+                eg.index_remove_row(f, row);
+            }
         }
     }
     let mut touched_keys: HashMap<FunctionId, HashSet<Vec<u32>>> = HashMap::new();
-    // δview for the FULL native-UF rebuild (`--native-uf` without
-    // `--fast-rebuild`): the VIEW rows genuinely inserted THIS iteration via a
-    // `set`. They are the new rows the relational rebuild's `δview ⋈ uf_old`
-    // seminaive term probes against the UF. Collected only when that probe will
-    // actually run (native-UF, full rebuild).
-    let collect_delta_view = eg.native_uf_enabled && !eg.fast_rebuild;
-    let mut set_delta_view_rows: Vec<(FunctionId, Row)> = Vec::new();
     for (f, row) in sets {
         let inputs_len = eg.info(f).arity.saturating_sub(1);
         let key: Vec<u32> = (0..inputs_len).map(|i| row_col(&row, i)).collect();
-        eg.index_insert_row(f, &row);
+        if track_index {
+            eg.index_insert_row(f, &row);
+        }
         let inserted = std::rc::Rc::make_mut(eg.mirror.entry(f).or_default()).insert(row.clone());
         changed |= inserted;
-        // δview: record genuinely-new VIEW rows for the full-rebuild probe.
-        if collect_delta_view && inserted && eg.native_uf_view_cols.contains_key(&f) {
-            set_delta_view_rows.push((f, row));
-        }
         touched_keys.entry(f).or_default().insert(key);
     }
 
@@ -220,62 +265,20 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
         changed |= eg.resolve_merge(f, keys);
     }
 
-    // FULL NATIVE-UF REBUILD (`--native-uf` without `--fast-rebuild`): run the
-    // relational rebuild's `δview ⋈ uf_old` seminaive term as a host probe.
-    //
-    // The relational rebuild join `view ⋈ uf` has two seminaive derivatives:
-    //   * `view ⋈ δuf`  — the REAL work, already done above by
-    //     `native_uf_rebuild_envs` (the reverse-index scan over displaced ids);
-    //   * `δview ⋈ uf_old` — canonicalize the NEW view rows added this iteration
-    //     against the (pre-drain) UF. It is EMPTY under canonicalize-at-creation
-    //     (new rows are born canonical, so every find returns the stored value),
-    //     but the relational backend still PAYS to probe each new row's find.
-    //
-    // `--fast-rebuild` is exactly the optimization that DROPS this empty term; so
-    // under `--native-uf` alone (full rebuild) we run it to mirror the relational
-    // cost, and under `--native-uf --fast-rebuild` we skip it (the delta-only
-    // behaviour). The probe reads `native_uf_find` (uf_old: the drain that would
-    // advance the UF runs below, after this), runs the same per-row find /
-    // `@canon`-staleness check the rebuild rule's guard applies, and discards the
-    // (always-`None`) result — it changes nothing, it is pure wasted work,
-    // exactly as on the relational side.
-    if eg.native_uf_enabled && !eg.fast_rebuild {
-        // δview = the `set`-inserted new view rows (collected above) PLUS the
-        // hash-consed constructor rows (`lookup_or_create`, the bulk on an eqsat
-        // workload), drained from the per-iteration buffer.
-        let hashconsed = std::mem::take(&mut eg.native_uf_delta_view);
-        let mut probed = 0usize;
-        let mut stale = 0usize;
-        for (f, row) in set_delta_view_rows.iter().chain(hashconsed.iter()) {
-            // `native_uf_view_cols` is populated by `native_uf_rebuild_envs` the
-            // first time a view func is canonicalized; only those funcs carry
-            // eq-sort columns the rebuild probes (others have an empty / absent
-            // entry and contribute no find work, exactly as relational).
-            if let Some(col_uf) = eg.native_uf_view_cols.get(f).cloned() {
-                if probe_delta_view_row(eg, row, &col_uf) {
-                    stale += 1;
-                }
-                probed += 1;
-            }
-        }
-        // Keep the probe observable to the optimizer (the finds above are
-        // otherwise dead since `stale` is 0 under canon-at-creation).
-        std::hint::black_box(stale);
-        // Env-gated diagnostic: confirm the `δview ⋈ uf_old` probe actually
-        // visits the new view rows (off in normal runs; `eprintln!` intended).
-        #[allow(clippy::disallowed_macros)]
-        if std::env::var("FLOWLOG_DEBUG_DVIEW").is_ok() && probed > 0 {
-            eprintln!("[DVIEW] probed={probed} new view rows");
-        }
-    }
+    // The FULL native-UF rebuild's `δview ⋈ uf_old` seminaive probe is handled
+    // per path with NO host-side probe in either case: PURE-ENGINE runs the
+    // `@rebuild_dview_probe*` rule on the DD engine (a pure view-scan body with
+    // the `@canon_S` guard, fired on δview by seminaive); CUSTOM (`fast_rebuild`)
+    // is δuf-only and drops the probe rule at the `drop_rule` filter above.
 
     // Native-UF drain at the iteration boundary: apply this call's enqueued
     // unions (from intercepted `(set (@UF_Sf lhs) rhs)` head actions) to every
     // in-core UF. After this, every UF is flat, so the NEXT iteration's
-    // `find_ro` reads — and the host-pass rebuild — see fresh leaders. A union
-    // that actually merged two classes displaces ids; surface that as a real
-    // change so the outer saturate loop keeps iterating (the relational path's
-    // signal was `@UF_S` / flat-index churn, which we no longer produce).
+    // `find_ro` reads — and the rebuild's `@canon_S` finds (DD-engine on the pure
+    // path, host-pass on the custom path) — see fresh leaders. A union that
+    // actually merged two classes displaces ids; surface that as a real change so
+    // the outer saturate loop keeps iterating (the relational path's signal was
+    // `@UF_S` / flat-index churn, not produced here).
     if eg.native_uf_enabled {
         let displaced = eg.native_uf_drain_all();
         if displaced > 0 {
@@ -336,26 +339,35 @@ pub(crate) fn rule_category(name: &str) -> &'static str {
 
 /// True for PR #782's `@uf_change_drain_rule*` drain rules (the
 /// `@uf_change_drain` ruleset). Under `--native-uf` these are DROPPED: the
-/// host-pass rebuild owns onchange consumption, and the `@UFChange_S` relation
-/// they drain is never populated (the leader-change callback is never invoked
-/// on FlowLog). Matched by the `fresh()`-suffixed name's stable prefix.
+/// `@UFChange_S` onchange relation they drain is never populated (the
+/// leader-change callback is never invoked on FlowLog — unions route into the
+/// in-core UF instead), so the drain matches nothing anyway. Matched by the
+/// `fresh()`-suffixed name's stable prefix.
 pub(crate) fn is_uf_drain_rule(name: &str) -> bool {
     rule_category(name) == "uf_change_drain"
 }
 
 /// True for the encoding's `@rebuild_dview_probe*` rule (the FULL native-UF
-/// rebuild's `δview ⋈ uf_old` probe term, emitted for the bridge). Its body has
-/// the impure `@canon_S` guard prim, which the DD dataflow cannot host; under
-/// `--native-uf` FlowLog mirrors this probe host-side (`probe_delta_view_row`)
-/// and DROPS the rule from the engine path. (It is NOT a `@rebuild_rule*`, so
-/// `rule_category` classifies it as `<user>` — match it explicitly by name.)
+/// rebuild's `δview ⋈ uf_old` probe term, emitted for the bridge). Its body is a
+/// pure view scan with the `@canon_S` guard prim (evaluated host-side in the
+/// fused worker's prim tail, like every value prim), so the DD dataflow runs it
+/// directly: under `--native-uf` alone it runs on the engine (full rebuild),
+/// and `--native-uf --fast-rebuild` DROPS it from the engine path (the
+/// optimisation that elides this empty-under-canon-at-creation δview term). (It
+/// is NOT a `@rebuild_rule*`, so `rule_category` classifies it as `<user>` —
+/// match it explicitly by name.)
 pub(crate) fn is_uf_dview_probe_rule(name: &str) -> bool {
     name.contains("rebuild_dview_probe")
 }
 
 /// True for PR #782's `@rebuild_rule*` canonicalization rules (the
-/// `@rebuilding` ruleset). Under `--native-uf` these are intercepted host-side
-/// (`native_uf_rebuild_envs`) instead of running on the DD dataflow.
+/// `@rebuilding` ruleset). Routed per the `--fast-rebuild` axis: PURE-ENGINE
+/// (`!fast_rebuild`) rewrites them to the DD-engine form (`rebuild_rule_dd_ir`:
+/// the always-empty `@UFChange_S` onchange atom replaced by a
+/// `@DispΔ(eqsort_col)` atom) so they lower to `view ⋈ δdisplaced` on the DD
+/// dataflow; CUSTOM (`fast_rebuild`) intercepts them host-side
+/// (`native_uf_rebuild_envs`, the reverse-index δuf scan) so they never drive
+/// the DD dataflow.
 pub(crate) fn is_uf_rebuild_rule(name: &str) -> bool {
     rule_category(name) == "canonicalize"
 }
@@ -395,16 +407,17 @@ fn fused_bindings(
     let mut atom_positions: Vec<usize> = Vec::new();
     let mut atom_rule_idxs: Vec<usize> = Vec::new();
     for (pos, (idx, rule)) in rules.iter().enumerate() {
-        // Native-UF rebuild interception: PR #782's `@rebuild_rule*`
-        // (`canonicalize`) rules join the view against the `@UFChange_S`
-        // onchange relation and re-canonicalize via `@canon_S`. Under
-        // `--native-uf` the host-pass owns the rebuild: `@UFChange_S` is empty
-        // (so the DD join would produce nothing anyway), and finds go through
-        // the in-core UF. Produce this rule's binding envs directly from a view
-        // scan (`native_uf_rebuild_envs`) and DON'T route it to the fused DD
-        // worker (nor re-run its prim tail — the leader env already encodes the
-        // changed-row filter the guard expresses).
-        if eg.native_uf_enabled && is_uf_rebuild_rule(&rule.name) {
+        let _ = idx;
+        // CUSTOM rebuild (`--native-uf --fast-rebuild`): intercept PR #782's
+        // `@rebuild_rule*` (`canonicalize`) rules host-side. `@UFChange_S` is
+        // empty (the DD join would produce nothing anyway) and finds go through
+        // the in-core UF, so produce this rule's binding envs from the
+        // reverse-indexed view scan (`native_uf_rebuild_envs`) — DON'T route it
+        // to the fused DD worker (nor re-run its prim tail — the leader env
+        // already encodes the changed-row filter the guard expresses). On the
+        // PURE-ENGINE path the rule was already rewritten to `view ⋈ δdisplaced`
+        // (`rebuild_rule_dd_ir`) and flows through the atom-bearing path below.
+        if eg.native_uf_enabled && eg.fast_rebuild && is_uf_rebuild_rule(&rule.name) {
             out[pos] = native_uf_rebuild_envs(eg, read, rule)?;
             continue;
         }
@@ -683,8 +696,185 @@ fn fused_bindings(
     Ok(out)
 }
 
-/// Host-side native-UF rebuild for one PR #782 `@rebuild_rule*` (`canonicalize`)
-/// rule under `--native-uf --flowlog`.
+/// Feed each `@UF_Sf` function's synthetic `@DispΔ` displaced-ids relation with
+/// EXACTLY the previous round's displaced ids (`native_uf_displaced_prev`), so
+/// the DD-engine rebuild's `view ⋈ δdisplaced` join fires the matching view rows
+/// THIS iteration. Called at the top of `run_iteration`, BEFORE the read
+/// snapshot, so the snapshot (which shares the mirror `Rc`) sees the fed rows.
+///
+/// Setting each relation's mirror to exactly the current displaced set (and
+/// clearing it otherwise) makes the fused `fed`-diff present this round's ids as
+/// a `+1` delta and last round's as a `-1` delta — the seminaive driver of
+/// re-canonicalization. This is the native analog of the relational `@UF_Sf`
+/// flat-index relation the plain-`--flowlog` rebuild joins the view against; the
+/// only difference is `@DispΔ` carries just the displaced ids (the in-core UF
+/// supplies the leaders via the `@canon_S` guard/head), keeping the O(1) find
+/// native while the JOIN runs on DD.
+///
+/// Idempotence: the `@rebuild_rule` head retracts the stale row and re-inserts
+/// the canonical one; the `@canon_S` guard rejects rows already canonical. So an
+/// over-inclusive displaced feed is still bit-exact — exactly the prior host
+/// pass's scoped-scan guarantee.
+fn sync_displaced_relations(eg: &mut EGraph) {
+    if !eg.native_uf_enabled {
+        return;
+    }
+    // Snapshot the per-UF displaced ids first (immutable borrow), then mutate the
+    // mirror. `native_uf_displaced_prev` is the previous round's displaced set,
+    // stashed by `native_uf_drain_all` (the SAME source the host pass consumed).
+    let updates: Vec<(FunctionId, Vec<i64>)> = eg
+        .native_uf_disp_rel
+        .iter()
+        .map(|(&uf, &disp_rel)| {
+            let ids = eg
+                .native_uf_displaced_prev
+                .get(&uf)
+                .cloned()
+                .unwrap_or_default();
+            (disp_rel, ids)
+        })
+        .collect();
+    for (disp_rel, ids) in updates {
+        let set = std::rc::Rc::make_mut(eg.mirror.entry(disp_rel).or_default());
+        // Reset to exactly this round's displaced ids: the fed-diff then yields
+        // the right +/- delta. (A row is the single-column `[id]`.)
+        set.clear();
+        for id in ids {
+            set.insert(vec![id as u32].into_boxed_slice());
+        }
+    }
+}
+
+/// Rewrite one PR #782 `@rebuild_rule*` (`canonicalize`) rule into the DD-engine
+/// form, mirroring DuckDB's `rewrite_native_uf_rule`: strip the always-empty
+/// `@UFChange_S` onchange body atom and replace it with a `@DispΔ(eqsort_col)`
+/// atom over the synthetic displaced-ids relation, leaving the view atom + the
+/// `@canon_S` guard prims. The result lowers to `view ⋈ δdisplaced` on the fused
+/// DD worker (`plan_join` accepts it; the guard runs in the host prim tail).
+///
+/// The source rule shape is
+/// ```text
+/// (rule ((@UFChange_S _wl_ _wr_ _ll_ _rl_ _nl_ disp_)   ; ALWAYS empty under native-UF
+///        (@View c0_ .. cn_)
+///        (= cj disp_)                                    ; cj = the view eq-sort col
+///        (guard (or (bool-!= ci (@canon_S ci)) ..)))
+///       ((@View (@canon_S c0_) .. (@canon_S cn_) ())     ; head re-canonicalize
+///        (delete (@View c0_ .. cn_))))
+/// ```
+/// `(= cj disp_)` is encoded by the onchange's `disp_` slot and the view's `cj`
+/// slot sharing one variable, so `cj` survives as a view column after the
+/// onchange atom is dropped. We append `@DispΔ(cj)` joining the view on `cj` —
+/// `cj`'s UF is the one the head's `@canon_S` call on `cj` canonicalizes against,
+/// so `@DispΔ` is that UF func's displaced relation.
+///
+/// Cached by rule index in `native_uf_rebuild_dd_ir` (the source IR is fixed).
+fn rebuild_rule_dd_ir(eg: &mut EGraph, idx: usize, rule: &RuleIr) -> RuleIr {
+    if let Some(cached) = eg.native_uf_rebuild_dd_ir.get(&idx) {
+        return cached.clone();
+    }
+
+    // The view = the head `set` (the canonicalized re-insert) target.
+    let view_func = rule.head.iter().find_map(|op| match op {
+        HeadOp::Set { func, .. } => Some(*func),
+        _ => None,
+    });
+    // Map each eq-sort body var (a `@canon_S` head-call arg) → its UF func, so
+    // we know which displaced relation each eq-sort column joins against.
+    let mut var_uf: HashMap<u32, FunctionId> = HashMap::new();
+    for op in &rule.head {
+        if let HeadOp::Call { id, args, .. } = op {
+            if let Some(&uf) = eg.native_uf_canon_prim.get(id) {
+                if let Some(Slot::Var(v)) = args.first() {
+                    var_uf.entry(*v).or_insert(uf);
+                }
+            }
+        }
+    }
+
+    // Vars bound by the (empty) onchange atom — any body atom that is NOT the
+    // view and NOT itself a native UF / displaced relation.
+    let is_view = |f: FunctionId| Some(f) == view_func;
+    let mut onchange_vars: HashSet<u32> = HashSet::new();
+    let mut other_vars: HashSet<u32> = HashSet::new();
+    for op in &rule.body {
+        if let BodyOp::Atom(a) = op {
+            let target = if is_view(a.func) {
+                &mut other_vars
+            } else {
+                &mut onchange_vars
+            };
+            for s in &a.slots {
+                if let Slot::Var(v) = s {
+                    target.insert(*v);
+                }
+            }
+        }
+    }
+    // A var is onchange-only if no surviving (view) atom binds it.
+    let onchange_only: HashSet<u32> = onchange_vars.difference(&other_vars).copied().collect();
+
+    // The displaced column the dropped onchange constrained (`= cj disp_`): the
+    // view eq-sort var that the onchange atom ALSO bound (its `disp_` slot was
+    // unified with this view column `cj`). The encoder emits one `@rebuild_rule`
+    // per eq-sort view column, so exactly one of the view's eq-sort columns is
+    // the onchange's `disp_` — pick THAT one (NOT merely the first eq-sort
+    // column, which for a multi-eq-sort view would join `@DispΔ` on the wrong
+    // column and starve the rebuild → under-derivation).
+    let eqsort_var = rule.body.iter().find_map(|op| match op {
+        BodyOp::Atom(a) if is_view(a.func) => a.slots.iter().find_map(|s| match s {
+            Slot::Var(v) if var_uf.contains_key(v) && onchange_vars.contains(v) => Some(*v),
+            _ => None,
+        }),
+        _ => None,
+    });
+
+    let mut new_body: Vec<BodyOp> = Vec::new();
+    for op in &rule.body {
+        match op {
+            // Drop the onchange (non-view) table atom.
+            BodyOp::Atom(a) if !is_view(a.func) => {}
+            // Drop prims that reference an onchange-only var (a dangling
+            // `(= cj disp_)`-style binding); keep the `@canon_S` guard prims
+            // (they reference the surviving view eq-sort columns).
+            BodyOp::Prim { args, ret, .. }
+                if args
+                    .iter()
+                    .chain(std::iter::once(ret))
+                    .any(|s| matches!(s, Slot::Var(v) if onchange_only.contains(v))) => {}
+            other => new_body.push(other.clone()),
+        }
+    }
+
+    // Append the synthetic `@DispΔ(eqsort_var)` atom so the rule becomes
+    // `view ⋈ δdisplaced` (joined on the view's eq-sort column). If we cannot
+    // identify the eq-sort var / UF / displaced relation, leave the body as the
+    // pure view scan (still correct: the `@canon_S` guard re-canonicalizes; only
+    // the displaced-scoping speedup is lost — the dview-probe path).
+    if let Some(ev) = eqsort_var {
+        if let Some(uf) = var_uf.get(&ev) {
+            if let Some(&disp_rel) = eg.native_uf_disp_rel.get(uf) {
+                new_body.push(BodyOp::Atom(crate::compile::BodyAtom {
+                    func: disp_rel,
+                    slots: vec![Slot::Var(ev)],
+                }));
+            }
+        }
+    }
+
+    let rewritten = RuleIr {
+        name: rule.name.clone(),
+        body: new_body,
+        head: rule.head.clone(),
+    };
+    eg.native_uf_rebuild_dd_ir.insert(idx, rewritten.clone());
+    rewritten
+}
+
+/// CUSTOM rebuild (`--native-uf --fast-rebuild`): the off-engine host-pass
+/// rebuild for one PR #782 `@rebuild_rule*` (`canonicalize`) rule. This is the
+/// reverse-indexed, δuf-only scoped scan — the specialized "custom rebuild" the
+/// `+fastrb` axis selects (the PURE-ENGINE path runs the DD-engine
+/// `view ⋈ @DispΔ` join instead; see `rebuild_rule_dd_ir`).
 ///
 /// The relational rebuild rule is
 /// ```text
@@ -695,17 +885,20 @@ fn fused_bindings(
 ///       ((@CView (@canon_S c0_) .. (@canon_S cn_) ())  ; canonicalized re-set
 ///        (delete (@CView c0_ .. cn_))))                ; retract the stale row
 /// ```
-/// Under `--native-uf` the `@UFChange_S` onchange relation is empty (the host-
-/// pass owns onchange consumption; the leader-change callback never runs on
-/// FlowLog), so the relational join produces nothing. We instead DRIVE THE
-/// REBUILD FROM A VIEW SCAN: for every view row whose canonical form differs
-/// (some eq-sort column's `find_ro` leader differs from the stored value), we
-/// emit ONE binding env that binds the view's body vars. `apply_head` then runs
-/// the rule's head VERBATIM — its `@canon_S` calls re-canonicalize each eq-sort
+/// Under `--native-uf` the `@UFChange_S` onchange relation is empty (the
+/// leader-change callback never runs on FlowLog; unions route into the in-core
+/// UF), so the relational join produces nothing. We instead DRIVE THE REBUILD
+/// FROM A SCOPED VIEW SCAN: for every view row touching a previous-round
+/// displaced id (the host-side `view ⋈ δuf`) whose canonical form differs (some
+/// eq-sort column's `find_ro` leader differs from the stored value), we emit ONE
+/// binding env that binds the view's body vars. `apply_head` then runs the
+/// rule's head VERBATIM — its `@canon_S` calls re-canonicalize each eq-sort
 /// column from the in-core UF, the `set` re-inserts the canonical row, and the
 /// `delete` retracts the stale one — reproducing the relational rebuild's
 /// retract-old / insert-canonical writes bit-for-bit, but touching only changed
-/// rows (the `guard` filter, applied here as the changed-row test).
+/// rows (the `guard` filter, applied here as the changed-row test). The
+/// `δview ⋈ uf_old` term is DROPPED (δuf-only — that is the `--fast-rebuild`
+/// optimisation), so new view rows are not re-probed (they are born canonical).
 ///
 /// Recognition (the only difference from the committed `flowlog-native-uf`
 /// pattern, which read `@UF_Sf` body atoms): #782 encodes the eq-sort columns
@@ -780,83 +973,70 @@ fn native_uf_rebuild_envs(
         return Ok(Vec::new());
     };
 
-    // NATIVE-UF DELTA REBUILD (always on under native-UF): scope the scan to
-    // view rows touching a previous-round displaced id (the host-side
-    // `view ⋈ δuf`), instead of scanning every view row. The index is built on
-    // the FIRST rebuild for this view func (a one-time full scan that seeds it
-    // — the correctness fallback for the first iteration) and maintained
+    // Scope the scan to view rows touching a previous-round displaced id (the
+    // host-side `view ⋈ δuf`), instead of scanning every view row. The index is
+    // built on the FIRST rebuild for this view func (a one-time full scan that
+    // seeds it — the correctness fallback for the first iteration) and maintained
     // incrementally thereafter (see `index_insert_row` / `index_remove_row`).
     // When the index is already built we look up only the displaced ids' rows;
     // the per-row `find != cur` guard below stays the exactness check, so an
     // over-inclusive candidate set is still bit-exact.
-    let use_scoped = eg.native_uf_enabled;
-    if use_scoped {
-        // Cache this view func's eq-sort columns so the index hooks know which
-        // columns to track (set together with the index entry below).
-        eg.native_uf_view_cols.insert(view_func, col_uf.clone());
 
-        let index_built = eg.native_uf_rev_index.contains_key(&view_func);
-        if !index_built {
-            // First rebuild for this func: full scan over the snapshot, building
-            // the reverse index as we go (so subsequent rounds can scope).
-            let mut index: HashMap<u32, HashSet<Row>> = HashMap::new();
-            let mut envs: Vec<Env> = Vec::new();
-            for row in set.iter() {
-                for &(ci, _uf) in &col_uf {
-                    if let Some(&v) = row.get(ci) {
-                        index.entry(v).or_default().insert(row.clone());
-                    }
-                }
-                if row_needs_rebuild(eg, row, &col_uf) {
-                    envs.push(bind_view_env(row, &var_col));
+    // Cache this view func's eq-sort columns so the index hooks know which
+    // columns to track (set together with the index entry below).
+    eg.native_uf_view_cols.insert(view_func, col_uf.clone());
+
+    let index_built = eg.native_uf_rev_index.contains_key(&view_func);
+    if !index_built {
+        // First rebuild for this func: full scan over the snapshot, building
+        // the reverse index as we go (so subsequent rounds can scope).
+        let mut index: HashMap<u32, HashSet<Row>> = HashMap::new();
+        let mut envs: Vec<Env> = Vec::new();
+        for row in set.iter() {
+            for &(ci, _uf) in &col_uf {
+                if let Some(&v) = row.get(ci) {
+                    index.entry(v).or_default().insert(row.clone());
                 }
             }
-            eg.native_uf_rev_index.insert(view_func, index);
-            return Ok(envs);
+            if row_needs_rebuild(eg, row, &col_uf) {
+                envs.push(bind_view_env(row, &var_col));
+            }
         }
+        eg.native_uf_rev_index.insert(view_func, index);
+        return Ok(envs);
+    }
 
-        // Index is built: gather the candidate rows for the displaced ids of
-        // every UF func this view canonicalizes against (the previous round's
-        // displaced set, stashed by `native_uf_drain_all`). Clone the rows out
-        // so the immutable index borrow drops before the guard pass.
-        let mut uf_funcs: Vec<FunctionId> = col_uf.iter().map(|&(_, uf)| uf).collect();
-        uf_funcs.sort();
-        uf_funcs.dedup();
-        let mut candidates: HashSet<Row> = HashSet::new();
-        if let Some(index) = eg.native_uf_rev_index.get(&view_func) {
-            for uf in &uf_funcs {
-                if let Some(disp) = eg.native_uf_displaced_prev.get(uf) {
-                    for &d in disp {
-                        if let Some(rows) = index.get(&(d as u32)) {
-                            for row in rows {
-                                candidates.insert(row.clone());
-                            }
+    // Index is built: gather the candidate rows for the displaced ids of
+    // every UF func this view canonicalizes against (the previous round's
+    // displaced set, stashed by `native_uf_drain_all`). Clone the rows out
+    // so the immutable index borrow drops before the guard pass.
+    let mut uf_funcs: Vec<FunctionId> = col_uf.iter().map(|&(_, uf)| uf).collect();
+    uf_funcs.sort();
+    uf_funcs.dedup();
+    let mut candidates: HashSet<Row> = HashSet::new();
+    if let Some(index) = eg.native_uf_rev_index.get(&view_func) {
+        for uf in &uf_funcs {
+            if let Some(disp) = eg.native_uf_displaced_prev.get(uf) {
+                for &d in disp {
+                    if let Some(rows) = index.get(&(d as u32)) {
+                        for row in rows {
+                            candidates.insert(row.clone());
                         }
                     }
                 }
             }
         }
-        // Mark that a rebuild scan consumed the displaced sets THIS iteration.
-        // ONE UF func backs MANY view funcs (every function with a column of
-        // that eq-sort), and the encoder emits one `@rebuild_rule` per view —
-        // all fused into THIS `run_iteration`. So the displaced sets must NOT be
-        // cleared here (that would starve the views processed after this one);
-        // instead `native_uf_drain_all` clears them once, at the iteration
-        // boundary, after every rebuild rule in this call has consumed them.
-        eg.native_uf_rebuild_ran = true;
-        let mut envs: Vec<Env> = Vec::new();
-        for row in &candidates {
-            if row_needs_rebuild(eg, row, &col_uf) {
-                envs.push(bind_view_env(row, &var_col));
-            }
-        }
-        return Ok(envs);
     }
-
+    // Mark that a rebuild scan consumed the displaced sets THIS iteration.
+    // ONE UF func backs MANY view funcs (every function with a column of
+    // that eq-sort), and the encoder emits one `@rebuild_rule` per view —
+    // all fused into THIS `run_iteration`. So the displaced sets must NOT be
+    // cleared here (that would starve the views processed after this one);
+    // instead `native_uf_drain_all` clears them once, at the iteration
+    // boundary, after every rebuild rule in this call has consumed them.
+    eg.native_uf_rebuild_ran = true;
     let mut envs: Vec<Env> = Vec::new();
-    for row in set.iter() {
-        // The `guard (or (bool-!= ci (@canon_S ci)))`: keep only rows where some
-        // eq-sort column's leader differs from the stored value.
+    for row in &candidates {
         if row_needs_rebuild(eg, row, &col_uf) {
             envs.push(bind_view_env(row, &var_col));
         }
@@ -866,8 +1046,8 @@ fn native_uf_rebuild_envs(
 
 /// The `@rebuild_rule` guard `(or (bool-!= ci (@canon_S ci)))`: true iff some
 /// eq-sort column's stored value is NOT its current UF leader (so the row is
-/// stale and must be re-canonicalized). The exactness check under both the
-/// full-scan and the `--fast-rebuild` scoped paths.
+/// stale and must be re-canonicalized). The exactness check for the custom
+/// host-pass rebuild (`native_uf_rebuild_envs`).
 fn row_needs_rebuild(eg: &EGraph, row: &Row, col_uf: &[(usize, FunctionId)]) -> bool {
     for &(ci, uf_func) in col_uf {
         let cur = row_col(row, ci);
@@ -876,38 +1056,6 @@ fn row_needs_rebuild(eg: &EGraph, row: &Row, col_uf: &[(usize, FunctionId)]) -> 
         }
     }
     false
-}
-
-/// The `δview ⋈ uf_old` seminaive probe over ONE new view row, for the FULL
-/// native-UF rebuild (`--native-uf` without `--fast-rebuild`).
-///
-/// Mirrors the per-row cost the relational rebuild's `δview ⋈ uf_old` term pays
-/// on a brand-new view row: that join canonicalizes EVERY eq-sort column (the
-/// head re-`set`s `(@CView (@canon c0) .. (@canon cn))`, so all of them are
-/// computed — no short-circuit) and materializes the candidate canonical tuple,
-/// which the rebuild rule's `(guard (or (bool-!= ci (@canon ci))))` then rejects
-/// because a new row is born canonical (every `find` returns the stored value).
-/// The result is discarded — it is the wasted work `--fast-rebuild` drops, kept
-/// here so `--native-uf` alone is the full rebuild. Returns whether the candidate
-/// differed (always `false` under canon-at-creation), so the caller / optimizer
-/// cannot elide the finds.
-fn probe_delta_view_row(eg: &EGraph, row: &Row, col_uf: &[(usize, FunctionId)]) -> bool {
-    // Materialize the candidate canonicalized row: copy the row, then overwrite
-    // each eq-sort column with its `find` leader (exactly the tuple the head
-    // `(set (@CView (@canon c0) ..))` would build before the guard rejects it).
-    let mut candidate: Vec<u32> = row.to_vec();
-    let mut differs = false;
-    for &(ci, uf_func) in col_uf {
-        let cur = row_col(row, ci);
-        let leader = eg.native_uf_find(uf_func, cur);
-        if ci < candidate.len() {
-            candidate[ci] = leader;
-        }
-        differs |= leader != cur;
-    }
-    // `differs` is `false` under canon-at-creation; returning it (rather than
-    // discarding) keeps the find loop observable so it is not optimized away.
-    differs && !candidate.is_empty()
 }
 
 /// Bind every view body var to its column value. `apply_head` then runs the
@@ -1117,14 +1265,14 @@ fn lookup_or_create(
     let mut full: Vec<u32> = key.iter().map(|v| v.rep()).collect();
     full.push(id);
     let row: Row = full.into_boxed_slice();
-    eg.index_insert_row(func, &row);
-    // δview (full native-UF rebuild only): a hash-consed VIEW row is a new row
-    // this iteration, so the `δview ⋈ uf_old` probe must visit it. Constructor
-    // creation in a rewrite head is a `lookup_or_create`, NOT a `set`, so this is
-    // the dominant source of δview on an eqsat workload. Skipped under
-    // fast-rebuild / relational mode (the probe never runs there).
-    if eg.native_uf_enabled && !eg.fast_rebuild && eg.native_uf_view_cols.contains_key(&func) {
-        eg.native_uf_delta_view.push((func, row.clone()));
+    // CUSTOM rebuild only: a hash-consed VIEW row is a new row this iteration, so
+    // add it to the reverse index (no-op unless this view func's index is built)
+    // so a later displaced-id scan can find it. The PURE-ENGINE path keeps no
+    // reverse index, and its DD-engine dview probe (`@rebuild_dview_probe*`)
+    // picks up the new row as δview on the NEXT iteration's fused `fed`-diff —
+    // so neither path needs host-side δview bookkeeping here.
+    if eg.native_uf_enabled && eg.fast_rebuild {
+        eg.index_insert_row(func, &row);
     }
     std::rc::Rc::make_mut(eg.mirror.entry(func).or_default()).insert(row);
     Value::new(id)
