@@ -601,7 +601,7 @@ def run_once(binary: Path, flags: list[str], bench: Path, timeout: float,
         except subprocess.TimeoutExpired:
             pass
         if report_file:
-            os.unlink(report_file.name)
+            Path(report_file.name).unlink(missing_ok=True)
         return {"error": f"timeout after {timeout}s"}
     elapsed = time.perf_counter() - start
 
@@ -611,7 +611,7 @@ def run_once(binary: Path, flags: list[str], bench: Path, timeout: float,
 
     if proc.returncode != 0:
         if report_file:
-            os.unlink(report_file.name)
+            Path(report_file.name).unlink(missing_ok=True)
         msg = _failure_msg((prog_stderr or "") + "\n" + (stdout or ""),
                            proc.returncode)
         return {"error": f"exit {proc.returncode}: {msg}"}
@@ -625,7 +625,7 @@ def run_once(binary: Path, flags: list[str], bench: Path, timeout: float,
         phases_raw = parse_feldera_prof(prog_stderr)
     elif capture_phases_for == "bridge" and report_file:
         phases_raw = parse_bridge_report(Path(report_file.name))
-        os.unlink(report_file.name)
+        Path(report_file.name).unlink(missing_ok=True)
 
     return {"elapsed": elapsed, "rss": rss,
             "stdout": stdout or "", "stderr": prog_stderr,
@@ -668,7 +668,9 @@ def measure_sizes(binary, bench, flags, env_extra, timeout):
         sizes = parse_sizes(out["stdout"] + "\n" + out["stderr"])
         return sizes, None
     finally:
-        os.unlink(tmp.name)
+        # tolerate a cleanup race: parallel cells + the binary's own --proofs
+        # runs can leave/remove tmp*.egg in the dir, so the temp may be gone
+        Path(tmp.name).unlink(missing_ok=True)
 
 
 _HEAD_ATOM_RE = re.compile(r"[^\s()\";]+")
@@ -843,7 +845,7 @@ def bench_cell(binary, bench, rel, condition, backend, mode, flags,
         return result
     finally:
         if tmp_bench is not None:
-            os.unlink(tmp_bench)
+            tmp_bench.unlink(missing_ok=True)
 
 
 def _failure_msg(text, returncode):
