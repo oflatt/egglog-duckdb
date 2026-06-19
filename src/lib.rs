@@ -3110,6 +3110,21 @@ impl<'a> BackendRule<'a> {
             ("to-string", "String", Some("i64")) => Some("i64-to-string"),
             ("to-string", "String", Some("f64")) => Some("f64-to-string"),
             ("to-string", "String", Some("BigInt")) => Some("bigint-to-string"),
+            // BigInt arithmetic overloads: `+`, `*`, ... on BigInt have
+            // no SQL equivalent (the operands are pool handles), so route
+            // each to a per-op UDF that unwraps/operates/interns. Match
+            // on the BigInt *output* type to disambiguate from the
+            // i64/f64 overloads of the same op name.
+            ("+", "BigInt", _) => Some("bigint-add"),
+            ("-", "BigInt", _) => Some("bigint-sub"),
+            ("*", "BigInt", _) => Some("bigint-mul"),
+            ("/", "BigInt", _) => Some("bigint-div"),
+            ("%", "BigInt", _) => Some("bigint-rem"),
+            ("&", "BigInt", _) => Some("bigint-and"),
+            ("|", "BigInt", _) => Some("bigint-or"),
+            ("^", "BigInt", _) => Some("bigint-xor"),
+            ("min", "BigInt", _) => Some("bigint-min"),
+            ("max", "BigInt", _) => Some("bigint-max"),
             // BigRat overloads: dispatch by op name and arg sort.
             // Comparisons return Unit; arithmetic returns BigRat;
             // numer/denom return BigInt; to-f64 returns f64. We use

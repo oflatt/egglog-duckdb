@@ -1640,6 +1640,34 @@ fn prim_sql(op: &str, args: &[String], rule_name: &str) -> Result<String> {
         "ordering-max" | "max" => func("GREATEST"),
         "ordering-min" | "min" => func("LEAST"),
         "abs" => func("ABS"),
+        "exp" => func("EXP"),
+        "log" => {
+            if args.len() != 1 {
+                return Err(anyhow!(
+                    "rule {rule_name}: primitive `log` expects 1 arg, got {}",
+                    args.len()
+                ));
+            }
+            // Partial: egglog `log` is defined only for a > 0 (None otherwise);
+            // mirror that with a domain guard so out-of-domain yields NULL.
+            Ok(format!(
+                "(CASE WHEN ({a}) > 0 THEN LN({a}) ELSE NULL END)",
+                a = args[0]
+            ))
+        }
+        "sqrt" => {
+            if args.len() != 1 {
+                return Err(anyhow!(
+                    "rule {rule_name}: primitive `sqrt` expects 1 arg, got {}",
+                    args.len()
+                ));
+            }
+            // Partial: defined only for a >= 0.
+            Ok(format!(
+                "(CASE WHEN ({a}) >= 0 THEN SQRT({a}) ELSE NULL END)",
+                a = args[0]
+            ))
+        }
         "%" => binop("%"),
         "neg" => unop("-"),
         "not-i64" => unop("~"),
@@ -1779,6 +1807,15 @@ fn prim_sql(op: &str, args: &[String], rule_name: &str) -> Result<String> {
         // `lib.rs`). The UDFs call into the shared base-value pool to
         // intern the parsed/constructed value and return its `Value`
         // rep as a BIGINT handle.
+        "bigint" => {
+            if args.len() != 1 {
+                return Err(anyhow!(
+                    "rule {rule_name}: primitive `bigint` expects 1 arg, got {}",
+                    args.len()
+                ));
+            }
+            Ok(format!("__egglog_bigint({})", args[0]))
+        }
         "from-string" => {
             if args.len() != 1 {
                 return Err(anyhow!(
@@ -1819,6 +1856,16 @@ fn prim_sql(op: &str, args: &[String], rule_name: &str) -> Result<String> {
         // name uses `_` instead of `-` to keep it as a valid SQL
         // identifier — same convention as `sanitize_for_udf`.
         s if s.starts_with("bigrat-") => {
+            let udf = format!("__egglog_{}", s.replace('-', "_"));
+            Ok(format!("{udf}({})", args.join(", ")))
+        }
+        // BigInt arithmetic aliases — the frontend renames the
+        // BigInt-overloaded `+`, `*`, ... call sites to `bigint-add`,
+        // `bigint-mul`, ... (a raw SQL `+` would do pool-index math, not
+        // BigInt math). Route them to the per-op UDFs registered by
+        // `register_builtin_prim_udf` (see `lib.rs`), same `-`→`_`
+        // identifier convention as the bigrat aliases.
+        s if s.starts_with("bigint-") => {
             let udf = format!("__egglog_{}", s.replace('-', "_"));
             Ok(format!("{udf}({})", args.join(", ")))
         }

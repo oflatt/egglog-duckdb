@@ -162,6 +162,50 @@ impl VScalar for FromStringScalar {
     }
 }
 
+/// UDF for the `bigint` primitive (egglog's `i64 -> Z` constructor for
+/// `BigInt`). Takes a BIGINT row holding a raw `i64`, widens it into a
+/// `num::BigInt`, and interns the result as `Z = Boxed<BigInt>` in the
+/// shared base-value pool. Returns the `Value`'s `u32` rep widened to
+/// `BIGINT`. Total (infallible), so no NULL handling like `from-string`.
+struct BigintConstructorScalar;
+
+impl VScalar for BigintConstructorScalar {
+    type State = BigPoolState;
+
+    unsafe fn invoke(
+        state: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        unsafe {
+            use egglog_backend_trait::BaseValuePool;
+            use egglog_numeric_id::NumericId;
+            use num::BigInt;
+
+            let n = input.len();
+            let in_vec = input.flat_vector(0);
+            let in_slice = in_vec.as_slice_with_len::<i64>(n);
+
+            let mut out_vec = output.flat_vector();
+            let out_slice = out_vec.as_mut_slice::<i64>();
+
+            for i in 0..n {
+                let z = egglog_core_relations::Boxed::new(BigInt::from(in_slice[i]));
+                let val = state.pool.intern_dyn(state.bigint_ty, Box::new(z));
+                out_slice[i] = val.rep() as i64;
+            }
+            Ok(())
+        }
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeHandle::from(LogicalTypeId::Bigint)],
+            LogicalTypeHandle::from(LogicalTypeId::Bigint),
+        )]
+    }
+}
+
 /// UDF for the `bigrat` primitive (egglog's `Z × Z -> Q` constructor
 /// for `BigRat`). Inputs are two `BIGINT` columns holding `Z` handles
 /// produced by `__egglog_from_string` (or any other source); the UDF
@@ -670,6 +714,167 @@ impl VScalar for BigratNumDenomScalar {
     fn signatures() -> Vec<ScalarFunctionSignature> {
         vec![ScalarFunctionSignature::exact(
             vec![LogicalTypeHandle::from(LogicalTypeId::Bigint)],
+            LogicalTypeHandle::from(LogicalTypeId::Bigint),
+        )]
+    }
+}
+
+/// BigInt binary `Z × Z → Z` operations that need a UDF wrapper for
+/// the same reason as [`BigratOp`]: their egglog name (`+`, `*`, …) is
+/// overloaded across sorts, and DuckDB SQL has no arbitrary-precision
+/// integers (a raw SQL `+` on the BIGINT *handle* columns would do
+/// pool-index arithmetic, not BigInt math). The frontend renames each
+/// BigInt call site to a sort-specific duck name (`bigint-mul`, …);
+/// each variant here selects the operation the UDF performs.
+#[derive(Copy, Clone, Debug)]
+enum BigintOp {
+    Add,
+    Sub,
+    Mul,
+    // Div / Rem are fallible (None on divide-by-zero), matching the
+    // bridge's `-?>` semantics in `egglog::sort::bigint`.
+    Div,
+    Rem,
+    And,
+    Or,
+    Xor,
+    Min,
+    Max,
+}
+
+impl BigintOp {
+    fn from_duck_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "bigint-add" => BigintOp::Add,
+            "bigint-sub" => BigintOp::Sub,
+            "bigint-mul" => BigintOp::Mul,
+            "bigint-div" => BigintOp::Div,
+            "bigint-rem" => BigintOp::Rem,
+            "bigint-and" => BigintOp::And,
+            "bigint-or" => BigintOp::Or,
+            "bigint-xor" => BigintOp::Xor,
+            "bigint-min" => BigintOp::Min,
+            "bigint-max" => BigintOp::Max,
+            _ => return None,
+        })
+    }
+}
+
+/// State for the family of bigint arithmetic UDFs. Holds a clone of
+/// the pool (intern tables Arc-shared with the EGraph), the `Z`
+/// `BaseValueId`, and the specific op this UDF instance performs.
+#[derive(Clone)]
+struct BigintExecState {
+    pool: base_values::DuckdbBaseValuePool,
+    bigint_ty: egglog_backend_trait::BaseValueId,
+    op: BigintOp,
+}
+
+/// Run a binary BigInt → BigInt operation. Returns `Some(Z)` on
+/// success, `None` for fallible ops on bad inputs (`/` or `%` by zero)
+/// so the UDF emits SQL NULL and downstream rules drop via NULL
+/// propagation. Mirrors the bridge-side closures in
+/// `egglog::sort::bigint::register_primitives`.
+fn run_bigint(op: BigintOp, a: &num::BigInt, b: &num::BigInt) -> Option<num::BigInt> {
+    use num::Zero;
+    Some(match op {
+        BigintOp::Add => a + b,
+        BigintOp::Sub => a - b,
+        BigintOp::Mul => a * b,
+        BigintOp::Div => {
+            if b.is_zero() {
+                return None;
+            }
+            a / b
+        }
+        BigintOp::Rem => {
+            if b.is_zero() {
+                return None;
+            }
+            a % b
+        }
+        BigintOp::And => a & b,
+        BigintOp::Or => a | b,
+        BigintOp::Xor => a ^ b,
+        BigintOp::Min => a.min(b).clone(),
+        BigintOp::Max => a.max(b).clone(),
+    })
+}
+
+/// Unwrap a `Z`-handle (BIGINT) row into a `BigInt`.
+fn unwrap_bigint(
+    pool: &base_values::DuckdbBaseValuePool,
+    bigint_ty: egglog_backend_trait::BaseValueId,
+    raw: i64,
+) -> std::result::Result<num::BigInt, Box<dyn std::error::Error>> {
+    use egglog_backend_trait::{BaseValuePool, Value};
+    use egglog_numeric_id::NumericId;
+    let val = Value::new(raw as u32);
+    let boxed = pool.unwrap_dyn(bigint_ty, val);
+    let z: &egglog_core_relations::Boxed<num::BigInt> =
+        boxed
+            .downcast_ref()
+            .ok_or_else(|| -> Box<dyn std::error::Error> {
+                "expected Boxed<BigInt> from pool".into()
+            })?;
+    Ok(z.0.clone())
+}
+
+/// UDF for binary `Z × Z → Z` bigint operations. Variants of
+/// [`BigintOp`]; fallible ops emit SQL NULL on bad inputs.
+struct BigintBinaryScalar;
+
+impl VScalar for BigintBinaryScalar {
+    type State = BigintExecState;
+
+    unsafe fn invoke(
+        state: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        unsafe {
+            use egglog_backend_trait::BaseValuePool;
+            use egglog_numeric_id::NumericId;
+            let n = input.len();
+            let a_vec = input.flat_vector(0);
+            let b_vec = input.flat_vector(1);
+            let a_slice = a_vec.as_slice_with_len::<i64>(n);
+            let b_slice = b_vec.as_slice_with_len::<i64>(n);
+
+            let mut results: Vec<Option<i64>> = Vec::with_capacity(n);
+            for i in 0..n {
+                let a = unwrap_bigint(&state.pool, state.bigint_ty, a_slice[i])?;
+                let b = unwrap_bigint(&state.pool, state.bigint_ty, b_slice[i])?;
+                results.push(run_bigint(state.op, &a, &b).map(|r| {
+                    let boxed = egglog_core_relations::Boxed::new(r);
+                    state
+                        .pool
+                        .intern_dyn(state.bigint_ty, Box::new(boxed))
+                        .rep() as i64
+                }));
+            }
+            let mut out_vec = output.flat_vector();
+            {
+                let out_slice = out_vec.as_mut_slice::<i64>();
+                for (i, r) in results.iter().enumerate() {
+                    out_slice[i] = r.unwrap_or(0);
+                }
+            }
+            for (i, r) in results.iter().enumerate() {
+                if r.is_none() {
+                    out_vec.set_null(i);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![
+                LogicalTypeHandle::from(LogicalTypeId::Bigint),
+                LogicalTypeHandle::from(LogicalTypeId::Bigint),
+            ],
             LogicalTypeHandle::from(LogicalTypeId::Bigint),
         )]
     }
@@ -2586,6 +2791,18 @@ impl EGraph {
             None
         };
         let result: duckdb::Result<()> = match name {
+            "bigint" => {
+                let state = BigPoolState {
+                    pool: self.backend_base_value_pool.clone(),
+                    bigint_ty,
+                    bigrat_ty,
+                };
+                self.conn
+                    .register_scalar_function_with_state::<BigintConstructorScalar>(
+                        "__egglog_bigint",
+                        &state,
+                    )
+            }
             "from-string" => {
                 let state = BigPoolState {
                     pool: self.backend_base_value_pool.clone(),
@@ -2619,6 +2836,17 @@ impl EGraph {
                         "__egglog_get_size",
                         &state,
                     )
+            }
+            other if BigintOp::from_duck_name(other).is_some() => {
+                let op = BigintOp::from_duck_name(other).unwrap();
+                let state = BigintExecState {
+                    pool: self.backend_base_value_pool.clone(),
+                    bigint_ty,
+                    op,
+                };
+                let udf_name = format!("__egglog_{}", other.replace('-', "_"));
+                self.conn
+                    .register_scalar_function_with_state::<BigintBinaryScalar>(&udf_name, &state)
             }
             other if BigratOp::from_duck_name(other).is_some() => {
                 let Some(bigrat_ty) = bigrat_ty else { return };
