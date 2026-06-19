@@ -941,7 +941,7 @@ fn build_cq_plan(plan: &JoinPlan, atom_vars: &[Vec<u32>]) -> Option<CqPlan> {
 /// Detect a general WCOJ-worthy body: a >=3-atom CYCLIC query for which a
 /// bit-exact WCOJ plan is constructible. Returns the plan, or `None` (stay on
 /// the binary chain). See the module note above for the criteria.
-pub(crate) fn detect_cyclic_cq(plan: &JoinPlan) -> Option<CqPlan> {
+pub(crate) fn detect_cyclic_cq(plan: &JoinPlan, allow_acyclic: bool) -> Option<CqPlan> {
     let trace = std::env::var_os("FLOWLOG_WCOJ_TRACE").is_some();
     if plan.atoms.len() < 3 {
         return None;
@@ -973,7 +973,10 @@ pub(crate) fn detect_cyclic_cq(plan: &JoinPlan) -> Option<CqPlan> {
             plan.atoms.len()
         );
     }
-    if !cyclic {
+    // Broadening WCOJ to acyclic >=3-atom rules is off by default (callers
+    // pass `allow_acyclic: false`). Tests that verify acyclic correctness
+    // pass `true` explicitly.
+    if !cyclic && !allow_acyclic {
         return None;
     }
     let plan_out = build_cq_plan(plan, &atom_vars);
@@ -1299,6 +1302,7 @@ impl FusedDdJoin {
         transient_funcs: &HashSet<FunctionId>,
         delta_rebuild: bool,
         wcoj: bool,
+        allow_acyclic: bool,
     ) -> Result<FusedDdJoin> {
         let alloc = Allocator::Thread(Thread::default());
         let mut worker = Worker::new(
@@ -1357,7 +1361,7 @@ impl FusedDdJoin {
                 // triangle never also takes the general path.
                 let triangle = if wcoj { detect_triangle(plan) } else { None };
                 let cq = if wcoj && triangle.is_none() {
-                    detect_cyclic_cq(plan)
+                    detect_cyclic_cq(plan, allow_acyclic)
                 } else {
                     None
                 };
@@ -2098,13 +2102,31 @@ fn wcoj_cq_collection<'scope>(
                         };
                         let key_atom_cols = e.key_atom_cols.clone();
                         let propose_col = e.propose_col;
-                        CollectionIndex::index(src.map(move |r: Row| {
-                            let mut k = empty_row();
-                            for (i, &c) in key_atom_cols.iter().enumerate() {
-                                k[i] = r[c];
-                            }
-                            (k, r[propose_col])
-                        }))
+                        // A JOIN-var proposal is SET-semantic: "does this atom hold
+                        // a row with these key cols proposing this var?" — weight 1,
+                        // regardless of how many full rows witness it. Without the
+                        // `.distinct()`, an atom carrying PAYLOAD (or any) columns
+                        // beyond (key, propose) yields the SAME (K,V) pair once per
+                        // such row, and `propose`/`validate` MULTIPLY the prefix
+                        // weight by that multiplicity (the `propose`/`validate`
+                        // traces are non-distinct; only `count` is). That
+                        // over-counted the acyclic star/path bodies (e.g. two F-rows
+                        // sharing (v0,v1) doubled the binding weight). Dedup the
+                        // (K,V) pairs so the proposal is exactly the SET of valid
+                        // extensions. (Payload values are recovered separately, in
+                        // the `recovers` step below, where multiplicity is correct.)
+                        let kv = src
+                            .map(move |r: Row| {
+                                let mut k = empty_row();
+                                for (i, &c) in key_atom_cols.iter().enumerate() {
+                                    k[i] = r[c];
+                                }
+                                (k, r[propose_col])
+                            })
+                            .map(|kv| (kv, ()))
+                            .distinct()
+                            .map(|(kv, ())| kv);
+                        CollectionIndex::index(kv)
                     })
                     .collect();
 
@@ -2437,6 +2459,142 @@ mod tests {
         }
     }
 
+    /// Feed one all-at-once delta of `rows` per func into a fresh `FusedDdJoin`
+    /// (single rule idx 0, plan rebuilt from `atoms`), returning the rule's
+    /// sorted output bindings.
+    fn run_once(
+        atoms: &[(FunctionId, &[u32])],
+        wcoj: bool,
+        rows: &HashMap<FunctionId, Vec<(Vec<u32>, isize)>>,
+    ) -> Vec<(Vec<u32>, isize)> {
+        let plan = plan_of(atoms);
+        let mut j =
+            FusedDdJoin::build(&[(0usize, plan)], &HashSet::new(), false, wcoj, true).unwrap();
+        let mut out = j.step(rows).unwrap().remove(0);
+        out.sort();
+        out
+    }
+
+    /// ACYCLIC >=3-atom bodies must be bit-exact under the general WCOJ
+    /// construction (broadened past the cyclic-only gate). We compare the WCOJ
+    /// output against the binary chain (ground truth) row-for-row, on several
+    /// acyclic shapes that previously over-derived (cross-product). The WCOJ
+    /// detector is forced on for the acyclic shapes via `allow_acyclic: true`
+    /// (production uses `false`; the test helper `run_once` passes `true`).
+    #[test]
+    fn wcoj_acyclic_bit_exact_vs_binary() {
+        let f = FunctionId::new(0);
+        let g = FunctionId::new(1);
+        let h = FunctionId::new(2);
+
+        // --- Shape 1: 3-atom STAR  F(v0,v1,v2), G(v0,v3), H(v1,v4) ----------
+        {
+            let atoms: &[(FunctionId, &[u32])] = &[(f, &[0, 1, 2]), (g, &[0, 3]), (h, &[1, 4])];
+            assert!(
+                detect_cyclic_cq(&plan_of(atoms), true).is_some(),
+                "star fires WCOJ"
+            );
+            let mut rows = HashMap::new();
+            rows.insert(
+                f,
+                vec![
+                    (vec![1, 2, 100], 1),
+                    (vec![1, 2, 101], 1),
+                    (vec![1, 3, 102], 1),
+                ],
+            );
+            rows.insert(
+                g,
+                vec![(vec![1, 10], 1), (vec![1, 11], 1), (vec![7, 70], 1)],
+            );
+            rows.insert(
+                h,
+                vec![(vec![2, 20], 1), (vec![3, 21], 1), (vec![9, 99], 1)],
+            );
+            let want = run_once(atoms, false, &rows);
+            let got = run_once(atoms, true, &rows);
+            assert_eq!(got, want, "STAR-3 acyclic WCOJ must match binary");
+        }
+
+        // --- Shape 1 with SELF-JOIN: F(v0,v1,v2), G(v0,v3), G(v1,v4) --------
+        {
+            let atoms: &[(FunctionId, &[u32])] = &[(f, &[0, 1, 2]), (g, &[0, 3]), (g, &[1, 4])];
+            assert!(
+                detect_cyclic_cq(&plan_of(atoms), true).is_some(),
+                "self-join star fires WCOJ"
+            );
+            let mut rows = HashMap::new();
+            rows.insert(
+                f,
+                vec![
+                    (vec![1, 2, 100], 1),
+                    (vec![1, 3, 101], 1),
+                    (vec![4, 2, 102], 1),
+                ],
+            );
+            rows.insert(
+                g,
+                vec![
+                    (vec![1, 10], 1),
+                    (vec![1, 11], 1),
+                    (vec![2, 20], 1),
+                    (vec![3, 21], 1),
+                    (vec![4, 40], 1),
+                    (vec![9, 99], 1),
+                ],
+            );
+            let want = run_once(atoms, false, &rows);
+            let got = run_once(atoms, true, &rows);
+            assert_eq!(got, want, "STAR-3 self-join acyclic WCOJ must match binary");
+        }
+
+        // --- Shape 2: 4-atom STAR (3-way self-join) -------------------------
+        // F(v0,v1,v2,v3), G(v0,v4), G(v1,v5), G(v2,v6)
+        {
+            let atoms: &[(FunctionId, &[u32])] =
+                &[(f, &[0, 1, 2, 3]), (g, &[0, 4]), (g, &[1, 5]), (g, &[2, 6])];
+            assert!(
+                detect_cyclic_cq(&plan_of(atoms), true).is_some(),
+                "4-star fires WCOJ"
+            );
+            let mut rows = HashMap::new();
+            rows.insert(f, vec![(vec![1, 2, 3, 100], 1), (vec![1, 2, 8, 101], 1)]);
+            rows.insert(
+                g,
+                vec![
+                    (vec![1, 10], 1),
+                    (vec![1, 11], 1),
+                    (vec![2, 20], 1),
+                    (vec![3, 30], 1),
+                    (vec![8, 80], 1),
+                    (vec![9, 99], 1),
+                ],
+            );
+            let want = run_once(atoms, false, &rows);
+            let got = run_once(atoms, true, &rows);
+            assert_eq!(got, want, "STAR-4 acyclic WCOJ must match binary");
+        }
+
+        // --- Shape 3: 3-atom PATH  R(a,b), S(b,c), T(c,d) -------------------
+        {
+            let r = FunctionId::new(3);
+            let s = FunctionId::new(4);
+            let t = FunctionId::new(5);
+            let atoms: &[(FunctionId, &[u32])] = &[(r, &[0, 1]), (s, &[1, 2]), (t, &[2, 3])];
+            assert!(
+                detect_cyclic_cq(&plan_of(atoms), true).is_some(),
+                "path fires WCOJ"
+            );
+            let mut rows = HashMap::new();
+            rows.insert(r, vec![(vec![1, 2], 1), (vec![1, 5], 1), (vec![9, 2], 1)]);
+            rows.insert(s, vec![(vec![2, 3], 1), (vec![5, 6], 1), (vec![2, 7], 1)]);
+            rows.insert(t, vec![(vec![3, 4], 1), (vec![6, 8], 1), (vec![7, 100], 1)]);
+            let want = run_once(atoms, false, &rows);
+            let got = run_once(atoms, true, &rows);
+            assert_eq!(got, want, "PATH-3 acyclic WCOJ must match binary");
+        }
+    }
+
     /// The general WCOJ detector: fires on cyclic >=3-atom bodies, falls back to
     /// the binary chain (returns `None`) on 2-atom / acyclic / const shapes.
     #[test]
@@ -2445,18 +2603,18 @@ mod tests {
         let s = FunctionId::new(1);
 
         // 2 atoms: never WCOJ (acyclic, no blowup).
-        assert!(detect_cyclic_cq(&plan_of(&[(r, &[0, 1]), (s, &[1, 2])])).is_none());
+        assert!(detect_cyclic_cq(&plan_of(&[(r, &[0, 1]), (s, &[1, 2])]), false).is_none());
 
         // 3-atom ACYCLIC (a path a-b-c-d): stays on the binary chain.
         let path = plan_of(&[(r, &[0, 1]), (r, &[1, 2]), (r, &[2, 3])]);
         assert!(!is_cyclic_cq(&[vec![0, 1], vec![1, 2], vec![2, 3]]));
-        assert!(detect_cyclic_cq(&path).is_none());
+        assert!(detect_cyclic_cq(&path, false).is_none());
 
         // 3-atom triangle (cyclic): fires the general path, with one delta query
         // per atom and every join var bound.
         let tri = plan_of(&[(r, &[0, 1]), (r, &[1, 2]), (r, &[2, 0])]);
         assert!(is_cyclic_cq(&[vec![0, 1], vec![1, 2], vec![2, 0]]));
-        let cq = detect_cyclic_cq(&tri).expect("triangle is a cyclic CQ");
+        let cq = detect_cyclic_cq(&tri, false).expect("triangle is a cyclic CQ");
         assert_eq!(cq.drivers.len(), 3, "one delta query per atom");
 
         // 4-clique-with-payload (term-encoding shape: each edge atom carries a
@@ -2469,7 +2627,7 @@ mod tests {
             (r, &[1, 3, 14, 24]),
             (r, &[2, 3, 15, 25]),
         ]);
-        let cqc = detect_cyclic_cq(&clique).expect("4-clique is a cyclic CQ");
+        let cqc = detect_cyclic_cq(&clique, false).expect("4-clique is a cyclic CQ");
         assert_eq!(cqc.drivers.len(), 6);
         // Each driver recovers every NON-driver atom's payload (n_atoms-1).
         for d in &cqc.drivers {

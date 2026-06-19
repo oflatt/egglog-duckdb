@@ -499,7 +499,8 @@ fn fused_bindings(
         // ruleset keep the binary `.join` chain (hybrid). Off ⇒ byte-identical
         // to the pre-WCOJ build.
         let wcoj = eg.wcoj_enabled;
-        let fused = dd_native::FusedDdJoin::build(&plans, &transient_funcs, delta_rebuild, wcoj)?;
+        let fused =
+            dd_native::FusedDdJoin::build(&plans, &transient_funcs, delta_rebuild, wcoj, false)?;
         eg.dd_fused.insert(key.clone(), fused);
     }
 
