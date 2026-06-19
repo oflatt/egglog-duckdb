@@ -169,15 +169,12 @@ pub fn cli(mut egraph: EGraph) {
     // onchange-driven rebuild rules. All backends support `--native-uf`.
     // Native-UF on the dataflow/SQL backends is TERM mode only (proofs are a
     // later step; `--proofs` is supported only on the native bridge).
-    if args.native_uf
-        && (args.flowlog_backend || args.feldera_backend || args.duckdb_backend)
-        && args.proofs
-    {
-        log::error!(
-            "--native-uf with --flowlog/--feldera/--duckdb is TERM mode only; --proofs is not yet supported"
-        );
-        std::process::exit(1);
-    }
+    // native-UF + proofs validates on the native bridge, feldera, AND flowlog:
+    // proofs are tracked at the ENCODING level (proof_encoding.rs), independent of
+    // whether the host drives a native-UF host-pass rebuild (verified via
+    // --proof-testing). Only the DuckDB backend can't yet build proof-mode
+    // native-UF functions; it rejects those precisely on its own (clean error, and
+    // only for the files that actually need them), so no blanket CLI guard here.
 
     // `--wcoj` is a FlowLog-only knob (the worst-case-optimal triangle delta
     // query lives in the FlowLog DD backend). Reject it on any other path so a
@@ -419,6 +416,13 @@ pub fn cli(mut egraph: EGraph) {
                     backend_eg = backend_eg.with_native_uf();
                 }
                 backend_eg.parser = std::mem::take(&mut egraph.parser);
+                // Carry over the experimental user-defined commands (run-schedule,
+                // multi-extract) that egglog-experimental registered. The parser
+                // taken above routes `(run-schedule ...)` to a UserDefinedCommand,
+                // so without the command registry it fails "Unrecognized
+                // user-defined command: run-schedule". (The duckdb path keeps these
+                // by pre-building + extending in main.rs; this rebuild dropped them.)
+                backend_eg.commands = std::mem::take(&mut egraph.commands);
                 backend_eg.fact_directory.clone_from(&args.fact_directory);
                 backend_eg.ensure_no_reserved_symbols(false);
                 match backend_eg
