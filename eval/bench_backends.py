@@ -175,19 +175,21 @@ def conditions():
         - +nuf         : native UF,     pure-engine rebuild              (--native-uf)
         - +nuf+fastrb  : native UF,     specialized rebuild              (--native-uf --fast-rebuild)
 
-    NEW axis -- WCOJ (`--wcoj`), flowlog TERM-ENCODING ONLY:
-    * Worst-case-optimal join. The `--wcoj` flag is rejected on every backend
-      except flowlog, so we cross it in ONLY for flowlog -- and ONLY on its
-      term-encoding cells: each flowlog term-encoding rebuild cell additionally
-      gets a `+wcoj` variant (`--wcoj` appended to the flags, `+wcoj` to the
-      label). So flowlog's term cells become {plain, +fastrb, +nuf,
-      +nuf+fastrb} x {no-wcoj, +wcoj} = 8 cells; its proofs cells get NO `+wcoj`
-      variant. Proof mode is excluded on purpose: WCOJ is a term-encoding join
-      optimization untested under proofs, and parity only checks the print-size
-      (tuple-count) block, so a flowlog-proofs+wcoj cell with WRONG proof terms
-      but matching tuple counts would FALSE-PASS. WCOJ is correctness-
-      preserving on the term cells, so it diffs against the same family
-      reference (REFERENCE_BY_FAMILY is unchanged).
+    PROOFS is a FULL orthogonal axis. `--proofs` is crossed with every treatment
+    combo, on every backend that supports it, and the eval measures `--proofs`
+    PERFORMANCE (the proof-instrumented term encoding). Proof CORRECTNESS is
+    validated separately by tests/files.rs (proof_testing), NOT re-extracted
+    per-cell here -- so there is no false-pass concern from the tuple-count parity.
+    native-UF + proofs validates on bridge, feldera, and flowlog (verified via
+    --proof-testing); only duckdb can't build proof-mode native-UF functions, so
+    its proofs cells get no `+nuf` variant (see `nuf_ok`).
+
+    WCOJ (`--wcoj`): worst-case-optimal join, flowlog-only (rejected elsewhere).
+    Crossed into BOTH flowlog term-encoding AND proofs cells: proofs+wcoj is
+    validated sound (the WCOJ join path preserves proof terms -- verified via
+    --proof-testing on a cyclic-CQ-with-check file). So every flowlog term/proof
+    rebuild cell gets a `+wcoj` variant. WCOJ is correctness-preserving, so it
+    diffs against the same family reference (REFERENCE_BY_FAMILY is unchanged).
 
     The condition label carries the extra axes: "+nuf" for native-UF,
     "+fastrb" for fast-rebuild, "+wcoj" for the WCOJ join. The bare base label
@@ -215,10 +217,11 @@ def conditions():
                 yield (base_label, backend, encoding, list(base_flags), False, False)
                 continue
 
-            # `--native-uf` supports `--proofs` only on the native bridge; on
-            # the dataflow/SQL backends it is TERM mode only, so skip the
-            # degenerate +nuf-on-proofs cells there.
-            nuf_ok = (encoding == "term-encoding") or (backend == "bridge")
+            # native-UF + proofs validates on bridge, feldera, AND flowlog (proofs
+            # are tracked at the encoding level, independent of the host-pass
+            # rebuild -- verified via --proof-testing). Only duckdb can't build
+            # proof-mode native-UF functions, so exclude its +nuf-on-proofs cells.
+            nuf_ok = (encoding == "term-encoding") or (backend != "duckdb")
 
             # The four rebuild cells (suffix, native_uf, fast_rebuild). All four
             # are real, distinct, and bit-exact. +fastrb / +nuf+fastrb add the
@@ -233,13 +236,12 @@ def conditions():
                     ("+nuf+fastrb", True, True),   # native UF, specialized rebuild
                 ]
 
-            # WCOJ cross-product: flowlog TERM-ENCODING cells ONLY. Other
-            # backends reject --wcoj, and proof mode is intentionally excluded:
-            # WCOJ is a term-encoding join optimization untested under proofs,
-            # and the eval only checks the print-size (tuple-count) block, so a
-            # flowlog-proofs+wcoj cell with WRONG proof terms but matching tuple
-            # counts would FALSE-PASS. So gate on the term encoding.
-            if backend == "flowlog" and encoding == "term-encoding":
+            # WCOJ cross-product: flowlog ONLY (other backends reject --wcoj), now
+            # crossed into BOTH term-encoding and proofs cells. proofs+wcoj is
+            # validated sound (the WCOJ join path preserves proof terms -- verified
+            # via --proof-testing on a cyclic-CQ-with-check file); the eval measures
+            # --proofs perf and tests/files.rs validates proof correctness.
+            if backend == "flowlog":
                 wcoj_variants = [("", []), ("+wcoj", ["--wcoj"])]
             else:
                 wcoj_variants = [("", [])]
@@ -267,6 +269,10 @@ class BenchDB:
         # from `errors` so the errors table shows only real backend failures on
         # supported files, not noise from whole files we chose not to benchmark.
         self.skipped = []
+        # Cell-level capability gaps: a (condition, file) that failed because the
+        # backend/encoding doesn't support a feature the file uses. Separate from
+        # `errors` (reserved for UNEXPECTED failures / real bugs).
+        self.unsupported = []
         # Provenance: "paper-sequential" (accurate, uncontended) vs
         # "parallel-Njobs" (fast coverage, contended -> inflated wall-times).
         self.timing_mode = timing_mode
@@ -313,10 +319,20 @@ class BenchDB:
     def add_skip(self, benchmark, reason):
         self.skipped.append({"benchmark": benchmark, "reason": reason})
 
+    def add_unsupported(self, benchmark, backend, mode, condition, reason):
+        # A cell that failed because the backend/encoding doesn't support a
+        # feature the file uses (run-schedule, push/pop, proofs-incompatible
+        # commands, timeout). Kept OUT of `errors` so that table shows only
+        # unexpected failures (real bugs).
+        self.unsupported.append({
+            "benchmark": benchmark, "backend": backend, "mode": mode,
+            "condition": condition, "reason": reason,
+        })
+
     def to_dict(self):
         return {"timing_mode": self.timing_mode,
                 "timings": self.timings, "errors": self.errors,
-                "skipped": self.skipped}
+                "skipped": self.skipped, "unsupported": self.unsupported}
 
     def save_json(self, path):
         Path(path).write_text(json.dumps(self.to_dict(), indent=2))
@@ -369,7 +385,12 @@ def find_benchmarks(path: Path) -> list[Path]:
     # are not benchmarks -- running them only adds expected-failure noise. (Do
     # NOT filter by the bare "fail" substring: container-fail.egg and
     # repro-small-rebuild-fail-term-encoding.egg are positive tests.)
-    return sorted(p for p in path.rglob("*.egg") if "fail-typecheck" not in str(p))
+    # Also drop leaked eval temp files: `measure_sizes` / extract-strip write
+    # `tmp<8 chars>.egg` into the bench dir and unlink them on clean exit, but a
+    # KILLED run can leak them into the corpus.
+    return sorted(p for p in path.rglob("*.egg")
+                  if "fail-typecheck" not in str(p)
+                  and not re.fullmatch(r"tmp[a-z0-9_]{8}\.egg", p.name))
 
 
 # --- Per-phase profile: bucket per-ruleset/per-class times into a uniform
@@ -590,8 +611,8 @@ def run_once(binary: Path, flags: list[str], bench: Path, timeout: float,
     if proc.returncode != 0:
         if report_file:
             os.unlink(report_file.name)
-        tail = (prog_stderr or stdout or "").strip().splitlines()
-        msg = tail[-1] if tail else f"exit code {proc.returncode}"
+        msg = _failure_msg((prog_stderr or "") + "\n" + (stdout or ""),
+                           proc.returncode)
         return {"error": f"exit {proc.returncode}: {msg}"}
 
     phases_raw = {}
@@ -649,6 +670,84 @@ def measure_sizes(binary, bench, flags, env_extra, timeout):
         os.unlink(tmp.name)
 
 
+_HEAD_ATOM_RE = re.compile(r"[^\s()\";]+")
+
+
+def _skip_string(src, i):
+    """src[i] == '\"'; return the index just past the closing quote."""
+    j, n = i + 1, len(src)
+    while j < n:
+        if src[j] == "\\":
+            j += 2
+            continue
+        if src[j] == '"':
+            return j + 1
+        j += 1
+    return n
+
+
+def _form_end(src, i):
+    """src[i] == '('; return the index just past the matching ')'."""
+    depth, j, n = 0, i, len(src)
+    while j < n:
+        c = src[j]
+        if c == '"':
+            j = _skip_string(src, j)
+            continue
+        if c == ";":
+            k = src.find("\n", j)
+            j = n if k == -1 else k
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+        j += 1
+    return n
+
+
+def _head_atom(form):
+    """First token after the opening '(' of a form (the command head)."""
+    m = _HEAD_ATOM_RE.match(form[1:].lstrip())
+    return m.group(0) if m else ""
+
+
+def strip_extract_commands(src):
+    """Remove top-level `(extract ...)` commands. `extract` is OUTPUT-ONLY -- it
+    prints an extracted term and does NOT modify the e-graph, so removing it
+    leaves tuple counts (parity) unchanged. Several backends/encodings can't run
+    extraction (feldera/flowlog, duckdb extract-of-expr, proofs), so the eval
+    strips it to measure eqsat perf instead of erroring on output. Respects `;`
+    comments and `"..."` string literals; only TOP-LEVEL `extract` forms go."""
+    out = []
+    i, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        if c == ";":
+            j = src.find("\n", i)
+            j = n if j == -1 else j + 1
+            out.append(src[i:j])
+            i = j
+        elif c == '"':
+            j = _skip_string(src, i)
+            out.append(src[i:j])
+            i = j
+        elif c == "(":
+            j = _form_end(src, i)
+            if _head_atom(src[i:j]) == "extract":
+                if j < n and src[j] == "\n":   # swallow the trailing newline
+                    j += 1
+            else:
+                out.append(src[i:j])
+            i = j
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
 def bench_cell(binary, bench, rel, condition, backend, mode, flags,
                native_uf, fast_rebuild, warmup, runs, timeout):
     """Run one matrix cell: `warmup` discarded runs, `runs` timed runs (each
@@ -681,48 +780,120 @@ def bench_cell(binary, bench, rel, condition, backend, mode, flags,
         " ".join(f"{k}={v}" for k, v in sorted(rebuild_env.items())),
         Path(binary).name, *flags, rel]))
 
-    # Warm-up runs (discarded): pay one-time costs (page cache, etc.). Warm the
-    # treatment's actual rebuild path; skip the profile dump (warmup is untimed).
-    for _ in range(warmup):
-        run_once(binary, flags, bench, timeout, env_extra=rebuild_env)
+    # Strip top-level `(extract ...)` commands: they are OUTPUT-ONLY (don't
+    # change the e-graph, so tuple-count parity is unchanged) and several
+    # backends/encodings can't run extraction (feldera/flowlog, duckdb
+    # extract-of-expr, proofs). Run a stripped copy so the cell measures eqsat
+    # perf instead of erroring on output. Applies to EVERY cell (incl. the
+    # bridge-normal reference), so parity stays apples-to-apples.
+    src = bench.read_text()
+    stripped = strip_extract_commands(src)
+    tmp_bench = None
+    if stripped != src:
+        st = tempfile.NamedTemporaryFile(suffix=".egg", delete=False, mode="w",
+                                         dir=str(bench.parent))
+        st.write(stripped)
+        st.close()
+        tmp_bench = Path(st.name)
+        bench = tmp_bench
 
-    timings = []
-    rss_vals = []
-    phase_runs = []
-    for _ in range(runs):
-        out = run_once(binary, flags, bench, timeout, env_extra=env_extra,
-                       capture_phases_for=backend)
-        if "error" in out:
-            return {"benchmark": rel, "backend": backend, "mode": mode,
-                    "condition": condition, "command": command,
-                    "error": out["error"]}
-        timings.append(round(out["elapsed"], 6))
-        if out.get("rss"):
-            rss_vals.append(out["rss"])
-        if out.get("phases_raw"):
-            phase_runs.append(out["phases_raw"])
+    try:
+        # Warm-up runs (discarded): pay one-time costs (page cache, etc.). Warm
+        # the treatment's actual rebuild path; skip the profile (warmup untimed).
+        for _ in range(warmup):
+            run_once(binary, flags, bench, timeout, env_extra=rebuild_env)
 
-    result = {"benchmark": rel, "backend": backend, "mode": mode,
-              "condition": condition, "command": command,
-              "timing_list": timings}
-    if rss_vals:
-        # Peak RSS = max observed across timed runs (bytes).
-        result["rss"] = max(rss_vals)
+        timings = []
+        rss_vals = []
+        phase_runs = []
+        for _ in range(runs):
+            out = run_once(binary, flags, bench, timeout, env_extra=env_extra,
+                           capture_phases_for=backend)
+            if "error" in out:
+                return {"benchmark": rel, "backend": backend, "mode": mode,
+                        "condition": condition, "command": command,
+                        "error": out["error"]}
+            timings.append(round(out["elapsed"], 6))
+            if out.get("rss"):
+                rss_vals.append(out["rss"])
+            if out.get("phases_raw"):
+                phase_runs.append(out["phases_raw"])
 
-    if phase_runs:
-        # Bucket the median run's raw profile into the uniform schema.
-        mid = phase_runs[len(phase_runs) // 2]
-        buckets = bucket_phases(backend, mid)
-        if buckets:
-            result["phases"] = buckets
+        result = {"benchmark": rel, "backend": backend, "mode": mode,
+                  "condition": condition, "command": command,
+                  "timing_list": timings}
+        if rss_vals:
+            # Peak RSS = max observed across timed runs (bytes).
+            result["rss"] = max(rss_vals)
 
-    # Tuple-count parity: one extra run with `(print-size)` appended. Use the
-    # profile-free env (the fast-rebuild knob still applies; the profile dump
-    # does NOT, so it can't pollute the scraped size output).
-    sizes, size_err = measure_sizes(binary, bench, flags, rebuild_env, timeout)
-    if size_err is None and sizes is not None:
-        result["sizes"] = sizes
-    return result
+        if phase_runs:
+            # Bucket the median run's raw profile into the uniform schema.
+            mid = phase_runs[len(phase_runs) // 2]
+            buckets = bucket_phases(backend, mid)
+            if buckets:
+                result["phases"] = buckets
+
+        # Tuple-count parity: one extra run with `(print-size)` appended. Use the
+        # profile-free env (the fast-rebuild knob still applies; the profile dump
+        # does NOT, so it can't pollute the scraped size output).
+        sizes, size_err = measure_sizes(binary, bench, flags, rebuild_env, timeout)
+        if size_err is None and sizes is not None:
+            result["sizes"] = sizes
+        return result
+    finally:
+        if tmp_bench is not None:
+            os.unlink(tmp_bench)
+
+
+def _failure_msg(text, returncode):
+    """Best failure line from a cell's combined stderr/stdout. Prefers the Rust
+    panic MESSAGE (not the trailing 'note: run with RUST_BACKTRACE' line) and
+    egglog `[ERROR]` lines, so the stored error is classifiable -- the last line
+    alone is often useless."""
+    lines = [l.rstrip() for l in text.splitlines() if l.strip()]
+    if not lines:
+        return f"exit code {returncode}"
+    for i, l in enumerate(lines):
+        if "panicked at" in l:
+            m = re.search(r"panicked at [^:]*:\d+:\d+:\s*(\S.*)", l)
+            if m:
+                return m.group(1)
+            return lines[i + 1] if i + 1 < len(lines) else l
+    for i, l in enumerate(lines):
+        if "[ERROR]" in l:
+            # Keep the "Offending command:" detail if it follows, so the stored
+            # message names WHICH command (and stays classifiable).
+            for l2 in lines[i + 1:i + 4]:
+                if "Offending command" in l2:
+                    return f"{l} {l2.strip()}"
+            return l
+    return lines[-1]
+
+
+def classify_unsupported(error_text):
+    """Return a short reason if `error_text` is a KNOWN backend/encoding
+    capability gap (-> recorded under `unsupported`, not `errors`), else None (a
+    real, unexpected failure that stays in `errors`). `extract` is stripped
+    before running and missing primitives are bugs to FIX, so neither is
+    reclassified here."""
+    t = error_text or ""
+    if "timeout" in t.lower():
+        return "timeout (too slow at the cell timeout)"
+    if "Unrecognized user-defined command" in t:
+        return "command unsupported on this backend (e.g. run-schedule)"
+    if "clone_boxed" in t:
+        return "push/pop unsupported (clone_boxed deferred)"
+    # proofs-encoding rejections. The proof-term encoder gates unsupported
+    # commands (run-schedule, :no-merge/:unextractable functions, multi-extract).
+    # With the [ERROR]-preferring capture the message reads "...not supported by
+    # the current proof term encoding impl"; the "Offending command:" detail may
+    # or may not be present -- match either form.
+    if ("proof term encoding" in t or "Offending command" in t
+            or ":no-merge" in t or ":unextractable" in t):
+        return "proofs encoding: command unsupported"
+    if "does not yet support proof-mode native-UF" in t:
+        return "proofs + native-UF unsupported (duckdb)"
+    return None
 
 
 def apply_cell_result(result, db, oracle_sizes):
@@ -734,9 +905,14 @@ def apply_cell_result(result, db, oracle_sizes):
     mode = result["mode"]
     condition = result["condition"]
     if "error" in result:
-        db.add_error(rel, backend, mode, condition, result["error"],
-                     command=result.get("command"))
-        print(f"    {rel}: {condition:28} ERROR: {result['error']}", flush=True)
+        reason = classify_unsupported(result["error"])
+        if reason is not None:
+            db.add_unsupported(rel, backend, mode, condition, reason)
+            print(f"    {rel}: {condition:28} skip ({reason})", flush=True)
+        else:
+            db.add_error(rel, backend, mode, condition, result["error"],
+                         command=result.get("command"))
+            print(f"    {rel}: {condition:28} ERROR: {result['error']}", flush=True)
         return
 
     timings = result["timing_list"]
