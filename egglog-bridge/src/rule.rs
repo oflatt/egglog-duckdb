@@ -837,6 +837,20 @@ impl Query {
         //
         let mut constraints: Vec<(core_relations::AtomId, Constraint)> =
             Vec::with_capacity(self.atoms.len());
+        // Fast-rebuild: a non-empty `focus_exclude` marks this as a relational
+        // rebuild rule (`view ⋈ δuf_a ⋈ δuf_b ⋈ …`). We DROP the variant that
+        // focuses (delta) the view table — under canonicalize-at-creation new
+        // view rows are already canonical, so `δview ⋈ uf_old` is empty work.
+        // But the surviving `view ⋈ δuf` variants must then NOT pin the *other*
+        // atoms to the `ts < mid_ts` ("old") range: a single union can set a row
+        // in the view AND set leaders for SEVERAL eq-sort columns in the SAME
+        // iteration, so a sibling UF-leader atom (and the view itself) can be
+        // brand new this iteration. The standard seminaive `prefix < mid` bound
+        // exists only to avoid double-counting across the per-atom variants; for
+        // an idempotent rebuild (set + delete) that over-counting is harmless,
+        // whereas pinning a sibling to "old" drops the real work. So when
+        // `focus_exclude` is set, every non-focus atom sees ALL rows.
+        let drop_old_bound = !self.focus_exclude.is_empty();
         'outer: for focus_atom in 0..self.atoms.len() {
             // Fast-rebuild: skip generating the variant that focuses (delta)
             // this atom's table. Excluding the rebuild view drops the
@@ -859,21 +873,26 @@ impl Query {
                     },
                 ))
             }
-            for (i, (table, _, schema_info)) in self.atoms[0..focus_atom].iter().enumerate() {
+            for (i, (_table, _, schema_info)) in self.atoms[0..focus_atom].iter().enumerate() {
+                // Fast-rebuild (`focus_exclude` set): every non-focus atom — the
+                // excluded view AND any sibling UF-leader atom — must see ALL
+                // rows in this variant (no `ts < mid_ts` "old" bound), and the
+                // `mid_ts == 0` skip below must NOT fire. See `drop_old_bound`.
+                //
+                // The `mid_ts == 0` skip is the standard seminaive shortcut: on
+                // the very first run every atom's delta is the whole table, so
+                // only the focus=first-atom variant is kept and the rest are
+                // redundant. But fast-rebuild DROPS that focus=0 (view) variant,
+                // so on a `mid_ts == 0` rebuild we'd otherwise generate no rule
+                // at all and skip the entire initial rebuild. Keeping the
+                // `δuf(>= 0) = all` focus variant here (with the view unbounded)
+                // restores exactly the work the dropped `δview(>= 0) = all`
+                // variant used to do.
+                if drop_old_bound {
+                    continue;
+                }
                 if mid_ts == Timestamp::new(0) {
                     continue 'outer;
-                }
-                // Fast-rebuild: a focus-excluded atom (the rebuild view) must see
-                // ALL rows in every remaining variant, not just `ts < mid_ts`.
-                // Dropping the `δview` focus removed the term that covered view
-                // rows born THIS iteration; to stay sound the surviving
-                // `view ⋈ δuf` term must join δuf against the FULL view (old +
-                // just-inserted), mirroring duckdb's `t_view.ts < ?2` boundary.
-                // Without this, a view atom positioned before the focus would be
-                // pinned to old rows and miss new ones whose child was re-pointed
-                // by a union this same iteration.
-                if self.focus_exclude.contains(table) {
-                    continue;
                 }
                 let ts_col = ColumnId::from_usize(schema_info.ts_col());
                 constraints.push((
