@@ -1,0 +1,27 @@
+; General-WCOJ regression guard: a 4-CLIQUE counting rule over a directed
+; graph. The body has SIX edge atoms forming a cyclic (non-triangle) query, so
+; the WCOJ detector's GENERAL cyclic-cq path must fire (and stay bit-exact with
+; the binary chain).
+;
+;   clique(a,b,c,d) :- edge(a,b), edge(a,c), edge(a,d),
+;                      edge(b,c), edge(b,d), edge(c,d)
+;
+; (A 4-clique is the canonical cyclic query past the triangle; GYO cannot
+; reduce it.) We seed a small dense graph so multiple 4-cliques exist and check
+; the derived clique count matches the reference backend.
+(relation edge (i64 i64))
+(relation clique (i64 i64 i64 i64))
+
+(rule ((edge a b) (edge a c) (edge a d)
+       (edge b c) (edge b d) (edge c d))
+      ((clique a b c d)))
+
+; A graph on 0..5: directed edges i->j for i<j over a dense subset.
+(edge 0 1) (edge 0 2) (edge 0 3) (edge 0 4) (edge 0 5)
+(edge 1 2) (edge 1 3) (edge 1 4) (edge 1 5)
+(edge 2 3) (edge 2 4) (edge 2 5)
+(edge 3 4) (edge 3 5)
+(edge 4 5)
+
+(run 2)
+(print-size clique)

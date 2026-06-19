@@ -1,0 +1,21 @@
+; General-WCOJ regression guard: a 4-CYCLE (square) join — cyclic but NOT a
+; clique, with a different degree structure than the 4-clique (every variable
+; appears in exactly 2 atoms, so GYO has no ear vertex -> cyclic). The binary
+; chain materializes an a-b-c-d path before closing the cycle on d=a; the
+; GENERAL cyclic-cq WCOJ path must fire and stay bit-exact.
+;
+;   sq(a,b,c,d) :- r(a,b), r(b,c), r(c,d), r(d,a)
+(relation r (i64 i64))
+(relation sq (i64 i64 i64 i64))
+
+(rule ((r a b) (r b c) (r c d) (r d a))
+      ((sq a b c d)))
+
+; A directed graph with several 4-cycles.
+(r 0 1) (r 1 2) (r 2 3) (r 3 0)
+(r 1 0) (r 2 1) (r 3 2) (r 0 3)
+(r 0 2) (r 2 0) (r 1 3) (r 3 1)
+(r 4 5) (r 5 6) (r 6 7) (r 7 4)
+
+(run 2)
+(print-size sq)

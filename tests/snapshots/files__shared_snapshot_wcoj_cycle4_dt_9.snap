@@ -1,0 +1,11 @@
+---
+source: tests/files.rs
+expression: snapshot_content_across_treatments
+---
+2688
+88
+((Add 16)
+ (Const 0)
+ (Mul 88)
+ (Var 3)
+ (square 2688))

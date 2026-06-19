@@ -1,0 +1,7 @@
+---
+source: tests/files.rs
+expression: snapshot_content_across_treatments
+---
+15
+((clique 15)
+ (edge 15))

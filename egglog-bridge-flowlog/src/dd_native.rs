@@ -146,6 +146,13 @@ fn empty_row() -> Row {
     Row([0u32; W])
 }
 
+impl Default for Row {
+    #[inline]
+    fn default() -> Self {
+        empty_row()
+    }
+}
+
 /// SPIKE evidence flag: `FLOWLOG_DD_NATIVE_TRACE=1` prints per-epoch input/output
 /// delta sizes to stderr (proof of incrementality + retraction). Off by default.
 fn trace_enabled() -> bool {
@@ -569,6 +576,414 @@ pub(crate) fn detect_triangle(plan: &JoinPlan) -> Option<TriangleShape> {
     })
 }
 
+// ===========================================================================
+// Stage 2: GENERAL incremental WCOJ for an arbitrary >=3-atom CYCLIC body
+// ===========================================================================
+//
+// Generalizes the hardcoded triangle (above) to any >=3-atom rule whose body
+// join is CYCLIC — the class where a binary-join chain materializes an
+// intermediate exceeding the output (the AGM blowup WCOJ removes). Acyclic and
+// <=2-atom rules keep the binary `.join` chain (hybrid, Free-Join style): WCOJ
+// buys nothing there and adds per-prefix index/intersection overhead.
+//
+// ## Detector (`detect_cyclic_cq`)
+//
+// Structural, no name/func-id dependence:
+//   1. >= 3 table atoms, all slots distinct `Var`s within each atom, no consts
+//      (a const/repeated-var atom is a SELECTION the binary path handles; we
+//      leave it on the binary chain to stay conservative + bit-exact).
+//   2. The body hypergraph is CYCLIC by GYO reduction (repeatedly drop an "ear"
+//      vertex appearing in <=1 remaining edge, and any edge subset of another;
+//      acyclic iff it reduces to empty). Cyclic ⇒ the binary chain blows up.
+//   3. A full WCOJ plan is constructible (see `build_cq_plan`): for EVERY
+//      driver atom there is a variable order extending the driver one variable
+//      at a time, each step binding a variable that is the LAST unbound variable
+//      of some atom (so that atom keys entirely on already-bound columns). If
+//      any driver cannot be covered this way, we BAIL (return None → binary
+//      chain). This is the "only fire where provably bit-exact" stance: the
+//      construction mirrors the Stage-1 triangle exactly (full k-stream delta
+//      decomposition, ALL reads inside the AltNeu scope), and we only emit it
+//      when every variable is bound by an in-scope extend/propose.
+//
+// ## Plan (`CqPlan`)
+//
+// `var_col` (carried) + a `CqDriver` per atom. Each driver records its initial
+// bound columns (the driver atom's vars, written straight from the delta row)
+// then a sequence of `CqStep`s, each extending the prefix with ONE variable
+// `bind_col` via a set of `CqExtender`s (`atom_idx` + the prefix columns the
+// atom keys on + the relation column it proposes + whether the atom reads ALT
+// (atom index < driver) or NEU (atom index > driver)). >=2 extenders for a step
+// ⇒ multiway `extend` (the WCOJ intersection); exactly 1 ⇒ `propose_using`.
+
+/// One extender in a WCOJ extension step: read relation `atom_idx`'s `propose_col`
+/// keyed by the prefix's `key_cols`, from the ALT (old) or NEU (new) trace.
+#[derive(Clone, Debug)]
+pub(crate) struct CqExtender {
+    /// Index into `CqPlan.atom_funcs` / the rule's atom list.
+    atom_idx: usize,
+    /// Binding-row columns (already bound in the prefix) this atom keys on.
+    /// Parallel to `key_atom_cols`.
+    key_cols: Vec<usize>,
+    /// The atom's relation columns (0-based slot positions) holding the key
+    /// vars, parallel to `key_cols` — used to build the atom's lookup index so
+    /// its key matches the prefix key_selector's columns.
+    key_atom_cols: Vec<usize>,
+    /// The relation column (0-based in the atom's row) that proposes the var.
+    propose_col: usize,
+    /// true ⇒ read the ALT (old) trace; false ⇒ the NEU (new) trace.
+    alt: bool,
+}
+
+/// One JOIN-variable extension step: bind binding-row column `bind_col` from
+/// `exts`. The intersected variable is a JOIN variable (appears in >=2 atoms).
+/// With >=2 extenders this is the multiway `extend` (the WCOJ intersection that
+/// collapses the intermediate); with a single extender it is a `propose_using`.
+#[derive(Clone, Debug)]
+pub(crate) struct CqStep {
+    /// The binding-row column this step writes.
+    bind_col: usize,
+    exts: Vec<CqExtender>,
+}
+
+/// A per-atom PAYLOAD recovery: once an atom's JOIN columns are all bound,
+/// recover its payload variables (those appearing only in this atom) in ONE
+/// `propose_using` keyed on the atom's join columns. `payload_cols[k]` =
+/// `(binding_col, relation_col)` for the k-th payload var.
+#[derive(Clone, Debug)]
+pub(crate) struct CqRecover {
+    atom_idx: usize,
+    /// Binding columns (already bound) the atom keys on. Parallel to
+    /// `key_atom_cols`.
+    key_cols: Vec<usize>,
+    /// The atom's relation columns holding the key (join) vars.
+    key_atom_cols: Vec<usize>,
+    /// `(binding_col, relation_col)` per payload var to write from the proposal.
+    payload: Vec<(usize, usize)>,
+    /// true ⇒ read the ALT (old) trace; false ⇒ the NEU (new) trace.
+    alt: bool,
+}
+
+/// One delta query `dQ/dA_driver`: seed the prefix from the driver atom's delta
+/// row, bind every JOIN variable via `steps` (the WCOJ core), then recover each
+/// non-driver atom's payload via `recovers`. ALL inside the AltNeu scope.
+#[derive(Clone, Debug)]
+pub(crate) struct CqDriver {
+    /// The driver atom's index.
+    driver_idx: usize,
+    /// `(binding_col, relation_col)` for each of the driver atom's variables —
+    /// written straight from the delta row into the initial prefix.
+    seed: Vec<(usize, usize)>,
+    steps: Vec<CqStep>,
+    recovers: Vec<CqRecover>,
+}
+
+/// A general WCOJ plan for a cyclic >=3-atom body.
+#[derive(Clone, Debug)]
+pub(crate) struct CqPlan {
+    /// Relation id per atom (atom order = the rule's `plan.atoms` order).
+    atom_funcs: Vec<FunctionId>,
+    /// One delta query per atom.
+    drivers: Vec<CqDriver>,
+}
+
+/// The variables of an atom (its distinct `Var` slots), or `None` if the atom
+/// has any const or repeated var (we leave those selections on the binary path).
+fn atom_distinct_vars(slots: &[Slot]) -> Option<Vec<u32>> {
+    let mut out: Vec<u32> = Vec::with_capacity(slots.len());
+    for s in slots {
+        match s {
+            Slot::Var(v) => {
+                if out.contains(v) {
+                    return None;
+                }
+                out.push(*v);
+            }
+            Slot::Const(_) => return None,
+        }
+    }
+    Some(out)
+}
+
+/// GYO acyclicity test on the body hypergraph (atoms = hyperedges, vars =
+/// vertices). Returns `true` iff the query is CYCLIC (GYO does not reduce to
+/// empty). `atom_vars[i]` is atom i's vertex set.
+fn is_cyclic_cq(atom_vars: &[Vec<u32>]) -> bool {
+    // Work on owned mutable vertex sets; `removed[i]` drops an absorbed edge.
+    let mut edges: Vec<HashSet<u32>> = atom_vars
+        .iter()
+        .map(|vs| vs.iter().copied().collect())
+        .collect();
+    let mut removed = vec![false; edges.len()];
+
+    loop {
+        let mut progress = false;
+
+        // (a) Ear removal: drop a vertex that appears in <= 1 live edge.
+        let mut vert_count: HashMap<u32, usize> = HashMap::new();
+        for (i, e) in edges.iter().enumerate() {
+            if removed[i] {
+                continue;
+            }
+            for &v in e {
+                *vert_count.entry(v).or_insert(0) += 1;
+            }
+        }
+        let ears: Vec<u32> = vert_count
+            .iter()
+            .filter(|&(_, &c)| c <= 1)
+            .map(|(&v, _)| v)
+            .collect();
+        if !ears.is_empty() {
+            for e in edges.iter_mut() {
+                for v in &ears {
+                    e.remove(v);
+                }
+            }
+            progress = true;
+        }
+
+        // (b) Absorb an edge that is a subset of another live edge.
+        let live: Vec<usize> = (0..edges.len()).filter(|&i| !removed[i]).collect();
+        'outer: for &i in &live {
+            if edges[i].is_empty() {
+                removed[i] = true;
+                progress = true;
+                continue;
+            }
+            for &j in &live {
+                if i == j || removed[j] {
+                    continue;
+                }
+                if edges[i].is_subset(&edges[j]) {
+                    removed[i] = true;
+                    progress = true;
+                    continue 'outer;
+                }
+            }
+        }
+
+        if !progress {
+            break;
+        }
+    }
+
+    // Cyclic iff any non-empty edge remains (GYO got stuck).
+    edges
+        .iter()
+        .enumerate()
+        .any(|(i, e)| !removed[i] && !e.is_empty())
+}
+
+/// Build the general WCOJ plan for `plan`, or `None` if it is not constructible
+/// bit-exactly. Splits variables into JOIN vars (in >=2 atoms — the cyclic core)
+/// and PAYLOAD vars (in exactly 1 atom — eclass/extra columns). The WCOJ binds
+/// each JOIN var one at a time (each being the last-unbound JOIN var of >=1
+/// atom, so that atom keys on already-bound join columns), then recovers each
+/// atom's payload via one `propose`. If any driver's join vars cannot be ordered
+/// this way, bail (`None` ⇒ binary chain).
+fn build_cq_plan(plan: &JoinPlan, atom_vars: &[Vec<u32>]) -> Option<CqPlan> {
+    let n_atoms = plan.atoms.len();
+    let var_col = &plan.var_col;
+    let atom_funcs: Vec<FunctionId> = plan.atoms.iter().map(|a| a.func).collect();
+
+    // relation-col lookup: atom i, variable v -> the 0-based slot position.
+    let atom_var_col = |i: usize, v: u32| -> Option<usize> {
+        plan.atoms[i]
+            .slots
+            .iter()
+            .position(|s| matches!(s, Slot::Var(x) if *x == v))
+    };
+
+    // JOIN vars = vars appearing in >= 2 atoms. PAYLOAD vars = in exactly 1.
+    let mut var_atom_count: HashMap<u32, usize> = HashMap::new();
+    for vs in atom_vars {
+        for &v in vs {
+            *var_atom_count.entry(v).or_insert(0) += 1;
+        }
+    }
+    let is_join = |v: u32| -> bool { var_atom_count.get(&v).copied().unwrap_or(0) >= 2 };
+    let join_vars_of = |i: usize| -> Vec<u32> {
+        atom_vars[i]
+            .iter()
+            .copied()
+            .filter(|&v| is_join(v))
+            .collect()
+    };
+    let all_join_vars: HashSet<u32> = atom_vars
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|&v| is_join(v))
+        .collect();
+
+    let mut drivers: Vec<CqDriver> = Vec::with_capacity(n_atoms);
+    for driver_idx in 0..n_atoms {
+        // Seed: the driver atom's own variables (join + payload), straight from
+        // the delta row — they are all immediately bound.
+        let mut bound: HashSet<u32> = atom_vars[driver_idx].iter().copied().collect();
+        let seed: Vec<(usize, usize)> = atom_vars[driver_idx]
+            .iter()
+            .map(|&v| (var_col[&v], atom_var_col(driver_idx, v).unwrap()))
+            .collect();
+
+        // Bind JOIN vars one at a time. The next join var must be the LAST
+        // unbound JOIN var of >= 1 atom (payload vars never block — they are
+        // recovered after, not used as keys). Prefer the var constrained by the
+        // MOST atoms (most-constrained-variable = the deepest WCOJ
+        // intersection); ties broken by var id for determinism.
+        let mut steps: Vec<CqStep> = Vec::new();
+        while bound.iter().filter(|&&v| is_join(v)).count() < all_join_vars.len() {
+            let mut best: Option<(u32, Vec<usize>)> = None;
+            for &v in &all_join_vars {
+                if bound.contains(&v) {
+                    continue;
+                }
+                let mut ready_atoms: Vec<usize> = Vec::new();
+                for (i, vs) in atom_vars.iter().enumerate() {
+                    if !vs.contains(&v) {
+                        continue;
+                    }
+                    // v is bindable from atom i iff every OTHER JOIN var of atom
+                    // i is already bound.
+                    if vs
+                        .iter()
+                        .all(|&w| w == v || !is_join(w) || bound.contains(&w))
+                    {
+                        ready_atoms.push(i);
+                    }
+                }
+                if ready_atoms.is_empty() {
+                    continue;
+                }
+                let better = match &best {
+                    None => true,
+                    Some((bv, ba)) => {
+                        (ready_atoms.len(), std::cmp::Reverse(v))
+                            > (ba.len(), std::cmp::Reverse(*bv))
+                    }
+                };
+                if better {
+                    best = Some((v, ready_atoms));
+                }
+            }
+
+            let (v, ready_atoms) = best?; // no ready join var ⇒ not constructible.
+            let exts: Vec<CqExtender> = ready_atoms
+                .iter()
+                .map(|&i| {
+                    // Key on the atom's OTHER join vars (all bound by now).
+                    let key_vars: Vec<u32> =
+                        join_vars_of(i).into_iter().filter(|&w| w != v).collect();
+                    CqExtender {
+                        atom_idx: i,
+                        key_cols: key_vars.iter().map(|w| var_col[w]).collect(),
+                        key_atom_cols: key_vars
+                            .iter()
+                            .map(|&w| atom_var_col(i, w).unwrap())
+                            .collect(),
+                        propose_col: atom_var_col(i, v).unwrap(),
+                        alt: i < driver_idx,
+                    }
+                })
+                .collect();
+            steps.push(CqStep {
+                bind_col: var_col[&v],
+                exts,
+            });
+            bound.insert(v);
+        }
+
+        // Recover each NON-driver atom's payload vars (those appearing only in
+        // it), keyed on the atom's join columns (all bound). The driver atom's
+        // payload is already in the seed. An atom with NO payload var still must
+        // be VALIDATED so its tuple constrains the result; we emit a recover
+        // with an empty payload (a pure existence `propose`). That is sound (no
+        // over-count): empty payload ⟺ every column is a join var ⟺ the key
+        // covers the whole row, and rows are set-semantic, so the key matches at
+        // most one row (weight 1). In the term encoding every atom carries an
+        // eclass + extra column, so this empty-payload case does not arise.
+        let mut recovers: Vec<CqRecover> = Vec::new();
+        for (i, avs) in atom_vars.iter().enumerate() {
+            if i == driver_idx {
+                continue;
+            }
+            let payload_vars: Vec<u32> = avs.iter().copied().filter(|&v| !is_join(v)).collect();
+            let key_vars = join_vars_of(i);
+            recovers.push(CqRecover {
+                atom_idx: i,
+                key_cols: key_vars.iter().map(|w| var_col[w]).collect(),
+                key_atom_cols: key_vars
+                    .iter()
+                    .map(|&w| atom_var_col(i, w).unwrap())
+                    .collect(),
+                payload: payload_vars
+                    .iter()
+                    .map(|&v| (var_col[&v], atom_var_col(i, v).unwrap()))
+                    .collect(),
+                alt: i < driver_idx,
+            });
+        }
+
+        drivers.push(CqDriver {
+            driver_idx,
+            seed,
+            steps,
+            recovers,
+        });
+    }
+
+    Some(CqPlan {
+        atom_funcs,
+        drivers,
+    })
+}
+
+/// Detect a general WCOJ-worthy body: a >=3-atom CYCLIC query for which a
+/// bit-exact WCOJ plan is constructible. Returns the plan, or `None` (stay on
+/// the binary chain). See the module note above for the criteria.
+pub(crate) fn detect_cyclic_cq(plan: &JoinPlan) -> Option<CqPlan> {
+    let trace = std::env::var_os("FLOWLOG_WCOJ_TRACE").is_some();
+    if plan.atoms.len() < 3 {
+        return None;
+    }
+    // All atoms must be pure distinct-Var atoms (no const/repeated-var
+    // selections — those stay on the binary path).
+    let mut atom_vars: Vec<Vec<u32>> = Vec::with_capacity(plan.atoms.len());
+    for a in &plan.atoms {
+        match atom_distinct_vars(&a.slots) {
+            Some(vs) => atom_vars.push(vs),
+            None => {
+                #[allow(clippy::disallowed_macros)]
+                if trace {
+                    eprintln!(
+                        "[WCOJ] detect_cyclic_cq: bail (atom with const/repeated var) atoms={}",
+                        plan.atoms.len()
+                    );
+                }
+                return None;
+            }
+        }
+    }
+    // Only fire where the binary chain provably blows up: a CYCLIC join.
+    let cyclic = is_cyclic_cq(&atom_vars);
+    #[allow(clippy::disallowed_macros)]
+    if trace {
+        eprintln!(
+            "[WCOJ] detect_cyclic_cq: atoms={} cyclic={cyclic} atom_vars={atom_vars:?}",
+            plan.atoms.len()
+        );
+    }
+    if !cyclic {
+        return None;
+    }
+    let plan_out = build_cq_plan(plan, &atom_vars);
+    #[allow(clippy::disallowed_macros)]
+    if trace && plan_out.is_none() {
+        eprintln!("[WCOJ] detect_cyclic_cq: cyclic but NOT constructible -> binary chain");
+    }
+    plan_out
+}
+
 /// The persistent, in-process DD body join for one rule. Built once; driven
 /// across epochs by [`step`]. Owns its timely `Worker`, so it can be stepped
 /// between host iterations without re-spawning threads.
@@ -919,6 +1334,10 @@ impl FusedDdJoin {
             /// `--wcoj` and this rule is the recognized triangle ⇒ build the WCOJ
             /// delta query instead of the binary `.join` chain. `None` ⇒ binary.
             triangle: Option<TriangleShape>,
+            /// `--wcoj` and this rule is a general detected cyclic >=3-atom body
+            /// (NOT already matched by `triangle`) ⇒ the general WCOJ delta
+            /// query. `None` ⇒ triangle or binary.
+            cq: Option<CqPlan>,
         }
         let rule_plans: Vec<RulePlan> = plans
             .iter()
@@ -930,9 +1349,18 @@ impl FusedDdJoin {
                         body_funcs.push(f);
                     }
                 }
-                // Detect the triangle ONLY when `--wcoj` is set; off ⇒ always
-                // `None`, so the build is byte-identical to the binary path.
+                // Detect WCOJ shapes ONLY when `--wcoj` is set; off ⇒ both
+                // `None`, so the build is byte-identical to the binary path. The
+                // Stage-1 triangle is kept as its own hand-built path (the
+                // regression guarantee); other detected cyclic >=3-atom bodies
+                // route to the general construction. A rule matched by the
+                // triangle never also takes the general path.
                 let triangle = if wcoj { detect_triangle(plan) } else { None };
+                let cq = if wcoj && triangle.is_none() {
+                    detect_cyclic_cq(plan)
+                } else {
+                    None
+                };
                 RulePlan {
                     idx: *idx,
                     atoms: plan.atoms.iter().map(|a| a.slots.clone()).collect(),
@@ -941,6 +1369,7 @@ impl FusedDdJoin {
                     n_vars: plan.var_order.len(),
                     body_funcs,
                     triangle,
+                    cq,
                 }
             })
             .collect();
@@ -1018,6 +1447,22 @@ impl FusedDdJoin {
                     let mul = rel_coll[&tri.mul_func].clone();
                     let add = rel_coll[&tri.add_func].clone();
                     wcoj_triangle_collection(scope, mul, add, tri.clone())
+                } else if let Some(cq) = &rp.cq {
+                    // GENERAL WCOJ: a detected cyclic >=3-atom body. One shared
+                    // input collection per atom (in atom order), fed to the
+                    // k-stream delta decomposition. Emits the same n_vars-wide
+                    // binding Row as the binary chain.
+                    #[allow(clippy::disallowed_macros)]
+                    if std::env::var_os("FLOWLOG_WCOJ_TRACE").is_some() {
+                        eprintln!(
+                            "[WCOJ] cyclic-cq rule idx={} atoms={} funcs={:?}",
+                            rp.idx,
+                            cq.atom_funcs.len(),
+                            cq.atom_funcs
+                        );
+                    }
+                    let colls: Vec<_> = cq.atom_funcs.iter().map(|f| rel_coll[f].clone()).collect();
+                    wcoj_cq_collection(scope, &colls, cq.clone())
                 } else {
                     let mut bound = vec![false; n_vars];
                     let slots0 = atom_slots[0].clone();
@@ -1569,6 +2014,188 @@ fn merge_atom_into(
 }
 
 // ---------------------------------------------------------------------------
+// Stage 2: GENERAL `--wcoj` worst-case-optimal delta query (any cyclic body)
+// ---------------------------------------------------------------------------
+
+/// A WCOJ collection index over the `Row`-keyed encoding used by the general
+/// construction: K = the prefix `Row` (with the relevant bound columns filled,
+/// others 0), V = the single proposed variable value (`u32`).
+type CqIndex<'scope> = CollectionIndex<Row, u32, AltNeu<u32>, isize>;
+
+/// The key-selector closure type shared by every general-WCOJ extender: read
+/// `cols` of the prefix `Row` into a fresh key `Row`. Writing it ONCE here (one
+/// source location) makes every `extend_using(make_key_selector(...))` the SAME
+/// concrete `CollectionExtender` type, so a step's extenders can live in one
+/// `Vec` and be passed as a `&mut [&mut dyn PrefixExtender]` slice to `extend`.
+fn cq_key_selector(cols: Vec<usize>) -> impl Fn(&Row) -> Row + Clone + 'static {
+    move |p: &Row| {
+        let mut k = empty_row();
+        for (i, &c) in cols.iter().enumerate() {
+            k[i] = p[c];
+        }
+        k
+    }
+}
+
+/// Build the GENERAL worst-case-optimal join for a detected cyclic body
+/// (`CqPlan`) as a collection of full-width binding `Row`s — the SAME shape the
+/// binary `.join` chain emits, so the downstream consolidate / capture / env
+/// scatter is bit-identical.
+///
+/// Implements the full k-stream delta decomposition (one delta query per body
+/// atom) inside ONE `AltNeu<u32>` nested scope, exactly mirroring the Stage-1
+/// triangle: in delta query `dQ/dA_d`, atoms with index < d read the ALT (old)
+/// trace and atoms with index > d read the NEU (new) trace, so simultaneous
+/// cross-atom updates are counted exactly once. ALL reads (the multiway
+/// intersections AND the per-atom payload recoveries) are inside the AltNeu
+/// scope. Each JOIN step binds ONE join variable: a >=2-extender step is the
+/// WCOJ multiway `extend` (the intersection that collapses the intermediate); a
+/// 1-extender step is a `propose_using`. After the join core is pinned, each
+/// non-driver atom's payload vars are recovered (and the atom validated) by one
+/// `propose` keyed on its join columns.
+fn wcoj_cq_collection<'scope>(
+    scope: Scope<'scope, u32>,
+    colls: &[VecCollection<'scope, u32, Row, isize>],
+    plan: CqPlan,
+) -> VecCollection<'scope, u32, Row, isize> {
+    use differential_dataflow::AsCollection;
+    use timely::dataflow::operators::Concatenate;
+
+    scope.scoped::<AltNeu<u32>, _, _>("WcojCq", move |inner| {
+        // Enter every relation; build an ALT and a NEU copy of each.
+        let alt: Vec<_> = colls.iter().map(|c| c.clone().enter(inner)).collect();
+        let neu: Vec<_> = alt
+            .iter()
+            .map(|c| c.clone().delay(|t| AltNeu::neu(t.time)))
+            .collect();
+
+        // Per-driver delta query. We build the indexes each driver needs lazily
+        // (cloning a CollectionIndex shares its traces, so repeats are cheap).
+        let mut streams = Vec::with_capacity(plan.drivers.len());
+        for driver in &plan.drivers {
+            // Seed the prefix from the driver atom's delta row.
+            let seed = driver.seed.clone();
+            let prefix = alt[driver.driver_idx].clone().map(move |r: Row| {
+                let mut p = empty_row();
+                for &(bind_col, rel_col) in &seed {
+                    p[bind_col] = r[rel_col];
+                }
+                p
+            });
+
+            let mut cur = prefix;
+            for step in &driver.steps {
+                // One index per extender (over the ALT or NEU copy of its atom),
+                // keyed by the atom's key columns, proposing the step's var.
+                let mut indexes: Vec<CqIndex> = step
+                    .exts
+                    .iter()
+                    .map(|e| {
+                        let src = if e.alt {
+                            alt[e.atom_idx].clone()
+                        } else {
+                            neu[e.atom_idx].clone()
+                        };
+                        let key_atom_cols = e.key_atom_cols.clone();
+                        let propose_col = e.propose_col;
+                        CollectionIndex::index(src.map(move |r: Row| {
+                            let mut k = empty_row();
+                            for (i, &c) in key_atom_cols.iter().enumerate() {
+                                k[i] = r[c];
+                            }
+                            (k, r[propose_col])
+                        }))
+                    })
+                    .collect();
+
+                // Build the extenders (all the same concrete type — see
+                // `cq_key_selector`), then intersect via `extend` (>=2) or
+                // recover via `propose_using` (==1).
+                let mut extenders: Vec<_> = indexes
+                    .iter_mut()
+                    .zip(step.exts.iter())
+                    .map(|(idx, e)| idx.extend_using(cq_key_selector(e.key_cols.clone())))
+                    .collect();
+
+                let bind_col = step.bind_col;
+                cur = if extenders.len() == 1 {
+                    cur.propose_using(&mut extenders[0])
+                        .map(move |(mut p, val): (Row, u32)| {
+                            p[bind_col] = val;
+                            p
+                        })
+                } else {
+                    let mut refs: Vec<
+                        &mut dyn differential_dogs3::PrefixExtender<
+                            AltNeu<u32>,
+                            isize,
+                            Prefix = Row,
+                            Extension = u32,
+                        >,
+                    > = extenders
+                        .iter_mut()
+                        .map(|e| {
+                            e as &mut dyn differential_dogs3::PrefixExtender<
+                                AltNeu<u32>,
+                                isize,
+                                Prefix = Row,
+                                Extension = u32,
+                            >
+                        })
+                        .collect();
+                    cur.extend(&mut refs[..])
+                        .map(move |(mut p, val): (Row, u32)| {
+                            p[bind_col] = val;
+                            p
+                        })
+                };
+            }
+
+            // Payload recovery: every non-driver atom is now keyed entirely on
+            // bound join columns. One `propose` per atom recovers its payload
+            // vars (V = a Row packing the payload values) AND validates the
+            // atom's existence (an atom with no payload still must be present).
+            for rec in &driver.recovers {
+                let src = if rec.alt {
+                    alt[rec.atom_idx].clone()
+                } else {
+                    neu[rec.atom_idx].clone()
+                };
+                let key_atom_cols = rec.key_atom_cols.clone();
+                let payload = rec.payload.clone();
+                // Index (K = join-key Row, V = payload-values Row).
+                let idx: CollectionIndex<Row, Row, AltNeu<u32>, isize> =
+                    CollectionIndex::index(src.map(move |r: Row| {
+                        let mut k = empty_row();
+                        for (i, &c) in key_atom_cols.iter().enumerate() {
+                            k[i] = r[c];
+                        }
+                        let mut v = empty_row();
+                        for (slot, &(_bind, rel_col)) in payload.iter().enumerate() {
+                            v[slot] = r[rel_col];
+                        }
+                        (k, v)
+                    }));
+                let mut ext = idx.extend_using(cq_key_selector(rec.key_cols.clone()));
+                let payload2 = rec.payload.clone();
+                cur = cur
+                    .propose_using(&mut ext)
+                    .map(move |(mut p, vals): (Row, Row)| {
+                        for (slot, &(bind_col, _rel)) in payload2.iter().enumerate() {
+                            p[bind_col] = vals[slot];
+                        }
+                        p
+                    });
+            }
+
+            streams.push(cur.inner);
+        }
+
+        inner.concatenate(streams).as_collection().leave(scope)
+    })
+}
+
+// ---------------------------------------------------------------------------
 // `--wcoj` triangle worst-case-optimal delta query
 // ---------------------------------------------------------------------------
 
@@ -1782,6 +2409,71 @@ mod tests {
                     slots: vec![Slot::Var(1), Slot::Var(2)],
                 },
             ],
+        }
+    }
+
+    /// Build a `JoinPlan` directly from `(func, vars)` atoms (all slots are
+    /// distinct `Var`s — the shape the WCOJ detector accepts).
+    fn plan_of(atoms: &[(FunctionId, &[u32])]) -> JoinPlan {
+        let mut var_order: Vec<u32> = Vec::new();
+        let mut var_col: HashMap<u32, usize> = HashMap::new();
+        let mut planned: Vec<PlanAtom> = Vec::new();
+        for (func, vars) in atoms {
+            for &v in *vars {
+                if !var_col.contains_key(&v) {
+                    var_col.insert(v, var_order.len());
+                    var_order.push(v);
+                }
+            }
+            planned.push(PlanAtom {
+                func: *func,
+                slots: vars.iter().map(|&v| Slot::Var(v)).collect(),
+            });
+        }
+        JoinPlan {
+            var_order,
+            var_col,
+            atoms: planned,
+        }
+    }
+
+    /// The general WCOJ detector: fires on cyclic >=3-atom bodies, falls back to
+    /// the binary chain (returns `None`) on 2-atom / acyclic / const shapes.
+    #[test]
+    fn detect_cyclic_cq_boundary() {
+        let r = FunctionId::new(0);
+        let s = FunctionId::new(1);
+
+        // 2 atoms: never WCOJ (acyclic, no blowup).
+        assert!(detect_cyclic_cq(&plan_of(&[(r, &[0, 1]), (s, &[1, 2])])).is_none());
+
+        // 3-atom ACYCLIC (a path a-b-c-d): stays on the binary chain.
+        let path = plan_of(&[(r, &[0, 1]), (r, &[1, 2]), (r, &[2, 3])]);
+        assert!(!is_cyclic_cq(&[vec![0, 1], vec![1, 2], vec![2, 3]]));
+        assert!(detect_cyclic_cq(&path).is_none());
+
+        // 3-atom triangle (cyclic): fires the general path, with one delta query
+        // per atom and every join var bound.
+        let tri = plan_of(&[(r, &[0, 1]), (r, &[1, 2]), (r, &[2, 0])]);
+        assert!(is_cyclic_cq(&[vec![0, 1], vec![1, 2], vec![2, 0]]));
+        let cq = detect_cyclic_cq(&tri).expect("triangle is a cyclic CQ");
+        assert_eq!(cq.drivers.len(), 3, "one delta query per atom");
+
+        // 4-clique-with-payload (term-encoding shape: each edge atom carries a
+        // fresh eclass + extra payload column). Cyclic core a,b,c,d; fires.
+        let clique = plan_of(&[
+            (r, &[0, 1, 10, 20]),
+            (r, &[0, 2, 11, 21]),
+            (r, &[0, 3, 12, 22]),
+            (r, &[1, 2, 13, 23]),
+            (r, &[1, 3, 14, 24]),
+            (r, &[2, 3, 15, 25]),
+        ]);
+        let cqc = detect_cyclic_cq(&clique).expect("4-clique is a cyclic CQ");
+        assert_eq!(cqc.drivers.len(), 6);
+        // Each driver recovers every NON-driver atom's payload (n_atoms-1).
+        for d in &cqc.drivers {
+            assert_eq!(d.recovers.len(), 5);
         }
     }
 

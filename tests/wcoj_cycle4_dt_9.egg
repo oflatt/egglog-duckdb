@@ -1,0 +1,29 @@
+; Run-9 drift variant of wcoj_cycle4_dt.egg: the same datatype 4-cycle WCOJ
+; trigger, but stepped to a higher iteration count. The e-graph saturates by
+; run 7, so the extra epochs drive the GENERAL cyclic-cq WCOJ dataflow with
+; stable deltas — a cross-epoch AltNeu-timing drift guard that the run-7 file
+; does not reach.
+(datatype Math
+  (Add Math Math)
+  (Mul Math Math)
+  (Var String)
+  (Const i64))
+
+(relation square (Math Math Math Math))
+
+(rule ((= e1 (Mul a b)) (= e2 (Mul b c)) (= e3 (Mul c d)) (= e4 (Mul d a)))
+      ((square a b c d)))
+
+(rewrite (Mul a b) (Mul b a))
+(rewrite (Add a b) (Add b a))
+(rewrite (Mul a (Add b c)) (Add (Mul a b) (Mul a c)))
+(rewrite (Mul (Mul a b) c) (Mul a (Mul b c)))
+(rewrite (Mul a (Mul b c)) (Mul (Mul a b) c))
+
+(let t (Mul (Add (Var "x") (Var "y"))
+            (Mul (Var "y") (Mul (Var "z") (Var "x")))))
+(let u (Mul (Mul (Var "x") (Var "y")) (Mul (Var "z") (Var "x"))))
+
+(run 9)
+(print-size square)
+(print-size Mul)

@@ -1,0 +1,39 @@
+; General-WCOJ regression guard over a DATATYPE: full eqsat + rebuild +
+; congruence + retraction across many epochs (the regime where the WCOJ
+; AltNeu cross-epoch timing must stay bit-exact with the binary chain).
+;
+; The trigger rule is a 4-CYCLE of Mul atoms over eclasses a,b,c,d (NOT a
+; triangle, so it routes to the GENERAL cyclic-cq WCOJ path, not the Stage-1
+; hand-built triangle path):
+;   square(a,b,c,d) :- Mul(a,b), Mul(b,c), Mul(c,d), Mul(d,a)
+; We record the cycle into a relation so it is observable, and ALSO keep the
+; ordinary ring rewrites firing so the Mul/Add tables grow and merge every
+; epoch (exercising delta + retraction under the WCOJ).
+(datatype Math
+  (Add Math Math)
+  (Mul Math Math)
+  (Var String)
+  (Const i64))
+
+(relation square (Math Math Math Math))
+
+; The cyclic (non-triangle) trigger.
+(rule ((= e1 (Mul a b)) (= e2 (Mul b c)) (= e3 (Mul c d)) (= e4 (Mul d a)))
+      ((square a b c d)))
+
+; Ordinary ring rewrites: keep Mul/Add growing + merging so the body relations
+; change every epoch.
+(rewrite (Mul a b) (Mul b a))
+(rewrite (Add a b) (Add b a))
+(rewrite (Mul a (Add b c)) (Add (Mul a b) (Mul a c)))
+(rewrite (Mul (Mul a b) c) (Mul a (Mul b c)))
+(rewrite (Mul a (Mul b c)) (Mul (Mul a b) c))
+
+; A seed term with several Vars so multiple Mul cycles can form.
+(let t (Mul (Add (Var "x") (Var "y"))
+            (Mul (Var "y") (Mul (Var "z") (Var "x")))))
+(let u (Mul (Mul (Var "x") (Var "y")) (Mul (Var "z") (Var "x"))))
+
+(run 7)
+(print-size square)
+(print-size Mul)

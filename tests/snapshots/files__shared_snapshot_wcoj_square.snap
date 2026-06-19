@@ -1,0 +1,7 @@
+---
+source: tests/files.rs
+expression: snapshot_content_across_treatments
+---
+88
+((r 16)
+ (sq 88))
