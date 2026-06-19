@@ -269,10 +269,11 @@ class BenchDB:
         # from `errors` so the errors table shows only real backend failures on
         # supported files, not noise from whole files we chose not to benchmark.
         self.skipped = []
-        # Cell-level capability gaps: a (condition, file) that failed because the
-        # backend/encoding doesn't support a feature the file uses. Separate from
-        # `errors` (reserved for UNEXPECTED failures / real bugs).
-        self.unsupported = []
+        # Cell-level WARNINGS: a (condition, file) that failed for an EXPECTED,
+        # non-bug reason -- a timeout, or a backend/encoding feature the file uses
+        # that isn't supported. Separate from `errors` (real, unexpected bugs);
+        # surfaced as a warnings table.
+        self.warnings = []
         # Provenance: "paper-sequential" (accurate, uncontended) vs
         # "parallel-Njobs" (fast coverage, contended -> inflated wall-times).
         self.timing_mode = timing_mode
@@ -319,12 +320,12 @@ class BenchDB:
     def add_skip(self, benchmark, reason):
         self.skipped.append({"benchmark": benchmark, "reason": reason})
 
-    def add_unsupported(self, benchmark, backend, mode, condition, reason):
-        # A cell that failed because the backend/encoding doesn't support a
-        # feature the file uses (run-schedule, push/pop, proofs-incompatible
-        # commands, timeout). Kept OUT of `errors` so that table shows only
-        # unexpected failures (real bugs).
-        self.unsupported.append({
+    def add_warning(self, benchmark, backend, mode, condition, reason):
+        # A cell that failed for an EXPECTED, non-bug reason: a timeout, or a
+        # feature the backend/encoding does not support (push/pop, proofs-
+        # incompatible commands, etc.). Kept OUT of `errors` so that table shows
+        # only unexpected failures (real bugs); surfaced as a warnings table.
+        self.warnings.append({
             "benchmark": benchmark, "backend": backend, "mode": mode,
             "condition": condition, "reason": reason,
         })
@@ -332,7 +333,7 @@ class BenchDB:
     def to_dict(self):
         return {"timing_mode": self.timing_mode,
                 "timings": self.timings, "errors": self.errors,
-                "skipped": self.skipped, "unsupported": self.unsupported}
+                "skipped": self.skipped, "warnings": self.warnings}
 
     def save_json(self, path):
         Path(path).write_text(json.dumps(self.to_dict(), indent=2))
@@ -872,7 +873,7 @@ def _failure_msg(text, returncode):
 
 def classify_unsupported(error_text):
     """Return a short reason if `error_text` is a KNOWN backend/encoding
-    capability gap (-> recorded under `unsupported`, not `errors`), else None (a
+    capability gap (-> recorded under `warnings`, not `errors`), else None (a
     real, unexpected failure that stays in `errors`). `extract` is stripped
     before running and missing primitives are bugs to FIX, so neither is
     reclassified here."""
@@ -907,8 +908,8 @@ def apply_cell_result(result, db, oracle_sizes):
     if "error" in result:
         reason = classify_unsupported(result["error"])
         if reason is not None:
-            db.add_unsupported(rel, backend, mode, condition, reason)
-            print(f"    {rel}: {condition:28} skip ({reason})", flush=True)
+            db.add_warning(rel, backend, mode, condition, reason)
+            print(f"    {rel}: {condition:28} warning ({reason})", flush=True)
         else:
             db.add_error(rel, backend, mode, condition, result["error"],
                          command=result.get("command"))
