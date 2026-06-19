@@ -86,6 +86,16 @@ pub fn extend_with_experimental(egraph: &mut EGraph) {
     egraph
         .add_command("run-schedule".into(), Arc::new(RunExtendedSchedule))
         .unwrap();
+    // Parse-time routing for `run-schedule`: scheduler-free schedules lower to
+    // core egglog's proof-supported `RunSchedule`; schedules using a scheduler
+    // stay on the experimental `RunExtendedSchedule` path above. Registered
+    // here (not in `experimental_parser`) so it lands after `add_command`,
+    // whose `add_user_defined` would otherwise reject the already-registered
+    // `run-schedule` macro. Parser command macros take precedence over the
+    // user-defined routing, so this intercepts every `(run-schedule ...)`.
+    egraph
+        .parser
+        .add_command_macro(Arc::new(sugar::RunSchedule));
 
     egraph
         .add_command(
