@@ -494,7 +494,12 @@ fn fused_bindings(
         // var is set. (Under native-UF the rebuild rules run host-side, not on
         // the DD join, so this is a no-op there.)
         let delta_rebuild = eg.fast_rebuild || dd_native::delta_rebuild_enabled();
-        let fused = dd_native::FusedDdJoin::build(&plans, &transient_funcs, delta_rebuild)?;
+        // `--wcoj`: enable the worst-case-optimal triangle delta query. The
+        // build detects the triangle shape per rule; non-triangle rules in the
+        // ruleset keep the binary `.join` chain (hybrid). Off ⇒ byte-identical
+        // to the pre-WCOJ build.
+        let wcoj = eg.wcoj_enabled;
+        let fused = dd_native::FusedDdJoin::build(&plans, &transient_funcs, delta_rebuild, wcoj)?;
         eg.dd_fused.insert(key.clone(), fused);
     }
 

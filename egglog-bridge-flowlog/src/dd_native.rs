@@ -49,12 +49,18 @@ use std::rc::Rc;
 
 use anyhow::Result;
 use differential_dataflow::input::InputSession;
+// `--wcoj` triangle worst-case-optimal join: dogsdogsdogs prefix-extension /
+// AltNeu delta-query operators (vendored + patched `differential-dogs3`).
+use differential_dataflow::VecCollection;
+use differential_dogs3::altneu::AltNeu;
+use differential_dogs3::{CollectionIndex, ProposeExtensionMethod};
 use egglog_backend_trait::FunctionId;
 use hashbrown::{HashMap, HashSet};
 use timely::communication::allocator::thread::Thread;
 use timely::communication::allocator::Allocator;
 use timely::dataflow::operators::probe::Handle as ProbeHandle;
 use timely::dataflow::operators::{Inspect, Probe};
+use timely::dataflow::Scope;
 use timely::worker::Worker;
 use timely::WorkerConfig;
 
@@ -438,6 +444,131 @@ pub fn plan_join(rule: &RuleIr) -> Result<JoinPlan, String> {
     })
 }
 
+// ===========================================================================
+// `--wcoj` triangle worst-case-optimal join
+// ===========================================================================
+//
+// Detects the reverse-distributivity triangle rule
+//   (rewrite (Add (Mul a b) (Mul a c)) (Mul a (Add b c)))
+// which lowers (term encoding) to three arity-4 atoms
+//   A0  Mul(a, b, m1, x1)     [a, b,  m1, x1]
+//   A1  Mul(a, c, m2, x2)     [a, c,  m2, x2]
+//   A2  Add(m1, m2, o, x3)    [m1, m2, o,  x3]
+// where A0,A1 are the SAME relation (a self-join sharing col-0 `a`), A2 is a
+// different relation joining A0.col2=m1 and A1.col2=m2, and every named
+// variable is distinct. The cyclic core is the triangle on (a, m1, m2): the
+// binary join Mul_a ⋈ Mul_b on `a` materializes a `Σ_a deg(a)²` intermediate
+// the WCOJ collapses to the output.
+
+/// The recognized triangle, with the BINDING-ROW column index of each of the 9
+/// distinct variables (a,b,m1,x1,c,m2,x2,o,x3) plus the two relation ids. All
+/// downstream `extend_using` key selectors and the final `Row` assembly index
+/// the binding row by these columns, so the WCOJ emits the SAME 9-column
+/// binding row as the binary join (bit-exact head firing).
+#[derive(Clone, Debug)]
+pub(crate) struct TriangleShape {
+    mul_func: FunctionId,
+    add_func: FunctionId,
+    // binding-row columns (positions in the n_vars-wide Row)
+    col_a: usize,
+    col_b: usize,
+    col_m1: usize,
+    col_x1: usize,
+    col_c: usize,
+    col_m2: usize,
+    col_x2: usize,
+    col_o: usize,
+    col_x3: usize,
+}
+
+/// Recognize the triangle shape in `plan`, or `None` if it does not match.
+/// Structural (no name/func-id hardcoding): three arity-4 atoms, atoms 0 and 1
+/// the same relation sharing exactly their col-0 var, atom 2 a different
+/// relation whose col-0 = atom0.col2 and col-1 = atom1.col2, and all 9 named
+/// variables distinct. Stage 1 recognizes exactly this 3-atom triangle;
+/// generalization is Stage 2.
+pub(crate) fn detect_triangle(plan: &JoinPlan) -> Option<TriangleShape> {
+    if plan.atoms.len() != 3 {
+        return None;
+    }
+    // Each atom must be arity 4 with all-distinct Var slots (no consts, no
+    // repeated vars within an atom).
+    let atom_var = |i: usize| -> Option<[u32; 4]> {
+        let s = &plan.atoms[i].slots;
+        if s.len() != 4 {
+            return None;
+        }
+        let mut out = [0u32; 4];
+        for (j, slot) in s.iter().enumerate() {
+            match slot {
+                Slot::Var(v) => out[j] = *v,
+                Slot::Const(_) => return None,
+            }
+        }
+        // distinct within the atom
+        for j in 0..4 {
+            for k in (j + 1)..4 {
+                if out[j] == out[k] {
+                    return None;
+                }
+            }
+        }
+        Some(out)
+    };
+    let a0 = atom_var(0)?;
+    let a1 = atom_var(1)?;
+    let a2 = atom_var(2)?;
+
+    let mul_func = plan.atoms[0].func;
+    // A0, A1 same relation; A2 a different relation.
+    if plan.atoms[1].func != mul_func {
+        return None;
+    }
+    let add_func = plan.atoms[2].func;
+    if add_func == mul_func {
+        return None;
+    }
+
+    // A0 = [a, b, m1, x1]; A1 = [a, c, m2, x2] — share col-0 (a), nothing else.
+    let (a, b, m1, x1) = (a0[0], a0[1], a0[2], a0[3]);
+    let (a_, c, m2, x2) = (a1[0], a1[1], a1[2], a1[3]);
+    if a != a_ {
+        return None;
+    }
+    // A2 = [m1, m2, o, x3] — col0 = A0.col2 (m1), col1 = A1.col2 (m2).
+    let (m1_, m2_, o, x3) = (a2[0], a2[1], a2[2], a2[3]);
+    if m1_ != m1 || m2_ != m2 {
+        return None;
+    }
+
+    // All 9 named variables distinct (rules out degenerate self-overlap the
+    // generic shape would not produce; the binary join would treat such a rule
+    // differently, so we leave it to the binary path).
+    let vars = [a, b, m1, x1, c, m2, x2, o, x3];
+    for i in 0..vars.len() {
+        for j in (i + 1)..vars.len() {
+            if vars[i] == vars[j] {
+                return None;
+            }
+        }
+    }
+
+    let col = |v: u32| -> usize { plan.var_col[&v] };
+    Some(TriangleShape {
+        mul_func,
+        add_func,
+        col_a: col(a),
+        col_b: col(b),
+        col_m1: col(m1),
+        col_x1: col(x1),
+        col_c: col(c),
+        col_m2: col(m2),
+        col_x2: col(x2),
+        col_o: col(o),
+        col_x3: col(x3),
+    })
+}
+
 /// The persistent, in-process DD body join for one rule. Built once; driven
 /// across epochs by [`step`]. Owns its timely `Worker`, so it can be stepped
 /// between host iterations without re-spawning threads.
@@ -752,6 +883,7 @@ impl FusedDdJoin {
         plans: &[(usize, JoinPlan)],
         transient_funcs: &HashSet<FunctionId>,
         delta_rebuild: bool,
+        wcoj: bool,
     ) -> Result<FusedDdJoin> {
         let alloc = Allocator::Thread(Thread::default());
         let mut worker = Worker::new(
@@ -784,6 +916,9 @@ impl FusedDdJoin {
             var_col: HashMap<u32, usize>,
             n_vars: usize,
             body_funcs: Vec<FunctionId>,
+            /// `--wcoj` and this rule is the recognized triangle ⇒ build the WCOJ
+            /// delta query instead of the binary `.join` chain. `None` ⇒ binary.
+            triangle: Option<TriangleShape>,
         }
         let rule_plans: Vec<RulePlan> = plans
             .iter()
@@ -795,6 +930,9 @@ impl FusedDdJoin {
                         body_funcs.push(f);
                     }
                 }
+                // Detect the triangle ONLY when `--wcoj` is set; off ⇒ always
+                // `None`, so the build is byte-identical to the binary path.
+                let triangle = if wcoj { detect_triangle(plan) } else { None };
                 RulePlan {
                     idx: *idx,
                     atoms: plan.atoms.iter().map(|a| a.slots.clone()).collect(),
@@ -802,6 +940,7 @@ impl FusedDdJoin {
                     var_col: plan.var_col.clone(),
                     n_vars: plan.var_order.len(),
                     body_funcs,
+                    triangle,
                 }
             })
             .collect();
@@ -861,48 +1000,70 @@ impl FusedDdJoin {
                 let var_col = &rp.var_col;
                 let n_vars = rp.n_vars;
 
-                let mut bound = vec![false; n_vars];
-                let slots0 = atom_slots[0].clone();
-                let vc0 = var_col.clone();
-                let mut cur = rel_coll[&rp.atom_funcs[0]]
-                    .clone()
-                    .flat_map(move |r: Row| bind_atom(&r, &slots0, &vc0));
-                mark_bound(&atom_slots[0], var_col, &mut bound);
-
-                for i in 1..n_atoms {
-                    let slots = atom_slots[i].clone();
-                    let shared: Vec<u32> = atom_vars(&slots)
-                        .into_iter()
-                        .filter(|v| var_col.get(v).map(|&c| bound[c]).unwrap_or(false))
-                        .collect();
-                    let shared_cols_left: Vec<usize> = shared.iter().map(|v| var_col[v]).collect();
-                    let shared_atom_cols: Vec<usize> = shared
-                        .iter()
-                        .map(|v| {
-                            slots
-                                .iter()
-                                .position(|s| matches!(s, Slot::Var(x) if x == v))
-                                .expect("shared var present in atom")
-                        })
-                        .collect();
-
-                    let scl = shared_cols_left.clone();
-                    let left = cur.map(move |b: Row| (pack_key(&b, &scl), b));
-                    let sac = shared_atom_cols.clone();
-                    let right = rel_coll[&rp.atom_funcs[i]]
+                // `--wcoj`: the recognized triangle rule runs the worst-case-
+                // optimal delta query (prefix-extension + AltNeu 3-stream
+                // decomposition) over the SHARED Mul/Add input collections,
+                // emitting the SAME n_vars-wide binding Row as the binary chain.
+                let cur = if let Some(tri) = &rp.triangle {
+                    // Diagnostic (gated `FLOWLOG_WCOJ_TRACE`): confirm which rules
+                    // route to the WCOJ path. Mirrors the other `FLOWLOG_*` debug
+                    // gates; zero cost when off.
+                    #[allow(clippy::disallowed_macros)]
+                    if std::env::var_os("FLOWLOG_WCOJ_TRACE").is_some() {
+                        eprintln!(
+                            "[WCOJ] triangle rule idx={} mul={:?} add={:?}",
+                            rp.idx, tri.mul_func, tri.add_func
+                        );
+                    }
+                    let mul = rel_coll[&tri.mul_func].clone();
+                    let add = rel_coll[&tri.add_func].clone();
+                    wcoj_triangle_collection(scope, mul, add, tri.clone())
+                } else {
+                    let mut bound = vec![false; n_vars];
+                    let slots0 = atom_slots[0].clone();
+                    let vc0 = var_col.clone();
+                    let mut cur = rel_coll[&rp.atom_funcs[0]]
                         .clone()
-                        .map(move |r: Row| (pack_key(&r, &sac), r));
+                        .flat_map(move |r: Row| bind_atom(&r, &slots0, &vc0));
+                    mark_bound(&atom_slots[0], var_col, &mut bound);
 
-                    let slotsc = slots.clone();
-                    let vc = var_col.clone();
-                    let bound_now = bound.clone();
-                    cur = left
-                        .join(right)
-                        .flat_map(move |(_k, (b, r)): (Key, (Row, Row))| {
-                            merge_atom_into(&b, &r, &slotsc, &vc, &bound_now)
-                        });
-                    mark_bound(&slots, var_col, &mut bound);
-                }
+                    for i in 1..n_atoms {
+                        let slots = atom_slots[i].clone();
+                        let shared: Vec<u32> = atom_vars(&slots)
+                            .into_iter()
+                            .filter(|v| var_col.get(v).map(|&c| bound[c]).unwrap_or(false))
+                            .collect();
+                        let shared_cols_left: Vec<usize> =
+                            shared.iter().map(|v| var_col[v]).collect();
+                        let shared_atom_cols: Vec<usize> = shared
+                            .iter()
+                            .map(|v| {
+                                slots
+                                    .iter()
+                                    .position(|s| matches!(s, Slot::Var(x) if x == v))
+                                    .expect("shared var present in atom")
+                            })
+                            .collect();
+
+                        let scl = shared_cols_left.clone();
+                        let left = cur.map(move |b: Row| (pack_key(&b, &scl), b));
+                        let sac = shared_atom_cols.clone();
+                        let right = rel_coll[&rp.atom_funcs[i]]
+                            .clone()
+                            .map(move |r: Row| (pack_key(&r, &sac), r));
+
+                        let slotsc = slots.clone();
+                        let vc = var_col.clone();
+                        let bound_now = bound.clone();
+                        cur = left
+                            .join(right)
+                            .flat_map(move |(_k, (b, r)): (Key, (Row, Row))| {
+                                merge_atom_into(&b, &r, &slotsc, &vc, &bound_now)
+                            });
+                        mark_bound(&slots, var_col, &mut bound);
+                    }
+                    cur
+                };
 
                 // PERF: the output `.distinct()` is redundant here. `step`
                 // accumulates each rule's binding deltas into a per-key weight map
@@ -1405,6 +1566,195 @@ fn merge_atom_into(
         }
     }
     vec![out]
+}
+
+// ---------------------------------------------------------------------------
+// `--wcoj` triangle worst-case-optimal delta query
+// ---------------------------------------------------------------------------
+
+/// Build the worst-case-optimal triangle join as a differential-dataflow
+/// collection of full `n_vars`-wide binding `Row`s — the SAME shape the binary
+/// `.join` chain emits, so the downstream consolidate / capture / env scatter
+/// is bit-identical.
+///
+/// Implements the FULL 3-stream delta decomposition (one delta query per body
+/// atom) inside a single `AltNeu<u32>` nested scope, following dogsdogsdogs'
+/// `examples/delta_query_wcoj.rs`. The total atom order is A0(Mul_a) <
+/// A1(Mul_b) < A2(Add): in each delta query, atoms BEFORE the driving atom read
+/// the `alt` (old) trace and atoms AFTER read the `neu` (new) trace, so
+/// simultaneous cross-atom updates (incl. the Mul self-join) are not
+/// double-counted. The ONLY multiway-intersected variable is the core `a`
+/// (driven by dA2: intersect the `a`-sets of the two Mul eclasses m1,m2 — the
+/// `Σ_a deg(a)²` collapse); every other variable is functionally recovered by a
+/// single in-scope `propose_using`. ALL reads (core intersection AND payload
+/// recovery) are inside the AltNeu scope — unlike the spike shortcut whose
+/// out-of-scope recovery drifted at high iteration counts.
+fn wcoj_triangle_collection<'scope>(
+    scope: Scope<'scope, u32>,
+    mul: VecCollection<'scope, u32, Row, isize>,
+    add: VecCollection<'scope, u32, Row, isize>,
+    tri: TriangleShape,
+) -> VecCollection<'scope, u32, Row, isize> {
+    use differential_dataflow::AsCollection;
+    use timely::dataflow::operators::Concatenate;
+
+    // Raw-relation column layout (fixed by the term encoding's arity-4 schema):
+    //   Mul row = [arg0=a/c, arg1=b/c-payload, eclass=m, rowextra=x]
+    //   Add row = [m1, m2, eclass=o, rowextra=x]
+    // (cols 0..3 are the RELATION columns; tri.col_* are the BINDING columns.)
+    // Each stream assembles a full-width `empty_row()` and writes only the 9
+    // triangle columns; columns >= n_vars stay 0 — identical to the binary
+    // chain, which also leaves unused binding columns at 0. (n_vars itself is
+    // not needed here; the downstream drain reads cols 0..rule.n_vars.)
+    let (ca, cb, cm1, cx1) = (tri.col_a, tri.col_b, tri.col_m1, tri.col_x1);
+    let (cc, cm2, cx2) = (tri.col_c, tri.col_m2, tri.col_x2);
+    let (co, cx3) = (tri.col_o, tri.col_x3);
+
+    scope.scoped::<AltNeu<u32>, _, _>("WcojTriangle", move |inner| {
+        let mul = mul.enter(inner);
+        let add = add.enter(inner);
+        let mul_neu = mul.clone().delay(|t| AltNeu::neu(t.time));
+        let add_neu = add.clone().delay(|t| AltNeu::neu(t.time));
+
+        // --- indices over the entered collections ---------------------------
+        // Mul indices: (K=eclass m, V=arg a), (K=arg a, V=eclass m),
+        //              (K=(a,m), V=(b,x))  [payload recovery]
+        let alt_mul_by_m = CollectionIndex::index(mul.clone().map(|r: Row| (r[2], r[0])));
+        let alt_mul_by_a = CollectionIndex::index(mul.clone().map(|r: Row| (r[0], r[2])));
+        let neu_mul_by_a = CollectionIndex::index(mul_neu.clone().map(|r: Row| (r[0], r[2])));
+        let alt_mul_by_am =
+            CollectionIndex::index(mul.clone().map(|r: Row| ((r[0], r[2]), (r[1], r[3]))));
+        let neu_mul_by_am =
+            CollectionIndex::index(mul_neu.clone().map(|r: Row| ((r[0], r[2]), (r[1], r[3]))));
+        // Add indices: (K=m1, V=m2), (K=m2, V=m1), (K=(m1,m2), V=(o,x)).
+        let neu_add_by_m1 = CollectionIndex::index(add_neu.clone().map(|r: Row| (r[0], r[1])));
+        let neu_add_by_m2 = CollectionIndex::index(add_neu.clone().map(|r: Row| (r[1], r[0])));
+        let neu_add_by_m1m2 =
+            CollectionIndex::index(add_neu.clone().map(|r: Row| ((r[0], r[1]), (r[2], r[3]))));
+
+        // ===== dQ/dA0 : driven by dMul as Mul_a(a,b,m1,x1) ==================
+        // bound a,b,m1,x1 ; A1(Mul_b) NEU, A2(Add) NEU.
+        let changes0 = {
+            // initial prefix: place the Mul delta row's cols into a,b,m1,x1.
+            let prefix = mul.clone().map(move |r: Row| {
+                let mut p = empty_row();
+                p[ca] = r[0];
+                p[cb] = r[1];
+                p[cm1] = r[2];
+                p[cx1] = r[3];
+                p
+            });
+            // 1. intersect m2: Add(m1,·)=m2 (NEU) ∩ Mul(a,·)=m2 (NEU).
+            let with_m2 = prefix
+                .extend(&mut [
+                    &mut neu_add_by_m1.extend_using(move |p: &Row| p[cm1]),
+                    &mut neu_mul_by_a.extend_using(move |p: &Row| p[ca]),
+                ])
+                .map(move |(mut p, m2): (Row, u32)| {
+                    p[cm2] = m2;
+                    p
+                });
+            // 2. recover (c,x2) for Mul_b given (a,m2) (NEU).
+            let with_cx2 = with_m2
+                .propose_using(&mut neu_mul_by_am.extend_using(move |p: &Row| (p[ca], p[cm2])))
+                .map(move |(mut p, (c, x2)): (Row, (u32, u32))| {
+                    p[cc] = c;
+                    p[cx2] = x2;
+                    p
+                });
+            // 3. recover (o,x3) for Add given (m1,m2) (NEU).
+            with_cx2
+                .propose_using(&mut neu_add_by_m1m2.extend_using(move |p: &Row| (p[cm1], p[cm2])))
+                .map(move |(mut p, (o, x3)): (Row, (u32, u32))| {
+                    p[co] = o;
+                    p[cx3] = x3;
+                    p
+                })
+        };
+
+        // ===== dQ/dA1 : driven by dMul as Mul_b(a,c,m2,x2) ==================
+        // bound a,c,m2,x2 ; A0(Mul_a) ALT, A2(Add) NEU.
+        let changes1 = {
+            let prefix = mul.clone().map(move |r: Row| {
+                let mut p = empty_row();
+                p[ca] = r[0];
+                p[cc] = r[1];
+                p[cm2] = r[2];
+                p[cx2] = r[3];
+                p
+            });
+            // 1. intersect m1: Add(·,m2)=m1 (NEU) ∩ Mul(a,·)=m1 (ALT).
+            let with_m1 = prefix
+                .extend(&mut [
+                    &mut neu_add_by_m2.extend_using(move |p: &Row| p[cm2]),
+                    &mut alt_mul_by_a.extend_using(move |p: &Row| p[ca]),
+                ])
+                .map(move |(mut p, m1): (Row, u32)| {
+                    p[cm1] = m1;
+                    p
+                });
+            // 2. recover (b,x1) for Mul_a given (a,m1) (ALT).
+            let with_bx1 = with_m1
+                .propose_using(&mut alt_mul_by_am.extend_using(move |p: &Row| (p[ca], p[cm1])))
+                .map(move |(mut p, (b, x1)): (Row, (u32, u32))| {
+                    p[cb] = b;
+                    p[cx1] = x1;
+                    p
+                });
+            // 3. recover (o,x3) for Add given (m1,m2) (NEU).
+            with_bx1
+                .propose_using(&mut neu_add_by_m1m2.extend_using(move |p: &Row| (p[cm1], p[cm2])))
+                .map(move |(mut p, (o, x3)): (Row, (u32, u32))| {
+                    p[co] = o;
+                    p[cx3] = x3;
+                    p
+                })
+        };
+
+        // ===== dQ/dA2 : driven by dAdd(m1,m2,o,x3) =========================
+        // bound m1,m2,o,x3 ; A0(Mul_a) ALT, A1(Mul_b) ALT.
+        let changes2 = {
+            let prefix = add.clone().map(move |r: Row| {
+                let mut p = empty_row();
+                p[cm1] = r[0];
+                p[cm2] = r[1];
+                p[co] = r[2];
+                p[cx3] = r[3];
+                p
+            });
+            // 1. intersect a: Mul(·,·)=m1 → a (ALT) ∩ Mul(·,·)=m2 → a (ALT).
+            //    THE worst-case-optimal collapse.
+            let with_a = prefix
+                .extend(&mut [
+                    &mut alt_mul_by_m.extend_using(move |p: &Row| p[cm1]),
+                    &mut alt_mul_by_m.extend_using(move |p: &Row| p[cm2]),
+                ])
+                .map(move |(mut p, a): (Row, u32)| {
+                    p[ca] = a;
+                    p
+                });
+            // 2. recover (b,x1) for Mul_a given (a,m1) (ALT).
+            let with_bx1 = with_a
+                .propose_using(&mut alt_mul_by_am.extend_using(move |p: &Row| (p[ca], p[cm1])))
+                .map(move |(mut p, (b, x1)): (Row, (u32, u32))| {
+                    p[cb] = b;
+                    p[cx1] = x1;
+                    p
+                });
+            // 3. recover (c,x2) for Mul_b given (a,m2) (ALT).
+            with_bx1
+                .propose_using(&mut alt_mul_by_am.extend_using(move |p: &Row| (p[ca], p[cm2])))
+                .map(move |(mut p, (c, x2)): (Row, (u32, u32))| {
+                    p[cc] = c;
+                    p[cx2] = x2;
+                    p
+                })
+        };
+
+        // Concat the three delta streams and leave the AltNeu scope.
+        let streams = vec![changes0.inner, changes1.inner, changes2.inner];
+        inner.concatenate(streams).as_collection().leave(scope)
+    })
 }
 
 #[cfg(test)]

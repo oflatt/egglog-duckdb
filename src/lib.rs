@@ -597,6 +597,9 @@ impl EGraph {
         if config.fast_rebuild {
             db.enable_fast_rebuild();
         }
+        if config.wcoj {
+            db.enable_wcoj();
+        }
         let backend: Box<dyn egglog_backend_trait::Backend> = Box::new(db);
         let mut eg = Self::with_backend(backend);
 
@@ -628,6 +631,15 @@ pub struct FlowlogBackendConfig {
     /// so this flag is a no-op there. (Also reachable via the
     /// `FLOWLOG_DELTA_REBUILD` env var.) Experimental; off by default.
     pub fast_rebuild: bool,
+    /// `--wcoj`: route the reverse-distributivity triangle rule
+    /// `(rewrite (Add (Mul a b) (Mul a c)) (Mul a (Add b c)))` through the
+    /// FlowLog backend's worst-case-optimal delta-query join (dogsdogsdogs
+    /// prefix-extension + AltNeu 3-stream decomposition) instead of the
+    /// left-deep binary `.join` chain. Collapses the `Σ_a deg(a)²` triangle
+    /// intermediate to track the output; bit-exact with the binary join at all
+    /// run counts. Other rules stay on the binary chain (hybrid). Experimental;
+    /// off by default.
+    pub wcoj: bool,
 }
 
 /// Knobs for [`EGraph::with_feldera_backend_config`]. Mirrors

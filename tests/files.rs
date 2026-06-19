@@ -44,6 +44,14 @@ struct Run {
     /// `EGGLOG_TEST_NATIVE_UF=1` (plus the per-backend `EGGLOG_TEST_FLOWLOG` /
     /// `EGGLOG_TEST_FELDERA` gates) so it never perturbs the default run.
     native_uf: bool,
+    /// Run the FlowLog treatment with `--wcoj` enabled: the reverse-
+    /// distributivity triangle rule is routed through the worst-case-optimal
+    /// delta-query join instead of the binary `.join` chain. WCOJ is a
+    /// correctness-preserving optimization, so this is diffed against the SAME
+    /// shared snapshot — any divergence is a real bug. Only meaningful with
+    /// `flowlog: true`; gated behind `EGGLOG_TEST_WCOJ=1` (plus the existing
+    /// `EGGLOG_TEST_FLOWLOG` gate) so it never perturbs the default run.
+    wcoj: bool,
     threads: usize,
 }
 
@@ -132,6 +140,7 @@ impl Run {
                 feldera: false,
                 flowlog: false,
                 native_uf: false,
+                wcoj: false,
                 threads: self.threads,
             };
             let proof_check_prog = if self.proof_testing {
@@ -272,6 +281,10 @@ impl Run {
             let mut egraph = EGraph::with_flowlog_backend_config(FlowlogBackendConfig {
                 native_uf: self.native_uf,
                 fast_rebuild: false,
+                // `--wcoj`: route the triangle rule through the worst-case-
+                // optimal delta query. Bit-exact with the binary join, so it is
+                // diffed against the same shared snapshot.
+                wcoj: self.wcoj,
             })
             .unwrap_or_else(|e| panic!("EGraph::with_flowlog_backend init failed: {e}"));
             if self.native_uf {
@@ -498,6 +511,9 @@ impl Run {
                 if self.0.native_uf {
                     write!(f, "_native_uf")?;
                 }
+                if self.0.wcoj {
+                    write!(f, "_wcoj")?;
+                }
 
                 if self.0.threads > 1 {
                     write!(f, "_{}threads", self.0.threads)?;
@@ -579,6 +595,7 @@ fn generate_tests(glob: &str) -> Vec<Trial> {
             feldera: false,
             flowlog: false,
             native_uf: false,
+            wcoj: false,
             threads: 1,
         };
         let should_fail = run.should_fail();
@@ -675,6 +692,19 @@ fn generate_tests(glob: &str) -> Vec<Trial> {
                 flowlog: true,
                 ..run.clone()
             });
+
+            // flowlog + `--wcoj`: route the triangle rule through the
+            // worst-case-optimal delta query. WCOJ is correctness-preserving, so
+            // it shares the reference snapshot — any divergence is a real bug.
+            // Gated behind `EGGLOG_TEST_WCOJ=1` (plus the flowlog gate) so it
+            // never perturbs the default run.
+            if std::env::var("EGGLOG_TEST_WCOJ").is_ok() {
+                push_trial(Run {
+                    flowlog: true,
+                    wcoj: true,
+                    ..run.clone()
+                });
+            }
         }
 
         // native-UF treatments (PR #782 `--native-uf`, TERM mode only): run

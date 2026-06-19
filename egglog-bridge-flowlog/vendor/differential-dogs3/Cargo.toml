@@ -1,0 +1,38 @@
+[package]
+edition = "2021"
+rust-version = "1.86"
+name = "differential-dogs3"
+# Vendored from crates.io `differential-dogs3 = 0.24.0` (Frank McSherry's
+# `dogsdogsdogs`: worst-case-optimal delta-query operators for differential
+# dataflow) with ONE bug fix: `src/operators/lookup_map.rs` read
+# `key_con.index(1)` of a length-1 key container, panicking on EVERY lookup
+# against its own pinned differential-dataflow 0.24.0 (`index out of bounds:
+# the len is 1 but the index is 1`). Both occurrences changed to
+# `key_con.index(0)`. This is an upstreamable bug fix, not a workaround.
+# Used by `egglog-bridge-flowlog`'s `--wcoj` triangle WCOJ (`dd_native.rs`).
+version = "0.24.0"
+authors = ["Frank McSherry <fmcsherry@me.com>"]
+description = "Advanced join patterns in differential dataflow (vendored + patched)"
+homepage = "https://github.com/TimelyDataflow/differential-dataflow"
+license = "MIT"
+repository = "https://github.com/TimelyDataflow/differential-dataflow.git"
+publish = false
+
+[features]
+default = []
+
+[lib]
+name = "differential_dogs3"
+path = "src/lib.rs"
+
+[dependencies.differential-dataflow]
+version = "=0.24.0"
+default-features = false
+
+[dependencies.serde]
+version = "1.0"
+features = ["derive"]
+
+[dependencies.timely]
+version = "=0.30.0"
+default-features = false

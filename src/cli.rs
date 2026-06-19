@@ -128,6 +128,16 @@ struct Args {
     /// Bit-exact with the full rebuild; off by default.
     #[clap(long = "fast-rebuild")]
     fast_rebuild: bool,
+    /// Enable the FlowLog backend's worst-case-optimal triangle join. Routes
+    /// the reverse-distributivity triangle rule
+    /// `(rewrite (Add (Mul a b) (Mul a c)) (Mul a (Add b c)))` through a
+    /// dogsdogsdogs prefix-extension / AltNeu delta-query WCOJ (3-stream delta
+    /// decomposition) instead of the left-deep binary `.join` chain, collapsing
+    /// the `Σ_a deg(a)²` intermediate to track the output. `--flowlog` only;
+    /// other rules stay on the binary chain (hybrid). Bit-exact with the binary
+    /// join at all run counts. Off by default.
+    #[clap(long = "wcoj")]
+    wcoj: bool,
 }
 
 /// Start a command-line interface for the E-graph.
@@ -166,6 +176,14 @@ pub fn cli(mut egraph: EGraph) {
         log::error!(
             "--native-uf with --flowlog/--feldera/--duckdb is TERM mode only; --proofs is not yet supported"
         );
+        std::process::exit(1);
+    }
+
+    // `--wcoj` is a FlowLog-only knob (the worst-case-optimal triangle delta
+    // query lives in the FlowLog DD backend). Reject it on any other path so a
+    // misplaced flag is a hard error rather than a silent no-op.
+    if args.wcoj && !args.flowlog_backend {
+        log::error!("--wcoj is only supported with --flowlog");
         std::process::exit(1);
     }
 
@@ -385,9 +403,12 @@ pub fn cli(mut egraph: EGraph) {
                     // matching #782 encoding (`with_native_uf`) below — both are
                     // needed (the encoding emits the program; the backend
                     // interception runs it through the host-pass rebuild).
+                    // `--wcoj` routes the triangle rule through the WCOJ delta
+                    // query (FlowLog only; ignored on other backends).
                     egglog::EGraph::with_flowlog_backend_config(egglog::FlowlogBackendConfig {
                         native_uf: args.native_uf,
                         fast_rebuild: args.fast_rebuild,
+                        wcoj: args.wcoj,
                     })
                 }
                 .unwrap_or_else(|err| {

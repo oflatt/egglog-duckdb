@@ -297,6 +297,13 @@ pub struct EGraph {
     /// rule lowers to `view ⋈ δdisplaced` on the fused DD worker. Built lazily
     /// the first time a rebuild rule is routed (the source IR never changes).
     pub(crate) native_uf_rebuild_dd_ir: HashMap<usize, RuleIr>,
+    /// `--wcoj`: route the reverse-distributivity triangle rule through the
+    /// worst-case-optimal delta-query join (dogsdogsdogs prefix-extension +
+    /// AltNeu 3-stream decomposition in [`dd_native`]) instead of the left-deep
+    /// binary `.join` chain. Detected structurally per rule at fused-build time;
+    /// non-triangle rules are unaffected. Off by default — when off the FlowLog
+    /// join path is byte-identical to the pre-WCOJ behavior.
+    pub(crate) wcoj_enabled: bool,
 }
 
 impl Default for EGraph {
@@ -369,6 +376,7 @@ impl EGraph {
             native_uf_view_cols: HashMap::new(),
             native_uf_disp_rel: HashMap::new(),
             native_uf_rebuild_dd_ir: HashMap::new(),
+            wcoj_enabled: false,
         }
     }
 
@@ -391,6 +399,15 @@ impl EGraph {
     ///     `view ⋈ @DispΔ` join). The host UfTable is shared by both.
     pub fn enable_fast_rebuild(&mut self) {
         self.fast_rebuild = true;
+    }
+
+    /// Turn on `--wcoj`: route the reverse-distributivity triangle rule through
+    /// the worst-case-optimal delta-query join (see [`dd_native`]). When off,
+    /// every rule lowers to the left-deep binary `.join` chain exactly as
+    /// before. Detected structurally at fused-build time; non-triangle rules are
+    /// unaffected. Off by default.
+    pub fn enable_wcoj(&mut self) {
+        self.wcoj_enabled = true;
     }
 
     /// Read-only native-UF find for the `@UF_Sf` function `uf_func`. Returns the

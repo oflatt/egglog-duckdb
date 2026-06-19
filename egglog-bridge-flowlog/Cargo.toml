@@ -29,6 +29,16 @@ flowlog-runtime = { git = "https://github.com/flowlog-rs/flowlog", rev = "fb0eeb
 # already in Cargo.lock (pulled by flowlog-runtime) so no duplicate copies.
 differential-dataflow = "=0.24.0"
 timely = "=0.30.0"
+# `--wcoj` triangle worst-case-optimal join: Frank McSherry's `dogsdogsdogs`
+# prefix-extension / AltNeu delta-query operators (`CollectionIndex`, `extend`,
+# `extend_using`). Vendored + one-line-patched from crates.io
+# `differential-dogs3 = 0.24.0` (the published crate reads `key_con.index(1)`
+# of a length-1 key container and panics on every lookup against its own pinned
+# differential-dataflow 0.24.0; fixed to `.index(0)` — an upstreamable bug fix).
+# Pins the SAME differential-dataflow 0.24.0 / timely 0.30.0 as above, so it
+# shares the single copy already in Cargo.lock (zero version conflict). See
+# `vendor/differential-dogs3/Cargo.toml` for the patch note.
+differential-dogs3 = { path = "vendor/differential-dogs3" }
 # serde is needed for the wide ([u32; W>32]) DD binding row: timely's
 # `ExchangeData` requires `Serialize + Deserialize`, and serde only derives
 # those for arrays up to length 32, so `dd_native::Row` is a newtype with a
