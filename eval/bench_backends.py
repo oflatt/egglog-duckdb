@@ -15,14 +15,19 @@ Treatment axes
 * backend  : bridge (default in-memory), duckdb (`--duckdb`),
              feldera (`--feldera`), flowlog (`--flowlog`).
 * encoding : normal, term-encoding (`--term-encoding`), proofs (`--proofs`).
-* native-UF: `--native-uf` -- the host-pass union-find encoding. Only meaningful
-             on term/proof cells (the relational-UF encoding it replaces only
-             exists under term encoding).
-* fast-rebuild: the relational-deltaUF rebuild optimisation, gated per backend
-             by env (`DUCK_DELTA_REBUILD` / `FELDERA_DELTA_REBUILD` /
-             `FLOWLOG_DELTA_REBUILD`). Valid only on relational-UF cells; it is
-             mutually exclusive with `--native-uf` (where the rebuild is the
-             host-pass, not the relational deltaUF rule).
+* native-UF: `--native-uf` -- the host-pass union-find encoding (vs relational
+             UF). Only meaningful on term/proof cells (the relational-UF
+             encoding it replaces only exists under term encoding).
+* fast-rebuild: `--fast-rebuild` -- a custom/specialized rebuild vs the
+             pure-engine rebuild (dataflow backends: custom host-pass vs pure
+             DD engine; bridge/duckdb: on-engine specialized vs full). The flag
+             drives it for ALL backends INCLUDING the bridge. It is ORTHOGONAL
+             to native-UF: the two axes cross into four distinct, bit-exact
+             rebuild cells per term-like cell -- plain, +fastrb, +nuf,
+             +nuf+fastrb.
+* wcoj     : `--wcoj` -- worst-case-optimal join, flowlog ONLY (rejected on the
+             other backends). Crosses with flowlog's rebuild cells so each gets
+             a `+wcoj` variant; correctness-preserving (same family reference).
 
 The reference / oracle cell is **bridge-normal** (in-memory bridge, no term
 encoding). Every other cell's correctness is judged against it by tuple-count
@@ -115,9 +120,14 @@ def _encoding_family(condition):
         return "term-encoding"
     return "normal"
 
-# Per-backend env var that turns on the relational-deltaUF fast-rebuild.
+# Per-backend env var that ALSO turns on the specialized (fast) rebuild. The
+# primary driver is now the `--fast-rebuild` CLI flag, which is carried in the
+# cell's `flags` for EVERY backend INCLUDING the bridge (the bridge gained a
+# relational fast-rebuild in the committed work); these env knobs are kept as
+# legacy/redundant fallbacks for the backends that still honor them. bridge has
+# no env knob (the flag alone drives it), so its +fastrb cell is flag-only.
 FAST_REBUILD_ENV = {
-    "bridge": None,  # no relational-deltaUF fast-rebuild knob on the bridge
+    "bridge": None,  # flag-only: `--fast-rebuild` drives the bridge fast-rebuild
     "duckdb": "DUCK_DELTA_REBUILD",
     "feldera": "FELDERA_DELTA_REBUILD",
     "flowlog": "FLOWLOG_DELTA_REBUILD",
@@ -146,20 +156,42 @@ def conditions():
     no `--term-encoding` flag (that would be redundant / can panic the
     backend); "proofs" adds `--proofs` for proof-instrumented term encoding.
 
-    On top of the base cells we add two treatment axes, skipping degenerate
-    combinations:
+    On top of each term-like base cell we cross TWO orthogonal rebuild axes,
+    yielding FOUR distinct, bit-exact rebuild cells per term-like cell:
 
-    * native-UF (`--native-uf`): only on term/proof cells (the relational-UF
+    * native-UF (`--native-uf`): the host-pass union-find encoding (vs the
+      relational-UF encoding). Only on term/proof cells (the relational-UF
       encoding it replaces only exists under term encoding). Never on the
       bridge-normal oracle.
-    * fast-rebuild (relational-deltaUF, per-backend env): only on relational-UF
-      cells (i.e. NOT native-UF) of backends that have the knob, and never on
-      the bridge (no relational fast-rebuild knob there). Mutually exclusive
-      with native-UF.
+    * fast-rebuild (`--fast-rebuild`): a custom/specialized rebuild vs the
+      pure-engine rebuild. On the dataflow backends (feldera/flowlog) it
+      selects a custom host-pass rebuild instead of the pure DD-engine rebuild;
+      on bridge/duckdb it selects an on-engine specialized rebuild instead of
+      the full one. The `--fast-rebuild` CLI flag drives it for ALL backends,
+      INCLUDING the bridge (the bridge gained relational fast-rebuild in the
+      committed work). All four cells are real and bit-exact:
+        - plain        : relational UF, pure-engine rebuild              (no flag)
+        - +fastrb      : relational UF, specialized rebuild              (--fast-rebuild)
+        - +nuf         : native UF,     pure-engine rebuild              (--native-uf)
+        - +nuf+fastrb  : native UF,     specialized rebuild              (--native-uf --fast-rebuild)
 
-    The condition label carries the extra axes: a "+nuf" suffix for native-UF
-    and "+fastrb" for fast-rebuild. The bare base label is the relational-UF
-    encoding with rebuild OFF.
+    NEW axis -- WCOJ (`--wcoj`), flowlog TERM-ENCODING ONLY:
+    * Worst-case-optimal join. The `--wcoj` flag is rejected on every backend
+      except flowlog, so we cross it in ONLY for flowlog -- and ONLY on its
+      term-encoding cells: each flowlog term-encoding rebuild cell additionally
+      gets a `+wcoj` variant (`--wcoj` appended to the flags, `+wcoj` to the
+      label). So flowlog's term cells become {plain, +fastrb, +nuf,
+      +nuf+fastrb} x {no-wcoj, +wcoj} = 8 cells; its proofs cells get NO `+wcoj`
+      variant. Proof mode is excluded on purpose: WCOJ is a term-encoding join
+      optimization untested under proofs, and parity only checks the print-size
+      (tuple-count) block, so a flowlog-proofs+wcoj cell with WRONG proof terms
+      but matching tuple counts would FALSE-PASS. WCOJ is correctness-
+      preserving on the term cells, so it diffs against the same family
+      reference (REFERENCE_BY_FAMILY is unchanged).
+
+    The condition label carries the extra axes: "+nuf" for native-UF,
+    "+fastrb" for fast-rebuild, "+wcoj" for the WCOJ join. The bare base label
+    is relational-UF with the pure-engine rebuild.
     """
     for backend, bflags, term_only in BACKENDS:
         for encoding, eflags in ENCODINGS:
@@ -178,33 +210,49 @@ def conditions():
             # oracle (and any other non-term cell) has no UF axes.
             term_like = encoding in ("term-encoding", "proofs")
 
-            # 1) Base cell: relational-UF, rebuild OFF (the oracle is here).
-            yield (base_label, backend, encoding, list(base_flags), False, False)
-
             if not term_like:
+                # Non-term cell (the bridge-normal oracle): a single plain cell.
+                yield (base_label, backend, encoding, list(base_flags), False, False)
                 continue
 
-            # 2) native-UF cell (host-pass rebuild). No fast-rebuild env (the
-            #    host-pass IS the rebuild). Adds the --native-uf flag.
-            #    `--native-uf` supports `--proofs` only on the native bridge; on
-            #    the dataflow/SQL backends it is TERM mode only, so skip the
-            #    degenerate +nuf-on-proofs cell there.
+            # `--native-uf` supports `--proofs` only on the native bridge; on
+            # the dataflow/SQL backends it is TERM mode only, so skip the
+            # degenerate +nuf-on-proofs cells there.
             nuf_ok = (encoding == "term-encoding") or (backend == "bridge")
-            if nuf_ok:
-                yield (f"{base_label}+nuf", backend, encoding,
-                       base_flags + ["--native-uf"], True, False)
 
-            # 3) fast-rebuild cell (relational-deltaUF), only where the backend
-            #    has the knob (not the bridge). Relational-UF (no --native-uf),
-            #    enabled via the `--fast-rebuild` CLI flag. This drops the
-            #    always-empty `δview ⋈ uf_old` rebuild term (sound under
-            #    canonicalize-at-creation). There is no `+nuf+fastrb` cell:
-            #    under native-UF the rebuild already scopes to `view ⋈ δuf`
-            #    (the delta path is the native-UF DEFAULT), so `--fast-rebuild`
-            #    is a no-op there and `+nuf+fastrb` would be degenerate == `+nuf`.
-            if FAST_REBUILD_ENV.get(backend):
-                yield (f"{base_label}+fastrb", backend, encoding,
-                       base_flags + ["--fast-rebuild"], False, True)
+            # The four rebuild cells (suffix, native_uf, fast_rebuild). All four
+            # are real, distinct, and bit-exact. +fastrb / +nuf+fastrb add the
+            # `--fast-rebuild` CLI flag for EVERY backend (bridge included).
+            rebuild_cells = [
+                ("", False, False),               # plain: relational UF, pure-engine rebuild
+                ("+fastrb", False, True),         # relational UF, specialized rebuild
+            ]
+            if nuf_ok:
+                rebuild_cells += [
+                    ("+nuf", True, False),         # native UF, pure-engine rebuild
+                    ("+nuf+fastrb", True, True),   # native UF, specialized rebuild
+                ]
+
+            # WCOJ cross-product: flowlog TERM-ENCODING cells ONLY. Other
+            # backends reject --wcoj, and proof mode is intentionally excluded:
+            # WCOJ is a term-encoding join optimization untested under proofs,
+            # and the eval only checks the print-size (tuple-count) block, so a
+            # flowlog-proofs+wcoj cell with WRONG proof terms but matching tuple
+            # counts would FALSE-PASS. So gate on the term encoding.
+            if backend == "flowlog" and encoding == "term-encoding":
+                wcoj_variants = [("", []), ("+wcoj", ["--wcoj"])]
+            else:
+                wcoj_variants = [("", [])]
+
+            for suffix, native_uf, fast_rebuild in rebuild_cells:
+                flags = list(base_flags)
+                if native_uf:
+                    flags.append("--native-uf")
+                if fast_rebuild:
+                    flags.append("--fast-rebuild")
+                for wcoj_suffix, wcoj_flags in wcoj_variants:
+                    yield (f"{base_label}{suffix}{wcoj_suffix}", backend, encoding,
+                           flags + wcoj_flags, native_uf, fast_rebuild)
 
 
 class BenchDB:
@@ -316,7 +364,12 @@ def find_benchmarks(path: Path) -> list[Path]:
         return sorted(dest.rglob("*.egg"))
     if path.is_file():
         return [path]
-    return sorted(path.rglob("*.egg"))
+    # Exclude fail-typecheck negative tests: they are EXPECTED to fail (mirrors
+    # tests/files.rs `should_fail()` = path contains "fail-typecheck"), so they
+    # are not benchmarks -- running them only adds expected-failure noise. (Do
+    # NOT filter by the bare "fail" substring: container-fail.egg and
+    # repro-small-rebuild-fail-term-encoding.egg are positive tests.)
+    return sorted(p for p in path.rglob("*.egg") if "fail-typecheck" not in str(p))
 
 
 # --- Per-phase profile: bucket per-ruleset/per-class times into a uniform
