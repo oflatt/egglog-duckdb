@@ -242,7 +242,9 @@ This has the added benefit of allowing us to keep terms around
 # Globals
 
 *Before the term encoding*, egglog desugars all global
-  variables to constructors with the `proof_global_remover.rs` pass.
+  variables with the `remove_globals.rs` pass (run with
+  `use_constructors_for_eq_sort = true`): eq-sort globals become 0-arg
+  constructors, and non-eq-sort globals become 0-arg `Custom` functions.
 This makes the encoding simpler and makes it so the backend
   need not worry about globals.
 The above program doesn't have any global variables, so it stays the same.

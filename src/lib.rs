@@ -2435,6 +2435,11 @@ impl EGraph {
             // TODO this is ugly- we don't need an entire e-graph just for type information.
             let typechecked = original_typechecking.typecheck_program(&desugared)?;
 
+            // This proof-encoding gate intentionally runs on the *user*
+            // program, before global removal (see `resolve_command`). Global
+            // removal injects `:unsafe-seminaive` rules (for `Custom` globals
+            // referenced in a rule head); gating here keeps those internal
+            // rules exempt from the `:unsafe-seminaive` rejection below.
             for command in &typechecked {
                 if let Err(reason) = command_supports_proof_encoding(
                     &command.to_command(),
@@ -2453,7 +2458,12 @@ impl EGraph {
         } else {
             let mut typechecked = self.typecheck_program(&desugared)?;
 
-            typechecked = remove_globals::remove_globals(typechecked, &mut self.parser.symbol_gen);
+            typechecked = remove_globals::remove_globals(
+                typechecked,
+                // Native backend: lower every global to a 0-arg `Custom`
+                // function (no constructor lifting).
+                false,
+            );
             for command in &typechecked {
                 self.names.check_shadowing(command)?;
             }
@@ -2474,11 +2484,13 @@ impl EGraph {
                 desugared_before_proofs: vec![],
             })
         } else {
-            // Now remove globals for actual execution (but NOT from desugared_commands)
-            let typechecked_no_globals = proof_global_remover::remove_globals(
-                resolved_before_proofs.clone(),
-                &mut self.parser.symbol_gen,
-            );
+            // Remove globals for actual execution (but NOT from
+            // desugared_commands). Term/proof encoding lifts eq-sort
+            // globals to constructors so they get a real eclass; non-eq-sort
+            // globals become 0-arg `Custom` functions that the encoder
+            // leaves as plain key-value stores.
+            let typechecked_no_globals =
+                remove_globals::remove_globals(resolved_before_proofs.clone(), true);
             for command in &typechecked_no_globals {
                 self.names.check_shadowing(command)?;
             }
@@ -2494,12 +2506,12 @@ impl EGraph {
                 }
 
                 // Now typecheck using self, adding term type information.
+                // The term encoder's intermediate top-level `let`s (e.g.
+                // `(let @v (bigint 3))`) are removed here so no globals
+                // survive into execution.
                 let desugared_typechecked = self.typecheck_program(&desugared)?;
-                // remove globals again, but this time allow primitive globals
-                let desugared_typechecked = remove_globals::remove_globals(
-                    desugared_typechecked,
-                    &mut self.parser.symbol_gen,
-                );
+                let desugared_typechecked =
+                    remove_globals::remove_globals(desugared_typechecked, false);
 
                 new_typechecked.extend(desugared_typechecked);
             }

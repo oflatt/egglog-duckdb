@@ -2,15 +2,33 @@
 //! them into functions with no arguments.
 //! This requires type information, so it is done after type checking.
 //! Primitives are translated into functions with a primitive output.
-//! When a globally-bound primitive value is used in the actions of a rule,
-//! we add a new variable to the query bound to the primitive value.
+//!
+//! This is the single global-removal pass shared by all backends. The
+//! `use_constructors_for_eq_sort` flag selects between two lowerings for
+//! *eq-sort* globals:
+//!
+//! - Native backend (`false`): every global becomes a 0-arg `Custom`
+//!   function whose value is `set`. References to the global become a
+//!   direct `Custom` lookup `($x)`.
+//! - Term/proof encoding (`true`): an eq-sort global becomes a 0-arg
+//!   `Constructor` plus a `union`, which the term encoder can lift to a
+//!   real 0-arg term (giving it an eclass). Non-eq-sort globals still
+//!   become `Custom` functions (there is no eclass to allocate).
+//!
+//! In both modes, a global referenced in a rule head is lowered by
+//! rewriting the reference to a 0-arg call. For a `Custom` global the
+//! call is a RHS function lookup, so the rule opts into
+//! `:unsafe-seminaive` (see `any_custom_global_in_head`).
 
 use crate::*;
 use crate::{core::ResolvedCall, typechecking::FuncType};
-use egglog_ast::generic_ast::{GenericAction, GenericExpr, GenericFact, GenericRule};
+use egglog_ast::generic_ast::{GenericAction, GenericExpr, GenericRule};
 
-struct GlobalRemover<'a> {
-    fresh: &'a mut SymbolGen,
+struct GlobalRemover {
+    /// When true, eq-sort globals are lifted to constructors (for the
+    /// term/proof encoding); otherwise everything becomes a 0-arg
+    /// `Custom` function (the native backend).
+    use_constructors_for_eq_sort: bool,
 }
 
 /// Removes all globals from a program.
@@ -36,150 +54,199 @@ struct GlobalRemover<'a> {
 /// (rule ((Neg y))
 ///       ((Add x x)))
 /// ```
-/// We instrument the query to make the value available:
+/// the references in the head are rewritten to the 0-arg call:
 /// ```ignore
-/// (rule ((Neg y)
-///        (= fresh_var_for_x (x)))
-///       ((Add fresh_var_for_x fresh_var_for_x)))
+/// (rule ((Neg y))
+///       ((Add (x) (x))) :unsafe-seminaive)
 /// ```
+/// `(x)` is a RHS function lookup, so the rule is marked
+/// `:unsafe-seminaive` to permit the read.
 pub(crate) fn remove_globals(
     prog: Vec<ResolvedNCommand>,
-    fresh: &mut SymbolGen,
+    use_constructors_for_eq_sort: bool,
 ) -> Vec<ResolvedNCommand> {
-    let mut remover = GlobalRemover { fresh };
+    let mut remover = GlobalRemover {
+        use_constructors_for_eq_sort,
+    };
     prog.into_iter()
         .flat_map(|cmd| remover.remove_globals_cmd(cmd))
         .collect()
 }
 
-fn resolved_var_to_call(var: &ResolvedVar) -> ResolvedCall {
-    assert!(
-        var.is_global_ref,
-        "resolved_var_to_call called on non-global var"
-    );
-    ResolvedCall::Func(FuncType {
-        name: var.name.clone(),
-        subtype: FunctionSubtype::Custom,
-        input: vec![],
-        output: var.sort.clone(),
-    })
-}
-
-/// TODO (yz) it would be better to implement replace_global_var
-/// as a function from ResolvedVar to ResolvedExpr
-/// and use it as an argument to `subst` instead of `visit_expr`,
-/// but we have not implemented `subst` for command.
-fn replace_global_vars(expr: ResolvedExpr) -> ResolvedExpr {
-    match expr.get_global_var() {
-        Some(resolved_var) => {
-            GenericExpr::Call(expr.span(), resolved_var_to_call(&resolved_var), vec![])
+impl GlobalRemover {
+    /// Subtype to use for a reference to a global of the given sort.
+    /// Must match the decl-time lowering in `remove_globals_cmd`: under
+    /// `use_constructors_for_eq_sort`, eq-sort globals are constructors and
+    /// everything else is `Custom`. Decided purely from the sort so it is
+    /// consistent even though each command is desugared by a fresh remover
+    /// (the decl and its references may live in different commands).
+    fn global_subtype(&self, sort: &ArcSort) -> FunctionSubtype {
+        if self.use_constructors_for_eq_sort && sort.is_eq_sort() {
+            FunctionSubtype::Constructor
+        } else {
+            FunctionSubtype::Custom
         }
-        None => expr,
     }
-}
 
-fn remove_globals_expr(expr: ResolvedExpr) -> ResolvedExpr {
-    expr.visit_exprs(&mut replace_global_vars)
-}
+    fn resolved_var_to_call(&self, var: &ResolvedVar) -> ResolvedCall {
+        assert!(
+            var.is_global_ref,
+            "resolved_var_to_call called on non-global var"
+        );
+        ResolvedCall::Func(FuncType {
+            name: var.name.clone(),
+            subtype: self.global_subtype(&var.sort),
+            input: vec![],
+            output: var.sort.clone(),
+        })
+    }
 
-fn remove_globals_action(action: ResolvedAction) -> ResolvedAction {
-    action.visit_exprs(&mut replace_global_vars)
-}
+    /// TODO (yz) it would be better to implement replace_global_var
+    /// as a function from ResolvedVar to ResolvedExpr
+    /// and use it as an argument to `subst` instead of `visit_expr`,
+    /// but we have not implemented `subst` for command.
+    fn replace_global_vars(&self, expr: ResolvedExpr) -> ResolvedExpr {
+        match expr.get_global_var() {
+            Some(resolved_var) => GenericExpr::Call(
+                expr.span(),
+                self.resolved_var_to_call(&resolved_var),
+                vec![],
+            ),
+            None => expr,
+        }
+    }
 
-impl GlobalRemover<'_> {
+    fn remove_globals_expr(&self, expr: ResolvedExpr) -> ResolvedExpr {
+        expr.visit_exprs(&mut |e| self.replace_global_vars(e))
+    }
+
+    fn remove_globals_action(&self, action: ResolvedAction) -> ResolvedAction {
+        action.visit_exprs(&mut |e| self.replace_global_vars(e))
+    }
+
     fn remove_globals_cmd(&mut self, cmd: ResolvedNCommand) -> Vec<ResolvedNCommand> {
         match cmd {
             GenericNCommand::CoreAction(action) => match action {
                 GenericAction::Let(span, name, expr) => {
                     let ty = expr.output_type();
+                    let body = self.remove_globals_expr(expr);
 
-                    let resolved_call = ResolvedCall::Func(FuncType {
-                        name: name.name.clone(),
-                        subtype: FunctionSubtype::Custom,
-                        input: vec![],
-                        output: ty.clone(),
-                    });
-                    let func_decl = ResolvedFunctionDecl {
-                        name: name.name,
-                        subtype: FunctionSubtype::Custom,
-                        impl_kind: FunctionImpl::Default,
-                        schema: Schema {
+                    if self.use_constructors_for_eq_sort && ty.is_eq_sort() {
+                        // Term/proof encoding: lift the eq-sort global to a
+                        // 0-arg constructor and union it with its value, so
+                        // the term encoder can give it a real eclass.
+                        let resolved_call = ResolvedCall::Func(FuncType {
+                            name: name.name.clone(),
+                            subtype: FunctionSubtype::Constructor,
                             input: vec![],
-                            output: ty.name().to_owned(),
-                        },
-                        resolved_schema: resolved_call.clone(),
-                        merge: None,
-                        cost: None,
-                        unextractable: true,
-                        internal_hidden: false,
-                        internal_let: true,
-                        span: span.clone(),
-                        term_constructor: None,
-                    };
-                    vec![
-                        GenericNCommand::Function(func_decl),
-                        GenericNCommand::CoreAction(GenericAction::Set(
-                            span,
-                            resolved_call,
-                            vec![],
-                            remove_globals_expr(expr),
-                        )),
-                    ]
+                            output: ty.clone(),
+                        });
+                        let func_decl = ResolvedFunctionDecl {
+                            name: name.name,
+                            subtype: FunctionSubtype::Constructor,
+                            impl_kind: FunctionImpl::Default,
+                            schema: Schema {
+                                input: vec![],
+                                output: ty.name().to_owned(),
+                            },
+                            resolved_schema: resolved_call.clone(),
+                            merge: None,
+                            cost: None,
+                            unextractable: true,
+                            internal_hidden: false,
+                            internal_let: true,
+                            span: span.clone(),
+                            term_constructor: None,
+                        };
+                        vec![
+                            GenericNCommand::Function(func_decl),
+                            GenericNCommand::CoreAction(GenericAction::Union(
+                                span.clone(),
+                                ResolvedExpr::Call(span, resolved_call, vec![]),
+                                body,
+                            )),
+                        ]
+                    } else {
+                        // Native backend (all globals) and non-eq-sort
+                        // globals under term encoding: a 0-arg `Custom`
+                        // function whose value is `set`. A non-eq-sort
+                        // function has no eclass/congruence, so the term
+                        // encoder leaves it as a plain key-value store and
+                        // reads it back with a direct 0-arg lookup.
+                        let resolved_call = ResolvedCall::Func(FuncType {
+                            name: name.name.clone(),
+                            subtype: FunctionSubtype::Custom,
+                            input: vec![],
+                            output: ty.clone(),
+                        });
+                        let func_decl = ResolvedFunctionDecl {
+                            name: name.name,
+                            subtype: FunctionSubtype::Custom,
+                            impl_kind: FunctionImpl::Default,
+                            schema: Schema {
+                                input: vec![],
+                                output: ty.name().to_owned(),
+                            },
+                            resolved_schema: resolved_call.clone(),
+                            merge: None,
+                            cost: None,
+                            unextractable: true,
+                            internal_hidden: false,
+                            internal_let: true,
+                            span: span.clone(),
+                            term_constructor: None,
+                        };
+                        vec![
+                            GenericNCommand::Function(func_decl),
+                            GenericNCommand::CoreAction(GenericAction::Set(
+                                span,
+                                resolved_call,
+                                vec![],
+                                body,
+                            )),
+                        ]
+                    }
                 }
-                _ => vec![GenericNCommand::CoreAction(remove_globals_action(action))],
+                _ => vec![GenericNCommand::CoreAction(
+                    self.remove_globals_action(action),
+                )],
             },
             GenericNCommand::NormRule { rule } => {
-                // A map from the global variables in actions to their new names
-                // in the query.
-                let mut globals = HashMap::default();
-                rule.head.clone().visit_exprs(&mut |expr| {
-                    if let Some(resolved_var) = expr.get_global_var() {
-                        let new_name = self.fresh.fresh(&resolved_var.name);
-                        globals.insert(
-                            resolved_var.clone(),
-                            GenericExpr::Var(
-                                expr.span(),
-                                ResolvedVar {
-                                    name: new_name,
-                                    sort: resolved_var.sort.clone(),
-                                    is_global_ref: false,
-                                },
-                            ),
-                        );
-                    }
-                    expr
-                });
-                let new_facts: Vec<ResolvedFact> = globals
-                    .iter()
-                    .map(|(old, new)| {
-                        GenericFact::Eq(
-                            new.span(),
-                            GenericExpr::Call(new.span(), resolved_var_to_call(old), vec![]),
-                            new.clone(),
-                        )
-                    })
-                    .collect();
+                // Option B (unsafe-lookup): rewrite every global reference
+                // in the body AND head to its 0-arg call. A `Custom` global
+                // in the head is a RHS function lookup, so the rule must opt
+                // into `:unsafe-seminaive`. (Constructor globals are 0-arg
+                // terms and need no such flag.)
+                let any_custom_global_in_head = {
+                    let mut found = false;
+                    rule.head.clone().visit_exprs(&mut |expr| {
+                        if let Some(resolved_var) = expr.get_global_var()
+                            && self.global_subtype(&resolved_var.sort) == FunctionSubtype::Custom
+                        {
+                            found = true;
+                        }
+                        expr
+                    });
+                    found
+                };
 
                 let new_rule = GenericRule {
                     span: rule.span,
-                    // instrument the old facts and add the new facts to the end
                     body: rule
                         .body
                         .iter()
-                        .map(|fact| fact.clone().visit_exprs(&mut replace_global_vars))
-                        .chain(new_facts)
-                        .collect(),
-                    // replace references to globals with the newly bound names
-                    head: rule.head.clone().visit_exprs(&mut |expr| {
-                        if let Some(resolved_var) = expr.get_global_var() {
-                            globals.get(&resolved_var).unwrap().clone()
-                        } else {
-                            expr
-                        }
-                    }),
+                        .map(|fact| {
+                            fact.clone()
+                                .visit_exprs(&mut |e| self.replace_global_vars(e))
+                        })
+                        .collect::<Vec<ResolvedFact>>(),
+                    head: rule
+                        .head
+                        .clone()
+                        .visit_exprs(&mut |e| self.replace_global_vars(e)),
                     name: rule.name.clone(),
                     ruleset: rule.ruleset.clone(),
-                    unsafe_seminaive: rule.unsafe_seminaive,
+                    unsafe_seminaive: rule.unsafe_seminaive || any_custom_global_in_head,
                     naive: rule.naive,
                     no_decomp: rule.no_decomp,
                 };
@@ -194,7 +261,7 @@ impl GlobalRemover<'_> {
                 removed.push(new_command);
                 removed
             }
-            _ => vec![cmd.visit_exprs(&mut replace_global_vars)],
+            _ => vec![cmd.visit_exprs(&mut |e| self.replace_global_vars(e))],
         }
     }
 }

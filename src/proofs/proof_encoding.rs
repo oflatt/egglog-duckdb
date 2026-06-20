@@ -71,6 +71,15 @@ pub(crate) struct EncodingState {
     /// view name to its backend `FunctionId` and calls
     /// `RuleBuilderOps::set_focus_exclude_table`.
     pub rebuild_view_exclude: HashMap<String, String>,
+    /// Names of non-eq-sort globals (e.g. `$N` from `(let $N (bigrat 3 1))`)
+    /// that the term encoder passes through as plain 0-arg key-value stores
+    /// instead of building term/view tables for them. Populated in
+    /// `term_encode_command`'s `Function` arm when the decl is recognized (by
+    /// its `internal_let` flag) as such a global; consulted in the `Set` and
+    /// expression-read paths so they emit a direct `($N)` lookup rather than a
+    /// (nonexistent) view access. Keyed by name because `FuncType` (the only
+    /// info available at the read sites) does not carry `internal_let`.
+    pub pass_through_globals: HashSet<String>,
 }
 
 impl EncodingState {
@@ -96,6 +105,7 @@ impl EncodingState {
             uf_change_drained: HashSet::default(),
             fast_rebuild: false,
             rebuild_view_exclude: HashMap::default(),
+            pass_through_globals: HashSet::default(),
         }
     }
 }
@@ -1287,6 +1297,30 @@ impl<'a> ProofInstrumentor<'a> {
                 }
                 match resolved_call {
                     ResolvedCall::Func(func_type) => {
+                        // A non-eq-sort global is a plain 0-arg key-value store
+                        // (see `is_non_eq_sort_global_decl`); read it back with
+                        // the direct 0-arg lookup `($N)` and treat its value like
+                        // a primitive constant (fiat-justified), the same as a
+                        // non-eq-sort variable or literal in a fact.
+                        if self.is_pass_through_global(&func_type.name) {
+                            let value =
+                                format!("({} {})", func_type.name, ListDisplay(&new_args, " "));
+                            let proof = if self.proofs_enabled() {
+                                let fiat_constructor = &self.proof_names().fiat_constructor;
+                                let to_ast = self
+                                    .proof_names()
+                                    .sort_to_ast_constructor
+                                    .get(func_type.output.name())
+                                    .unwrap();
+                                format!(
+                                    "({fiat_constructor} ({to_ast} {value}) ({to_ast} {value}))"
+                                )
+                            } else {
+                                "()".to_string()
+                            };
+                            return (value, proof);
+                        }
+
                         assert!(
                             func_type.subtype == FunctionSubtype::Constructor,
                             "Only constructor function calls are allowed in fact expressions due to proof normal form. Got {func_type:?}",
@@ -1399,8 +1433,19 @@ impl<'a> ProofInstrumentor<'a> {
                     );
                 };
 
-                let (add_code, _fv) = self.add_term_and_view(func_type, &exprs, justification);
-                res.extend(add_code);
+                if self.is_pass_through_global(&func_type.name) {
+                    // Non-eq-sort global: store the value directly (no
+                    // term/view tables exist for it). See `term_encode_command`.
+                    res.push(format!(
+                        "(set ({} {}) {})",
+                        func_type.name,
+                        ListDisplay(&exprs[..exprs.len() - 1], " "),
+                        exprs[exprs.len() - 1],
+                    ));
+                } else {
+                    let (add_code, _fv) = self.add_term_and_view(func_type, &exprs, justification);
+                    res.extend(add_code);
+                }
             }
             ResolvedAction::Change(_span, change, h, generic_exprs) => {
                 if let ResolvedCall::Func(func_type) = h {
@@ -1637,9 +1682,16 @@ impl<'a> ProofInstrumentor<'a> {
                 match resolved_call {
                     ResolvedCall::Func(func_type) => {
                         if func_type.subtype == FunctionSubtype::Custom {
-                            // Globals are desugared to no-arg functions (in non-proof mode)
-                            // They're allowed, in proof mode they are constructors.
-                            if self.egraph.type_info.is_global(&func_type.name) {
+                            // A non-eq-sort global is a plain 0-arg key-value
+                            // store with no term/view (eq-sort globals are
+                            // lowered to constructors, handled below). Read it
+                            // back with the direct 0-arg lookup `($N)`. The rule
+                            // was marked `:unsafe-seminaive` by `remove_globals`
+                            // (a RHS function lookup), which permits this read.
+                            // The value flows into the parent term as an ordinary
+                            // primitive child, so the parent's proof justification
+                            // covers it (same as a literal).
+                            if self.is_pass_through_global(&func_type.name) {
                                 return format!("({} {})", func_type.name, ListDisplay(&args, " "));
                             }
                             panic!(
@@ -1842,8 +1894,22 @@ impl<'a> ProofInstrumentor<'a> {
                 res.extend(self.declare_sort(name));
             }
             ResolvedNCommand::Function(fdecl) => {
-                res.extend(self.term_and_view(fdecl));
-                res.extend(self.rebuilding_rules(fdecl));
+                if self.is_non_eq_sort_global_decl(fdecl) {
+                    // Pass a non-eq-sort global through unchanged: it is a
+                    // plain 0-arg key-value store with no eclass, so it needs
+                    // no term/view tables or rebuild rules. Reads use the
+                    // direct 0-arg lookup `($N)` (see `instrument_action_expr`).
+                    // Record the name so the `Set`/read sites (which only have a
+                    // `FuncType`) recognize it via `is_pass_through_global`.
+                    self.egraph
+                        .proof_state
+                        .pass_through_globals
+                        .insert(fdecl.name.clone());
+                    res.push(command.to_command().make_unresolved());
+                } else {
+                    res.extend(self.term_and_view(fdecl));
+                    res.extend(self.rebuilding_rules(fdecl));
+                }
             }
             ResolvedNCommand::NormRule { rule } => {
                 res.extend(self.instrument_rule(rule));

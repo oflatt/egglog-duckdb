@@ -6,8 +6,8 @@ use std::path::Path;
 use crate::{
     EGraph, TypeInfo,
     ast::{
-        Command, Expr, Fact, GenericCommand, ResolvedAction, ResolvedCommand, ResolvedExpr,
-        ResolvedExprExt, Schedule,
+        Command, Expr, Fact, FunctionSubtype, GenericCommand, ResolvedAction, ResolvedCommand,
+        ResolvedExpr, ResolvedFunctionDecl, Schedule,
     },
     proofs::proof_encoding::ProofInstrumentor,
     util::{FreshGen, HashMap, SymbolGen},
@@ -293,6 +293,40 @@ impl ProofInstrumentor<'_> {
         self.egraph.proof_state.proofs_enabled
     }
 
+    /// True for the *declaration* of a non-eq-sort global, lowered by
+    /// `remove_globals` to a 0-arg `Custom` function (e.g.
+    /// `(let $N (bigrat 3 1))`). Such a function has no eclass and never
+    /// participates in UF/congruence, so the term encoder leaves it as a plain
+    /// 0-arg key-value store rather than building a term/view: the value is
+    /// `set` directly and read back via the 0-arg lookup `($N)`. The rule
+    /// referencing it was marked `:unsafe-seminaive` by `remove_globals`
+    /// (a RHS function lookup), which permits the read.
+    ///
+    /// Recognized by the `internal_let` flag (set only by `remove_globals` on
+    /// lifted globals — never on user functions, so a 0-arg user function like
+    /// `(function MyMap () i64 :merge …)` is correctly NOT matched), restricted
+    /// to the 0-arg non-eq-sort `Custom` shape. `is_global` is NOT usable here:
+    /// at term-encode time the global's `global_sorts` entry is not yet
+    /// registered (that happens later, during the post-encoding typecheck). The
+    /// name is recorded in `pass_through_globals` so the read sites — which only
+    /// have a `FuncType` (no `internal_let`) — recognize it via
+    /// `is_pass_through_global`.
+    pub(crate) fn is_non_eq_sort_global_decl(&self, fdecl: &ResolvedFunctionDecl) -> bool {
+        fdecl.internal_let
+            && fdecl.subtype == FunctionSubtype::Custom
+            && fdecl.schema.input.is_empty()
+            && !fdecl.resolved_schema.output().is_eq_sort()
+    }
+
+    /// True if `name` is a non-eq-sort global the term encoder is passing
+    /// through as a plain key-value store (recorded by
+    /// `is_non_eq_sort_global_decl` at its declaration). Read sites consult
+    /// this instead of re-deriving the property, since a `FuncType` does not
+    /// carry `internal_let`.
+    pub(crate) fn is_pass_through_global(&self, name: &str) -> bool {
+        self.egraph.proof_state.pass_through_globals.contains(name)
+    }
+
     /// True when the native-UF encoding mode is active. This mode is only
     /// ever set in term-encoding, non-proof mode on the native bridge, so
     /// callers can use it directly to switch encoding behavior.
@@ -515,10 +549,6 @@ pub enum ProofEncodingUnsupportedReason {
     #[error("missing merge function. All functions need to specify a :merge function.")]
     NoMergeOnNonGlobalFunction,
     #[error(
-        "let binding with a primitive in the body. For silly internal reasons, we don't support primitive bindings for proofs at the moment, sorry."
-    )]
-    LetBindingWithNonEqSort,
-    #[error(
         "rule uses `:unsafe-seminaive`. Arbitrary RHS database reads are a direct-backend feature and are not representable by the term/proof encoding."
     )]
     UnsafeSeminaive,
@@ -679,26 +709,6 @@ pub(crate) fn command_supports_proof_encoding(
                 Ok(())
             } else {
                 Err(ProofEncodingUnsupportedReason::NoMergeOnNonGlobalFunction)
-            }
-        }
-        // let binding with non-eq sort not supported by
-        // proof_global_desugar — proof-mode only.
-        ResolvedCommand::Action(ResolvedAction::Let(_, _, expr)) if proofs_enabled => {
-            // we detect as setting something that is no-merge to a primitive not supported (global primitive binding)
-            if expr.output_type().is_eq_sort() {
-                Ok(())
-            } else {
-                Err(ProofEncodingUnsupportedReason::LetBindingWithNonEqSort)
-            }
-        }
-        // After global desugar it may look like this — proof-mode only.
-        ResolvedCommand::Action(ResolvedAction::Set(_span, head, _children, expr))
-            if proofs_enabled =>
-        {
-            if !type_info.is_global(head.name()) || expr.output_type().is_eq_sort() {
-                Ok(())
-            } else {
-                Err(ProofEncodingUnsupportedReason::LetBindingWithNonEqSort)
             }
         }
         _ => Ok(()),

@@ -646,11 +646,18 @@ fn generate_tests(glob: &str) -> Vec<Trial> {
         // `--term-encoding` skips. `(extract …)` is silently
         // ignored by the backend; the shared snapshot drops its
         // output so both modes still match.
+        // `luminal-llama.egg` newly became proof-eligible once non-eq-sort
+        // globals were supported (the `LetBindingWithNonEqSort` rejection was
+        // removed). Its `--term-encoding`/`--proofs` variants run fine (~12–60s),
+        // but the `--duckdb` variants run the full llama workload through SQL and
+        // take many minutes (the `_proofs_duckdb`/`_proof_testing_duckdb` combos
+        // worst of all) — too slow for CI, like math-microbenchmark above.
         let duckdb_static_skip = [
             "math-microbenchmark.egg",
             "eggcc-2mm.egg",
             "subsume.egg",
             "subsume-relation.egg",
+            "luminal-llama.egg",
         ];
         let mut duckdb_supported = !should_fail
             && !requires_proofs
@@ -768,8 +775,16 @@ fn generate_tests(glob: &str) -> Vec<Trial> {
         // duckdb feature, so files relying on them would diverge
         // from the shared snapshot just because every run gets
         // appended onto the previous run's state.
-        let mut duckdb_proofs_supported =
-            !should_fail && !requires_proofs && file_supports_proofs(&run.path);
+        // luminal-llama runs the full llama workload; through SQL it takes many
+        // minutes (the proof+duckdb combination worst of all), so its duckdb
+        // variants are skipped. (Kept separate from `duckdb_static_skip` so
+        // math-microbenchmark's existing `_proofs_duckdb` coverage is preserved
+        // — it is in the plain-duckdb skip but still gets the proof+duckdb run.)
+        let duckdb_proofs_too_slow = ["luminal-llama.egg"];
+        let mut duckdb_proofs_supported = !should_fail
+            && !requires_proofs
+            && file_supports_proofs(&run.path)
+            && !duckdb_proofs_too_slow.iter().any(|f| run.path.ends_with(f));
         if duckdb_proofs_supported
             && let Ok(src) = std::fs::read_to_string(&run.path)
             && (src.contains("(push") || src.contains("(pop"))
