@@ -513,12 +513,15 @@ pub fn file_supports_proofs(path: &Path) -> bool {
 
     let mut egraph = EGraph::default();
     let filename = canonical.to_string_lossy().into_owned();
-    let desugared = match egraph.resolve_program(Some(filename.clone()), &contents) {
-        Ok(commands) => commands,
-        Err(_) => return false,
-    };
-
-    program_supports_proofs(&desugared, &egraph.type_info)
+    // Run the proof-encoding gate exactly as the pipeline does: on the
+    // typechecked program BEFORE global removal. Checking it after
+    // `resolve_program` (which removes globals) false-negatives on let-global
+    // files, because global removal injects `:unsafe-seminaive` rules that the
+    // gate's `UnsafeSeminaive` arm rejects — rules the real proof pipeline
+    // never gates (it gates the user program first, then removes globals).
+    egraph
+        .check_program_proof_gate(Some(filename), &contents)
+        .is_ok()
 }
 
 /// Reasons why a command doesn't support proof encoding

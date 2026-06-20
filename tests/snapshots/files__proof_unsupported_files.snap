@@ -1,11 +1,8 @@
 ---
 source: tests/files.rs
-assertion_line: 571
+assertion_line: 862
 expression: snapshot
 ---
-array.egg
-bdd.egg
-before-proofs.egg
 bignum.egg
 bool.egg
 complex-merge-prim.egg
@@ -33,14 +30,11 @@ levenshtein-distance.egg
 list.egg
 looking_up_global.egg
 looking_up_nonconstructor_in_rewrite_good.egg
-luminal-llama.egg
 map.egg
-math.egg
 merge_read.egg
 multiset.egg
 nested-container-dirty-propagation.egg
 pair.egg
-prims.egg
 print-function.egg
 python_array_optimize.egg
 rat-pow-eval.egg
@@ -50,7 +44,6 @@ repro-desugar-143.egg
 repro-herbie-vanilla.egg
 repro-new-backend-python-vec.egg
 repro-querybug3.egg
-repro-unsound.egg
 repro-vec-unequal.egg
 set.egg
 set_sort_function.egg
@@ -63,6 +56,7 @@ type-constraints-tests.egg
 typed_primitive_unstable_app.egg
 typeinfer.egg
 uf-extraction.egg
+uf_function.egg
 unsafe-seminaive-read-prim.egg
 unsafe-seminaive.egg
 unstable-fn.egg

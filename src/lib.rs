@@ -2522,21 +2522,65 @@ impl EGraph {
         }
     }
 
-    /// Run a program, returning the desugared outputs as well as the CommandOutputs.
-    /// Can optionally not run the commands, just adding type information.
-    /// Parse + resolve a program into the normalized IR
-    /// (`ResolvedNCommand`s) without executing it. Used by alternative
-    /// backends (e.g. DuckDB) that consume the resolved IR directly.
-    pub(crate) fn resolve_program_to_ncommands(
+    /// Returns `Ok(())` iff every command in `input` passes the
+    /// proof-encoding gate, matching exactly what the proof/term-encoding
+    /// pipeline checks (see the gate in `resolve_command_before_proofs`).
+    ///
+    /// The gate must be evaluated on the typechecked program BEFORE global
+    /// removal: global removal injects `:unsafe-seminaive` rules (for `Custom`
+    /// globals referenced in a rule head), and the gate's `UnsafeSeminaive`
+    /// arm would otherwise reject those internal rules — a false negative the
+    /// real pipeline never hits, because it gates the user program first
+    /// (`resolve_command_before_proofs`, proof branch) and only then removes
+    /// globals. This is the supportability probe used by `file_supports_proofs`;
+    /// it does not run term encoding (only the gate verdict is needed).
+    pub(crate) fn check_program_proof_gate(
         &mut self,
         filename: Option<String>,
         input: &str,
-    ) -> Result<Vec<ResolvedNCommand>, Error> {
+    ) -> Result<(), Error> {
         let parsed = self.parser.get_program_from_string(filename, input)?;
-        let res = self.process_program_internal(parsed, false)?;
-        Ok(res.resolved)
+        for before_expanded_command in parsed {
+            let macro_expanded = self.command_macros.apply(
+                before_expanded_command,
+                &mut self.parser.symbol_gen,
+                &self.type_info,
+            )?;
+            for command in macro_expanded {
+                if let Command::Include(span, file) = &command {
+                    let s = std::fs::read_to_string(file)
+                        .map_err(|e| Error::IoError(file.clone().into(), e, span.clone()))?;
+                    self.check_program_proof_gate(Some(file.clone()), &s)?;
+                    continue;
+                }
+                let desugared =
+                    desugar_command(command, &mut self.parser, self.proof_state.proof_testing)?;
+                // Typecheck (building up type info for later commands), then run
+                // the gate on the pre-global-removal form — identical to the
+                // pipeline gate. `typecheck_program` mutates `self.type_info`,
+                // so subsequent commands see earlier declarations.
+                let typechecked = self.typecheck_program(&desugared)?;
+                for command in &typechecked {
+                    if let Err(reason) = command_supports_proof_encoding(
+                        &command.to_command(),
+                        &self.type_info,
+                        // The probe answers "are proofs supported", so apply the
+                        // full (proofs-enabled) set of checks.
+                        true,
+                    ) {
+                        return Err(Error::UnsupportedProofCommand {
+                            command: format!("{}", command.to_command()),
+                            reason,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
+    /// Run a program, returning the desugared outputs as well as the CommandOutputs.
+    /// Can optionally not run the commands, just adding type information.
     fn process_program_internal(
         &mut self,
         program: Vec<Command>,
