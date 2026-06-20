@@ -672,7 +672,11 @@ def _split_time_block(stderr: str):
 def measure_sizes(binary, bench, flags, env_extra, timeout):
     """Run the cell ONCE with `(print-size)` appended to capture per-function
     tuple counts (for parity). Returns (sizes_list, None) or (None, error)."""
-    src = bench.read_text()
+    # Strip the same way bench_cell does, so the support GATE (which calls
+    # measure_sizes directly on the raw file) tests the SAME program the timed
+    # runs do. Otherwise Herbie files gate out on un-stripped multi-extract /
+    # scheduler under --term-encoding even though the stripped program runs.
+    src = strip_back_off_scheduler(strip_extract_commands(bench.read_text()))
     tmp = tempfile.NamedTemporaryFile(
         suffix=".egg", delete=False, mode="w", dir=str(bench.parent))
     try:
