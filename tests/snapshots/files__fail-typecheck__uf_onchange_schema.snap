@@ -1,0 +1,7 @@
+---
+source: tests/files.rs
+assertion_line: 180
+expression: err_msg
+---
+In 5:1-81 of uf_onchange_schema.egg: (function __UF_Math (Math) Math :impl displaced-union-find :onchange BadOnChange)
+:onchange relation BadOnChange must have schema (Math Math Math Math Math).
