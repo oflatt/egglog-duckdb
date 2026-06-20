@@ -283,6 +283,7 @@ class BenchDB:
                    sizes=None, command=None):
         row = {
             "benchmark": benchmark,
+            "suite": suite_of(benchmark),
             "backend": backend,
             "mode": mode,
             "condition": condition,
@@ -310,6 +311,7 @@ class BenchDB:
     def add_error(self, benchmark, backend, mode, condition, error, command=None):
         self.errors.append({
             "benchmark": benchmark,
+            "suite": suite_of(benchmark),
             "backend": backend,
             "mode": mode,
             "condition": condition,
@@ -318,7 +320,8 @@ class BenchDB:
         })
 
     def add_skip(self, benchmark, reason):
-        self.skipped.append({"benchmark": benchmark, "reason": reason})
+        self.skipped.append({"benchmark": benchmark, "suite": suite_of(benchmark),
+                             "reason": reason})
 
     def add_warning(self, benchmark, backend, mode, condition, reason):
         # A cell that failed for an EXPECTED, non-bug reason: a timeout, or a
@@ -326,7 +329,8 @@ class BenchDB:
         # incompatible commands, etc.). Kept OUT of `errors` so that table shows
         # only unexpected failures (real bugs); surfaced as a warnings table.
         self.warnings.append({
-            "benchmark": benchmark, "backend": backend, "mode": mode,
+            "benchmark": benchmark, "suite": suite_of(benchmark),
+            "backend": backend, "mode": mode,
             "condition": condition, "reason": reason,
         })
 
@@ -392,6 +396,21 @@ def find_benchmarks(path: Path) -> list[Path]:
     return sorted(p for p in path.rglob("*.egg")
                   if "fail-typecheck" not in str(p)
                   and not re.fullmatch(r"tmp[a-z0-9_]{8}\.egg", p.name))
+
+
+def suite_of(rel: str) -> str:
+    """Group a benchmark by corpus 'suite' for the results tables/filters.
+    `tests/` and `egglog-experimental/tests/` are the 'egglog' suite; each paper
+    corpus keeps its own suite (herbie / math-microbenchmark / pointer-analysis)."""
+    if "paper-benchmarks/herbie" in rel:
+        return "herbie"
+    if "paper-benchmarks/math-microbenchmark" in rel:
+        return "math-microbenchmark"
+    if "paper-benchmarks/pointer-analysis" in rel:
+        return "pointer-analysis"
+    if "paper-benchmarks" in rel:
+        return "paper"
+    return "egglog"
 
 
 # --- Per-phase profile: bucket per-ruleset/per-class times into a uniform
@@ -718,12 +737,14 @@ def _head_atom(form):
 
 
 def strip_extract_commands(src):
-    """Remove top-level `(extract ...)` commands. `extract` is OUTPUT-ONLY -- it
-    prints an extracted term and does NOT modify the e-graph, so removing it
-    leaves tuple counts (parity) unchanged. Several backends/encodings can't run
-    extraction (feldera/flowlog, duckdb extract-of-expr, proofs), so the eval
-    strips it to measure eqsat perf instead of erroring on output. Respects `;`
-    comments and `"..."` string literals; only TOP-LEVEL `extract` forms go."""
+    """Remove top-level `(extract ...)` and `(multi-extract ...)` commands. Both
+    are OUTPUT-ONLY -- they print extracted term(s) and do NOT modify the e-graph,
+    so removing them leaves tuple counts (parity) unchanged. Several
+    backends/encodings can't run extraction (feldera/flowlog, duckdb
+    extract-of-expr, proofs), so the eval strips it to measure eqsat perf instead
+    of erroring on output. Herbie dumps end in `multi-extract` (1215/1260 files)
+    and use no plain `extract`, so stripping multi-extract is what unblocks them.
+    Respects `;` comments and `"..."` string literals; only TOP-LEVEL forms go."""
     out = []
     i, n = 0, len(src)
     while i < n:
@@ -739,12 +760,68 @@ def strip_extract_commands(src):
             i = j
         elif c == "(":
             j = _form_end(src, i)
-            if _head_atom(src[i:j]) == "extract":
+            if _head_atom(src[i:j]) in ("extract", "multi-extract"):
                 if j < n and src[j] == "\n":   # swallow the trailing newline
                     j += 1
             else:
                 out.append(src[i:j])
             i = j
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _peek_head(src, i, n):
+    """src[i] == '('; return (head-atom token, index just past it)."""
+    k = i + 1
+    while k < n and src[k] in " \t\n":
+        k += 1
+    e = k
+    while e < n and src[e] not in " \t\n()\";":
+        e += 1
+    return src[k:e], e
+
+
+def strip_back_off_scheduler(src):
+    """Rewrite Herbie's back-off-scheduler run-schedules into scheduler-free ones:
+      `(let-scheduler NAME (back-off))`  -> removed
+      `(run-with NAME RULESET ...)`      -> `(run RULESET ...)`
+    The `repeat`/`saturate`/`:until` structure is preserved, so the iteration
+    count is unchanged -- only the back-off rule-selection heuristic is dropped
+    (the scheduler-free run-schedule then lowers to core, which every backend
+    runs uniformly). Herbie only ever uses `(back-off)` schedulers (620/1260
+    files), so stripping every `let-scheduler` + `run-with` is safe here; this is
+    the "drop the back-off scheduler, same iters" treatment for the paper.
+    Comment/string-aware; only those two heads are touched."""
+    out = []
+    i, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        if c == ";":
+            j = src.find("\n", i)
+            j = n if j == -1 else j + 1
+            out.append(src[i:j])
+            i = j
+        elif c == '"':
+            j = _skip_string(src, i)
+            out.append(src[i:j])
+            i = j
+        elif c == "(":
+            head, he = _peek_head(src, i, n)
+            if head == "let-scheduler":
+                i = _form_end(src, i)          # drop the scheduler definition
+            elif head == "run-with":
+                out.append("(run")             # `(run-with NAME ...` -> `(run ...`
+                p = he
+                while p < n and src[p] in " \t\n":
+                    p += 1
+                while p < n and src[p] not in " \t\n()\";":
+                    p += 1                      # skip the scheduler-name token
+                i = p
+            else:
+                out.append("(")
+                i += 1
         else:
             out.append(c)
             i += 1
@@ -790,7 +867,7 @@ def bench_cell(binary, bench, rel, condition, backend, mode, flags,
     # perf instead of erroring on output. Applies to EVERY cell (incl. the
     # bridge-normal reference), so parity stays apples-to-apples.
     src = bench.read_text()
-    stripped = strip_extract_commands(src)
+    stripped = strip_back_off_scheduler(strip_extract_commands(src))
     tmp_bench = None
     if stripped != src:
         st = tempfile.NamedTemporaryFile(suffix=".egg", delete=False, mode="w",
