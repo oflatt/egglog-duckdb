@@ -382,6 +382,11 @@ pub struct JoinPlan {
     var_col: HashMap<u32, usize>,
     /// Body table atoms in emission order.
     atoms: Vec<PlanAtom>,
+    /// `Some` ⇒ row projection (`FLOWLOG_PROJECT`) found a column-reusing layout
+    /// that fits `W` though the static var count does not; the binary chain uses
+    /// the per-step columns instead of `var_col`. `None` ⇒ the historical static
+    /// layout (every distinct var gets a permanent column).
+    projection: Option<ProjectionPlan>,
 }
 
 struct PlanAtom {
@@ -390,8 +395,16 @@ struct PlanAtom {
 }
 
 impl JoinPlan {
-    pub fn var_order(&self) -> &[u32] {
-        &self.var_order
+    /// The variable id at each CAPTURED binding-row column, in column order. With
+    /// projection this is the reduced surviving-var set (the build packs them into
+    /// columns `0..head_vars.len()`); without, it is the full static var order.
+    /// Either way the head scatter reads captured-row column `i` for var
+    /// `var_order()[i]`, so it stays correct.
+    pub fn var_order(&self) -> Vec<u32> {
+        match &self.projection {
+            Some(p) => p.head_vars.clone(),
+            None => self.var_order.clone(),
+        }
     }
 }
 
@@ -440,6 +453,26 @@ pub fn plan_join(rule: &RuleIr) -> Result<JoinPlan, String> {
     if atoms.is_empty() {
         return Err("no body table atoms (atom-less rule)".to_string());
     }
+    // ROW PROJECTION (gated `FLOWLOG_PROJECT`, default-off): when the static
+    // layout exceeds `W`, attempt a per-step register allocation that reuses
+    // binding-row columns for variables whose liveness intervals do not overlap
+    // (a body subterm var dies once the atom that consumes it has joined). If the
+    // reused-column frontier still fits `W`, the binary chain can run the rule on
+    // the existing fixed-width `Row` — this is what lets the giant Herbie seed
+    // rules (962 vars, frontier ~22) lower. Off ⇒ the historical bail below.
+    if project_enabled() {
+        if let Some(proj) = build_projection(&atoms, &rule.head, &rule.body) {
+            return Ok(JoinPlan {
+                var_order,
+                var_col,
+                atoms,
+                projection: Some(proj),
+            });
+        }
+        // Projection could not fit `W` (frontier too wide) ⇒ fall through to the
+        // historical reject.
+    }
+
     if var_order.len() > W {
         return Err(format!("too many body vars {} > W {}", var_order.len(), W));
     }
@@ -448,7 +481,181 @@ pub fn plan_join(rule: &RuleIr) -> Result<JoinPlan, String> {
         var_order,
         var_col,
         atoms,
+        projection: None,
     })
+}
+
+/// Is row projection enabled? (env `FLOWLOG_PROJECT`, default-off.) Flip the
+/// default by changing this one expression.
+pub(crate) fn project_enabled() -> bool {
+    std::env::var_os("FLOWLOG_PROJECT").is_some()
+}
+
+/// A per-step binding-row column layout produced by [`build_projection`]: column
+/// reuse (linear-scan register allocation over body-atom liveness) that keeps the
+/// frontier within [`W`] so a rule whose STATIC var count exceeds `W` can still
+/// run on the fixed-width `Row`. See the call site in [`plan_join`].
+#[derive(Clone, Debug)]
+pub(crate) struct ProjectionPlan {
+    /// `step_col[i]` maps each variable LIVE during step `i` (atom `i`'s join) to
+    /// its binding-row column at that step. A var's column is stable from its
+    /// birth step to its death step but may differ across non-overlapping vars.
+    pub step_col: Vec<HashMap<u32, usize>>,
+    /// The surviving (head/body-prim-relevant) variables and their FINAL columns,
+    /// in a deterministic order. Drives the reduced head-scatter `var_order`.
+    pub head_vars: Vec<u32>,
+    /// Final column of each surviving var (parallel to `head_vars`).
+    pub head_cols: Vec<usize>,
+}
+
+/// Build a column-reusing layout for the body atoms, or `None` if the reused
+/// frontier still exceeds `W`. Liveness is first-use..last-use over the EMITTED
+/// atom order, EXTENDED so any variable read by the head or a body prim stays
+/// live to the end (it must survive into the captured row). Linear-scan slot
+/// assignment: a column freed by a dead var is reused by a later var's birth.
+fn build_projection(
+    atoms: &[PlanAtom],
+    head: &[crate::compile::HeadOp],
+    body: &[BodyOp],
+) -> Option<ProjectionPlan> {
+    use hashbrown::HashSet;
+    let n = atoms.len();
+
+    // Variables the head / body prims read: these must survive to the end.
+    let mut survivor: HashSet<u32> = HashSet::new();
+    collect_head_vars(head, &mut survivor);
+    for op in body {
+        if let BodyOp::Prim { args, ret, .. } = op {
+            for s in args {
+                if let Slot::Var(v) = s {
+                    survivor.insert(*v);
+                }
+            }
+            if let Slot::Var(v) = ret {
+                survivor.insert(*v);
+            }
+        }
+    }
+
+    // first[v]/last[v] = first/last atom index where v appears. Survivors get
+    // last = n-1 (live to the final step) so they are never freed mid-chain.
+    let mut first: HashMap<u32, usize> = HashMap::new();
+    let mut last: HashMap<u32, usize> = HashMap::new();
+    for (i, a) in atoms.iter().enumerate() {
+        for s in &a.slots {
+            if let Slot::Var(v) = s {
+                first.entry(*v).or_insert(i);
+                last.insert(*v, i);
+            }
+        }
+    }
+    for v in &survivor {
+        if let Some(l) = last.get_mut(v) {
+            *l = n - 1;
+        }
+    }
+
+    // Vars born / dying at each step (in deterministic var-id order so the layout
+    // is reproducible).
+    let mut births: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut deaths: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut vars: Vec<u32> = first.keys().copied().collect();
+    vars.sort_unstable();
+    for v in vars {
+        births[first[&v]].push(v);
+        deaths[last[&v]].push(v);
+    }
+
+    // Linear-scan register allocation. `col_of` is the current column of each
+    // live var; `free` is a stack of reusable columns (lowest first, so the
+    // layout is deterministic); `next` is the high-water column allocator.
+    let mut col_of: HashMap<u32, usize> = HashMap::new();
+    let mut free: Vec<usize> = Vec::new();
+    let mut next: usize = 0;
+    let mut step_col: Vec<HashMap<u32, usize>> = Vec::with_capacity(n);
+    let mut peak = 0usize;
+    for i in 0..n {
+        // Births first (so this atom's fresh vars get columns before we snapshot).
+        for &v in &births[i] {
+            let c = if let Some(c) = free.pop() {
+                c
+            } else {
+                let c = next;
+                next += 1;
+                c
+            };
+            col_of.insert(v, c);
+        }
+        peak = peak.max(col_of.len());
+        if peak > W {
+            return None;
+        }
+        // Snapshot the layout AT this step (after births, before deaths) — every
+        // var the atom touches plus all still-live carried vars are present.
+        step_col.push(col_of.clone());
+        // Deaths free their columns for reuse by later births.
+        for &v in &deaths[i] {
+            if let Some(c) = col_of.remove(&v) {
+                free.push(c);
+            }
+            // freeing low-first keeps assignment deterministic
+            free.sort_unstable_by(|a, b| b.cmp(a));
+        }
+    }
+
+    // Surviving vars + their FINAL columns (the columns they hold at the last
+    // step, where they are guaranteed live). Deterministic order by var id.
+    let final_layout = &step_col[n - 1];
+    let mut head_vars: Vec<u32> = survivor
+        .into_iter()
+        .filter(|v| final_layout.contains_key(v))
+        .collect();
+    head_vars.sort_unstable();
+    let head_cols: Vec<usize> = head_vars.iter().map(|v| final_layout[v]).collect();
+
+    Some(ProjectionPlan {
+        step_col,
+        head_vars,
+        head_cols,
+    })
+}
+
+/// Collect every variable a head op references into `out`.
+fn collect_head_vars(head: &[crate::compile::HeadOp], out: &mut hashbrown::HashSet<u32>) {
+    use crate::compile::HeadOp;
+    let add = |s: &Slot, out: &mut hashbrown::HashSet<u32>| {
+        if let Slot::Var(v) = s {
+            out.insert(*v);
+        }
+    };
+    for op in head {
+        match op {
+            HeadOp::Set { slots, .. }
+            | HeadOp::Remove { slots, .. }
+            | HeadOp::Subsume { slots, .. } => {
+                for s in slots {
+                    add(s, out);
+                }
+            }
+            HeadOp::Lookup { args, ret, .. } => {
+                for s in args {
+                    add(s, out);
+                }
+                out.insert(*ret);
+            }
+            HeadOp::Call { args, ret, .. } => {
+                for s in args {
+                    add(s, out);
+                }
+                out.insert(*ret);
+            }
+            HeadOp::Union { l, r } => {
+                add(l, out);
+                add(r, out);
+            }
+            HeadOp::Panic(_) => {}
+        }
+    }
 }
 
 // ===========================================================================
@@ -1342,6 +1549,10 @@ impl FusedDdJoin {
             /// (NOT already matched by `triangle`) ⇒ the general WCOJ delta
             /// query. `None` ⇒ triangle or binary.
             cq: Option<CqPlan>,
+            /// `FLOWLOG_PROJECT`: per-step column-reuse layout ⇒ the binary chain
+            /// runs with projecting merges and packs the captured row to the
+            /// surviving vars. `None` ⇒ the historical static-column chain.
+            projection: Option<ProjectionPlan>,
         }
         let rule_plans: Vec<RulePlan> = plans
             .iter()
@@ -1365,15 +1576,23 @@ impl FusedDdJoin {
                 } else {
                     None
                 };
+                // With projection the CAPTURED row is packed to the surviving
+                // vars (columns `0..head_vars.len()`), so the capture/scatter
+                // width is `head_vars.len()`, not the full static var count.
+                let n_vars = match &plan.projection {
+                    Some(p) => p.head_vars.len(),
+                    None => plan.var_order.len(),
+                };
                 RulePlan {
                     idx: *idx,
                     atoms: plan.atoms.iter().map(|a| a.slots.clone()).collect(),
                     atom_funcs,
                     var_col: plan.var_col.clone(),
-                    n_vars: plan.var_order.len(),
+                    n_vars,
                     body_funcs,
                     triangle,
                     cq,
+                    projection: plan.projection.clone(),
                 }
             })
             .collect();
@@ -1467,6 +1686,71 @@ impl FusedDdJoin {
                     }
                     let colls: Vec<_> = cq.atom_funcs.iter().map(|f| rel_coll[f].clone()).collect();
                     wcoj_cq_collection(scope, &colls, cq.clone())
+                } else if let Some(proj) = &rp.projection {
+                    // PROJECTED binary chain (`FLOWLOG_PROJECT`): the binding row
+                    // is laid out per-step with column REUSE (`proj.step_col`), so
+                    // a rule whose static var count exceeds `W` still fits. The
+                    // chain is otherwise identical to the static path below; the
+                    // only differences are (a) every var's column is the per-step
+                    // column instead of the static `var_col`, (b) each merge REMAPS
+                    // carried-over vars whose column changed (reuse) and zeroes
+                    // freed columns, and (c) a final `.map` packs the surviving
+                    // vars into columns `0..head_vars.len()` for the capture.
+                    let step_col = &proj.step_col;
+                    let slots0 = atom_slots[0].clone();
+                    let sc0 = step_col[0].clone();
+                    let mut cur = rel_coll[&rp.atom_funcs[0]]
+                        .clone()
+                        .flat_map(move |r: Row| bind_atom(&r, &slots0, &sc0));
+
+                    for i in 1..n_atoms {
+                        let slots = atom_slots[i].clone();
+                        let prev = &step_col[i - 1];
+                        let curl = &step_col[i];
+                        // Shared = atom vars already live (present in `prev`).
+                        let shared: Vec<u32> = atom_vars(&slots)
+                            .into_iter()
+                            .filter(|v| prev.contains_key(v))
+                            .collect();
+                        // Left key reads each shared var from its PREVIOUS column.
+                        let shared_cols_left: Vec<usize> = shared.iter().map(|v| prev[v]).collect();
+                        let shared_atom_cols: Vec<usize> = shared
+                            .iter()
+                            .map(|v| {
+                                slots
+                                    .iter()
+                                    .position(|s| matches!(s, Slot::Var(x) if x == v))
+                                    .expect("shared var present in atom")
+                            })
+                            .collect();
+
+                        let scl = shared_cols_left.clone();
+                        let left = cur.map(move |b: Row| (pack_key(&b, &scl), b));
+                        let sac = shared_atom_cols.clone();
+                        let right = rel_coll[&rp.atom_funcs[i]]
+                            .clone()
+                            .map(move |r: Row| (pack_key(&r, &sac), r));
+
+                        // Carried vars: live at BOTH prev and cur but NOT produced
+                        // by this atom — copy them from prev[v] to cur[v]. Atom
+                        // vars: written/validated at cur[v]. (prev_col, cur_col,
+                        // is_shared, atom_col) per relevant var, precomputed.
+                        let slotsc = slots.clone();
+                        let prevc = prev.clone();
+                        let curc = curl.clone();
+                        cur = left
+                            .join(right)
+                            .flat_map(move |(_k, (b, r)): (Key, (Row, Row))| {
+                                remap_merge_atom_into(&b, &r, &slotsc, &prevc, &curc)
+                            });
+                    }
+
+                    // Final projection: pack the surviving vars (at their last-step
+                    // columns `head_cols`) into the capture columns `0..k`, zeroing
+                    // the rest, so the head scatter reads `bind[i]` for surviving
+                    // var `i` exactly like the static path.
+                    let head_cols = proj.head_cols.clone();
+                    cur.map(move |b: Row| pack_key(&b, &head_cols))
                 } else {
                     let mut bound = vec![false; n_vars];
                     let slots0 = atom_slots[0].clone();
@@ -2017,6 +2301,66 @@ fn merge_atom_into(
     vec![out]
 }
 
+/// Projecting merge for the `FLOWLOG_PROJECT` chain. Like [`merge_atom_into`] but
+/// rebuilds the row from scratch under a NEW column layout: `prev` is the
+/// left-row layout (step `i-1`), `cur` is the output layout (step `i`). Carried
+/// vars (live in both layouts but not produced here) are copied `prev[v]→cur[v]`;
+/// the atom's vars are validated (shared) or written (fresh) at `cur[v]`; every
+/// other output column is left zeroed. This is what reuses freed columns and so
+/// keeps the frontier within `W`. Empty vec on a const / repeated-var / shared-
+/// var constraint failure (same semantics as the static merge).
+fn remap_merge_atom_into(
+    b: &Row,
+    r: &Row,
+    slots: &[Slot],
+    prev: &HashMap<u32, usize>,
+    cur: &HashMap<u32, usize>,
+) -> Vec<Row> {
+    let mut out = empty_row();
+    // Carry over every still-live var (present in `cur`) that the left row
+    // already holds (present in `prev`). Atom-fresh vars are absent from `prev`,
+    // so they are NOT copied here — they are written from `r` below.
+    for (&v, &pc) in prev {
+        if let Some(&cc) = cur.get(&v) {
+            out[cc] = b[pc];
+        }
+    }
+    let mut local: HashMap<u32, u32> = HashMap::new();
+    for (i, s) in slots.iter().enumerate() {
+        let val = r[i];
+        match s {
+            Slot::Const(c) => {
+                if *c != val {
+                    return Vec::new();
+                }
+            }
+            Slot::Var(v) => {
+                if let Some(&prior) = local.get(v) {
+                    if prior != val {
+                        return Vec::new();
+                    }
+                    continue;
+                }
+                local.insert(*v, val);
+                // Every atom var is live at this step ⇒ present in `cur`.
+                let cc = cur[v];
+                if prev.contains_key(v) {
+                    // Shared (already bound): the carried value must agree. (The
+                    // join key already enforces this for the key columns; this
+                    // also covers shared vars not in the key, if any.)
+                    if out[cc] != val {
+                        return Vec::new();
+                    }
+                } else {
+                    // Fresh var born at this atom: write it.
+                    out[cc] = val;
+                }
+            }
+        }
+    }
+    vec![out]
+}
+
 // ---------------------------------------------------------------------------
 // Stage 2: GENERAL `--wcoj` worst-case-optimal delta query (any cyclic body)
 // ---------------------------------------------------------------------------
@@ -2431,6 +2775,7 @@ mod tests {
                     slots: vec![Slot::Var(1), Slot::Var(2)],
                 },
             ],
+            projection: None,
         }
     }
 
@@ -2456,6 +2801,7 @@ mod tests {
             var_order,
             var_col,
             atoms: planned,
+            projection: None,
         }
     }
 

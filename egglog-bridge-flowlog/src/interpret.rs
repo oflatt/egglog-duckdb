@@ -528,7 +528,6 @@ fn fused_bindings(
             dd_native::plan_join(rule)
                 .expect("plan re-derivable")
                 .var_order()
-                .to_vec()
         })
         .collect();
 
