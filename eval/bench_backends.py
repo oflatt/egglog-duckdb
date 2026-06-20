@@ -557,26 +557,84 @@ def bucket_phases(backend: str, raw: dict) -> dict:
 
 # --- Correctness: per-function tuple-count parity vs the bridge-normal oracle.
 
-# A `(print-size)` (no-arg) block is a single s-expression `((name size) ...)`,
-# alphabetically sorted by egglog. We must match THAT block exactly -- not loose
-# `(word number)` tokens anywhere in the output. The loose form scrapes stray
-# pairs out of warnings (e.g. `(let @v28 (R 0))` clobbers the real `(R 1)`),
-# extraction results, or profiling lines, producing PHANTOM divergences. The
-# block regex requires the outer `((` + `(ident number)` shape, which a lone
-# warning sexp like `(let @v28 (R 0))` cannot satisfy. Mirrors tests/files.rs,
-# which snapshots the structured print-size output exactly.
-_SIZE_PAIR_RE = re.compile(r"\(([A-Za-z_@][\w\-]*)\s+(\d+)\)")
-_SIZE_BLOCK_RE = re.compile(r"\(\s*(?:\([A-Za-z_@][\w\-]*\s+\d+\)\s*)+\)")
+# `(print-size)` (no-arg) emits ONE s-expression `((name size) (name size) ...)`,
+# appended last. We parse the output into structured s-exprs and take the LAST
+# top-level block that is a list of `(name integer)` pairs -- the tests/files.rs
+# approach (structured output, NOT a text/regex scrape). This handles any egglog
+# symbol name (`Sound-/`, `bad-merge?`, `bop->string`, `List<PtrPointees`, ...);
+# a regex name charset previously dropped the whole block for those -> vacuous
+# empty==empty parity. Stray warning sexps (e.g. `(let @v28 (R 0))`, whose
+# top-level elements are not all `(name int)` pairs) can never qualify, so they
+# cannot clobber the real block or pass vacuously.
+
+
+def _sexpr_blocks(text: str):
+    """Parse `text` into its top-level s-expressions (nested lists of str atoms),
+    tolerating interleaved non-sexpr noise. Respects "..." strings and ; comments."""
+    toks = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in " \t\r\n":
+            i += 1
+        elif c == ";":
+            j = text.find("\n", i)
+            i = n if j == -1 else j + 1
+        elif c in "()":
+            toks.append(c)
+            i += 1
+        elif c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            toks.append(text[i:min(j + 1, n)])
+            i = min(j + 1, n)
+        else:
+            j = i
+            while j < n and text[j] not in ' \t\r\n();"':
+                j += 1
+            toks.append(text[i:j])
+            i = j
+    exprs, stack, cur = [], [], None
+    for t in toks:
+        if t == "(":
+            new = []
+            if cur is not None:
+                cur.append(new)
+                stack.append(cur)
+            cur = new
+        elif t == ")":
+            if cur is None:
+                continue  # unbalanced ')' -- ignore
+            if stack:
+                cur = stack.pop()
+            else:
+                exprs.append(cur)
+                cur = None
+        elif cur is not None:
+            cur.append(t)
+        # top-level atoms (cur is None) are ignored
+    return exprs
 
 
 def parse_sizes(text: str):
-    """Extract the appended `(print-size)` block's `(name size)` counts EXACTLY
-    (the LAST size-block in the output, since print-size is appended last).
-    Returns a sorted [name, count] list, or [] if no block is present."""
-    blocks = [m.group(0) for m in _SIZE_BLOCK_RE.finditer(text)]
-    if not blocks:
+    """Extract the appended `(print-size)` block's `(name size)` counts via a
+    STRUCTURED s-expr parse (no regex name-charset assumptions; mirrors
+    tests/files.rs's structured output). Returns the LAST top-level block that is
+    a list of `(name integer)` pairs, as a sorted [name, count] list, or []."""
+    def _is_int(s):
+        return isinstance(s, str) and s.lstrip("-").isdigit()
+
+    best = None
+    for e in _sexpr_blocks(text):
+        if isinstance(e, list) and e and all(
+            isinstance(p, list) and len(p) == 2 and isinstance(p[0], str) and _is_int(p[1])
+            for p in e
+        ):
+            best = e  # print-size is appended last -> keep the last qualifying block
+    if best is None:
         return []
-    sizes = {name: int(n) for name, n in _SIZE_PAIR_RE.findall(blocks[-1])}
+    sizes = {p[0]: int(p[1]) for p in best}
     return sorted([name, n] for name, n in sizes.items())
 
 
@@ -1012,10 +1070,14 @@ def apply_cell_result(result, db, oracle_sizes):
     parity_diff = None
     ref_label = REFERENCE_BY_FAMILY.get(_encoding_family(condition))
     oracle = oracle_sizes.get((rel, ref_label))
-    if sizes is not None:
+    # Require NON-EMPTY sizes on both sides: an unparseable `(print-size)` block
+    # returns [], and `[] == []` would be a vacuous false-pass (parity=True with
+    # nothing compared). Leave parity=None when there are no real counts to
+    # compare -- mirrors files.rs, which refuses to assert on an empty snapshot.
+    if sizes:
         if condition == ref_label:
             parity = True  # this cell IS its family's reference
-        elif oracle is not None:
+        elif oracle:
             parity = (sizes == oracle)
             if not parity:
                 parity_diff = _size_diff(oracle, sizes)
@@ -1245,7 +1307,9 @@ def main():
         ran = set()
         for cond_label, backend, mode, flags, _nuf, _fr in probe_conds:
             sizes, err = measure_sizes(binary, bench, flags, {}, args.timeout)
-            if err is not None or sizes is None:
+            # Empty sizes = an unparseable (print-size) block; treat like an error
+            # so we never establish a vacuous (empty) oracle for this file.
+            if err is not None or not sizes:
                 continue
             ran.add(cond_label)
             if cond_label in ref_labels:
