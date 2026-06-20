@@ -1163,6 +1163,11 @@ impl<'a> ProofInstrumentor<'a> {
     ) -> String {
         match fact {
             // In proof normal form, this is the only way that function calls apppear.
+            // A non-eq-sort pass-through global (`(= $g var)` body equality) is
+            // excluded: it has no view table (`@$gView`), so it must be read via
+            // the 0-arg lookup `($g)` like the action path — handled by the
+            // generic `Eq` arm below (which calls `instrument_fact_expr`, which
+            // emits `($g)` for pass-through globals).
             ResolvedFact::Eq(
                 _span,
                 ResolvedExpr::Call(
@@ -1175,7 +1180,7 @@ impl<'a> ProofInstrumentor<'a> {
                 ),
                 // TODO this could actually be arbitrary pretty easily, it's just nested functions that are hard.
                 ResolvedExpr::Var(_span3, v),
-            ) => {
+            ) if !self.is_pass_through_global(head.name()) => {
                 let mut new_args = vec![];
                 let mut arg_proofs = vec![];
                 for arg in args {
