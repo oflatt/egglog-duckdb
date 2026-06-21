@@ -485,10 +485,13 @@ pub fn plan_join(rule: &RuleIr) -> Result<JoinPlan, String> {
     })
 }
 
-/// Is row projection enabled? (env `FLOWLOG_PROJECT`, default-off.) Flip the
-/// default by changing this one expression.
+/// Is row projection enabled? Default-ON; set `FLOWLOG_NO_PROJECT` to fall back
+/// to the static-column path. Projection is bit-exact (verified 49/49 vs the
+/// bridge reference) and perf-neutral (it rides the existing merge map — no added
+/// DD operator), and it is required for wide rules (e.g. Herbie's giant
+/// ground-term seed, 962 vars) to lower at all, so it is on by default.
 pub(crate) fn project_enabled() -> bool {
-    std::env::var_os("FLOWLOG_PROJECT").is_some()
+    std::env::var_os("FLOWLOG_NO_PROJECT").is_none()
 }
 
 /// A per-step binding-row column layout produced by [`build_projection`]: column
