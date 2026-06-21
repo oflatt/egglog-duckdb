@@ -353,6 +353,21 @@ impl PureExpr {
             }
         }
     }
+    /// Rewrite every column index through `remap` (static -> packed layout, used
+    /// by row projection). A column absent from `remap` is left as-is (it cannot
+    /// happen for a planned guard — every operand column is a survivor var).
+    fn remap(&self, remap: &HashMap<usize, usize>) -> PureExpr {
+        match self {
+            PureExpr::Col(c) => PureExpr::Col(remap.get(c).copied().unwrap_or(*c)),
+            PureExpr::Const(v) => PureExpr::Const(*v),
+            PureExpr::Min(a, b) => {
+                PureExpr::Min(Box::new(a.remap(remap)), Box::new(b.remap(remap)))
+            }
+            PureExpr::Max(a, b) => {
+                PureExpr::Max(Box::new(a.remap(remap)), Box::new(b.remap(remap)))
+            }
+        }
+    }
 }
 
 impl Cond {
@@ -370,6 +385,14 @@ impl Cond {
                 b.cols(out);
             }
             Cond::Or(cs) => cs.iter().for_each(|c| c.cols(out)),
+        }
+    }
+    /// Rewrite every column index through `remap` (static -> packed layout).
+    fn remap(&self, remap: &HashMap<usize, usize>) -> Cond {
+        match self {
+            Cond::Ne(a, b) => Cond::Ne(a.remap(remap), b.remap(remap)),
+            Cond::Eq(a, b) => Cond::Eq(a.remap(remap), b.remap(remap)),
+            Cond::Or(cs) => Cond::Or(cs.iter().map(|c| c.remap(remap)).collect()),
         }
     }
 }
@@ -412,6 +435,31 @@ struct PrimStep {
     ret: PrimRet,
 }
 
+impl PrimStep {
+    /// Rewrite every binding-row column index through `remap` (static -> packed
+    /// layout, used by row projection). Const args / asserts are unchanged.
+    fn remap(&self, remap: &HashMap<usize, usize>) -> PrimStep {
+        let args = self
+            .args
+            .iter()
+            .map(|a| match a {
+                ArgSrc::Col(c) => ArgSrc::Col(remap.get(c).copied().unwrap_or(*c)),
+                ArgSrc::Const(v) => ArgSrc::Const(*v),
+            })
+            .collect();
+        let ret = match self.ret {
+            PrimRet::Bind(c) => PrimRet::Bind(remap.get(&c).copied().unwrap_or(c)),
+            PrimRet::AssertCol(c) => PrimRet::AssertCol(remap.get(&c).copied().unwrap_or(c)),
+            PrimRet::AssertConst(v) => PrimRet::AssertConst(v),
+        };
+        PrimStep {
+            id: self.id,
+            args,
+            ret,
+        }
+    }
+}
+
 /// The analysis of a DBSP-eligible rule body: canonical variable order, the
 /// table atoms, and the boolean guards inlined from pure body prims.
 pub struct JoinPlan {
@@ -433,6 +481,44 @@ pub struct JoinPlan {
     /// order. Mutually exclusive with `guards`: a rule takes either the in-join
     /// rep fast path (no lock) or the call-prim path (locks per row), never both.
     steps: Vec<PrimStep>,
+    /// `Some` ⇒ row projection (`FELDERA_PROJECT`) found a column-reusing layout
+    /// that fits the bucket though the static var count does not; the join chain
+    /// uses the per-step columns instead of `var_col`. `None` ⇒ the historical
+    /// static layout (every distinct var gets a permanent column). Projection is
+    /// only attempted for a PURE relational join (`guards`/`steps` both empty), so
+    /// it never has to remap inlined-guard / call-prim column references.
+    projection: Option<ProjectionPlan>,
+}
+
+/// A per-step binding-row column layout produced by [`build_projection`]: column
+/// reuse (linear-scan register allocation over body-atom liveness) that keeps the
+/// frontier within [`JOIN_WIDTH`] so a rule whose STATIC var count exceeds the
+/// bucket can still run on the fixed-width [`Row`]. The giant Herbie ground-term
+/// seed rules (≈962 vars) have a frontier of ≈16, so they fit a normal bucket.
+#[derive(Clone, Debug)]
+pub(crate) struct ProjectionPlan {
+    /// `step_col[i]` maps each variable LIVE during atom `i`'s join to its
+    /// binding-row column at that step (the JOIN's per-atom layouts). A var's
+    /// column is stable from its birth step to its death step but may differ
+    /// across non-overlapping vars (reuse).
+    step_col: Vec<HashMap<u32, usize>>,
+    /// The column layout of the row the JOIN emits (the last atom event).
+    join_out_layout: HashMap<u32, usize>,
+    /// The full unified-timeline layouts (atoms, then guards, then steps). The
+    /// post-join guard/step chain runs under `event_col[event]`, RE-LAID-OUT
+    /// between events as columns are reused (the same column-reuse the join does
+    /// between atoms).
+    event_col: Vec<HashMap<u32, usize>>,
+    /// First guard event index in `event_col` (= `n_atoms`).
+    g0: usize,
+    /// First step event index in `event_col` (= `n_atoms + n_guards`).
+    s0: usize,
+    /// The surviving (head-read) variables and their FINAL columns, in a
+    /// deterministic order. After the chain the row is packed so survivor `i`
+    /// lands in column `i`, and this drives the reduced output `var_order`.
+    head_vars: Vec<u32>,
+    /// Final-event column of each surviving var (parallel to `head_vars`).
+    head_cols: Vec<usize>,
 }
 
 /// One table atom in the plan.
@@ -443,14 +529,25 @@ struct AtomPlan {
 }
 
 impl JoinPlan {
-    /// The number of canonical body variables (binding-row width in use).
+    /// The number of CAPTURED binding-row columns (the output row width the
+    /// consumer reads back). With projection this is the reduced surviving-var
+    /// count (the chain packs survivors into columns `0..head_vars.len()`);
+    /// without, the full static var count.
     pub fn n_vars(&self) -> usize {
-        self.var_order.len()
+        match &self.projection {
+            Some(p) => p.head_vars.len(),
+            None => self.var_order.len(),
+        }
     }
 
-    /// The canonical variable order (column i holds variable `var_order[i]`).
-    pub fn var_order(&self) -> &[u32] {
-        &self.var_order
+    /// The variable id at each CAPTURED binding-row column, in column order. The
+    /// consumer reads captured-row column `i` for var `var_order()[i]`, so this
+    /// stays correct under projection (where it is the packed survivor order).
+    pub fn var_order(&self) -> Vec<u32> {
+        match &self.projection {
+            Some(p) => p.head_vars.clone(),
+            None => self.var_order.clone(),
+        }
     }
 }
 
@@ -934,6 +1031,36 @@ pub fn plan_join(eg: &EGraph, rule: &RuleIr) -> Result<JoinPlan, String> {
     if atoms.is_empty() {
         reject!("no body atoms (constant-only / prim-only body)");
     }
+    // ROW PROJECTION (default-on; `FELDERA_NO_PROJECT` to disable): when the static
+    // layout exceeds the bucket, attempt a per-step register allocation that
+    // reuses binding-row columns for variables whose liveness intervals do not
+    // overlap (a body subterm var dies once the atom that consumes it has
+    // joined). If the reused-column frontier fits [`JOIN_WIDTH`], the join chain
+    // runs the rule on the existing fixed-width [`Row`] — this is what lets the
+    // giant Herbie ground-term seed rules (≈962 vars, frontier ≈16) lower.
+    //
+    // The post-join chain (`apply_guards` / `apply_steps`) reads binding-row
+    // columns by ABSOLUTE index. Projection lays out the captured row as the
+    // packed survivor columns `0..head_vars.len()`, so those guard/step column
+    // references must be REMAPPED to the packed layout. `build_projection` does
+    // that (treating every guard/step-referenced var as a survivor pinned live to
+    // the end), returning remapped guards/steps alongside the layout.
+    if var_order.len() > JOIN_WIDTH && project_enabled() {
+        if let Some((projection, pguards, psteps)) =
+            build_projection(&atoms, rule, &var_col, &guards, &steps)
+        {
+            return Ok(JoinPlan {
+                var_order,
+                var_col,
+                atoms,
+                guards: pguards,
+                steps: psteps,
+                projection: Some(projection),
+            });
+        }
+        // Projection could not fit the bucket (frontier too wide) ⇒ fall through
+        // to the historical reject below.
+    }
     if var_order.len() > JOIN_WIDTH {
         reject!(
             "too many vars {} > JOIN_WIDTH {}",
@@ -948,7 +1075,237 @@ pub fn plan_join(eg: &EGraph, rule: &RuleIr) -> Result<JoinPlan, String> {
         atoms,
         guards,
         steps,
+        projection: None,
     })
+}
+
+/// Is row projection enabled? (default-ON; set env `FELDERA_NO_PROJECT` to
+/// disable.) Flip the default by changing this one expression.
+pub(crate) fn project_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FELDERA_NO_PROJECT").is_none())
+}
+
+/// Build a column-reusing layout, or `None` if the reused frontier exceeds
+/// [`JOIN_WIDTH`]. Liveness is first-use..last-use over a UNIFIED timeline of the
+/// body atoms FOLLOWED BY the post-join guards/call-prim steps (the order they
+/// are applied). A structural var dies once the last atom OR step that reads it
+/// has run, freeing its column for reuse; only head-read vars stay live to the
+/// final event. This keeps the working width at the true frontier even when many
+/// short-lived literal/sub-term vars feed post-join prims (the giant Herbie seed:
+/// ~22 frontier vs 962 total / 34 if step vars were pinned live-to-end).
+///
+/// Returns `(plan, remapped_guards, remapped_steps)`: each guard/step column is
+/// rewritten from the static `var_col` layout to the per-event projected layout
+/// it runs under (`plan.event_col[event]`), and the join packs head-read
+/// survivors into the captured columns `0..head_vars.len()`.
+#[allow(clippy::type_complexity)]
+fn build_projection(
+    atoms: &[AtomPlan],
+    rule: &RuleIr,
+    var_col: &HashMap<u32, usize>,
+    guards: &[Cond],
+    steps: &[PrimStep],
+) -> Option<(ProjectionPlan, Vec<Cond>, Vec<PrimStep>)> {
+    let n_atoms = atoms.len();
+    let n_guards = guards.len();
+    let n_steps = steps.len();
+    // Timeline events: atoms `0..n_atoms`, then guards `n_atoms..n_atoms+n_guards`,
+    // then steps after. (Guards/steps are applied after the join; their relative
+    // order does not affect correctness, only column reuse.)
+    let g0 = n_atoms;
+    let s0 = n_atoms + n_guards;
+    let n_events = n_atoms + n_guards + n_steps;
+
+    // column -> var for the static layout (every guard/step column is some var,
+    // including prim-output Bind vars which `see_var` placed in `var_col`).
+    let col_var: HashMap<usize, u32> = var_col.iter().map(|(&v, &c)| (c, v)).collect();
+    let var_of = |c: usize| -> Option<u32> { col_var.get(&c).copied() };
+
+    // The vars each event references (reads + the Bind it writes).
+    let event_vars = |ev: usize| -> Vec<u32> {
+        let mut vs: Vec<u32> = Vec::new();
+        if ev < g0 {
+            for s in &atoms[ev].slots {
+                if let Slot::Var(v) = s {
+                    vs.push(*v);
+                }
+            }
+        } else if ev < s0 {
+            let mut cols = Vec::new();
+            guards[ev - g0].cols(&mut cols);
+            vs.extend(cols.into_iter().filter_map(var_of));
+        } else {
+            let st = &steps[ev - s0];
+            for a in &st.args {
+                if let ArgSrc::Col(c) = a {
+                    if let Some(v) = var_of(*c) {
+                        vs.push(v);
+                    }
+                }
+            }
+            match st.ret {
+                PrimRet::Bind(c) | PrimRet::AssertCol(c) => {
+                    if let Some(v) = var_of(c) {
+                        vs.push(v);
+                    }
+                }
+                PrimRet::AssertConst(_) => {}
+            }
+        }
+        vs
+    };
+
+    // Head-read vars survive to the final event (packed into the captured row).
+    let mut survivor: HashSet<u32> = HashSet::new();
+    for v in head_vars(rule) {
+        survivor.insert(v);
+    }
+
+    // first[v]/last[v] over the unified timeline. `first` is the var's BIRTH
+    // (atom that binds it, or step whose `Bind` produces it); `last` is the last
+    // event (atom OR later step OR — for survivors below — the final event) that
+    // references it. A prim-output var consumed by a later step (or the head) thus
+    // stays live across that whole span: liveness respects the step DAG, not a
+    // naive "dies at its own step".
+    let mut first: HashMap<u32, usize> = HashMap::new();
+    let mut last: HashMap<u32, usize> = HashMap::new();
+    for ev in 0..n_events {
+        for v in event_vars(ev) {
+            first.entry(v).or_insert(ev);
+            last.insert(v, ev);
+        }
+    }
+    // Atoms are events `0..g0`, so any atom-referenced var is born at an atom
+    // event (its `first` < g0) — the join binds every atom var before any step
+    // runs. A prim-output (`Bind`) var that an atom slot also names is therefore
+    // born at the atom (where the join binds it) and the step `AssertCol`s it (the
+    // emitter does exactly this for literal sub-terms: `Num`'s arg is the bigrat
+    // var, and the `bigrat` prim asserts it). So no step writes a column an atom
+    // later needs — the timeline ordering makes that impossible by construction.
+    // Survivors live to the last event so the final pack can read them.
+    let last_ev = n_events.saturating_sub(1);
+    for v in &survivor {
+        if let Some(l) = last.get_mut(v) {
+            *l = last_ev;
+        }
+    }
+
+    // Births/deaths per event (deterministic var-id order).
+    let mut births: Vec<Vec<u32>> = vec![Vec::new(); n_events.max(1)];
+    let mut deaths: Vec<Vec<u32>> = vec![Vec::new(); n_events.max(1)];
+    let mut vars: Vec<u32> = first.keys().copied().collect();
+    vars.sort_unstable();
+    for v in vars {
+        births[first[&v]].push(v);
+        deaths[last[&v]].push(v);
+    }
+
+    // Linear-scan register allocation over the whole timeline.
+    let mut col_of: HashMap<u32, usize> = HashMap::new();
+    let mut free: Vec<usize> = Vec::new();
+    let mut next: usize = 0;
+    let mut event_col: Vec<HashMap<u32, usize>> = Vec::with_capacity(n_events);
+    for ev in 0..n_events {
+        for &v in &births[ev] {
+            let c = free.pop().unwrap_or_else(|| {
+                let c = next;
+                next += 1;
+                c
+            });
+            col_of.insert(v, c);
+        }
+        if col_of.len() > JOIN_WIDTH {
+            if std::env::var("FELDERA_DBG_PLAN").is_ok() {
+                #[allow(clippy::disallowed_macros)]
+                {
+                    eprintln!(
+                        "[DBG_PROJ] FAIL frontier {} > cap {JOIN_WIDTH} at event {ev}/{n_events}",
+                        col_of.len()
+                    );
+                }
+            }
+            return None;
+        }
+        event_col.push(col_of.clone());
+        for &v in &deaths[ev] {
+            if let Some(c) = col_of.remove(&v) {
+                free.push(c);
+            }
+        }
+        free.sort_unstable_by(|a, b| b.cmp(a));
+    }
+    if event_col.is_empty() {
+        return None;
+    }
+
+    // The join uses the atom-event layouts `0..n_atoms`.
+    let step_col: Vec<HashMap<u32, usize>> = event_col[..n_atoms].to_vec();
+    // Layout right after the join (the last atom event) — guards/steps remap onto
+    // their own event layouts, but the join's OUTPUT row is in this layout.
+    let join_out_layout = event_col[n_atoms - 1].clone();
+
+    // Head-read survivors → packed captured columns `0..k`. They are guaranteed
+    // live at the final event.
+    let final_layout = &event_col[last_ev];
+    let mut head_vars: Vec<u32> = survivor
+        .iter()
+        .copied()
+        .filter(|v| final_layout.contains_key(v))
+        .collect();
+    head_vars.sort_unstable();
+    let head_cols: Vec<usize> = head_vars.iter().map(|v| final_layout[v]).collect();
+
+    // Remap guards/steps: each runs under its OWN event layout. A guard at event
+    // `g0+i` reads columns in `event_col[g0+i]`; a step at `s0+i` reads/writes
+    // columns in `event_col[s0+i]`. Build a static-col → event-col remap per
+    // event and rewrite.
+    let remap_for = |ev: usize| -> HashMap<usize, usize> {
+        let layout = &event_col[ev];
+        let mut m: HashMap<usize, usize> = HashMap::new();
+        for (&v, &sc) in var_col {
+            if let Some(&ec) = layout.get(&v) {
+                m.insert(sc, ec);
+            }
+        }
+        m
+    };
+    let pguards: Vec<Cond> = guards
+        .iter()
+        .enumerate()
+        .map(|(i, g)| g.remap(&remap_for(g0 + i)))
+        .collect();
+    let psteps: Vec<PrimStep> = steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| s.remap(&remap_for(s0 + i)))
+        .collect();
+
+    if std::env::var("FELDERA_DBG_PLAN").is_ok() {
+        let frontier = event_col.iter().map(|m| m.len()).max().unwrap_or(0);
+        #[allow(clippy::disallowed_macros)]
+        {
+            eprintln!(
+                "[DBG_PROJ] OK: frontier={frontier} head_survivors={} (cap {JOIN_WIDTH}) atoms={n_atoms} guards={n_guards} steps={n_steps}",
+                head_vars.len()
+            );
+        }
+    }
+
+    Some((
+        ProjectionPlan {
+            step_col,
+            join_out_layout,
+            event_col,
+            g0,
+            s0,
+            head_vars,
+            head_cols,
+        },
+        pguards,
+        psteps,
+    ))
 }
 
 /// Variables read by a rule's head actions (so we can verify no symbolic
@@ -1094,6 +1451,256 @@ fn build_join_stream<R: Row>(
     }
 
     Ok(cur)
+}
+
+/// Build the join stream under a PROJECTION layout (`FELDERA_PROJECT`): the
+/// binding row is laid out per-step with column REUSE (`proj.step_col`), so a
+/// rule whose static var count exceeds the bucket still fits the fixed-width
+/// [`Row`]. Structurally identical to [`build_join_stream`]'s left-deep chain;
+/// the differences are (a) every var's column is the per-step column instead of
+/// the static `var_col`, (b) each merge REMAPS carried-over vars whose column
+/// changed (reuse) and zeroes freed columns, and (c) a final `.map` packs the
+/// surviving vars into columns `0..head_vars.len()` for the capture. Only used
+/// for a pure relational join (no guards/steps), so there is no guard `filter`.
+fn build_projected_join_stream<R: Row>(
+    streams: &[Stream<RootCircuit, OrdZSet<R>>],
+    atoms: &[Vec<Slot>],
+    proj: &ProjectionPlan,
+) -> Result<Stream<RootCircuit, OrdZSet<R>>> {
+    let step_col = &proj.step_col;
+    let slots0 = atoms[0].clone();
+    let sc0 = step_col[0].clone();
+    let s0 = streams
+        .first()
+        .ok_or_else(|| anyhow!("join has no atoms"))?
+        .clone();
+    // First atom: bind its vars into their step-0 columns.
+    let mut cur = s0.flat_map(move |r: &R| match bind_atom::<R>(r, &slots0, &sc0) {
+        Some(b) => vec![b],
+        None => vec![],
+    });
+
+    for (i, slots) in atoms.iter().enumerate().skip(1) {
+        let s = streams[i].clone();
+        let prev = &step_col[i - 1];
+        let curl = &step_col[i];
+
+        // Shared = atom vars already live (present in the previous layout).
+        let shared: Vec<u32> = atom_vars(slots)
+            .into_iter()
+            .filter(|v| prev.contains_key(v))
+            .collect();
+        // Left key reads each shared var from its PREVIOUS column.
+        let shared_cols_left: Vec<usize> = shared.iter().map(|v| prev[v]).collect();
+        let shared_atom_cols: Vec<usize> = shared
+            .iter()
+            .map(|v| {
+                slots
+                    .iter()
+                    .position(|s| matches!(s, Slot::Var(x) if x == v))
+                    .expect("shared var present in atom")
+            })
+            .collect();
+
+        let prevc = prev.clone();
+        let curc = curl.clone();
+        let slotsc = slots.clone();
+
+        if shared.is_empty() {
+            // No shared bound variable: cartesian product, unit key.
+            let left = cur.map_index(|b: &R| ((), *b));
+            let right = s.map_index(move |r: &R| ((), *r));
+            cur = left
+                .join(&right, move |_k, b: &R, r: &R| {
+                    remap_merge_atom_into::<R>(b, r, &slotsc, &prevc, &curc)
+                })
+                .flat_map(|o: &Option<R>| match o {
+                    Some(b) => vec![*b],
+                    None => vec![],
+                });
+        } else {
+            let scl = shared_cols_left.clone();
+            let left = cur.map_index(move |b: &R| (join_key::<R>(b, &scl), *b));
+            let sac = shared_atom_cols.clone();
+            let right = s.map_index(move |r: &R| (join_key::<R>(r, &sac), *r));
+            cur = left
+                .join(&right, move |_k, b: &R, r: &R| {
+                    remap_merge_atom_into::<R>(b, r, &slotsc, &prevc, &curc)
+                })
+                .flat_map(|o: &Option<R>| match o {
+                    Some(b) => vec![*b],
+                    None => vec![],
+                });
+        }
+    }
+
+    // The atom join leaves `cur` in `proj.join_out_layout`. The post-join
+    // guards/steps (`apply_projected_post_join`) relayout + run, then pack.
+    Ok(cur)
+}
+
+/// Relayout a projected row from `from` layout to `to` layout: copy each var live
+/// in BOTH to its new column, zero everything else. Used between post-join events
+/// (guards/steps) so freed columns are reused, keeping the width at the frontier.
+#[inline]
+fn relayout_row<R: Row>(b: &R, from: &HashMap<u32, usize>, to: &HashMap<u32, usize>) -> R {
+    let mut out = R::pack(&[]);
+    for (&v, &tc) in to {
+        if let Some(&fc) = from.get(&v) {
+            out = out.set(tc, b.get(fc));
+        }
+    }
+    out
+}
+
+/// Apply the projected post-join chain: each guard/step runs under its OWN
+/// timeline event layout (`proj.event_col[event]`), with the row RE-LAID-OUT
+/// between events so reused columns hold the right values (the same reuse the
+/// atom join does via `remap_merge_atom_into`). The (already-remapped) `pguards`
+/// / `psteps` read/write columns in their event's layout. Ends by packing the
+/// head-read survivors into capture columns `0..head_vars.len()`.
+fn apply_projected_post_join<R: Row>(
+    mut cur: Stream<RootCircuit, OrdZSet<R>>,
+    proj: &ProjectionPlan,
+    pguards: &[Cond],
+    psteps: &[PrimStep],
+    engine: &PrimEngine,
+) -> Stream<RootCircuit, OrdZSet<R>> {
+    // The row currently sits in `join_out_layout` (the last atom event's layout).
+    let mut cur_layout = proj.join_out_layout.clone();
+
+    // Guards: events `g0 .. g0+n_guards`.
+    for (i, g) in pguards.iter().enumerate() {
+        let ev = proj.g0 + i;
+        let to = proj.event_col[ev].clone();
+        let from = cur_layout.clone();
+        cur = cur.map(move |b: &R| relayout_row::<R>(b, &from, &to));
+        cur_layout = proj.event_col[ev].clone();
+        let g = g.clone();
+        cur = cur.filter(move |row: &R| g.eval(row));
+    }
+
+    // Steps: events `s0 .. s0+n_steps`.
+    for (i, step) in psteps.iter().enumerate() {
+        let ev = proj.s0 + i;
+        let to = proj.event_col[ev].clone();
+        let from = cur_layout.clone();
+        cur = cur.map(move |b: &R| relayout_row::<R>(b, &from, &to));
+        cur_layout = proj.event_col[ev].clone();
+        let step = step.clone();
+        let engine = engine.clone();
+        cur = cur.flat_map(move |row: &R| {
+            let argv: Vec<Value> = step
+                .args
+                .iter()
+                .map(|a| match a {
+                    ArgSrc::Col(c) => Value::new(get_col(row, *c)),
+                    ArgSrc::Const(v) => Value::new(*v),
+                })
+                .collect();
+            let Some(result) = engine.eval(step.id, &argv) else {
+                return Vec::new();
+            };
+            match step.ret {
+                PrimRet::Bind(col) => vec![set_col(*row, col, result.rep())],
+                PrimRet::AssertCol(col) => {
+                    if get_col(row, col) == result.rep() {
+                        vec![*row]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                PrimRet::AssertConst(c) => {
+                    if c == result.rep() {
+                        vec![*row]
+                    } else {
+                        Vec::new()
+                    }
+                }
+            }
+        });
+    }
+
+    // Final pack: copy each head-read survivor from its final-event column
+    // (`head_cols[i]`, which is a column in `cur_layout` = the last event's
+    // layout) into capture column `i`, zeroing the rest — so the consumer reads
+    // captured column `i` for survivor `head_vars[i]`.
+    debug_assert!(
+        proj.head_vars
+            .iter()
+            .zip(&proj.head_cols)
+            .all(|(v, &c)| cur_layout.get(v) == Some(&c)),
+        "head_cols must address the final post-join layout"
+    );
+    let head_cols = proj.head_cols.clone();
+    cur.map(move |b: &R| {
+        let mut a = [0u32; MAX_WIDTH];
+        for (i, &c) in head_cols.iter().enumerate() {
+            a[i] = b.get(c);
+        }
+        R::pack(&a[..R::WIDTH])
+    })
+}
+
+/// Projecting merge for the [`build_projected_join_stream`] chain. Like
+/// [`merge_atom_into`] but rebuilds the row from scratch under a NEW column
+/// layout: `prev` is the left-row layout (step `i-1`), `cur` is the output layout
+/// (step `i`). Carried vars (live in both layouts, not produced by this atom) are
+/// copied `prev[v]→cur[v]`; the atom's vars are validated (shared) or written
+/// (fresh) at `cur[v]`; every other output column is left zeroed. This is what
+/// reuses freed columns and so keeps the frontier within [`JOIN_WIDTH`]. `None`
+/// on a const / repeated-var / shared-var constraint failure (same semantics as
+/// the static merge).
+fn remap_merge_atom_into<R: Row>(
+    b: &R,
+    r: &R,
+    slots: &[Slot],
+    prev: &HashMap<u32, usize>,
+    cur: &HashMap<u32, usize>,
+) -> Option<R> {
+    let mut out = R::pack(&[]);
+    // Carry over every still-live var (present in `cur`) the left row holds
+    // (present in `prev`). Atom-fresh vars are absent from `prev`, so they are
+    // NOT copied here — they are written from `r` below.
+    for (&v, &pc) in prev {
+        if let Some(&cc) = cur.get(&v) {
+            out = out.set(cc, b.get(pc));
+        }
+    }
+    let mut local: HashMap<u32, u32> = HashMap::new();
+    for (i, s) in slots.iter().enumerate() {
+        let val = r.get(i);
+        match s {
+            Slot::Const(c) => {
+                if *c != val {
+                    return None;
+                }
+            }
+            Slot::Var(v) => {
+                if let Some(&prior) = local.get(v) {
+                    if prior != val {
+                        return None;
+                    }
+                    continue;
+                }
+                local.insert(*v, val);
+                // Every atom var is live at this step ⇒ present in `cur`.
+                let cc = cur[v];
+                if prev.contains_key(v) {
+                    // Shared (already bound): the carried value must agree. (The
+                    // join key already enforces this for the key columns; this
+                    // also covers any shared var not in the key.)
+                    if out.get(cc) != val {
+                        return None;
+                    }
+                } else {
+                    // Fresh var born at this atom: write it.
+                    out = out.set(cc, val);
+                }
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Apply the [`PrimStep`]s (Stage C call-prims) to the joined binding stream as
@@ -1609,18 +2216,31 @@ impl<R: Row> FusedJoinImpl<R> {
             guards: Vec<Cond>,
             steps: Vec<PrimStep>,
             n_vars: usize,
+            /// `FELDERA_PROJECT`: per-step column-reuse layout ⇒ the join chain
+            /// runs with projecting merges and packs the captured row to the
+            /// surviving vars. `None` ⇒ the historical static-column chain.
+            projection: Option<ProjectionPlan>,
         }
         let rule_plans: Vec<RulePlan> = plans
             .iter()
-            .map(|(idx, plan)| RulePlan {
-                idx: *idx,
-                atoms: plan.atoms.iter().map(|a| a.slots.clone()).collect(),
-                atom_funcs: plan.atoms.iter().map(|a| a.func).collect(),
-                var_col: plan.var_col.clone(),
-                var_order: plan.var_order.clone(),
-                guards: plan.guards.clone(),
-                steps: plan.steps.clone(),
-                n_vars: plan.var_order.len(),
+            .map(|(idx, plan)| {
+                // With projection the CAPTURED row is packed to the surviving vars
+                // (columns `0..head_vars.len()`), and the reduced var order is what
+                // the consumer reads back — so capture width and var order both
+                // come from the plan accessors (projection-aware).
+                let n_vars = plan.n_vars();
+                let var_order = plan.var_order();
+                RulePlan {
+                    idx: *idx,
+                    atoms: plan.atoms.iter().map(|a| a.slots.clone()).collect(),
+                    atom_funcs: plan.atoms.iter().map(|a| a.func).collect(),
+                    var_col: plan.var_col.clone(),
+                    var_order,
+                    guards: plan.guards.clone(),
+                    steps: plan.steps.clone(),
+                    n_vars,
+                    projection: plan.projection.clone(),
+                }
             })
             .collect();
 
@@ -1682,9 +2302,29 @@ impl<R: Row> FusedJoinImpl<R> {
                     .iter()
                     .map(|f| rel_stream[f].clone())
                     .collect();
-                let out =
-                    build_join_stream(&streams, &rp.atoms, &rp.var_col, &rp.guards, rp.n_vars)?;
-                let out = apply_steps(out, &rp.steps, &engine);
+                let out = match &rp.projection {
+                    Some(proj) => {
+                        // PROJECTED: join the atoms (row in `join_out_layout`),
+                        // then run the remapped guards + steps under per-event
+                        // layouts (relaid out between events) and pack the head
+                        // survivors. `rp.guards`/`rp.steps` are the projection-
+                        // remapped `pguards`/`psteps`.
+                        let joined = build_projected_join_stream(&streams, &rp.atoms, proj)?;
+                        apply_projected_post_join(joined, proj, &rp.guards, &rp.steps, &engine)
+                    }
+                    None => {
+                        // STATIC: `build_join_stream` applies guards inline; steps
+                        // run after.
+                        let joined = build_join_stream(
+                            &streams,
+                            &rp.atoms,
+                            &rp.var_col,
+                            &rp.guards,
+                            rp.n_vars,
+                        )?;
+                        apply_steps(joined, &rp.steps, &engine)
+                    }
+                };
                 // PERF (#23): the output `.distinct()` is also redundant here.
                 // `FusedJoin::step` accumulates each rule's binding deltas into a
                 // per-key weight map and the env consumer
