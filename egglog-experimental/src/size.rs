@@ -41,15 +41,17 @@ impl ReadPrim for GetSizePrimitive {
             .table_sizes()
             .into_iter()
             .filter_map(|(name, size)| {
-                if name.starts_with(INTERNAL_SYMBOL_PREFIX) {
-                    return None;
+                // An explicit filter is authoritative: count exactly the named
+                // tables, even internal (`@`-prefixed) ones. Term encoding uses
+                // this to point `get-size!` at the canonical `@<F>View` tables
+                // (the mode-invariant egraph size) instead of the monotonic
+                // hash-cons term tables — see `instrument_get_size` in
+                // `proof_encoding.rs`. With no filter, internal tables are
+                // excluded as before (term tables would otherwise over-count).
+                match &filters {
+                    Some(filter) => filter.contains(name).then_some(size),
+                    None => (!name.starts_with(INTERNAL_SYMBOL_PREFIX)).then_some(size),
                 }
-                if let Some(filter) = &filters
-                    && !filter.contains(name)
-                {
-                    return None;
-                }
-                Some(size)
             })
             .sum();
         let total_size = i64::try_from(total_size).ok()?;

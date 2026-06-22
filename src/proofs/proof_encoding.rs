@@ -1366,6 +1366,19 @@ impl<'a> ProofInstrumentor<'a> {
                                 "Term encoding does not support eq-sort primitive expressions in facts"
                             );
                         }
+                        // `get-size!` sums the sizes of (filtered) user tables as
+                        // a saturation budget. Under term encoding the user
+                        // constructors are monotonic hash-cons TERM tables; their
+                        // CANONICAL rows live in the `@<F>View` tables. Counting
+                        // the term tables over-counts vs the normal backend (the
+                        // budget then trips earlier — term != normal). Redirect
+                        // `get-size!` to the canonical view tables so the size
+                        // proxy is mode-invariant (see `instrument_get_size`).
+                        let new_args = if specialized_primitive.name() == "get-size!" {
+                            self.instrument_get_size(&new_args)
+                        } else {
+                            new_args
+                        };
                         let fv = self.fresh_var();
                         res.push(format!(
                             "(= {fv} ({} {}))",
@@ -1410,6 +1423,48 @@ impl<'a> ProofInstrumentor<'a> {
         }
 
         (res, action_lookups, self.format_prooflist(&proof))
+    }
+
+    /// Rewrite the (string-literal) arguments of a `get-size!` call so it counts
+    /// the canonical `@<F>View` tables instead of the monotonic hash-cons term
+    /// tables. `get-size!` (egglog-experimental) sums the sizes of the tables
+    /// named in its filter, or — when called with no args — all non-`@` tables.
+    /// Under term encoding both of those count the term tables, which over-count
+    /// vs the normal backend (stale/duplicate hash-cons rows; the canonical rows
+    /// live in `@<F>View`). We redirect:
+    ///   - no args (count all): emit the full set of view names PLUS the
+    ///     non-eq-sort pass-through globals (which have no view and are kept as
+    ///     plain non-`@` tables, exactly as the normal backend counts them), so
+    ///     the proxy is the canonical egraph size.
+    ///   - explicit `"F"` filters: map each to its view name `@<F>View` (leaving
+    ///     names without a view — e.g. pass-through globals — as-is).
+    /// `get-size!` (size.rs) treats an explicit filter as authoritative, so the
+    /// `@`-prefixed view names are counted despite the usual `@` exclusion.
+    fn instrument_get_size(&self, args: &[String]) -> Vec<String> {
+        let view_of = &self.egraph.proof_state.proof_names.view_name;
+        if args.is_empty() {
+            // Count-all: every term-encoded function's canonical view, plus the
+            // pass-through globals (no view; non-`@` tables the normal backend
+            // also counts).
+            let mut names: Vec<String> = view_of
+                .values()
+                .chain(self.egraph.proof_state.pass_through_globals.iter())
+                .map(|v| format!("\"{v}\""))
+                .collect();
+            names.sort(); // deterministic order
+            names
+        } else {
+            // Explicit filters: each arg is a quoted user-table name `"F"`.
+            args.iter()
+                .map(|quoted| {
+                    let name = quoted.trim_matches('"');
+                    match view_of.get(name) {
+                        Some(view) => format!("\"{view}\""),
+                        None => quoted.clone(),
+                    }
+                })
+                .collect()
+        }
     }
 
     // Actions need to be instrumented to add to the view
