@@ -134,6 +134,50 @@ impl ExternalFunction for DuckPlaceholderPrimWrapper {
     }
 }
 
+// Registry-free `ExternalFunction` wrapper for registry-backed primitives on
+// backends without an in-memory `ActionRegistry` (`supports_action_registry()
+// == false`: duckdb / flowlog / feldera). Unlike `RegistryPrimWrapper` it does
+// not build a `ReadState`/`FullState` (which require the `ActionRegistry` those
+// backends lack). On duckdb the wrapper is never invoked (primitive calls are
+// compiled to SQL). On flowlog/feldera the interpreter DOES invoke it, so it
+// must produce a value:
+//   - `get-size!`: sum a frontend-maintained size snapshot
+//     (`get_size_snapshot`), honoring the explicit `@<F>View` name filter the
+//     term encoder emits (or all entries when called with no args). This is the
+//     mode-invariant canonical egraph size (see `instrument_get_size`).
+//   - any other registry-backed primitive: not yet supported on these backends
+//     — panic with a clear message rather than silently returning a wrong value.
+#[derive(Clone)]
+struct RegistryFreePrimWrapper {
+    name: String,
+    get_size_snapshot: Arc<RwLock<HashMap<String, i64>>>,
+}
+
+impl ExternalFunction for RegistryFreePrimWrapper {
+    fn invoke(&self, exec_state: &mut ExecutionState, args: &[Value]) -> Option<Value> {
+        if self.name == "get-size!" {
+            let snapshot = self.get_size_snapshot.read().unwrap();
+            let total: i64 = if args.is_empty() {
+                snapshot.values().copied().sum()
+            } else {
+                args.iter()
+                    .map(|v| {
+                        let name = exec_state.base_values().unwrap::<crate::sort::S>(*v).0;
+                        snapshot.get(&name).copied().unwrap_or(0)
+                    })
+                    .sum()
+            };
+            return Some(exec_state.base_values().get::<i64>(total));
+        }
+        unreachable!(
+            "registry-backed primitive `{}` has no registry-free implementation on \
+             this backend (only `get-size!` is supported); it was invoked through \
+             RegistryFreePrimWrapper",
+            self.name
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct FuncType {
     pub name: String,
@@ -389,22 +433,39 @@ impl EGraph {
         T: Primitive + Clone,
         S: RegistryWrap<T> + 'static,
     {
-        // On the duckdb backend there is no `ActionRegistry`
-        // (`action_registry()` is `unimplemented!()`). DuckDB compiles
-        // primitive calls to SQL, so the wrapper's `invoke` is never
-        // reached — we only need the primitive registered to obtain an
-        // id + name. Register a placeholder wrapper instead of touching
-        // `action_registry()`. The bridge path is unchanged.
-        if self
-            .backend
-            .as_any()
-            .downcast_ref::<egglog_bridge_duckdb::EGraph>()
-            .is_some()
-        {
+        // Backends without an in-memory `ActionRegistry`
+        // (`supports_action_registry() == false`: duckdb, flowlog, feldera)
+        // cannot back a `RegistryPrimWrapper` (its construction clones
+        // `action_registry()`, which is `unimplemented!()` there). Register a
+        // registry-free wrapper instead — we still need the primitive's
+        // id + name + type registered. On duckdb the primitive runs as
+        // compiled SQL (the wrapper's `invoke` is never reached); on
+        // flowlog/feldera the wrapper IS invoked by the interpreter, so
+        // `RegistryFreePrimWrapper` dispatches it without an `ActionRegistry`
+        // (e.g. `get-size!` reads the size snapshot; see `snapshot_get_size`).
+        if !self.backend.supports_action_registry() {
+            // DuckDB compiles primitive calls to SQL (the wrapper's `invoke` is
+            // never reached — `get-size!` becomes the `__egglog_get_size()` UDF),
+            // so it keeps the `unreachable!()` placeholder unchanged. FlowLog /
+            // Feldera DO invoke the wrapper through their interpreters, so they
+            // get the registry-free wrapper that reads the `get-size!` snapshot.
+            let is_duckdb = self
+                .backend
+                .as_any()
+                .downcast_ref::<egglog_bridge_duckdb::EGraph>()
+                .is_some();
+            let snapshot = self.proof_state.get_size_snapshot.clone();
             self.register_per_context(x, validator, valid_ctxs, false, move |x, _ctx| {
-                Box::new(DuckPlaceholderPrimWrapper {
-                    name: x.name().to_owned(),
-                })
+                if is_duckdb {
+                    Box::new(DuckPlaceholderPrimWrapper {
+                        name: x.name().to_owned(),
+                    }) as Box<dyn ExternalFunction>
+                } else {
+                    Box::new(RegistryFreePrimWrapper {
+                        name: x.name().to_owned(),
+                        get_size_snapshot: snapshot.clone(),
+                    }) as Box<dyn ExternalFunction>
+                }
             });
             return;
         }

@@ -383,6 +383,36 @@ pub fn cli(mut egraph: EGraph) {
             // hooks to replicate. Build a fresh egraph with the requested
             // backend and route the program through the shared frontend.
             if args.feldera_backend || args.flowlog_backend {
+                // If the caller already handed us an egraph backed by the
+                // requested engine (e.g. `egglog-experimental`'s `main`
+                // pre-builds + extends it so the experimental primitives like
+                // `get-size!` and commands survive — see
+                // `new_experimental_egraph_flowlog/feldera`), route the program
+                // through it directly. Otherwise rebuild a fresh backend egraph
+                // below (which would drop those experimental registrations).
+                if (args.flowlog_backend && egraph.has_flowlog_backend())
+                    || (args.feldera_backend && egraph.has_feldera_backend())
+                {
+                    egraph.fact_directory.clone_from(&args.fact_directory);
+                    match egraph
+                        .parse_and_run_program(Some(input.to_str().unwrap().into()), &program)
+                    {
+                        Ok(msgs) => {
+                            if args.mode != RunMode::NoMessages {
+                                use std::io::Write;
+                                let mut out = io::stdout();
+                                for msg in msgs {
+                                    let _ = write!(out, "{msg}");
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            log::error!("{err}");
+                            std::process::exit(1);
+                        }
+                    }
+                    continue;
+                }
                 let mut backend_eg = if args.feldera_backend {
                     // `--native-uf --feldera`: enable the Feldera backend's
                     // in-process UF host-pass (`enable_native_uf`) here, and the

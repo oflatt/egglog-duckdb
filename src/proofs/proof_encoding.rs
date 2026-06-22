@@ -80,6 +80,18 @@ pub(crate) struct EncodingState {
     /// (nonexistent) view access. Keyed by name because `FuncType` (the only
     /// info available at the read sites) does not carry `internal_let`.
     pub pass_through_globals: HashSet<String>,
+    /// Shared `get-size!` size snapshot for backends without an in-memory
+    /// `ActionRegistry` (duckdb/flowlog/feldera — `supports_action_registry()
+    /// == false`). The `get-size!` ReadPrim's normal path reads table sizes
+    /// through the `ActionRegistry`/`ReadState`, which those backends lack;
+    /// instead the egglog frontend refreshes this map (`name -> row_count`,
+    /// from `functions` + `Backend::table_size`) before each `:until` query,
+    /// and the registry-free `RegistryFreePrimWrapper` sums it (honoring the
+    /// explicit `@<F>View` name filter the term encoder produces). Shared by
+    /// `Arc` so the wrapper (which only gets an `ExecutionState`, not the
+    /// `EGraph`) can read the frontend-maintained snapshot. Empty / unused on
+    /// the bridge backend (it has a real `ActionRegistry`).
+    pub get_size_snapshot: std::sync::Arc<std::sync::RwLock<HashMap<String, i64>>>,
 }
 
 impl EncodingState {
@@ -106,6 +118,7 @@ impl EncodingState {
             fast_rebuild: false,
             rebuild_view_exclude: HashMap::default(),
             pass_through_globals: HashSet::default(),
+            get_size_snapshot: std::sync::Arc::new(std::sync::RwLock::new(HashMap::default())),
         }
     }
 }
@@ -1834,11 +1847,20 @@ impl<'a> ProofInstrumentor<'a> {
         } else {
             ""
         };
+        // Preserve the `:naive` flag. A `:naive` rule typechecks its body in the
+        // Read/Full primitive contexts rather than Pure/Write (see
+        // `typecheck_rule`), which is what makes a read-primitive such as
+        // `get-size!` admissible — e.g. the one-shot `(run … :until (… (get-size!)))`
+        // query rule (`prelude::query` / `rust_rule_full`) is built `:naive`.
+        // Dropping it here re-typechecks the instrumented rule as seminaive,
+        // resolving `get-size!` in `Context::Pure` where it is invalid → "Unbound
+        // function get-size!".
+        let naive_opt = if rule.naive { ":naive" } else { "" };
         let instrumented = format!(
             "(rule ({})
                    ({proof_var_binding}
                     {})
-                    {ruleset_opt} {unsafe_opt}
+                    {ruleset_opt} {unsafe_opt} {naive_opt}
                     :name \"{name}\")",
             ListDisplay(facts, " "),
             ListDisplay(actions, " "),

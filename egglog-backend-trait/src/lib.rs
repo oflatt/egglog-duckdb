@@ -601,6 +601,19 @@ pub trait Backend: Send + Sync {
     /// gate; see `docs/backend_trait_inventory.md` Section 6.3).
     fn supports_containers(&self) -> bool;
 
+    /// Whether this backend exposes the in-memory `ActionRegistry` /
+    /// `ExecutionState` that registry-backed primitives
+    /// (`ReadPrim`/`WritePrim`/`FullPrim`) dispatch through. The reference
+    /// (bridge) backend wraps each such primitive in a `RegistryPrimWrapper`
+    /// that clones `action_registry()` at registration time; the dataflow /
+    /// SQL backends (`action_registry_any()` = `unimplemented!()`) cannot, so
+    /// the egglog frontend registers a registry-free placeholder/snapshot
+    /// wrapper instead (see `register_registry_primitive` in
+    /// `typechecking.rs`).
+    ///
+    /// Reference backend: `true`. DuckDB / FlowLog / Feldera: `false`.
+    fn supports_action_registry(&self) -> bool;
+
     // -- diagnostics --------------------------------------------------------
 
     /// Set the verbosity of the per-rule-iteration timing report.

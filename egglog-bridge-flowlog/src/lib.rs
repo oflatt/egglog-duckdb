@@ -1102,6 +1102,14 @@ impl Backend for EGraph {
         false
     }
 
+    fn supports_action_registry(&self) -> bool {
+        // No egglog `ActionRegistry`: `action_registry_any()` is `unimplemented!()`.
+        // Registry-backed primitives (e.g. `get-size!`) are registered via the
+        // frontend's registry-free placeholder/snapshot path and dispatched by the
+        // FlowLog interpreter's external-func mechanism.
+        false
+    }
+
     // -- diagnostics --------------------------------------------------------
 
     fn set_report_level(&mut self, level: ReportLevel) {

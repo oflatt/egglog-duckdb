@@ -1824,6 +1824,13 @@ impl EGraph {
     }
 
     fn check_facts(&mut self, span: &Span, facts: &[ResolvedFact]) -> Result<(), Error> {
+        // Refresh the `get-size!` size snapshot the registry-free wrapper reads
+        // on backends without an `ActionRegistry` (flowlog/feldera). `check_facts`
+        // is the `:until` evaluation point (called once per `run` iteration via
+        // `run_rules`), so the snapshot tracks the current table sizes each time
+        // the `:until` condition (e.g. `(<= 4000 (get-size!))`) is checked. No-op
+        // on backends with an `ActionRegistry` (bridge reads sizes live).
+        self.refresh_get_size_snapshot();
         let fresh_name = self.parser.symbol_gen.fresh("check_facts");
         let fresh_ruleset = self.parser.symbol_gen.fresh("check_facts_ruleset");
         let rule = ast::ResolvedRule {
@@ -1833,7 +1840,12 @@ impl EGraph {
             name: fresh_name.clone(),
             ruleset: fresh_ruleset.clone(),
             unsafe_seminaive: false,
-            naive: false,
+            // `:naive` so the body is typechecked/compiled in the Read/Full
+            // primitive contexts, not Pure/Write — required for a read-primitive
+            // like `get-size!` (a `ReadPrim`, valid in Read/Full only) to resolve
+            // in a `:until (… (get-size!))` condition. A one-shot existence check
+            // matches the whole DB anyway (no seminaive delta to ride).
+            naive: true,
             no_decomp: false,
         };
         let core_rule = rule.to_canonicalized_core_rule(
@@ -2316,6 +2328,40 @@ impl EGraph {
     /// survive into the run.
     pub fn has_duckdb_backend(&self) -> bool {
         self.backend.as_any().is::<egglog_bridge_duckdb::EGraph>()
+    }
+
+    /// Refresh the `get-size!` size snapshot used by the registry-free
+    /// `get-size!` wrapper on backends without an `ActionRegistry` (flowlog /
+    /// feldera; duckdb uses its own UDF snapshot). Fills `name -> row_count`
+    /// from the live function tables via the backend-agnostic
+    /// `Backend::table_size`, so the wrapper (which only sees an
+    /// `ExecutionState`) can answer `get-size!` honoring the term encoder's
+    /// `@<F>View` name filter. No-op on backends that have an `ActionRegistry`
+    /// (the standard `RegistryPrimWrapper`/`ReadState` path reads sizes live).
+    pub(crate) fn refresh_get_size_snapshot(&self) {
+        if self.backend.supports_action_registry() {
+            return;
+        }
+        let mut snap = self.proof_state.get_size_snapshot.write().unwrap();
+        snap.clear();
+        for (name, func) in &self.functions {
+            let size = self.backend.table_size(func.backend_id) as i64;
+            snap.insert(name.clone(), size);
+        }
+    }
+
+    /// True when this egraph is backed by the FlowLog engine. Used by the CLI
+    /// to short-circuit its `--flowlog` rebuild when handed an
+    /// already-flowlog-backed egraph (e.g. `egglog-experimental`'s `main`
+    /// pre-builds + extends it so its primitives/commands survive).
+    pub fn has_flowlog_backend(&self) -> bool {
+        self.backend.as_any().is::<egglog_bridge_flowlog::EGraph>()
+    }
+
+    /// True when this egraph is backed by the Feldera engine. See
+    /// [`Self::has_flowlog_backend`].
+    pub fn has_feldera_backend(&self) -> bool {
+        self.backend.as_any().is::<egglog_bridge_feldera::EGraph>()
     }
 
     /// Borrow the underlying backend trait object for diagnostic

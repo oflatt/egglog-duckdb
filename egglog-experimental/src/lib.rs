@@ -62,6 +62,39 @@ pub fn new_experimental_egraph_duckdb(config: egglog::DuckBackendConfig) -> anyh
     Ok(egraph)
 }
 
+/// Build an experimental egraph backed by FlowLog. Like
+/// [`new_experimental_egraph_duckdb`], this pre-builds the backend-specific
+/// engine and registers the experimental surface (sorts, primitives such as
+/// `get-size!`, commands) on it up front, so they survive into the run. (The
+/// CLI's `--flowlog` branch short-circuits its own rebuild when handed an
+/// already-flowlog-backed egraph — see `cli.rs`.) `with_native_uf` is applied
+/// to match the encoding when `config.native_uf` is set, mirroring `cli.rs`.
+pub fn new_experimental_egraph_flowlog(
+    config: egglog::FlowlogBackendConfig,
+) -> anyhow::Result<EGraph> {
+    let native_uf = config.native_uf;
+    let mut egraph = EGraph::with_flowlog_backend_config(config)?;
+    if native_uf {
+        egraph = egraph.with_native_uf();
+    }
+    extend_with_experimental(&mut egraph);
+    Ok(egraph)
+}
+
+/// Build an experimental egraph backed by Feldera. See
+/// [`new_experimental_egraph_flowlog`].
+pub fn new_experimental_egraph_feldera(
+    config: egglog::FelderaBackendConfig,
+) -> anyhow::Result<EGraph> {
+    let native_uf = config.native_uf;
+    let mut egraph = EGraph::with_feldera_backend_config(config)?;
+    if native_uf {
+        egraph = egraph.with_native_uf();
+    }
+    extend_with_experimental(&mut egraph);
+    Ok(egraph)
+}
+
 /// Register all experimental sorts, primitives, commands, and parser
 /// macros on the given egraph in place. Factored out so the same
 /// extensions can be applied to either a default (bridge-backed) or a

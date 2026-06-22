@@ -1220,6 +1220,13 @@ impl Backend for EGraph {
         false
     }
 
+    fn supports_action_registry(&self) -> bool {
+        // No in-memory ActionRegistry: primitive calls are compiled to SQL
+        // (and `get-size!` to the `__egglog_get_size()` UDF). `action_registry_any()`
+        // is `unimplemented!()`.
+        false
+    }
+
     // -- diagnostics --------------------------------------------------------
 
     fn set_report_level(&mut self, level: ReportLevel) {

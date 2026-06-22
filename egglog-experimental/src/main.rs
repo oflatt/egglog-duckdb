@@ -10,6 +10,15 @@ fn main() {
     // both sides) short-circuits its own rebuild.
     let argv: Vec<String> = std::env::args().collect();
     let want_duckdb = argv.iter().any(|a| a == "--duckdb");
+    // FlowLog / Feldera: like `--duckdb`, cli.rs rebuilds a fresh
+    // backend-specific egraph and would DROP the experimental primitives
+    // (`get-size!`, the rational sort, set-cost) and commands registered here.
+    // Pre-build the backend egraph + extend it up front so they survive; cli.rs
+    // then short-circuits its rebuild (it sees an already-flowlog/feldera-backed
+    // egraph). Without this, `(run R :until (<= N (get-size!)))` fails
+    // "Unbound function get-size!" on these backends.
+    let want_flowlog = argv.iter().any(|a| a == "--flowlog");
+    let want_feldera = argv.iter().any(|a| a == "--feldera");
     // Honor both the duckdb-specific `--duck-native-uf` and the unified
     // `--native-uf` (PR #782) so the duckdb egraph is built in native-UF mode
     // when either is set — otherwise the `--native-uf` encoding would emit
@@ -30,6 +39,7 @@ fn main() {
     let want_proofs = argv
         .iter()
         .any(|a| a == "--proofs" || a == "--proof-testing");
+    let want_wcoj = argv.iter().any(|a| a == "--wcoj");
     let egraph = if want_duckdb {
         egglog_experimental::new_experimental_egraph_duckdb(egglog::DuckBackendConfig {
             native_uf: want_native_uf,
@@ -37,6 +47,19 @@ fn main() {
             proofs: want_proofs,
         })
         .expect("failed to start DuckDB-backed experimental egraph")
+    } else if want_flowlog {
+        egglog_experimental::new_experimental_egraph_flowlog(egglog::FlowlogBackendConfig {
+            native_uf: want_native_uf,
+            fast_rebuild: want_fast_rebuild,
+            wcoj: want_wcoj,
+        })
+        .expect("failed to start FlowLog-backed experimental egraph")
+    } else if want_feldera {
+        egglog_experimental::new_experimental_egraph_feldera(egglog::FelderaBackendConfig {
+            native_uf: want_native_uf,
+            fast_rebuild: want_fast_rebuild,
+        })
+        .expect("failed to start Feldera-backed experimental egraph")
     } else {
         egglog_experimental::new_experimental_egraph()
     };

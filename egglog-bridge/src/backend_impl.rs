@@ -553,6 +553,10 @@ impl Backend for EGraph {
         true
     }
 
+    fn supports_action_registry(&self) -> bool {
+        true
+    }
+
     // -- diagnostics --------------------------------------------------------
 
     fn set_report_level(&mut self, level: ReportLevel) {
