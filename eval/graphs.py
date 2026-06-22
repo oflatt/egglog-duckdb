@@ -267,39 +267,104 @@ def parity_summary(data):
     return rows
 
 
-# --- Per-phase profile (rebuild / canonicalize / congruence) ----------------
+# --- Per-ruleset phase profile ----------------------------------------------
+# We break each cell down by INDIVIDUAL ruleset (from phases["raw"]) rather than
+# the 4 coarse rebuild/canonicalize/congruence/other buckets -- those collapsed
+# all the work into "other" for bridge (every user/@-ruleset's search+merge time
+# landed there). Per-ruleset makes the term-encoding overhead legible: the
+# `@rebuilding` / `@single_parent` / `@parent` congruence-as-rules machinery that
+# bridge-normal does in native engine code shows up as its own segments.
 
-_PHASE_BUCKETS = ("rebuild", "canonicalize", "congruence", "other")
+_MAX_PHASE_RULESETS = 10  # show the top-N rulesets; lump the rest into "other"
+_MAX_PHASE_CELLS = 10     # show only the top-N slowest cells (bars) in the breakdown
+
+
+def _cell_ruleset_times(row):
+    """Per-ruleset total seconds for one cell, from phases["raw"]. Handles both
+    the bridge/duckdb shape ({ruleset: {search_and_apply, merge, rebuild}}) and
+    the flowlog/feldera shape ({ruleset: total_seconds}). Returns {} if none."""
+    raw = (row.get("phases") or {}).get("raw") or {}
+    out = {}
+    for rs, st in raw.items():
+        if isinstance(st, dict):
+            out[rs] = sum(v for v in st.values() if isinstance(v, (int, float)))
+        elif isinstance(st, (int, float)):
+            out[rs] = st
+    return {k: v for k, v in out.items() if v}
+
+
+def _cell_wall(row):
+    """End-to-end wall seconds for one cell (mean of the timed runs), matching
+    what the mean-time table/graph report."""
+    return _mean(row.get("timing_list", []))
+
+
+# Segment name for the slice of end-to-end wall NOT attributed to any ruleset:
+# parse + type-check + desugar + the term/proof ENCODING & instrumentation pass
+# + e-graph construction + extraction + process startup. The per-ruleset report
+# (search_and_apply/merge/rebuild) only covers the eqsat run, so this is the rest.
+_UNACCOUNTED = "setup/encode/extract (non-ruleset)"
+
+
+def _global_top_rulesets(cells, limit=_MAX_PHASE_RULESETS):
+    """The `limit` rulesets with the largest summed time across the given cells,
+    ordered largest-first. `cells` are (label, ruleset_times, wall) tuples."""
+    from collections import defaultdict
+    glob = defaultdict(float)
+    for _, rt, _w in cells:
+        for rs, v in rt.items():
+            glob[rs] += v
+    return [rs for rs, _ in sorted(glob.items(), key=lambda x: -x[1])[:limit]]
+
+
+def _collect_phase_cells(data):
+    """(label, ruleset_times, wall) for every timing row that has a per-ruleset
+    profile. wall is end-to-end; ruleset_times sum to <= wall."""
+    cells = []
+    for row in data.get("timings", []):
+        rt = _cell_ruleset_times(row)
+        if not rt:
+            continue
+        label = f"{row['benchmark'].split('/')[-1]}\n{row['condition']}"
+        cells.append((label, rt, _cell_wall(row)))
+    return cells
 
 
 def phase_breakdown_table(data):
-    """One row per (benchmark, condition) that has a per-phase profile, with a
-    column per bucket (seconds) plus the bucket totals."""
+    """One row per (benchmark, condition) with a per-phase profile. Columns: each
+    global top-N ruleset (s), an "other rulesets" residual, the UNACCOUNTED
+    non-ruleset slice (= wall - sum(rulesets): parse/encode/instrument/extract),
+    and the end-to-end "wall (s)" total. Ordered by wall, descending."""
+    cells = [((lbl), rt, wall) for (lbl, rt, wall) in _collect_phase_cells(data)]
+    if not cells:
+        return []
+    top = _global_top_rulesets(cells)
+    topset = set(top)
+    cells.sort(key=lambda c: c[2], reverse=True)  # by wall
     rows = []
-    for row in data.get("timings", []):
-        phases = row.get("phases")
-        if not phases:
-            continue
-        r = {"benchmark": row["benchmark"], "condition": row["condition"]}
-        for b in _PHASE_BUCKETS:
-            v = phases.get(b)
-            r[b] = round(v, 4) if v else ""
+    for label, rt, wall in cells:
+        bench, cond = label.split("\n", 1) if "\n" in label else (label, "")
+        r = {"benchmark": bench, "condition": cond}
+        for rs in top:
+            v = rt.get(rs, 0.0)
+            r[rs] = round(v, 4) if v else ""
+        other = sum(v for rs, v in rt.items() if rs not in topset)
+        r["other rulesets"] = round(other, 4) if other else ""
+        unacc = max(0.0, wall - sum(rt.values()))
+        r[_UNACCOUNTED] = round(unacc, 4) if unacc else ""
+        r["wall (s)"] = round(wall, 4)   # end-to-end total
         rows.append(r)
     return rows
 
 
 def phase_stacked(data):
-    """Stacked bar: per (benchmark, condition) with a profile, stack the
-    rebuild/canonicalize/congruence/other bucket seconds. One bar per cell."""
+    """Stacked bar per (benchmark, condition): the bar TOTAL is end-to-end wall
+    time. Segments = the global top-N rulesets + an "other rulesets" residual +
+    an UNACCOUNTED slice (wall - all rulesets: parse/encode/instrument/extract),
+    so every bar reaches its true wall height and the non-eqsat cost is visible."""
     import matplotlib.pyplot as plt
 
-    cells = []
-    for row in data.get("timings", []):
-        phases = row.get("phases")
-        if not phases:
-            continue
-        label = f"{row['benchmark'].split('/')[-1]}\n{row['condition']}"
-        cells.append((label, phases))
+    cells = _collect_phase_cells(data)
     if not cells:
         fig, ax = plt.subplots(figsize=(6, 2))
         ax.text(0.5, 0.5, "no per-phase profiles captured", ha="center")
@@ -307,34 +372,87 @@ def phase_stacked(data):
         return fig
 
     n_cells = len(cells)
-    cells.sort(key=lambda c: sum(c[1].get(b, 0) or 0 for b in _PHASE_BUCKETS),
-               reverse=True)
-    cells = cells[:_MAX_BARS]
+    cells.sort(key=lambda c: c[2], reverse=True)  # by end-to-end wall
+    cells = cells[:_MAX_PHASE_CELLS]
+    top = _global_top_rulesets(cells)
+    topset = set(top)
+    segs = top + ["other rulesets", _UNACCOUNTED]
+    # Fixed palette (version-robust; avoids the churny matplotlib colormap API).
+    _PALETTE = ("#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f",
+                "#edc948", "#b07aa1", "#ff9da7", "#9c755f", "#bab0ac")
+    colors = {seg: _PALETTE[i % len(_PALETTE)] for i, seg in enumerate(top)}
+    colors["other rulesets"] = "#999999"
+    colors[_UNACCOUNTED] = "#dddddd"
+
     fig, ax = plt.subplots(figsize=(_fig_width(len(cells), 0.6), 5))
     xs = range(len(cells))
     bottoms = [0.0] * len(cells)
-    colors = {"rebuild": "#d9534f", "canonicalize": "#5bc0de",
-              "congruence": "#5cb85c", "other": "#bbbbbb"}
-    for b in _PHASE_BUCKETS:
-        ys = [c[1].get(b, 0) or 0 for c in cells]
-        ax.bar(xs, ys, bottom=bottoms, label=b, color=colors[b])
+    for seg in segs:
+        if seg == "other rulesets":
+            ys = [sum(v for rs, v in rt.items() if rs not in topset)
+                  for _, rt, _w in cells]
+        elif seg == _UNACCOUNTED:
+            # wall MINUS all ruleset time -> parse/encode/instrument/extract/startup
+            ys = [max(0.0, wall - sum(rt.values())) for _, rt, wall in cells]
+        else:
+            ys = [rt.get(seg, 0.0) for _, rt, _w in cells]
+        ax.bar(xs, ys, bottom=bottoms, label=seg, color=colors[seg])
         bottoms = [a + y for a, y in zip(bottoms, ys)]
     ax.set_xticks(list(xs))
     ax.set_xticklabels([c[0] for c in cells], rotation=75, ha="right", fontsize=6)
-    ax.set_ylabel("phase time (s)")
-    extra = f" (top {len(cells)} of {n_cells})" if n_cells > len(cells) else ""
-    ax.set_title("Per-phase bucket breakdown (rebuild / canonicalize / congruence)" + extra)
-    ax.legend(fontsize=8)
+    ax.set_ylabel("end-to-end wall time (s)")
+    extra = f" (top {len(cells)} of {n_cells} cells)" if n_cells > len(cells) else ""
+    ax.set_title(f"Per-ruleset phase breakdown — bar = end-to-end wall "
+                 f"(top {len(top)} rulesets)" + extra)
+    ax.legend(fontsize=7, ncol=2)
     plt.tight_layout()
     return fig
 
 
-def mean_time_filter(filtered_rows, data):
-    keep = {r["benchmark"] for r in filtered_rows}
+# --- filter_source helpers --------------------------------------------------
+# A filter_source(filtered_rows, data) receives the computed-table rows still
+# visible after the user's text filter and the (possibly already-narrowed) data
+# dict; it returns a new data dict with the raw rows (timings/errors/warnings/
+# skipped) narrowed so the graphs re-render on the same selection. We key off
+# whatever fields the filtered rows actually carry and skip raw rows missing
+# that field (never KeyError).
+
+_RAW_KEYS = ("timings", "errors", "warnings", "skipped")
+
+
+def filter_by_benchmark(filtered_rows, data):
+    """Keep only raw rows whose `benchmark` survives the table filter. Used by
+    every table keyed (at least) by benchmark."""
+    keep = {r["benchmark"] for r in filtered_rows if "benchmark" in r}
     return {
         **data,
-        "timings": [r for r in data.get("timings", []) if r["benchmark"] in keep],
-        "errors": [r for r in data.get("errors", []) if r["benchmark"] in keep],
+        **{k: [r for r in data.get(k, []) if r.get("benchmark") in keep]
+           for k in _RAW_KEYS},
+    }
+
+
+def filter_by_benchmark_basename(filtered_rows, data):
+    """Like `filter_by_benchmark`, but the table reports benchmarks by basename
+    (the trailing path component) while raw rows carry the full path. Match on
+    basename so the propagation still works (e.g. the phase-breakdown table)."""
+    keep = {r["benchmark"] for r in filtered_rows if "benchmark" in r}
+    return {
+        **data,
+        **{k: [r for r in data.get(k, [])
+               if str(r.get("benchmark", "")).split("/")[-1] in keep]
+           for k in _RAW_KEYS},
+    }
+
+
+def filter_by_condition(filtered_rows, data):
+    """Keep only raw rows whose `condition` survives the table filter. Used by
+    per-condition tables (e.g. parity_summary). `skipped` rows carry no
+    `condition`, so they are left untouched rather than dropped."""
+    keep = {r["condition"] for r in filtered_rows if "condition" in r}
+    return {
+        **data,
+        **{k: [r for r in data.get(k, []) if r.get("condition") in keep]
+           for k in ("timings", "errors", "warnings")},
     }
 
 
@@ -372,12 +490,19 @@ reg.graph("Mean time per benchmark", mean_time_grouped)
 reg.graph("Peak memory per benchmark", peak_memory_grouped)
 reg.graph("Geomean by condition", geomean_by_condition)
 reg.graph("Completion CDF (performance profile)", completion_cdf)
-reg.graph("Per-phase breakdown (stacked)", phase_stacked)
-# Only the mean-time computed table is registered, to keep the viewer
-# uncluttered. The other table fns (peak_memory_table, parity_table,
-# parity_summary, phase_breakdown_table, speedup_vs_bridge_normal,
-# skipped_table) stay DEFINED but UNregistered -- their data still lives in the
-# raw timings/errors/skipped tables and results.json. Re-add a reg.table(...)
-# line to bring any back. (Note: this also governs what --render writes.)
-reg.table("Mean time (s) per condition", mean_time_table, filter_source=mean_time_filter)
+reg.graph("Per-ruleset phase breakdown (stacked)", phase_stacked)
+# Every registered computed table carries a filter_source so filtering it
+# propagates up to re-render the graphs. The remaining table fns
+# (peak_memory_table, parity_table, parity_summary, speedup_vs_bridge_normal,
+# skipped_table) stay DEFINED but UNregistered, to keep the viewer uncluttered
+# -- their data still lives in the raw timings/errors/skipped tables and
+# results.json. Re-add a reg.table(...) line to bring any back, ALWAYS with a
+# filter_source (use filter_by_benchmark / filter_by_benchmark_basename /
+# filter_by_condition as appropriate). (This also governs what --render writes.)
+reg.table("Mean time (s) per condition", mean_time_table,
+          filter_source=filter_by_benchmark)
+# Keyed by (benchmark, condition) but the table reports benchmark by BASENAME,
+# so propagate at benchmark granularity matching on basename.
+reg.table("Per-ruleset phase breakdown (s)", phase_breakdown_table,
+          filter_source=filter_by_benchmark_basename)
 eval_live.registry = reg

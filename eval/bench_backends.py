@@ -36,7 +36,7 @@ parity (see below).
 Metrics captured per cell
 -------------------------
 * wall-clock: the timed subprocess elapsed (median/mean of `--runs`).
-* peak RSS  : maximum resident set size in BYTES, via macOS `/usr/bin/time -l`.
+* peak RSS  : peak resident set size in BYTES, sampled from /proc VmHWM (Linux).
 * per-phase : a per-ruleset rebuild/canonicalize/congruence bucket profile.
               bridge uses `--save-report` (RunReport JSON); duckdb uses
               DUCK_PERF_DUMP; feldera uses FELDERA_PROFILE; flowlog uses
@@ -69,14 +69,22 @@ import argparse
 import json
 import os
 import re
+import resource
 import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
 WORKSPACE = Path(__file__).resolve().parents[1]
+
+# Per-process virtual-memory cap (RLIMIT_AS), in bytes, applied to every
+# benchmark subprocess via a preexec_fn. Set from --mem-cap-gb in main(); None
+# disables the cap. A process that exceeds it dies (alloc failure / SIGKILL)
+# and the cell is recorded as an error instead of taking down the machine.
+MEM_CAP_BYTES = None
 
 # (name, backend-selecting CLI flags, term-encoding-only?) for each backend.
 # bridge has a real "normal" (non-term) mode; the others are term-only: their
@@ -290,8 +298,7 @@ class BenchDB:
             "command": command,
             "timing_list": timing_list,
         }
-        # Peak resident set size in BYTES (max across timed runs), via
-        # `/usr/bin/time -l`.
+        # Peak resident set size in BYTES (max across timed runs), from /proc VmHWM.
         if rss is not None:
             row["rss"] = rss
         # Per-phase rebuild/canonicalize/congruence bucket seconds (and the raw
@@ -343,6 +350,50 @@ class BenchDB:
         Path(path).write_text(json.dumps(self.to_dict(), indent=2))
 
 
+def _physical_cores():
+    """Best-effort PHYSICAL core count (excludes SMT/hyperthread siblings).
+    Used as the default --jobs so coverage runs put ~1 cell per physical core;
+    logical-CPU count (os.cpu_count) would oversubscribe SMT siblings 2:1, which
+    badly inflates wall-clock on these memory-bound cells. Falls back to logical."""
+    # Linux: distinct (physical id, core id) pairs in /proc/cpuinfo.
+    try:
+        phys, pid, cid = set(), None, None
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("physical id"):
+                    pid = line.split(":")[1].strip()
+                elif line.startswith("core id"):
+                    cid = line.split(":")[1].strip()
+                elif not line.strip():
+                    if pid is not None and cid is not None:
+                        phys.add((pid, cid))
+                    pid = cid = None
+        if pid is not None and cid is not None:
+            phys.add((pid, cid))
+        if phys:
+            return len(phys)
+    except OSError:
+        pass
+    # macOS: sysctl hw.physicalcpu.
+    try:
+        out = subprocess.run(["sysctl", "-n", "hw.physicalcpu"],
+                             capture_output=True, text=True)
+        if out.returncode == 0 and out.stdout.strip().isdigit():
+            return int(out.stdout.strip())
+    except OSError:
+        pass
+    return os.cpu_count() or 1
+
+
+def _ensure_cargo_on_path():
+    """Prepend ~/.cargo/bin to PATH so `cargo` resolves even in non-login
+    shells (rustup's default install location on Linux + macOS)."""
+    cargo_bin = os.path.expanduser("~/.cargo/bin")
+    parts = os.environ.get("PATH", "").split(os.pathsep)
+    if os.path.isdir(cargo_bin) and cargo_bin not in parts:
+        os.environ["PATH"] = cargo_bin + os.pathsep + os.environ.get("PATH", "")
+
+
 def build_egglog(build: bool, release: bool) -> Path:
     """Build and return the `egglog-experimental` CLI binary. The matrix drives
     egglog-experimental (NOT mainline egglog): it registers the experimental
@@ -356,6 +407,7 @@ def build_egglog(build: bool, release: bool) -> Path:
     built `target/{release,debug}/egglog-experimental`. (`build` is accepted for
     backwards compatibility but the build always happens.)"""
     del build  # build is unconditional: no prebuilt experimental binary exists.
+    _ensure_cargo_on_path()
     profile = ["--release"] if release else []
     print(f"Building egglog-experimental ({'release' if release else 'debug'})...", flush=True)
     subprocess.run(
@@ -370,6 +422,28 @@ def build_egglog(build: bool, release: bool) -> Path:
     return binary
 
 
+def _extract_tar_zst(path: Path, dest: Path):
+    """Extract a `.tar.zst`. Prefer the `tar` CLI (needs a zstd plugin); fall
+    back to the pure-Python `zstandard` module so it works without the zstd
+    binary (common on macOS / minimal Linux)."""
+    try:
+        subprocess.run(["tar", "-xf", str(path), "-C", str(dest)],
+                       check=True, capture_output=True)
+        return
+    except (OSError, subprocess.CalledProcessError):
+        pass  # no tar, or tar lacks zstd support -> Python fallback
+    import tarfile
+    try:
+        import zstandard
+    except ImportError:
+        sys.exit(f"cannot extract {path}: need the `zstd` CLI or the Python "
+                 f"`zstandard` module (`pip install zstandard`).")
+    with open(path, "rb") as f:
+        reader = zstandard.ZstdDecompressor().stream_reader(f)
+        with tarfile.open(fileobj=reader, mode="r|") as tar:
+            tar.extractall(str(dest))
+
+
 def find_benchmarks(path: Path) -> list[Path]:
     # A `.tar.zst` (e.g. the Herbie dumps) is extracted once to a sibling
     # `<name>.extracted/` dir and benchmarked from there. We benchmark EVERY
@@ -381,7 +455,7 @@ def find_benchmarks(path: Path) -> list[Path]:
         if not dest.exists():
             print(f"Extracting {path.name} -> {dest} ...", flush=True)
             dest.mkdir(parents=True)
-            subprocess.run(["tar", "-xf", str(path), "-C", str(dest)], check=True)
+            _extract_tar_zst(path, dest)
         return sorted(dest.rglob("*.egg"))
     if path.is_file():
         return [path]
@@ -638,9 +712,61 @@ def parse_sizes(text: str):
     return sorted([name, n] for name, n in sizes.items())
 
 
+def _child_preexec():
+    """Runs in the child between fork and exec. Start a new session (so the
+    timeout can kill the whole group) and apply the RLIMIT_AS memory cap.
+    MEM_CAP_BYTES is None off Linux, so the cap is simply skipped there."""
+    os.setsid()
+    if MEM_CAP_BYTES:
+        try:
+            resource.setrlimit(resource.RLIMIT_AS, (MEM_CAP_BYTES, MEM_CAP_BYTES))
+        except (ValueError, OSError):
+            pass
+
+
+_VMHWM_RE = re.compile(rb"^VmHWM:\s+(\d+)\s+kB", re.M)
+
+
+def _poll_peak_rss(pid: int, holder: dict):
+    """Sample peak RSS (bytes) until the process exits, into holder['peak'].
+    Linux: /proc/<pid>/status VmHWM (the kernel's monotonic high-water-mark).
+    Other platforms (macOS): poll `ps -o rss=` and track the max."""
+    def record(kb_bytes):
+        if holder["peak"] is None or kb_bytes > holder["peak"]:
+            holder["peak"] = kb_bytes
+
+    if sys.platform == "linux":
+        path = f"/proc/{pid}/status"
+        while True:
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+            except (FileNotFoundError, ProcessLookupError):
+                break
+            m = _VMHWM_RE.search(data)
+            if m:
+                record(int(m.group(1)) * 1024)
+            time.sleep(0.05)
+    else:
+        while True:
+            try:
+                out = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)],
+                                     capture_output=True, text=True)
+            except OSError:
+                break
+            line = out.stdout.strip()
+            if out.returncode != 0 or not line:
+                break  # process gone
+            try:
+                record(int(line) * 1024)  # ps RSS is in KiB
+            except ValueError:
+                pass
+            time.sleep(0.1)
+
+
 def run_once(binary: Path, flags: list[str], bench: Path, timeout: float,
              env_extra: dict | None = None, capture_phases_for: str | None = None):
-    """Run one egglog invocation wrapped in `/usr/bin/time -l` for peak RSS.
+    """Run one egglog invocation, sampling peak RSS from /proc (VmHWM).
 
     Returns a dict {elapsed, rss, stdout, stderr, phases} on success, or
     {error: msg} on failure/timeout. `env_extra` adds env vars (fast-rebuild /
@@ -656,16 +782,19 @@ def run_once(binary: Path, flags: list[str], bench: Path, timeout: float,
         report_file.close()
         cmd_flags += ["--save-report", report_file.name]
 
-    # Wrap with macOS `/usr/bin/time -l` for peak RSS (bytes). It prints the
-    # resource summary to ITS stderr, which we separate from the program's.
-    cmd = ["/usr/bin/time", "-l", str(binary), *cmd_flags, str(bench)]
+    # Run the binary directly (no portable `/usr/bin/time` across Linux+macOS).
+    # Peak RSS is sampled by a poller thread (/proc VmHWM on Linux, `ps` on mac);
+    # the Linux-only per-process memory cap is applied in `_child_preexec`.
+    cmd = [str(binary), *cmd_flags, str(bench)]
     start = time.perf_counter()
-    # `start_new_session=True` puts `/usr/bin/time` AND its `egglog` child in a
-    # fresh process group so a timeout can SIGKILL the WHOLE tree. Without it,
-    # the timeout kills only `/usr/bin/time` and the `egglog` grandchild orphans
-    # + keeps running — piling up across a full run's many timeouts.
+    # `start_new_session=True` puts the child in a fresh process group so a
+    # timeout can SIGKILL the WHOLE tree (the backend may spawn helpers).
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, env=env, start_new_session=True)
+                            text=True, env=env, preexec_fn=_child_preexec)
+    rss_holder = {"peak": None}
+    poller = threading.Thread(target=_poll_peak_rss, args=(proc.pid, rss_holder),
+                              daemon=True)
+    poller.start()
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -681,10 +810,10 @@ def run_once(binary: Path, flags: list[str], bench: Path, timeout: float,
             Path(report_file.name).unlink(missing_ok=True)
         return {"error": f"timeout after {timeout}s"}
     elapsed = time.perf_counter() - start
+    poller.join(timeout=1)
 
-    # `/usr/bin/time -l` appends its resource block to stderr. Split it off so
-    # the program's own stderr (and parity output) stays clean.
-    prog_stderr, rss = _split_time_block(stderr or "")
+    prog_stderr = stderr or ""
+    rss = rss_holder["peak"]
 
     if proc.returncode != 0:
         if report_file:
@@ -707,24 +836,6 @@ def run_once(binary: Path, flags: list[str], bench: Path, timeout: float,
     return {"elapsed": elapsed, "rss": rss,
             "stdout": stdout or "", "stderr": prog_stderr,
             "phases_raw": phases_raw}
-
-
-_TIME_RSS_RE = re.compile(r"^\s*(\d+)\s+maximum resident set size", re.M)
-# The `/usr/bin/time -l` resource block starts with a "<real> <user> <sys>" line.
-_TIME_HEADER_RE = re.compile(r"^\s*[\d.]+ real\s+[\d.]+ user\s+[\d.]+ sys", re.M)
-
-
-def _split_time_block(stderr: str):
-    """Separate the trailing `/usr/bin/time -l` resource block from the
-    program's own stderr. Returns (program_stderr, rss_bytes_or_None)."""
-    rss = None
-    m = _TIME_RSS_RE.search(stderr)
-    if m:
-        rss = int(m.group(1))
-    # Drop everything from the resource header line onward.
-    h = _TIME_HEADER_RE.search(stderr)
-    prog = stderr[:h.start()] if h else stderr
-    return prog, rss
 
 
 def measure_sizes(binary, bench, flags, env_extra, timeout):
@@ -752,6 +863,26 @@ def measure_sizes(binary, bench, flags, env_extra, timeout):
         # tolerate a cleanup race: parallel cells + the binary's own --proofs
         # runs can leave/remove tmp*.egg in the dir, so the temp may be gone
         Path(tmp.name).unlink(missing_ok=True)
+
+
+def _gate_file(binary, bench, rel, probe_conds, ref_labels, timeout):
+    """Probe the bridge reference conditions for ONE file (the gating step).
+    Pure worker for the gating thread pool: returns (rel, bench, ran, oracles)
+    where `ran` is the set of probe conditions that succeeded and `oracles` maps
+    each reference condition label to its print-size counts. Result application
+    (skip-recording, oracle storage) happens in the main thread to avoid races."""
+    ran = set()
+    oracles = {}
+    for cond_label, backend, mode, flags, _nuf, _fr in probe_conds:
+        sizes, err = measure_sizes(binary, bench, flags, {}, timeout)
+        # Empty sizes = an unparseable (print-size) block; treat like an error
+        # so we never establish a vacuous (empty) oracle for this file.
+        if err is not None or not sizes:
+            continue
+        ran.add(cond_label)
+        if cond_label in ref_labels:
+            oracles[cond_label] = sizes
+    return rel, bench, ran, oracles
 
 
 _HEAD_ATOM_RE = re.compile(r"[^\s()\";]+")
@@ -1201,11 +1332,16 @@ def main():
                         help="benchmark file or directory (default: tests/)")
     parser.add_argument("--runs", type=int, default=3, help="timed runs per cell (default 3)")
     parser.add_argument("--jobs", type=int, default=0,
-                        help="concurrent cells (default 0 = half the CPU cores, for "
-                             "memory headroom; the normal dev mode). Parity is exact "
-                             "regardless of contention; "
-                             "parallel wall-clock is approximate. `--paper` forces "
-                             "sequential (jobs=1) for the final uncontended timings.")
+                        help="concurrent cells (default 0 = PHYSICAL core count, "
+                             "so ~1 cell per physical core -- not logical/SMT, which "
+                             "oversubscribes memory-bound cells 2:1). Parity is exact "
+                             "regardless of contention; parallel wall-clock is "
+                             "approximate. `--paper` forces sequential (jobs=1) for "
+                             "the final uncontended timings.")
+    parser.add_argument("--mem-cap-gb", type=float, default=15.0,
+                        help="per-process virtual-memory cap (RLIMIT_AS) in GiB "
+                             "(default 15; 0 disables). A cell exceeding it dies "
+                             "and is recorded as an error rather than OOMing the box.")
     parser.add_argument("--warmup", type=int, default=1, help="discarded warm-up runs (default 1)")
     parser.add_argument("--timeout", type=float, default=60.0,
                         help="per-run timeout in seconds (default 60)")
@@ -1246,12 +1382,21 @@ def main():
     # regardless of contention, and contended wall-clock is a fine approximation
     # while iterating. Only the FINAL paper eval needs clean numbers: `--paper`
     # forces SEQUENTIAL (jobs=1) for uncontended paper-quality wall-clock/RSS.
+    global MEM_CAP_BYTES
+    # The RLIMIT_AS memory cap is Linux-only (it relies on /proc and is
+    # unreliable on macOS); off Linux we just skip it.
+    if args.mem_cap_gb > 0 and sys.platform == "linux":
+        MEM_CAP_BYTES = int(args.mem_cap_gb * 1024**3)
+    else:
+        MEM_CAP_BYTES = None
+
     if args.paper:
         args.jobs = 1
     elif args.jobs <= 0:
-        # Half the cores by default: heavy cells (mmb feldera/duckdb are multi-GB
-        # each) blow up memory at full-core concurrency. `--jobs N` to override.
-        args.jobs = max(1, (os.cpu_count() or 2) // 2)
+        # Default: one cell per PHYSICAL core (not logical/SMT). Cells are ~1
+        # active thread each but memory-bound, so 2 per physical core (logical
+        # count) inflates wall-clock badly. `--jobs N` to override.
+        args.jobs = _physical_cores()
     timing_mode = ("paper-sequential" if args.jobs <= 1
                    else f"parallel-{args.jobs}jobs (approx timings)")
     if args.warmup < 1:
@@ -1269,9 +1414,16 @@ def main():
         benchmarks = benchmarks[:args.limit]
 
     conds = list(conditions())
+    if MEM_CAP_BYTES:
+        cap_note = f"{args.mem_cap_gb} GiB/process"
+    elif args.mem_cap_gb <= 0:
+        cap_note = "disabled"
+    else:
+        cap_note = "disabled (Linux-only)"
     print(f"\n{len(benchmarks)} benchmark(s) x {len(conds)} condition(s), "
           f"{args.runs} run(s) each (warmup {args.warmup}, timeout {args.timeout}s)\n"
-          f"timing mode: {timing_mode}  [PAPER (sequential)]\n"
+          f"timing mode: {timing_mode}\n"
+          f"mem cap: {cap_note}\n"
           f"parity reference: bridge-normal (non-proof), "
           f"bridge-proofs (proofs)\n")
 
@@ -1300,28 +1452,30 @@ def main():
 
     runnable = []        # benchmarks that pass the normal + term-encoding gate
     oracle_sizes = {}    # {(rel, ref_condition_label): sorted [name, count] list}
-    print("Establishing references + term-encoding support per file ...",
-          flush=True)
-    for bench in benchmarks:
-        rel = rel_of(bench)
-        ran = set()
-        for cond_label, backend, mode, flags, _nuf, _fr in probe_conds:
-            sizes, err = measure_sizes(binary, bench, flags, {}, args.timeout)
-            # Empty sizes = an unparseable (print-size) block; treat like an error
-            # so we never establish a vacuous (empty) oracle for this file.
-            if err is not None or not sizes:
-                continue
-            ran.add(cond_label)
-            if cond_label in ref_labels:
-                oracle_sizes[(rel, cond_label)] = sizes
-        if ORACLE_CONDITION not in ran:
-            db.add_skip(rel, "does not run under bridge-normal")
-            print(f"    SKIP {rel}: bridge-normal errored", flush=True)
-        elif TERM_GATE not in ran:
-            db.add_skip(rel, "not supported by term encoding")
-            print(f"    SKIP {rel}: not supported by term encoding", flush=True)
-        else:
-            runnable.append(bench)
+    # Gating is embarrassingly parallel (files are independent), so run the
+    # per-file probes across the same job pool as the main grid -- otherwise
+    # this phase serializes ~3 subprocesses/file while every other core idles.
+    print(f"Establishing references + term-encoding support per file "
+          f"({args.jobs} parallel) ...", flush=True)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as ex:
+        futures = [ex.submit(_gate_file, binary, bench, rel_of(bench),
+                             probe_conds, ref_labels, args.timeout)
+                   for bench in benchmarks]
+        for fut in as_completed(futures):
+            rel, bench, ran, oracles = fut.result()
+            for label, sizes in oracles.items():
+                oracle_sizes[(rel, label)] = sizes
+            if ORACLE_CONDITION not in ran:
+                db.add_skip(rel, "does not run under bridge-normal")
+                print(f"    SKIP {rel}: bridge-normal errored", flush=True)
+            elif TERM_GATE not in ran:
+                db.add_skip(rel, "not supported by term encoding")
+                print(f"    SKIP {rel}: not supported by term encoding", flush=True)
+            else:
+                runnable.append(bench)
+    # as_completed yields in finish order; restore deterministic file order.
+    runnable.sort(key=lambda b: str(b))
     db.save_json(args.output)
     print(f"  {len(runnable)}/{len(benchmarks)} files benchmarkable "
           f"({len(db.skipped)} skipped: not normal+term-supported)\n", flush=True)
