@@ -31,3 +31,18 @@ lcov.info
 # Python virtualenv (local eval/eval-live tooling)
 venv/
 /.perf-wt/
+
+# Agent worktrees + session tooling
+.claude/
+
+# Scratch / experiment workspace
+.tmp/
+
+# Python bytecode caches
+__pycache__/
+*.pyc
+
+# eval scratch result dumps
+eval/herbie_sample_results.json
+eval/resultsjun19.json
+eval/results.json
