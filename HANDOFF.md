@@ -4,14 +4,43 @@ Self-contained handoff for a fresh agent on a new machine. Everything you need i
 committed; local memory, the scratchpad, and uncommitted experiment flags did **not**
 travel — their conclusions are captured below.
 
-## Project
-Backend-encoding paper: encode e-graphs across **4 backends** and show the **term
-encoding is bit-exact to the normal (native core-relations) encoding**. The encoding is
-representation, not semantics — every backend must reproduce the reference (`bridge`)
-tuple counts *exactly*. Current push: get all 4 backends running the **Herbie** benchmark
-suite, then measure and optimize.
+## What the paper is about
 
-- Repo: `oflatt/egglog-duckdb` (remote `duckfork`). Branch `egglog-encoding-main` → pushed to `main`. **HEAD at handoff: `bf07b455`.**
+**Thesis: add proofs to an e-graph engine as a front-end compiler pass, instead of
+instrumenting the whole engine.** Production e-graph engines bolt proof-production into
+every part of a bespoke engine (rewriting, congruence, union-find, rebuilding) — invasive
+and hard to port. Instead we **encode the e-graph as a compiler pass** onto a *minimal
+relational backend* that only needs a handful of generic operations: **run queries,
+insert into tables, delete rows, merge (union-find)**. Equality saturation *and proofs*
+fall out of that encoding — the backend stays a generic database, unaware of e-graphs or
+proofs. (Proofs in particular become ordinary recorded rows / derivations in the encoding
+rather than engine instrumentation.)
+
+**Mechanism.** egglog's term/proof encoding lowers an e-graph program into relational
+rules + tables over this minimal interface. The *same* encoding can target very different
+databases — which is the portability claim.
+
+**Portability — 4 backends, one encoding:**
+- `bridge` — core-relations, egglog's native relational engine (also the bit-exact reference).
+- `duckdb` — SQL / columnar OLAP.
+- `feldera` — DBSP (incremental view maintenance).
+- `flowlog` — differential-dataflow.
+
+**Correctness bar.** The encoded (term) representation must be **bit-exact to egglog's
+native (normal) encoding** — different representation, same semantics. Every backend must
+reproduce the reference (`bridge` normal) tuple counts *exactly*. (Verified via
+`measure_sizes`; see below.)
+
+**The three results we're after:**
+1. **Portability works** — all 4 backends run real workloads (Herbie, math-microbenchmark) bit-exactly. *Status: ✓ for bridge/feldera/flowlog; duckdb is a documented plan-bound gap on Herbie.*
+2. **Different backends win on different workloads** — the compelling result: because the encoding is portable, you can pick a backend suited to the workload (incremental dataflow vs SQL vs the native join engine), and they have genuinely different performance profiles. *Status: this is exactly what the cross-backend perf grid (next step) quantifies.*
+3. **Encoded performance ≈ native egglog** — close the gap between the *encoded* path and egglog's *default non-encoded* `bridge` performance. The encoding shouldn't cost much over native egglog. *Status: ongoing — the feldera/flowlog perf optimization (next step) is precisely this.*
+
+So the running tasks map onto the paper: "term == normal bit-exact" is the **correctness
+bar**; the 4-backend status is **portability**; and the upcoming feldera/flowlog perf work
+serves both **result #2** (different backends win) and **result #3** (encoded ≈ native).
+
+- Repo: `oflatt/egglog-duckdb` (remote `duckfork`). Branch `egglog-encoding-main` → pushed to `main`. The 4-backend **code** work is through `bf07b455`; `HANDOFF.md` + the eval sample are doc commits on top.
 - A fork of `egraphs-good/egglog` carrying the 4-backend work.
 
 ## Build & run
