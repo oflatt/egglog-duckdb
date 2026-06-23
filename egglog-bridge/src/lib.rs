@@ -135,6 +135,14 @@ pub struct EGraph {
     /// [`WriteState`] / [`FullState`] can resolve table actions at
     /// invoke time. Mutated in place from [`add_table`](EGraph::add_table).
     action_registry: Arc<std::sync::RwLock<ActionRegistry>>,
+    /// `--nativerb` (term-encoding native-UF, non-proof, native bridge only):
+    /// maps a per-sort `@UF_Sf` UF-backed function to the set of `@<F>View`
+    /// view functions that must be re-canonicalized against it by the ENGINE's
+    /// native table rebuild (`apply_rebuild`), replacing the encoding-level
+    /// `@rebuild_rule*` rules. Populated by
+    /// [`register_nativerb_view`](EGraph::register_nativerb_view). Empty (and
+    /// the rebuild loop is the unchanged `$uf`-only path) when the flag is off.
+    nativerb_views: HashMap<FunctionId, Vec<FunctionId>>,
 }
 
 pub type Result<T> = std::result::Result<T, anyhow::Error>;
@@ -231,6 +239,7 @@ impl Default for EGraph {
             panic_funcs,
             report_level: Default::default(),
             action_registry,
+            nativerb_views: Default::default(),
         }
     }
 }
@@ -613,6 +622,24 @@ impl EGraph {
         self.funcs[table].table
     }
 
+    /// `--nativerb`: register a `@<F>View` view function (`view_func`) to be
+    /// re-canonicalized by the ENGINE's native table rebuild against the
+    /// per-sort `@UF_Sf` UF-backed function (`uf_func`), instead of the
+    /// encoding-level `@rebuild_rule*` rules. The frontend calls this for every
+    /// view function once all functions are registered; `rebuild()` then drives
+    /// `apply_rebuild(uf, &views, ts)` per registered UF to a joint fixpoint.
+    /// `uf_func` must be a UF-backed function (`FunctionKind::Uf`).
+    pub fn register_nativerb_view(&mut self, uf_func: FunctionId, view_func: FunctionId) {
+        assert!(
+            self.funcs[uf_func].is_uf(),
+            "register_nativerb_view: {uf_func:?} is not a UF-backed function"
+        );
+        self.nativerb_views
+            .entry(uf_func)
+            .or_default()
+            .push(view_func);
+    }
+
     /// Register a UF-backed function in this EGraph.
     ///
     /// UF Functions record the series of "leader changes" in the e-graph, where
@@ -796,10 +823,22 @@ impl EGraph {
         self.run_rules_inner(rules)
     }
 
+    /// Total rows across the union-find tables that drive a rebuild: the global
+    /// `$uf`, plus (under `--nativerb`) every registered per-sort `@UF_Sf`. In
+    /// term-encoding native-UF mode unions go through `@UF_Sf`, not `$uf`, so
+    /// the rebuild trigger must watch those tables too.
+    fn rebuild_uf_size(&self) -> usize {
+        let mut total = self.db.get_table(self.uf_table).len();
+        for uf_func in self.nativerb_views.keys() {
+            total += self.db.get_table(self.funcs[*uf_func].table).len();
+        }
+        total
+    }
+
     fn run_rules_inner(&mut self, rules: &[RuleId]) -> Result<IterationReport> {
         let ts = self.next_ts();
 
-        let uf_size_before = self.db.get_table(self.uf_table).len();
+        let uf_size_before = self.rebuild_uf_size();
         let rule_set_report =
             run_rules_impl(&mut self.db, &mut self.rules, rules, ts, self.report_level)?;
         if let Some(message) = self.panic_message.lock().unwrap().take() {
@@ -810,7 +849,7 @@ impl EGraph {
             rule_set_report,
             rebuild_time: Duration::ZERO,
         };
-        let uf_size_after = self.db.get_table(self.uf_table).len();
+        let uf_size_after = self.rebuild_uf_size();
         if uf_size_before == uf_size_after {
             // No new unions: skip the full rebuild but still advance the
             // timestamp so that seminaive evaluation sees a fresh epoch.
@@ -900,8 +939,24 @@ impl EGraph {
                     )?
                     .changed
                 };
+                // `--nativerb`: re-canonicalize the registered `@<F>View` view
+                // tables against each per-sort `@UF_Sf` using the ENGINE's
+                // native table rebuild, replacing the encoding-level
+                // `@rebuild_rule*` rules. This runs inside the same saturating
+                // rebuild loop as the `$uf` rebuild so the two reach a JOINT
+                // fixpoint: congruence (still emitted as `@congruence_rule*`)
+                // issues unions on `@UF_Sf` from outside (in the `@rebuilding`
+                // ruleset), and the surrounding `(saturate @rebuilding)` re-runs
+                // congruence whenever this engine rebuild collapses a view row.
+                // Container rebuild first (same ordering rationale as above), in
+                // case a container holds eq-sort ids of this sort.
+                let nativerb_changed = self.nativerb_rebuild_pass()?;
                 self.inc_ts();
-                if !table_rebuild && !refreshed_rows && !container_rebuild.changed() && !uf_rebuild
+                if !table_rebuild
+                    && !refreshed_rows
+                    && !container_rebuild.changed()
+                    && !uf_rebuild
+                    && !nativerb_changed
                 {
                     break;
                 }
@@ -984,6 +1039,47 @@ impl EGraph {
         }
         log::info!("rebuild took {:?}", start.elapsed());
         Ok(())
+    }
+
+    /// `--nativerb`: re-canonicalize every registered `@<F>View` view table
+    /// against its per-sort `@UF_Sf` using the engine's native table rebuild.
+    /// Returns whether anything changed (a view row was re-canonicalized or
+    /// collapsed by `:merge`), so the caller's rebuild loop can iterate to a
+    /// fixpoint. A no-op (returns `false`) when no UF is registered.
+    fn nativerb_rebuild_pass(&mut self) -> Result<bool> {
+        if self.nativerb_views.is_empty() {
+            return Ok(false);
+        }
+        // Snapshot the registry so we can take `&mut self.db` in the loop.
+        let entries: Vec<(FunctionId, Vec<TableId>)> = self
+            .nativerb_views
+            .iter()
+            .map(|(uf, views)| {
+                (
+                    *uf,
+                    views
+                        .iter()
+                        .map(|v| self.funcs[*v].table)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        let mut changed = false;
+        for (uf_func, view_tables) in &entries {
+            let uf_table = self.funcs[*uf_func].table;
+            // Container rebuild first (same ordering rationale as the `$uf`
+            // path): a container value holding eq-sort ids of this sort must be
+            // re-canonicalized before the view rows that key on it.
+            let container_rebuild = self.db.rebuild_containers(uf_table);
+            let next_ts = self.next_ts().to_value();
+            let table_rebuild = self.db.apply_rebuild(uf_table, view_tables, next_ts);
+            let dirty_ids: Vec<Value> = container_rebuild.dirty_ids().iter().copied().collect();
+            let refreshed_rows = self
+                .db
+                .refresh_rows_for_values(view_tables, &dirty_ids, next_ts);
+            changed |= table_rebuild || refreshed_rows || container_rebuild.changed();
+        }
+        Ok(changed)
     }
 
     /// A variant of `rebuild` that attempts to combine rebuild rules into
@@ -1201,10 +1297,10 @@ impl EGraph {
     /// Flush the pending update buffers to the EGraph.
     /// Returns `true` if the database is updated.
     pub fn flush_updates(&mut self) -> bool {
-        let uf_size_before = self.db.get_table(self.uf_table).len();
+        let uf_size_before = self.rebuild_uf_size();
         let updated = self.db.merge_all();
         self.inc_ts();
-        let uf_size_after = self.db.get_table(self.uf_table).len();
+        let uf_size_after = self.rebuild_uf_size();
         if uf_size_before != uf_size_after {
             // Rebuilding is only necessary when new unions have been made because ids may need to be updated.
             // Adding terms doesn't necessarily touch the union-find, only doing a union between existing ids does.

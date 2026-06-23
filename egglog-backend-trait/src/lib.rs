@@ -286,6 +286,15 @@ pub trait Backend: Send + Sync {
     /// Wraps `egglog_bridge::EGraph::add_table`.
     fn add_table(&mut self, config: FunctionConfig) -> FunctionId;
 
+    /// `--nativerb` (native bridge, term-encoding native-UF, non-proof): register
+    /// a `@<F>View` view function (`view_func`) to be re-canonicalized by the
+    /// engine's native table rebuild against the per-sort `@UF_Sf` UF-backed
+    /// function (`uf_func`), replacing the encoding-level `@rebuild_rule*` rules.
+    /// The frontend calls this once per view function after all functions are
+    /// registered. Default no-op: only the native bridge supports a native table
+    /// rebuild; the dataflow/SQL backends drive their own host-pass rebuild.
+    fn register_nativerb_view(&mut self, _uf_func: FunctionId, _view_func: FunctionId) {}
+
     /// Register a union-find-backed function (see upstream PR #782).
     ///
     /// The function has schema `(S) S` for an EqSort `S` and records leader

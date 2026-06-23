@@ -64,6 +64,47 @@ pub(crate) struct EncodingState {
     /// their own fast-rebuild via `enable_fast_rebuild()`; this flag drives
     /// only the bridge's encoding-level drop. Default OFF.
     pub fast_rebuild: bool,
+    /// Native-engine-rebuild mode (`--nativerb`, native bridge + term-encoding
+    /// native-UF + non-proof only). When on, the per-constructor
+    /// `@rebuild_rule*` rebuild rules are NOT emitted; instead each `@<F>View`
+    /// view function is registered with the bridge backend
+    /// (`Backend::register_nativerb_view`) so the ENGINE's native table rebuild
+    /// (`apply_rebuild`) re-canonicalizes the views against their sort's
+    /// `@UF_Sf`. Congruence (`@congruence_rule*`) is still emitted as rules; the
+    /// bridge's rebuild loop and the `(saturate @rebuilding)` schedule reach a
+    /// joint fixpoint. The onchange relation + `@canon_S` primitive are still
+    /// emitted (congruence's guard uses `@canon_S`; the onchange callback still
+    /// fires but its rows are now only drained, never matched). Default OFF.
+    /// SCOPE: single eq-sort datatypes only (the engine `apply_rebuild` runs one
+    /// UF's `find` over all of a table's rebuild columns).
+    pub nativerb: bool,
+    /// `--nativerb`: the set of eq-sort names the encoder ever emits a `union`
+    /// on (via [`ProofInstrumentor::union`]). These are the sorts whose view
+    /// columns can hold a *stale* id and therefore need re-canonicalization. A
+    /// view that mixes id columns from MORE THAN ONE union-bearing eq-sort is
+    /// out of scope for the engine's `apply_rebuild` (one UF's `find` over all
+    /// id columns). Union-free passenger sorts (encoder-internal relation /
+    /// custom-function result sorts whose leader id is minted once and never
+    /// unioned) are safe: `find` against another sort's UF is a no-op (their ids
+    /// are never UF keys). Read by the lazy nativerb view registration.
+    pub nativerb_union_sorts: HashSet<String>,
+    /// `--nativerb`: the `@<F>View` view names the encoder chose to ENGINE-rebuild
+    /// (CONSTRUCTOR views whose `@rebuild_rule*` were suppressed). The frontend
+    /// registers exactly these with the backend. Custom (`:merge`) function views
+    /// are absent — they keep their relational rebuild rules.
+    pub nativerb_engine_rebuilt_views: HashSet<String>,
+    /// `--nativerb`: view names already registered with the backend for engine
+    /// rebuild. Registration runs before every `(run ...)` and registers only
+    /// the views not yet here, so views declared *after* an earlier run (e.g.
+    /// constructors introduced between `(push)` blocks) get registered too.
+    pub nativerb_registered: HashSet<String>,
+    /// `--nativerb` SCOPE violation: set to `Some((view_name, sorts))` the first
+    /// time a view function is found to mix id columns from more than one
+    /// eq-sort (the engine's `apply_rebuild` runs one UF's `find` over all id
+    /// columns, so a multi-eq-sort view would canonicalize a column against the
+    /// wrong UF). The next `(run ...)` reports this and aborts rather than
+    /// silently producing a wrong result. `None` when every view is single-sort.
+    pub nativerb_mixed_sort_view: Option<(String, String)>,
     /// Maps a generated relational-rebuild rule's name -> the view function
     /// name whose atom must be excluded from seminaive delta-focus (drops the
     /// `δview ⋈ uf_old` term). Populated by `rebuilding_rules` when
@@ -116,6 +157,11 @@ impl EncodingState {
             uf_change_rel: HashMap::default(),
             uf_change_drained: HashSet::default(),
             fast_rebuild: false,
+            nativerb: false,
+            nativerb_union_sorts: HashSet::default(),
+            nativerb_engine_rebuilt_views: HashSet::default(),
+            nativerb_registered: HashSet::default(),
+            nativerb_mixed_sort_view: None,
             rebuild_view_exclude: HashMap::default(),
             pass_through_globals: HashSet::default(),
             get_size_snapshot: std::sync::Arc::new(std::sync::RwLock::new(HashMap::default())),
@@ -145,6 +191,15 @@ impl<'a> ProofInstrumentor<'a> {
         rhs: &str,
         justification: &Justification,
     ) -> String {
+        // `--nativerb`: record which eq-sorts ever get a union, so the lazy view
+        // registration can tell a union-bearing sort (needs rebuild) from a
+        // union-free passenger sort (safe to leave in a mixed-column view).
+        if self.egraph.proof_state.nativerb {
+            self.egraph
+                .proof_state
+                .nativerb_union_sorts
+                .insert(type_name.to_string());
+        }
         // Native-UF mode: union via the UF-backed function. `(set (@UF_Sf a) b
         // <edge_proof>)` calls the union-find's `union(a, b)`, which picks the
         // min leader itself and records the leader change in the onchange
@@ -920,6 +975,40 @@ impl<'a> ProofInstrumentor<'a> {
     /// retracts the old row. This mirrors the relational rebuild's
     /// retract-old / insert-canonical behavior bit-for-bit, while only
     /// touching view rows that actually reference a changed class.
+    /// `--nativerb` rebuild rules: emit ONLY the onchange-relation drain rule
+    /// (one per onchange relation, deduped). No `@rebuild_rule*` rules — the
+    /// engine's native table rebuild re-canonicalizes the views. The onchange
+    /// relation is still written by the UF leader-change callback, so it must be
+    /// drained to stop it growing unbounded across `(run N)` iterations (the
+    /// same drain the rule-based native-UF path uses).
+    fn rebuild_drain_only_native_uf(&mut self, types: &[ArcSort]) -> Vec<Command> {
+        let mut rules = String::new();
+        for ty in types.iter() {
+            if !ty.is_eq_sort() {
+                continue;
+            }
+            let uf_change_rel = self.uf_change_rel_name(ty.name());
+            if self
+                .egraph
+                .proof_state
+                .uf_change_drained
+                .insert(uf_change_rel.clone())
+            {
+                let drain_name = self.egraph.parser.symbol_gen.fresh("uf_change_drain_rule");
+                let drain_ruleset = self.proof_names().uf_change_drain_ruleset_name.clone();
+                rules.push_str(&format!(
+                    "(rule (({uf_change_rel} wl_ wr_ ll_ rl_ nl_ disp_))
+                           ((delete ({uf_change_rel} wl_ wr_ ll_ rl_ nl_ disp_)))
+                            :ruleset {drain_ruleset} :name \"{drain_name}\")\n"
+                ));
+            }
+        }
+        if rules.is_empty() {
+            return vec![];
+        }
+        self.parse_program(&rules)
+    }
+
     fn rebuilding_rules_native_uf(
         &mut self,
         fdecl: &ResolvedFunctionDecl,
@@ -927,6 +1016,35 @@ impl<'a> ProofInstrumentor<'a> {
     ) -> Vec<Command> {
         if self.egraph.proof_state.proofs_enabled {
             return self.rebuilding_rules_native_uf_proof(fdecl, types);
+        }
+        // `--nativerb`: for CONSTRUCTOR views, do NOT emit the per-column
+        // `@rebuild_rule*` rules — the ENGINE's native table rebuild
+        // (`apply_rebuild`, driven from the bridge's `rebuild()` loop against the
+        // registered `@UF_Sf`) re-canonicalizes them instead. The onchange
+        // relation is still written by the leader-change callback (it backs the
+        // native UF) but nothing matches it, so emit ONLY a drain rule per
+        // onchange relation to stop it growing unbounded. Congruence
+        // (`@congruence_rule*`) stays as rules and reaches a joint fixpoint with
+        // the engine rebuild via `(saturate @rebuilding)`.
+        //
+        // CUSTOM (`:merge`) functions are NOT engine-rebuilt: their value-merge
+        // semantics (e.g. `(min old new)`) are implemented by a separate merge
+        // rule that needs BOTH pre-collapse rows to coexist so it can compare
+        // them, whereas the engine's `apply_rebuild` collapses the view's
+        // `:merge old` rows before the merge rule runs (dropping a value). So for
+        // a Custom function we KEEP the normal relational `@rebuild_rule*` (fall
+        // through); only its view is left unregistered. The two rebuild paths
+        // co-saturate in the same `@rebuilding` stratum. (Constructor views with
+        // a non-eq output are handled the same way — they have no value merge.)
+        if self.nativerb() && fdecl.subtype == FunctionSubtype::Constructor {
+            // Record this view as engine-rebuilt so the frontend registers
+            // exactly these (and only these) for `apply_rebuild`.
+            let view_name = self.view_name(&fdecl.name);
+            self.egraph
+                .proof_state
+                .nativerb_engine_rebuilt_views
+                .insert(view_name);
+            return self.rebuild_drain_only_native_uf(types);
         }
         let view_name = self.view_name(&fdecl.name);
         let child = |i: usize| format!("c{i}_");
@@ -998,42 +1116,44 @@ impl<'a> ProofInstrumentor<'a> {
             }
             let uf_change_rel = self.uf_change_rel_name(ty.name());
             let cj = child(j);
-            // Onchange row columns:
-            // (write_lhs write_rhs lhs_leader rhs_leader new_leader displaced).
-            let rule_name = self.egraph.parser.symbol_gen.fresh("rebuild_rule");
-            rules.push_str(&format!(
-                "(rule (({uf_change_rel} _wl_ _wr_ _ll_ _rl_ _nl_ disp_)
+            {
+                // Onchange row columns:
+                // (write_lhs write_rhs lhs_leader rhs_leader new_leader displaced).
+                let rule_name = self.egraph.parser.symbol_gen.fresh("rebuild_rule");
+                rules.push_str(&format!(
+                    "(rule (({uf_change_rel} _wl_ _wr_ _ll_ _rl_ _nl_ disp_)
                         ({view_name} {children})
                         (= {cj} disp_)
                         {guard})
                        ({updated_view}
                         (delete ({view_name} {children})))
                         :ruleset {rebuilding_ruleset} :name \"{rule_name}\")\n"
-            ));
+                ));
 
-            // `--fast-rebuild` (native-UF): drop this rule's always-empty
-            // `δview ⋈ uf_old` seminaive variant. The join above is
-            // `@UFChange_S ⋈ view`; seminaive runs it as `δ@UFChange_S ⋈ view`
-            // (the real re-canonicalization — a new leader change finds existing
-            // stale view rows) PLUS `@UFChange_S_old ⋈ δview` (re-probing view
-            // rows born THIS iteration against accumulated onchange rows). Under
-            // canonicalize-at-creation a fresh view row holds only current
-            // leaders, so it never matches an onchange `disp_` (a displaced
-            // non-leader): the δview variant is always empty, yet seminaive
-            // still pays to enumerate δview every iteration. Recording this
-            // rule's view in `rebuild_view_exclude` makes `add_rule` exclude the
-            // view atom from being a delta focus
-            // (`RuleBuilderOps::set_focus_exclude_table`), keeping only
-            // `δ@UFChange_S ⋈ view`. Mirrors the relational rebuild's
-            // fast-rebuild gating (~:876). Plain `--native-uf` (no
-            // `--fast-rebuild`) keeps the δview variant, so its per-column δview
-            // enumeration is the measurable cost of NOT fast-rebuilding.
-            // Bit-exact with the full rebuild; never in proof mode.
-            if self.fast_rebuild() {
-                self.egraph
-                    .proof_state
-                    .rebuild_view_exclude
-                    .insert(rule_name.clone(), view_name.clone());
+                // `--fast-rebuild` (native-UF): drop this rule's always-empty
+                // `δview ⋈ uf_old` seminaive variant. The join above is
+                // `@UFChange_S ⋈ view`; seminaive runs it as `δ@UFChange_S ⋈ view`
+                // (the real re-canonicalization — a new leader change finds existing
+                // stale view rows) PLUS `@UFChange_S_old ⋈ δview` (re-probing view
+                // rows born THIS iteration against accumulated onchange rows). Under
+                // canonicalize-at-creation a fresh view row holds only current
+                // leaders, so it never matches an onchange `disp_` (a displaced
+                // non-leader): the δview variant is always empty, yet seminaive
+                // still pays to enumerate δview every iteration. Recording this
+                // rule's view in `rebuild_view_exclude` makes `add_rule` exclude the
+                // view atom from being a delta focus
+                // (`RuleBuilderOps::set_focus_exclude_table`), keeping only
+                // `δ@UFChange_S ⋈ view`. Mirrors the relational rebuild's
+                // fast-rebuild gating (~:876). Plain `--native-uf` (no
+                // `--fast-rebuild`) keeps the δview variant, so its per-column δview
+                // enumeration is the measurable cost of NOT fast-rebuilding.
+                // Bit-exact with the full rebuild; never in proof mode.
+                if self.fast_rebuild() {
+                    self.egraph
+                        .proof_state
+                        .rebuild_view_exclude
+                        .insert(rule_name.clone(), view_name.clone());
+                }
             }
 
             // Drain the onchange relation. `@UFChange_S` is a relation, so it is

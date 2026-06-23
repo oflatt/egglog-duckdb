@@ -342,6 +342,14 @@ impl ProofInstrumentor<'_> {
         self.egraph.proof_state.fast_rebuild
     }
 
+    /// True when native-engine-rebuild mode is active (`--nativerb`). Suppresses
+    /// the `@rebuild_rule*` rebuild rules; the engine's native table rebuild
+    /// re-canonicalizes the views instead (see `EncodingState::nativerb`). Only
+    /// ever set alongside `native_uf()` in non-proof mode on the native bridge.
+    pub(crate) fn nativerb(&self) -> bool {
+        self.egraph.proof_state.nativerb
+    }
+
     /// Returns the proof output type: `Proof` when proofs are enabled, `Unit` otherwise.
     pub(crate) fn proof_type_str(&self) -> &str {
         if self.proofs_enabled() {

@@ -128,6 +128,16 @@ struct Args {
     /// Bit-exact with the full rebuild; off by default.
     #[clap(long = "fast-rebuild")]
     fast_rebuild: bool,
+    /// Native-engine table rebuild for the term-encoding native-UF rebuild
+    /// (`--nativerb`, native bridge only). Replaces the per-column
+    /// `@rebuild_rule*` rebuild rules with the ENGINE's native table rebuild
+    /// (`apply_rebuild` → `rebuild_buf` + the incremental/non-incremental size
+    /// heuristic), so big deltas get a tight full-table scan. Implies
+    /// `--native-uf`; congruence stays as rules and reaches a joint fixpoint
+    /// with the engine rebuild. Native bridge + non-proof + single eq-sort
+    /// datatypes only (rejected otherwise). Off by default.
+    #[clap(long = "nativerb")]
+    nativerb: bool,
     /// Enable the FlowLog backend's worst-case-optimal triangle join. Routes
     /// the reverse-distributivity triangle rule
     /// `(rewrite (Add (Mul a b) (Mul a c)) (Mul a (Add b c)))` through a
@@ -212,6 +222,27 @@ pub fn cli(mut egraph: EGraph) {
     // rebuild under canonicalize-at-creation.
     if args.fast_rebuild && !args.duckdb_backend && !args.feldera_backend && !args.flowlog_backend {
         egraph = egraph.with_fast_rebuild();
+    }
+
+    // `--nativerb` (native-engine table rebuild) is native-bridge + non-proof
+    // only: it drives the bridge engine's `apply_rebuild` over the view tables,
+    // which the dataflow/SQL backends do not expose, and the proof-mode encoding
+    // keeps its own rebuild wiring. Reject loud rather than silently no-op.
+    if args.nativerb {
+        if args.duckdb_backend || args.feldera_backend || args.flowlog_backend {
+            log::error!("--nativerb is only supported on the native bridge backend");
+            std::process::exit(1);
+        }
+        if args.proofs || args.proof_testing {
+            log::error!("--nativerb is not supported with --proofs / --proof-testing");
+            std::process::exit(1);
+        }
+        // Implies term-encoding + native-UF (set above for `--native-uf`); set
+        // them here too in case `--nativerb` was passed without `--native-uf`.
+        if !egraph.has_duckdb_backend() {
+            egraph = egraph.with_term_encoding_enabled();
+        }
+        egraph = egraph.with_nativerb();
     }
 
     if args.proofs && !egraph.are_proofs_enabled() {

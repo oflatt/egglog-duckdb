@@ -867,6 +867,20 @@ impl EGraph {
         self
     }
 
+    /// Enable native-engine-rebuild mode (`--nativerb`) on this e-graph: on the
+    /// native bridge, under term-encoding native-UF non-proof, the encoder
+    /// suppresses the `@rebuild_rule*` rules and the bridge's ENGINE drives the
+    /// view re-canonicalization via its native table rebuild (`apply_rebuild`)
+    /// against each sort's `@UF_Sf`. The view→UF registration happens lazily at
+    /// schedule time (`register_nativerb_views`). Implies `--native-uf`. SCOPE:
+    /// single eq-sort datatypes only (the engine rebuild runs one UF's `find`
+    /// over all of a table's id columns). Default OFF.
+    pub fn with_nativerb(mut self) -> Self {
+        self.proof_state.nativerb = true;
+        self.proof_state.native_uf = true;
+        self
+    }
+
     /// Enable proof generation on this e-graph.
     /// TODO proofs should be turned on during creation of the e-graph, not afterwards.
     /// This method is to support the current CLI implementation with egglog-experimental (https://github.com/egraphs-good/egglog/issues/768)
@@ -1204,6 +1218,78 @@ impl EGraph {
         }
 
         Ok(())
+    }
+
+    /// `--nativerb`: register the `@<F>View` view functions with the backend so
+    /// the ENGINE's native table rebuild re-canonicalizes them against their
+    /// eq-sort's `@UF_Sf`, replacing the suppressed `@rebuild_rule*` rules. Run
+    /// before every `(run ...)`; registers only views not already registered, so
+    /// constructors declared between runs (e.g. across `(push)` blocks) are
+    /// picked up too.
+    ///
+    /// A view returns `Unit`; its eq-sort ids live in its INPUT columns
+    /// (children + the eclass leader). The view is registered against its single
+    /// *union-bearing* eq-sort (one in `nativerb_union_sorts`). Union-free
+    /// passenger columns (encoder-internal relation / custom-function result
+    /// sorts, minted once and never unioned) are harmless: `find` against the
+    /// registered UF is a no-op for ids that are never that UF's keys. A view
+    /// that mixes TWO union-bearing eq-sorts (e.g. `(Approx M MTy)`) is out of
+    /// scope — `apply_rebuild` runs one UF's `find` over ALL id columns — so it
+    /// is flagged and the run aborts (see the guard in `run_command`).
+    fn register_nativerb_views(&mut self) {
+        // Collect first to avoid borrowing `self.functions` while mutating the
+        // backend.
+        let mut to_register: Vec<(String, egglog_bridge::FunctionId, String)> = Vec::new();
+        for func in self.functions.values() {
+            // Register exactly the views the encoder chose to ENGINE-rebuild
+            // (CONSTRUCTOR views whose `@rebuild_rule*` it suppressed). Custom
+            // (`:merge`) function views keep their relational rebuild rules and
+            // are not in this set.
+            if !self
+                .proof_state
+                .nativerb_engine_rebuilt_views
+                .contains(&*func.decl.name)
+            {
+                continue;
+            }
+            // Skip views already registered on an earlier run.
+            if self
+                .proof_state
+                .nativerb_registered
+                .contains(&*func.decl.name)
+            {
+                continue;
+            }
+            let mut union_sorts: Vec<String> = func
+                .decl
+                .schema
+                .input
+                .iter()
+                .filter(|s| self.proof_state.nativerb_union_sorts.contains(*s))
+                .cloned()
+                .collect();
+            union_sorts.sort();
+            union_sorts.dedup();
+            if union_sorts.len() > 1 {
+                self.proof_state
+                    .nativerb_mixed_sort_view
+                    .get_or_insert_with(|| (func.decl.name.to_string(), union_sorts.join(", ")));
+            } else if let Some(sort) = union_sorts.first()
+                && let Some(uf_name) = self.proof_state.uf_function.get(sort)
+                && let Some(uf_func) = self.functions.get(uf_name)
+            {
+                to_register.push((
+                    uf_func.name().to_string(),
+                    func.backend_id,
+                    func.decl.name.to_string(),
+                ));
+            }
+        }
+        for (uf_name, view_id, view_name) in to_register {
+            let uf_id = self.functions[&uf_name].backend_id;
+            self.backend.register_nativerb_view(uf_id, view_id);
+            self.proof_state.nativerb_registered.insert(view_name);
+        }
     }
 
     /// Build the backend table for a `:impl displaced-union-find` function.
@@ -2043,6 +2129,27 @@ impl EGraph {
                 log::info!("Declared rule {name}.")
             }
             ResolvedNCommand::RunSchedule(sched) => {
+                // `--nativerb`: lazily register the view tables for engine
+                // rebuild on the first run (the program is fully encoded by
+                // now), then enforce the single-union-bearing-eq-sort scope. The
+                // engine's `apply_rebuild` runs ONE union-find's `find` over ALL
+                // of a table's id columns, so a view mixing two *union-bearing*
+                // eq-sorts (e.g. `(Approx M MTy)`) would canonicalize a column
+                // against the wrong UF. Reject rather than silently producing a
+                // wrong (or non-terminating) result. A program may still have
+                // many eq-sorts globally — incl. union-free encoder helper sorts
+                // — and be in scope as long as no single view mixes two of the
+                // union-bearing ones.
+                if self.proof_state.nativerb {
+                    self.register_nativerb_views();
+                }
+                if let Some((view, sorts)) = &self.proof_state.nativerb_mixed_sort_view {
+                    return Err(Error::BackendError(format!(
+                        "--nativerb supports only datatypes where each view references a single \
+                         union-bearing eq-sort, but view `{view}` mixes eq-sorts ({sorts}). \
+                         Re-run without --nativerb (e.g. plain --native-uf --fast-rebuild)."
+                    )));
+                }
                 let report = self.run_schedule(&sched)?;
                 log::info!("Ran schedule {sched}.");
                 log::info!("Report: {report}");
