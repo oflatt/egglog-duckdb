@@ -443,6 +443,12 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
 
     // `change_detect` is now folded incrementally into apply/merge (O(delta));
     // there is no separate full before/after compare to time.
+    // Fold any proof-mode `Pair<sort, proof>` containers the head/on-circuit
+    // prims interned in the prim engine's (deep-cloned) container store back
+    // into `self.db`, the single store proof extraction reads. See
+    // `EGraph::sync_prim_engine_containers`. Cheap when no container was
+    // interned this iteration.
+    eg.sync_prim_engine_containers();
     Ok(changed)
 }
 

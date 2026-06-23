@@ -150,6 +150,19 @@ impl PrimEngine {
             .unwrap()
             .with_execution_state(|st| st.call_external_func(id, args))
     }
+
+    /// A clone of the engine's [`ContainerValues`] store. A cloned `Database`
+    /// shares its base-value intern tables (via `Arc`) but DEEP-CLONES its
+    /// container registry, so any container (proof mode's `Pair<sort, proof>`)
+    /// a prim interns through this engine lives ONLY in this clone's store —
+    /// invisible to `EGraph::db`. We snapshot it here so the host can fold it
+    /// back into `db` after each iteration, keeping the single authoritative
+    /// store (`db`, read by proof extraction) consistent with the ids the
+    /// on-circuit / head prims actually produced. See
+    /// [`EGraph::sync_prim_engine_containers`].
+    pub(crate) fn container_values_snapshot(&self) -> egglog_core_relations::ContainerValues {
+        self.0.lock().unwrap().container_values().clone()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -768,6 +781,32 @@ impl EGraph {
             self.prim_engine = Some(PrimEngine::new(self.db.clone()));
         }
         self.prim_engine.as_ref().unwrap().clone()
+    }
+
+    /// Fold the prim-engine's container store back into `self.db`.
+    ///
+    /// A cloned `Database` deep-clones its [`ContainerValues`] (only base-value
+    /// intern tables are `Arc`-shared), so every proof-mode `Pair<sort, proof>`
+    /// the head/on-circuit prims intern lives ONLY in the prim engine's store.
+    /// Proof extraction, however, reads `self.db`'s store
+    /// (`container_values_inner`), and the View tables persist the prim-engine
+    /// container ids — so without this sync the extractor resolves those ids
+    /// against a store that never saw them, reconstructing the wrong (or no)
+    /// term and producing a malformed/absent proof (the
+    /// "transitivity requires matching middle terms" panic, or a `prove` query
+    /// that never matches). Container interning in proof mode flows EXCLUSIVELY
+    /// through the prim engine (the head `pair` action and the on-circuit
+    /// `pair`/`pair-first`/`pair-second` body prims), so wholesale-replacing
+    /// `db`'s store with the engine's snapshot is id-faithful: it adopts the
+    /// exact ids the rules produced, with no counter divergence. Called after
+    /// each `run_iteration` so the next iteration's fresh prim-engine clone (and
+    /// any extraction) starts from a store that already holds them. No-op when
+    /// the engine has not been built (no on-circuit prim ran).
+    pub(crate) fn sync_prim_engine_containers(&mut self) {
+        if let Some(engine) = self.prim_engine.as_ref() {
+            let snapshot = engine.container_values_snapshot();
+            *self.db.container_values_mut() = snapshot;
+        }
     }
 
     /// Record a PURE primitive's user-visible name (Stage C). The frontend's
