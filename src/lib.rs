@@ -911,18 +911,28 @@ impl EGraph {
         }
         #[cfg(not(target_family = "wasm"))]
         {
-            // This will fail silently if the global pool has already been configured.
-            let err = rayon::ThreadPoolBuilder::new()
-                .num_threads(num_threads)
-                .build_global();
-            // print log if successful
-            if matches!(err, Ok(())) {
-                log::info!("Initialize global thread pool with  {num_threads} threads");
-            } else {
-                log::warn!(
-                    "Failed to initialize global thread pool with {num_threads} threads. This may be because the thread pool was already initialized with a different number of threads. Error: {err:?}"
-                );
-            }
+            // Configure the global rayon pool exactly once per process. rayon's
+            // `build_global` only succeeds before the pool is first used, so the
+            // FIRST `set_num_threads` call wins and later ones are silently
+            // ignored (matching this method's doc). The `Once` guard avoids a
+            // spurious GlobalPoolAlreadyInitialized warning when it's called more
+            // than once -- e.g. egglog-experimental's main configures the pool
+            // before constructing the egraph, then `cli` calls this again.
+            use std::sync::Once;
+            static INIT: Once = Once::new();
+            INIT.call_once(|| {
+                match rayon::ThreadPoolBuilder::new()
+                    .num_threads(num_threads)
+                    .build_global()
+                {
+                    Ok(()) => {
+                        log::info!("Initialized global thread pool with {num_threads} threads")
+                    }
+                    Err(e) => log::warn!(
+                        "Failed to initialize global thread pool with {num_threads} threads: {e:?}"
+                    ),
+                }
+            });
         }
     }
 

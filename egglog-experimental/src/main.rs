@@ -42,6 +42,16 @@ fn main() {
         .iter()
         .any(|a| a == "--proofs" || a == "--proof-testing");
     let want_wcoj = argv.iter().any(|a| a == "--wcoj");
+    // Configure the rayon global thread pool BEFORE constructing the egraph.
+    // `egglog::cli` sets it too, but only AFTER we hand it an already-built
+    // egraph -- and constructing the experimental/backend egraph touches rayon,
+    // which lazily initializes the global pool at its default (all logical
+    // CPUs). That makes cli's later `set_num_threads` a no-op
+    // (GlobalPoolAlreadyInitialized), so `--threads`/`-j` would be silently
+    // ignored and everything would run at full width. Setting it here first
+    // makes the flag take effect (cli's duplicate call is now an idempotent
+    // no-op). Mirrors cli's `--threads` default of 1 (0 = max).
+    egglog::EGraph::set_num_threads(parse_num_threads(&argv));
     let egraph = if want_duckdb {
         egglog_experimental::new_experimental_egraph_duckdb(egglog::DuckBackendConfig {
             native_uf: want_native_uf,
@@ -68,4 +78,27 @@ fn main() {
         egglog_experimental::new_experimental_egraph()
     };
     egglog::cli(egraph)
+}
+
+/// Parse the `--threads`/`-j` value from argv (matching `egglog::cli`'s clap
+/// option), defaulting to 1. Accepts `--threads N`, `--threads=N`, `-j N`, and
+/// `-jN`. `0` means "use the maximum" (rayon's default), same as cli.
+fn parse_num_threads(argv: &[String]) -> usize {
+    for (i, a) in argv.iter().enumerate() {
+        let val = if a == "--threads" || a == "-j" {
+            argv.get(i + 1).map(String::as_str)
+        } else if let Some(v) = a.strip_prefix("--threads=") {
+            Some(v)
+        } else if a.starts_with("-j") && a.len() > 2 {
+            Some(&a[2..])
+        } else {
+            None
+        };
+        if let Some(v) = val {
+            if let Ok(n) = v.parse::<usize>() {
+                return n;
+            }
+        }
+    }
+    1
 }
