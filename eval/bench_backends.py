@@ -489,7 +489,7 @@ def _uses_push_pop(path: Path) -> bool:
 
 def suite_of(rel: str) -> str:
     """Group a benchmark by corpus 'suite' for the results tables/filters.
-    `tests/` and `egglog-experimental/tests/` are the 'egglog' suite; each paper
+    `tests/` and `egglog-experimental/tests/` are the 'tests' suite; each paper
     corpus keeps its own suite (herbie / math-microbenchmark / pointer-analysis)."""
     if "paper-benchmarks/herbie" in rel:
         return "herbie"
@@ -499,7 +499,7 @@ def suite_of(rel: str) -> str:
         return "pointer-analysis"
     if "paper-benchmarks" in rel:
         return "paper"
-    return "egglog"
+    return "tests"
 
 
 # --- Per-phase profile: bucket per-ruleset/per-class times into a uniform
@@ -1343,8 +1343,12 @@ initEvalLive("tables", {results_json}, "egglog backends"{init_graphs_args});</sc
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("path", nargs="?", default=None,
-                        help="benchmark file or directory (default: tests/)")
+    parser.add_argument("path", nargs="*", default=None,
+                        help="one or more benchmark files/directories (default: "
+                             "tests/). Pass several to run multiple corpora in one "
+                             "go, e.g. `tests paper-benchmarks/herbie/sample100`; "
+                             "each benchmark's `suite` (egglog / herbie / ...) is "
+                             "recorded from its path.")
     parser.add_argument("--runs", type=int, default=3, help="timed runs per cell (default 3)")
     parser.add_argument("--jobs", type=int, default=0,
                         help="concurrent cells (default 0 = PHYSICAL core count, "
@@ -1419,12 +1423,21 @@ def main():
 
     binary = build_egglog(build=args.build, release=not args.debug)
 
-    bench_path = Path(args.path) if args.path else (WORKSPACE / "tests")
-    if not bench_path.is_absolute():
-        bench_path = (WORKSPACE / bench_path)
-    benchmarks = find_benchmarks(bench_path)
+    # One or more corpora; default tests/. Each path's benchmarks keep their own
+    # `suite` (from the path), so multiple corpora can run in a single results.json.
+    raw_paths = args.path if args.path else ["tests"]
+    benchmarks = []
+    seen = set()
+    for p in raw_paths:
+        bp = Path(p)
+        if not bp.is_absolute():
+            bp = WORKSPACE / bp
+        for b in find_benchmarks(bp):
+            if b not in seen:
+                seen.add(b)
+                benchmarks.append(b)
     if not benchmarks:
-        sys.exit(f"no .egg benchmarks found under {bench_path}")
+        sys.exit(f"no .egg benchmarks found under {', '.join(raw_paths)}")
     if args.limit is not None:
         benchmarks = benchmarks[:args.limit]
 
