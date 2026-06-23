@@ -472,6 +472,21 @@ def find_benchmarks(path: Path) -> list[Path]:
                   and not re.fullmatch(r"tmp[a-z0-9_]{8}\.egg", p.name))
 
 
+_PUSH_POP_RE = re.compile(r"\(\s*(?:push|pop)(?:\s|\))")
+
+
+def _uses_push_pop(path: Path) -> bool:
+    """True if the program uses `(push)`/`(pop)`. Those are intentionally OUT of
+    scope for this paper (and the feldera/flowlog backends can't clone the
+    egraph across them -- `clone_boxed`/push-pop deferred), so we skip such
+    files rather than record spurious backend failures. Matches the command
+    head only (a `(push-...` user symbol won't trip it)."""
+    try:
+        return bool(_PUSH_POP_RE.search(path.read_text()))
+    except OSError:
+        return False
+
+
 def suite_of(rel: str) -> str:
     """Group a benchmark by corpus 'suite' for the results tables/filters.
     `tests/` and `egglog-experimental/tests/` are the 'egglog' suite; each paper
@@ -1449,6 +1464,16 @@ def main():
     ref_labels = set(REFERENCE_BY_FAMILY.values())
     TERM_GATE = "bridge-term-encoding"
     probe_conds = [c for c in conds if c[0] in ref_labels or c[0] == TERM_GATE]
+
+    # Skip push/pop programs up front (out of scope for this paper; the dataflow
+    # backends can't clone the egraph across push/pop). Recorded as `skipped`,
+    # and excluded before probing so we don't waste gating runs on them.
+    pushpop = [b for b in benchmarks if _uses_push_pop(b)]
+    for b in pushpop:
+        db.add_skip(rel_of(b), "uses push/pop (out of scope for this paper)")
+    if pushpop:
+        print(f"  skipping {len(pushpop)} push/pop file(s) (out of scope)", flush=True)
+    benchmarks = [b for b in benchmarks if b not in set(pushpop)]
 
     runnable = []        # benchmarks that pass the normal + term-encoding gate
     oracle_sizes = {}    # {(rel, ref_condition_label): sorted [name, count] list}
