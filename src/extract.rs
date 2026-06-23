@@ -321,7 +321,7 @@ impl<C: Cost + Ord + Eq + Clone + Debug> Extractor<C> {
     /// Returns None if contains an undefined eqsort term (potentially after unfolding)
     fn compute_cost_node(&self, egraph: &EGraph, value: Value, sort: &ArcSort) -> Option<C> {
         if sort.is_container_sort() {
-            let elements = sort.inner_values(egraph.bridge().container_values(), value);
+            let elements = sort.inner_values(egraph.container_values(), value);
             let mut ch_costs: Vec<C> = Vec::new();
             for ch in elements.iter() {
                 ch_costs.push(self.compute_cost_node(egraph, ch.1, &ch.0)?);
@@ -361,7 +361,7 @@ impl<C: Cost + Ord + Eq + Clone + Debug> Extractor<C> {
 
     fn compute_topo_rnk_node(&self, egraph: &EGraph, value: Value, sort: &ArcSort) -> usize {
         if sort.is_container_sort() {
-            sort.inner_values(egraph.bridge().container_values(), value)
+            sort.inner_values(egraph.container_values(), value)
                 .iter()
                 .fold(0, |ret, (sort, value)| {
                     usize::max(ret, self.compute_topo_rnk_node(egraph, *value, sort))
@@ -526,19 +526,14 @@ impl<C: Cost + Ord + Eq + Clone + Debug> Extractor<C> {
         }
 
         let term = if sort.is_container_sort() {
-            let elements = sort.inner_values(egraph.bridge().container_values(), value);
+            let elements = sort.inner_values(egraph.container_values(), value);
             let mut ch_terms: Vec<TermId> = Vec::new();
             for ch in elements.iter() {
                 ch_terms.push(
                     self.reconstruct_termdag_node_helper(egraph, termdag, ch.1, &ch.0, cache),
                 );
             }
-            sort.reconstruct_termdag_container(
-                egraph.bridge().container_values(),
-                value,
-                termdag,
-                ch_terms,
-            )
+            sort.reconstruct_termdag_container(egraph.container_values(), value, termdag, ch_terms)
         } else if sort.is_eq_sort() {
             let (func_name, hyperedge) = self
                 .parent_edge

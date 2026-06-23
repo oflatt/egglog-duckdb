@@ -240,6 +240,7 @@ impl Run {
             let mut egraph = EGraph::with_feldera_backend_config(FelderaBackendConfig {
                 native_uf: self.native_uf,
                 fast_rebuild: false,
+                proofs: false,
             })
             .unwrap_or_else(|e| panic!("EGraph::with_feldera_backend init failed: {e}"));
             if self.native_uf {
@@ -285,6 +286,7 @@ impl Run {
                 // optimal delta query. Bit-exact with the binary join, so it is
                 // diffed against the same shared snapshot.
                 wcoj: self.wcoj,
+                proofs: false,
             })
             .unwrap_or_else(|e| panic!("EGraph::with_flowlog_backend init failed: {e}"));
             if self.native_uf {

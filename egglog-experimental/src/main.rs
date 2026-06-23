@@ -35,7 +35,9 @@ fn main() {
     // encoding active. Without this, cli.rs's `args.proof_testing`
     // branch would try `with_proofs_enabled()` after construction,
     // and that path clones the egraph for `original_typechecking`,
-    // hitting duckdb's unimplemented `clone_boxed`.
+    // hitting the duckdb/feldera/flowlog backends' unimplemented
+    // `clone_boxed`. Threading `proofs` into each backend config
+    // provisions a proof-enabled typechecker at construction instead.
     let want_proofs = argv
         .iter()
         .any(|a| a == "--proofs" || a == "--proof-testing");
@@ -52,12 +54,14 @@ fn main() {
             native_uf: want_native_uf,
             fast_rebuild: want_fast_rebuild,
             wcoj: want_wcoj,
+            proofs: want_proofs,
         })
         .expect("failed to start FlowLog-backed experimental egraph")
     } else if want_feldera {
         egglog_experimental::new_experimental_egraph_feldera(egglog::FelderaBackendConfig {
             native_uf: want_native_uf,
             fast_rebuild: want_fast_rebuild,
+            proofs: want_proofs,
         })
         .expect("failed to start Feldera-backed experimental egraph")
     } else {

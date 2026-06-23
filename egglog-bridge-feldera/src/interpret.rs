@@ -1213,7 +1213,17 @@ fn apply_head(
                 let result = if let Some(&uf_func) = eg.native_uf_canon_prim.get(id) {
                     Some(Value::new(eg.native_uf_find(uf_func, argv[0].rep())))
                 } else {
-                    eg.eval_prim_internal(*id, &argv)
+                    // Route head prim calls through the SAME shared primitive
+                    // engine the on-circuit body call-prims use, so any container
+                    // (proof mode's `Pair<sort, proof>`) a head `pair` action
+                    // interns is later visible to the body `pair-first` /
+                    // `pair-second` reads. `eval_prim_internal` uses `self.db`
+                    // directly, whose ContainerValues store is a DIFFERENT
+                    // instance from the engine's clone — container ids interned in
+                    // one are absent from the other (base values re-intern
+                    // identically; containers do not). Sharing one engine keeps
+                    // them consistent.
+                    eg.prim_engine().eval(*id, &argv)
                 };
                 if let Some(v) = result {
                     env.insert(*ret, v.rep());

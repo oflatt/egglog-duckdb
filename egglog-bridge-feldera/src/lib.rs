@@ -728,6 +728,35 @@ impl EGraph {
             .with_execution_state(|st| st.call_external_func(id, args))
     }
 
+    /// Inherent accessor for the embedded [`Database`]'s container registry, so
+    /// the frontend extraction path can read interned container values (proof
+    /// mode's `Pair<sort, proof>`). Mirrors `base_values()`.
+    pub fn container_values_inner(&self) -> &egglog_core_relations::ContainerValues {
+        self.db.container_values()
+    }
+
+    /// Register a container-value type `C` into the embedded [`Database`]'s
+    /// [`ContainerValues`], so the host primitive engine's `pair` /
+    /// `pair-first` / `pair-second` (used by proof mode's `Pair<sort, proof>` UF
+    /// function index) can intern and read back values. Container
+    /// rebuild/canonicalization is not driven through this `db`, so the merge
+    /// closure only keeps the smaller id. Idempotent. See the flowlog backend's
+    /// identical method for the full rationale.
+    pub fn register_container_ty<C: egglog_core_relations::ContainerValue>(&mut self) {
+        use std::any::TypeId;
+        if self
+            .db
+            .container_values()
+            .has_container_type(TypeId::of::<C>())
+        {
+            return;
+        }
+        let id_counter = self.db.add_counter();
+        self.db
+            .container_values_mut()
+            .register_type::<C>(id_counter, move |_state, old, new| std::cmp::min(old, new));
+    }
+
     /// A shareable clone of the primitive engine, built lazily on first use
     /// (after all primitives are registered). The returned [`PrimEngine`] is
     /// `Send + 'static` and can be captured into DBSP circuit closures so they

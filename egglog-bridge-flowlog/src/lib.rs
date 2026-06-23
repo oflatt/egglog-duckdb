@@ -554,6 +554,40 @@ impl EGraph {
         self.db.base_values()
     }
 
+    /// Inherent accessor for the embedded [`Database`]'s container registry, so
+    /// the frontend extraction path can read interned container values (proof
+    /// mode's `Pair<sort, proof>`). Mirrors `base_values_inner()`.
+    pub fn container_values_inner(&self) -> &egglog_core_relations::ContainerValues {
+        self.db.container_values()
+    }
+
+    /// Register a container-value type `C` into the embedded [`Database`]'s
+    /// [`ContainerValues`], so the host interpreter's container primitives
+    /// (`pair` / `pair-first` / `pair-second` — used by proof mode's
+    /// `Pair<sort, proof>` UF function index) can intern and read back values.
+    ///
+    /// Proof mode is the only consumer today: the relational proof encoding
+    /// bundles `(leader, proof)` into a `PairContainer` in the UF-function-index
+    /// rebuild rule. Container rebuild/canonicalization is NOT driven through
+    /// this `db` (flowlog rebuilds host-side and on the DD engine), so the merge
+    /// closure only needs to keep the smaller id on the (here unreached) id
+    /// collision — matching the reference bridge's `register_container_ty`.
+    /// Idempotent: re-registering the same type is a no-op.
+    pub fn register_container_ty<C: egglog_core_relations::ContainerValue>(&mut self) {
+        use std::any::TypeId;
+        if self
+            .db
+            .container_values()
+            .has_container_type(TypeId::of::<C>())
+        {
+            return;
+        }
+        let id_counter = self.db.add_counter();
+        self.db
+            .container_values_mut()
+            .register_type::<C>(id_counter, move |_state, old, new| std::cmp::min(old, new));
+    }
+
     /// Diagnostics: the number of rule firings whose body table-atom join ran on
     /// the in-process Differential-Dataflow dataflow. Every atom-bearing rule
     /// runs there (no host fallback); lets a test assert the join genuinely ran

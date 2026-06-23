@@ -554,9 +554,18 @@ impl EGraph {
 
         // Term encoding requires a separate bridge-backed typechecker EGraph for
         // re-typechecking after the encoder runs (the Feldera backend, like
-        // DuckDB, is not the typechecker). Mirror the DuckDB setup.
-        let typechecker = EGraph::default().with_term_encoding_enabled();
+        // DuckDB, is not the typechecker). Mirror the DuckDB setup, including
+        // building a proof-enabled typechecker when proofs are requested so the
+        // CLI never reaches the backend-cloning `with_proofs_enabled` path.
+        let typechecker = if config.proofs {
+            EGraph::new_with_proofs()
+        } else {
+            EGraph::default().with_term_encoding_enabled()
+        };
         eg.proof_state.original_typechecking = Some(Box::new(typechecker));
+        if config.proofs {
+            eg.proof_state.proofs_enabled = true;
+        }
         Ok(eg)
     }
 
@@ -607,9 +616,18 @@ impl EGraph {
         // (set in `EncodingState::new`); no per-backend override is needed here.
 
         // Term encoding requires a separate bridge-backed typechecker EGraph for
-        // re-typechecking after the encoder runs. Mirror the DuckDB/Feldera setup.
-        let typechecker = EGraph::default().with_term_encoding_enabled();
+        // re-typechecking after the encoder runs. Mirror the DuckDB/Feldera setup,
+        // including building a proof-enabled typechecker when proofs are requested
+        // so the CLI never reaches the backend-cloning `with_proofs_enabled` path.
+        let typechecker = if config.proofs {
+            EGraph::new_with_proofs()
+        } else {
+            EGraph::default().with_term_encoding_enabled()
+        };
         eg.proof_state.original_typechecking = Some(Box::new(typechecker));
+        if config.proofs {
+            eg.proof_state.proofs_enabled = true;
+        }
         Ok(eg)
     }
 }
@@ -640,6 +658,14 @@ pub struct FlowlogBackendConfig {
     /// run counts. Other rules stay on the binary chain (hybrid). Experimental;
     /// off by default.
     pub wcoj: bool,
+    /// `--proofs` / `--proof-testing`: build the egraph with proof-tracking term
+    /// encoding active from construction. Mirrors [`DuckBackendConfig::proofs`]:
+    /// it provisions a proof-enabled bridge typechecker and sets
+    /// `proofs_enabled`, so the CLI's `with_proofs_enabled()` path (which clones
+    /// the backend — unimplemented for FlowLog) is never taken. FlowLog executes
+    /// the relational proof encoding faithfully (no leader-id hash-cons to
+    /// disable), so no backend-level switch is required. Off by default.
+    pub proofs: bool,
 }
 
 /// Knobs for [`EGraph::with_feldera_backend_config`]. Mirrors
@@ -660,6 +686,14 @@ pub struct FelderaBackendConfig {
     /// so this flag is a no-op there. (Also reachable via the
     /// `FELDERA_DELTA_REBUILD` env var.) Experimental; off by default.
     pub fast_rebuild: bool,
+    /// `--proofs` / `--proof-testing`: build the egraph with proof-tracking term
+    /// encoding active from construction. Mirrors [`DuckBackendConfig::proofs`]:
+    /// it provisions a proof-enabled bridge typechecker and sets
+    /// `proofs_enabled`, so the CLI's `with_proofs_enabled()` path (which clones
+    /// the backend — unimplemented for Feldera) is never taken. Feldera executes
+    /// the relational proof encoding faithfully (no leader-id hash-cons to
+    /// disable), so no backend-level switch is required. Off by default.
+    pub proofs: bool,
 }
 
 struct ResolvedNCommands {
@@ -739,6 +773,37 @@ impl EGraph {
             return flow.base_values_inner();
         }
         panic!("EGraph::base_values: unknown backend type")
+    }
+
+    /// Backend-agnostic access to the underlying
+    /// [`egglog_core_relations::ContainerValues`]. Used by the extraction path
+    /// (which reads container element values via `Sort::inner_values`) so it
+    /// works on any backend without a bridge-only downcast. DuckDB has no
+    /// container registry (container sorts are gated out; `PairSort` survives as
+    /// a SQL `STRUCT` base value, never interned here), so it is unsupported.
+    pub(crate) fn container_values(&self) -> &egglog_core_relations::ContainerValues {
+        if let Some(bridge) = self
+            .backend
+            .as_any()
+            .downcast_ref::<egglog_bridge::EGraph>()
+        {
+            return bridge.container_values();
+        }
+        if let Some(feldera) = self
+            .backend
+            .as_any()
+            .downcast_ref::<egglog_bridge_feldera::EGraph>()
+        {
+            return feldera.container_values_inner();
+        }
+        if let Some(flow) = self
+            .backend
+            .as_any()
+            .downcast_ref::<egglog_bridge_flowlog::EGraph>()
+        {
+            return flow.container_values_inner();
+        }
+        panic!("EGraph::container_values: unsupported backend type (no container registry)")
     }
 
     /// Create a new e-graph with the term-encoding pipeline enabled.

@@ -980,6 +980,24 @@ impl<T: ContainerSort> Sort for ContainerSortImpl<T> {
         {
             let _ = duck.pair_column_ty();
         }
+        // FlowLog / Feldera: register the container type into the backend's
+        // embedded core-relations `Database`, where the host primitive engine
+        // (`pair` / `pair-first` / `pair-second`) interns values. Proof mode's
+        // `Pair<sort, proof>` UF function index is the only consumer today;
+        // without this, the `pair` primitive's `register_val` panics
+        // ("must register container type before registering a value").
+        if let Some(flow) = backend
+            .as_any_mut()
+            .downcast_mut::<egglog_bridge_flowlog::EGraph>()
+        {
+            flow.register_container_ty::<T::Container>();
+        }
+        if let Some(feldera) = backend
+            .as_any_mut()
+            .downcast_mut::<egglog_bridge_feldera::EGraph>()
+        {
+            feldera.register_container_ty::<T::Container>();
+        }
     }
 
     fn value_type(&self) -> Option<TypeId> {

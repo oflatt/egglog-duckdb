@@ -423,6 +423,7 @@ pub fn cli(mut egraph: EGraph) {
                     egglog::EGraph::with_feldera_backend_config(egglog::FelderaBackendConfig {
                         native_uf: args.native_uf,
                         fast_rebuild: args.fast_rebuild,
+                        proofs: args.proofs || args.proof_testing,
                     })
                 } else {
                     // `--native-uf --flowlog`: enable the FlowLog backend's
@@ -436,6 +437,7 @@ pub fn cli(mut egraph: EGraph) {
                         native_uf: args.native_uf,
                         fast_rebuild: args.fast_rebuild,
                         wcoj: args.wcoj,
+                        proofs: args.proofs || args.proof_testing,
                     })
                 }
                 .unwrap_or_else(|err| {
