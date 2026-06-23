@@ -1011,6 +1011,31 @@ impl<'a> ProofInstrumentor<'a> {
                         :ruleset {rebuilding_ruleset} :name \"{rule_name}\")\n"
             ));
 
+            // `--fast-rebuild` (native-UF): drop this rule's always-empty
+            // `δview ⋈ uf_old` seminaive variant. The join above is
+            // `@UFChange_S ⋈ view`; seminaive runs it as `δ@UFChange_S ⋈ view`
+            // (the real re-canonicalization — a new leader change finds existing
+            // stale view rows) PLUS `@UFChange_S_old ⋈ δview` (re-probing view
+            // rows born THIS iteration against accumulated onchange rows). Under
+            // canonicalize-at-creation a fresh view row holds only current
+            // leaders, so it never matches an onchange `disp_` (a displaced
+            // non-leader): the δview variant is always empty, yet seminaive
+            // still pays to enumerate δview every iteration. Recording this
+            // rule's view in `rebuild_view_exclude` makes `add_rule` exclude the
+            // view atom from being a delta focus
+            // (`RuleBuilderOps::set_focus_exclude_table`), keeping only
+            // `δ@UFChange_S ⋈ view`. Mirrors the relational rebuild's
+            // fast-rebuild gating (~:876). Plain `--native-uf` (no
+            // `--fast-rebuild`) keeps the δview variant, so its per-column δview
+            // enumeration is the measurable cost of NOT fast-rebuilding.
+            // Bit-exact with the full rebuild; never in proof mode.
+            if self.fast_rebuild() {
+                self.egraph
+                    .proof_state
+                    .rebuild_view_exclude
+                    .insert(rule_name.clone(), view_name.clone());
+            }
+
             // Drain the onchange relation. `@UFChange_S` is a relation, so it is
             // append-only — one row per leader change, retained forever. Without
             // draining, seminaive re-joins every later iteration's *new* view
@@ -1047,29 +1072,20 @@ impl<'a> ProofInstrumentor<'a> {
             }
         }
 
-        // FULL native-UF rebuild (`--native-uf` WITHOUT `--fast-rebuild`): also
-        // emit the `δview ⋈ uf_old` probe so `+nuf` does the same total work as
-        // the relational FULL rebuild (both seminaive terms), differing only in
-        // UF *storage*. The onchange rules above are the `view ⋈ δuf` term (the
-        // real re-canonicalization). The relational FULL rebuild additionally
-        // pays a `δview ⋈ uf_old` term: re-checking view rows born THIS
-        // iteration against the (unchanged) UF. Under canonicalize-at-creation
-        // those rows are already canonical, so the term is empty — but it costs
-        // a δview scan each iteration. We mirror that cost here with a rule
-        // whose only table atom is the view, so seminaive runs it on δview only;
-        // the `@canon_S` guard finds no stale row (empty result), exactly like
-        // the relational δview term. `--fast-rebuild` drops this probe, leaving
-        // only `view ⋈ δuf` (`+nuf+fastrb`). Bit-exact either way.
-        if !self.fast_rebuild() {
-            let probe_name = self.egraph.parser.symbol_gen.fresh("rebuild_dview_probe");
-            rules.push_str(&format!(
-                "(rule (({view_name} {children})
-                        {guard})
-                       ({updated_view}
-                        (delete ({view_name} {children})))
-                        :ruleset {rebuilding_ruleset} :name \"{probe_name}\")\n"
-            ));
-        }
+        // FULL native-UF rebuild (`--native-uf` WITHOUT `--fast-rebuild`) keeps
+        // the `δview ⋈ uf_old` term WITHOUT a separate probe rule: each
+        // per-column rule above is `@UFChange_S ⋈ view`, and seminaive already
+        // runs its `@UFChange_S_old ⋈ δview` variant (view rows born this
+        // iteration probed against accumulated onchange rows) when the view atom
+        // is not focus-excluded — which it is NOT unless `--fast-rebuild`
+        // registered it in `rebuild_view_exclude` (see above). So plain `+nuf`
+        // pays exactly that per-column δview enumeration — the measurable cost of
+        // the FULL rebuild — and `--fast-rebuild` drops it via `focus_exclude`,
+        // leaving only `δ@UFChange_S ⋈ view` (`+nuf+fastrb`). Under
+        // canonicalize-at-creation a fresh view row holds only current leaders
+        // and so matches no logged `disp_`, so the kept δview variant is empty:
+        // bit-exact with the relational rebuild's (likewise empty) `δview ⋈
+        // uf_old` term. No standalone probe rule is needed.
 
         self.parse_program(&rules)
     }
