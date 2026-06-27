@@ -304,6 +304,13 @@ pub struct EGraph {
     /// non-triangle rules are unaffected. Off by default — when off the FlowLog
     /// join path is byte-identical to the pre-WCOJ behavior.
     pub(crate) wcoj_enabled: bool,
+    /// `--native-merge`: maps an FD-keyed CONSTRUCTOR view's [`FunctionId`] to the
+    /// [`FunctionId`] of the union-find (`@UF_Sf`) that owns its eclass (OUTPUT)
+    /// column. Populated by [`Backend::register_native_merge_view`]. When a view
+    /// in this map has an FD conflict (`resolve_merge` finds two eclasses for one
+    /// children key), the loser is `enqueue_union`-ed with the winner into this UF
+    /// — congruence done INLINE at insert time instead of by a self-join rule.
+    pub(crate) native_merge_uf: HashMap<FunctionId, FunctionId>,
 }
 
 impl Default for EGraph {
@@ -377,6 +384,7 @@ impl EGraph {
             native_uf_disp_rel: HashMap::new(),
             native_uf_rebuild_dd_ir: HashMap::new(),
             wcoj_enabled: false,
+            native_merge_uf: HashMap::new(),
         }
     }
 
@@ -658,6 +666,14 @@ impl EGraph {
                 by_key.entry(&row[..inputs_len]).or_default().push(row);
             }
         }
+        // `--native-merge`: if this function is an FD-keyed constructor view, an
+        // FD conflict (same children, two eclasses) means those eclasses are
+        // CONGRUENT and must be unioned. The merge keeps the min output (the UF
+        // leader, matching union-by-min) AND injects a union of every losing
+        // eclass with the winner into the view's union-find — congruence INLINE at
+        // insert time. Collect the (a, b) pairs to enqueue after the borrow ends.
+        let native_merge_uf = self.native_merge_uf.get(&f).copied();
+        let mut union_pairs: Vec<(u32, u32)> = Vec::new();
         // Resolve each touched key; collect the rows to remove and the winner to
         // insert. Only keys with >1 candidate row can change.
         let mut new_rows: Vec<Row> = Vec::new();
@@ -682,14 +698,26 @@ impl EGraph {
             let mut winner: Vec<u32> = cands[0][..inputs_len].to_vec();
             winner.push(chosen);
             let winner: Row = winner.into_boxed_slice();
-            for row in cands {
-                if **row != *winner {
-                    drop_rows.insert((*row).clone());
+            for row in &cands {
+                if ***row != *winner {
+                    drop_rows.insert((**row).clone());
+                }
+            }
+            // Native-merge: union each candidate eclass with the chosen winner.
+            // `enqueue_union` is idempotent for already-equal ids and picks the min
+            // leader itself, so passing every candidate (incl. the winner) is safe;
+            // the dedup against `chosen` keeps the staged list small.
+            if native_merge_uf.is_some() {
+                for row in &cands {
+                    let out = row_col(row, inputs_len);
+                    if out != chosen {
+                        union_pairs.push((chosen, out));
+                    }
                 }
             }
             new_rows.push(winner);
         }
-        if drop_rows.is_empty() {
+        if drop_rows.is_empty() && union_pairs.is_empty() {
             return false;
         }
         {
@@ -710,6 +738,22 @@ impl EGraph {
             }
             for r in &new_rows {
                 self.index_insert_row(f, r);
+            }
+        }
+        // `--native-merge`: inject the congruence unions into the view's UF. The
+        // ids are drained + applied at the iteration boundary (`native_uf_drain_all`,
+        // like every other union); the displaced-id signal then drives the rebuild
+        // that re-canonicalizes any other rows holding the loser eclass. Returning
+        // `true` here keeps the outer saturate loop iterating until the unions and
+        // their rebuild fallout reach a fixpoint.
+        if let Some(uf_func) = native_merge_uf {
+            if let Some(uf) = self.native_ufs.get_mut(&uf_func) {
+                let mem = self.native_uf_members.entry(uf_func).or_default();
+                for (a, b) in &union_pairs {
+                    uf.enqueue_union(*a as i64, *b as i64);
+                    mem.insert(*a);
+                    mem.insert(*b);
+                }
             }
         }
         true
@@ -857,6 +901,17 @@ impl Backend for EGraph {
         let canon = self.register_external_func(Box::new(external_func::CanonStub));
         self.native_uf_canon_prim.insert(canon, id);
         Ok((id, canon))
+    }
+
+    fn register_native_merge_view(&mut self, uf_func: FunctionId, view_func: FunctionId) {
+        // `--native-merge`: the view's eclass (OUTPUT) column belongs to `uf_func`.
+        // Record the association so `resolve_merge` injects a union into this UF on
+        // an FD conflict (same children, two eclasses) — inline congruence.
+        debug_assert!(
+            self.native_ufs.contains_key(&uf_func),
+            "register_native_merge_view: uf_func is not a native union-find"
+        );
+        self.native_merge_uf.insert(view_func, uf_func);
     }
 
     fn table_size(&self, table: FunctionId) -> usize {

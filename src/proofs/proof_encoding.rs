@@ -64,6 +64,28 @@ pub(crate) struct EncodingState {
     /// their own fast-rebuild via `enable_fast_rebuild()`; this flag drives
     /// only the bridge's encoding-level drop. Default OFF.
     pub fast_rebuild: bool,
+    /// Native-merge mode (`--native-merge`, term-encoding + native-UF + non-proof,
+    /// FlowLog backend only for now). When on, a CONSTRUCTOR's `@<F>View` is keyed
+    /// on its CHILDREN ONLY (an FD view `(children) -> eclass`) with a side-effecting
+    /// `:merge` (lowered to `MergeFn::UnionId`): on an FD conflict (same children,
+    /// two eclasses) the backend UNIONS the two eclasses into the union-find and
+    /// keeps the min, doing congruence INLINE at insert time. The separate
+    /// `@congruence_rule*` self-join rule is then NOT emitted (deleted from the
+    /// per-iteration rebuild). This is the non-proof half of egglog PR #933 (native
+    /// backend merge for congruence). Requires `--native-uf` (the injected union
+    /// edge goes into the in-core union-find via `enqueue_union`). Default OFF; the
+    /// relational/`:merge old` encoding is byte-identical when off.
+    pub native_merge: bool,
+    /// Native-merge mode only: the set of `@<F>View` view function names declared
+    /// FD-keyed `(children) -> eclass` with the UnionId merge (CONSTRUCTOR views).
+    /// `update_view` / `query_view_and_get_proof` consult this to emit the
+    /// `(set (@FView children) eclass)` / `(= eclass (@FView children))` forms
+    /// (eclass as the function OUTPUT) instead of the all-columns-key form.
+    pub native_merge_views: HashSet<String>,
+    /// Native-merge mode only: view names already registered with the backend for
+    /// the view -> output-sort-UF association (so `register_native_merge_views`
+    /// registers only the not-yet-registered views before each run).
+    pub native_merge_registered: HashSet<String>,
     /// Native-engine-rebuild mode (`--nativerb`, native bridge + term-encoding
     /// native-UF + non-proof only). When on, the per-constructor
     /// `@rebuild_rule*` rebuild rules are NOT emitted; instead each `@<F>View`
@@ -173,6 +195,9 @@ impl EncodingState {
             uf_change_rel: HashMap::default(),
             uf_change_drained: HashSet::default(),
             fast_rebuild: false,
+            native_merge: false,
+            native_merge_views: HashSet::default(),
+            native_merge_registered: HashSet::default(),
             nativerb: false,
             nativerb_union_sorts: HashSet::default(),
             nativerb_engine_rebuilt_views: HashSet::default(),
@@ -532,30 +557,44 @@ impl<'a> ProofInstrumentor<'a> {
 
     /// Rules that execute deletion and subsumption based on the tables requesting the deletion/subsumption.
     fn delete_and_subsume(&mut self, fdecl: &ResolvedFunctionDecl) -> String {
-        let child_names = fdecl
+        let child_names_vec: Vec<String> = fdecl
             .schema
             .input
             .iter()
             .enumerate()
             .map(|(i, _)| format!("c{i}_"))
-            .collect::<Vec<_>>()
-            .join(" ");
+            .collect();
+        let child_names = child_names_vec.join(" ");
         let to_delete_name = self.delete_name(&fdecl.name);
         let subsumed_name = self.subsumed_name(&fdecl.name);
         let view_name = self.view_name(&fdecl.name);
         let delete_subsume_ruleset = self.proof_names().delete_subsume_ruleset_name.clone();
         let fresh_name = self.egraph.parser.symbol_gen.fresh("delete_rule");
 
+        // View-row column list: `children..., out`. For a native-merge FD view the
+        // helpers emit the `(= out (@view children))` body atom and the
+        // children-keyed `(delete (@view children))` / `(subsume (@view children))`
+        // forms; for the baseline all-columns view they emit the flat forms.
+        let mut cols = child_names_vec.clone();
+        cols.push("out".to_string());
+        let view_atom = self.view_body_atom(&fdecl.name, &cols);
+        let view_del = self.view_delete(&fdecl.name, &cols);
+        let view_subsume = if self.is_native_merge_view(&view_name) {
+            format!("(subsume ({view_name} {child_names}))")
+        } else {
+            format!("(subsume ({view_name} {child_names} out))")
+        };
+
         format!(
             "(rule (({to_delete_name} {child_names})
-                    ({view_name} {child_names} out))
-                   ((delete ({view_name} {child_names} out))
+                    {view_atom})
+                   ({view_del}
                     (delete ({to_delete_name} {child_names})))
                     :ruleset {delete_subsume_ruleset}
                     :name \"{fresh_name}\")
              (rule (({subsumed_name} {child_names})
-                    ({view_name} {child_names} out))
-                   ((subsume ({view_name} {child_names} out)))
+                    {view_atom})
+                   ({view_subsume})
                     :ruleset {delete_subsume_ruleset}
                     :name \"{fresh_name}_subsume\")"
         )
@@ -745,6 +784,20 @@ impl<'a> ProofInstrumentor<'a> {
                 &view_name,
                 &rebuilding_ruleset,
             )
+        } else if self.native_merge()
+            && fdecl.resolved_schema.output().is_eq_sort()
+            && !fdecl.schema.input.is_empty()
+        {
+            // Native-merge: congruence is done INLINE by the FD view's UnionId
+            // merge (same children + different eclass => union the eclasses at
+            // insert time). The separate `@congruence_rule*` self-join rule is
+            // therefore NOT emitted — this is the rule deletion that makes
+            // native-merge faster than the rule-encoded congruence. Mirrors the
+            // `native_merge_view` gate in `term_and_view` (constructor, eq-sort
+            // output, non-empty inputs, non-proof term mode — `native_merge()` is
+            // only ever set then). 0-input constructors keep the congruence rule
+            // (their view stays the baseline all-columns form).
+            String::new()
         } else {
             self.handle_congruence(fdecl, &child_names, &rebuilding_ruleset)
         }
@@ -763,6 +816,34 @@ impl<'a> ProofInstrumentor<'a> {
         let view_name = self.view_name(&fdecl.name);
         let in_sorts = ListDisplay(schema.input.clone(), " ");
         let fresh_sort = self.egraph.parser.symbol_gen.fresh("view");
+
+        // Native-merge (`--native-merge`): a CONSTRUCTOR's view is keyed on its
+        // CHILDREN ONLY (an FD view `(children) -> eclass`) with a side-effecting
+        // UnionId merge that unions the two eclasses on an FD conflict — congruence
+        // done INLINE at insert time. Recorded BEFORE any view helper runs so that
+        // `delete_and_subsume` / the rebuild rules / `add_term_and_view` all emit
+        // the FD `(children) -> eclass` body/set/delete forms (the view column set
+        // is unchanged — `children..., eclass` — only the FD key and the OUTPUT
+        // column change). Term mode + eq-sort-output constructors only; otherwise
+        // the baseline all-columns-key `:merge old` view is byte-identical.
+        // A 0-input constructor (a global `let`, or a nullary constructor) cannot
+        // be FD-keyed on children-only: with no inputs the FD view would be a bare
+        // `() -> eclass`, which the `:internal-term-constructor` view validation
+        // and extraction (reconstructing a term from its input columns) reject —
+        // and congruence is trivial there anyway (one term, no children to match).
+        // Keep the baseline all-columns view for those.
+        let native_merge_view = self.native_merge()
+            && fdecl.subtype == FunctionSubtype::Constructor
+            && fdecl.resolved_schema.output().is_eq_sort()
+            && !schema.input.is_empty()
+            && !self.egraph.proof_state.proofs_enabled;
+        if native_merge_view {
+            self.egraph
+                .proof_state
+                .native_merge_views
+                .insert(view_name.clone());
+        }
+
         let delete_rule = self.delete_and_subsume(fdecl);
         let to_delete_name = self.delete_name(&fdecl.name);
         let subsumed_name = self.subsumed_name(&fdecl.name);
@@ -811,9 +892,23 @@ impl<'a> ProofInstrumentor<'a> {
         if fdecl.internal_let {
             view_flags.push_str(" :internal-let");
         }
-        let view_decl = format!(
-            "(function {view_name} ({view_sorts}) {proof_type} :merge old :internal-term-constructor {name}{view_flags})"
-        );
+        // Native-merge view declaration (the flag + `native_merge_views` insert
+        // happened earlier so the view helpers above already used the FD forms).
+        let view_decl = if native_merge_view {
+            // FD view: inputs are the children (`in_sorts`), output is the eclass
+            // (`out_type`). The `:merge old` is a placeholder — lowering substitutes
+            // `MergeFn::UnionId` by name (see `lib.rs`). The view's columns are
+            // unchanged (`children..., eclass`); only the FD key shrinks (children,
+            // not all columns) and the output column becomes the eclass instead of
+            // the Unit/proof slot.
+            format!(
+                "(function {view_name} ({in_sorts}) {out_type} :merge old :internal-term-constructor {name}{view_flags})"
+            )
+        } else {
+            format!(
+                "(function {view_name} ({view_sorts}) {proof_type} :merge old :internal-term-constructor {name}{view_flags})"
+            )
+        };
         self.parse_program(&format!(
             "
             (sort {fresh_sort})
@@ -1089,7 +1184,6 @@ impl<'a> ProofInstrumentor<'a> {
         let view_name = self.view_name(&fdecl.name);
         let child = |i: usize| format!("c{i}_");
         let children_vec: Vec<String> = (0..types.len()).map(child).collect();
-        let children = ListDisplay(&children_vec, " ").to_string();
 
         // Canonicalized children: eq-sort columns wrapped in `@canon_S`,
         // non-eq-sort columns left as-is. (For non-eq columns `@canon`
@@ -1160,13 +1254,15 @@ impl<'a> ProofInstrumentor<'a> {
                 // Onchange row columns:
                 // (write_lhs write_rhs lhs_leader rhs_leader new_leader displaced).
                 let rule_name = self.egraph.parser.symbol_gen.fresh("rebuild_rule");
+                let view_atom = self.view_body_atom(&fdecl.name, &children_vec);
+                let view_del = self.view_delete(&fdecl.name, &children_vec);
                 rules.push_str(&format!(
                     "(rule (({uf_change_rel} _wl_ _wr_ _ll_ _rl_ _nl_ disp_)
-                        ({view_name} {children})
+                        {view_atom}
                         (= {cj} disp_)
                         {guard})
                        ({updated_view}
-                        (delete ({view_name} {children})))
+                        {view_del})
                         :ruleset {rebuilding_ruleset} :name \"{rule_name}\")\n"
                 ));
 
@@ -1380,11 +1476,21 @@ impl<'a> ProofInstrumentor<'a> {
                 new_args.push(v.to_string());
 
                 let view_name = self.view_name(head.name());
-                let args_str = ListDisplay(new_args, " ");
 
-                // View is always a function; query it and bind the output
-                let proof_var = self.fresh_var();
-                res.push(format!("(= {proof_var} ({view_name} {args_str}))"));
+                // Native-merge FD view (`(children) -> eclass`): the eclass IS the
+                // function output, so query it as `(= eclass (@view children))`
+                // (binding `v`) — there is no separate Unit/proof output column.
+                // The baseline all-columns view binds a fresh proof_var as output.
+                let proof_var = if self.is_native_merge_view(&view_name) {
+                    res.push(self.view_body_atom(head.name(), &new_args));
+                    // No proof column on an FD view; proofs are off in native-merge.
+                    "()".to_string()
+                } else {
+                    let args_str = ListDisplay(&new_args, " ");
+                    let proof_var = self.fresh_var();
+                    res.push(format!("(= {proof_var} ({view_name} {args_str}))"));
+                    proof_var
+                };
 
                 if self.egraph.proof_state.proofs_enabled {
                     let mut proof = proof_var;
@@ -1522,14 +1628,24 @@ impl<'a> ProofInstrumentor<'a> {
 
                         let fv = self.fresh_var();
                         let view_name = self.view_name(&func_type.name);
-                        let args_str = ListDisplay(new_args, " ");
 
                         let proof = {
-                            // View is always a function; query it and bind the output
-                            let view_proof_var = self.fresh_var();
-                            res.push(format!(
-                                "(= {view_proof_var} ({view_name} {args_str} {fv}))"
-                            ));
+                            // Native-merge FD view: the eclass is the output, so
+                            // query `(= fv (@view children))` (binding `fv`); there
+                            // is no proof column. Baseline view binds a Unit proof.
+                            let view_proof_var = if self.is_native_merge_view(&view_name) {
+                                let mut cols = new_args.clone();
+                                cols.push(fv.clone());
+                                res.push(self.view_body_atom(&func_type.name, &cols));
+                                "()".to_string()
+                            } else {
+                                let args_str = ListDisplay(&new_args, " ");
+                                let view_proof_var = self.fresh_var();
+                                res.push(format!(
+                                    "(= {view_proof_var} ({view_name} {args_str} {fv}))"
+                                ));
+                                view_proof_var
+                            };
                             if self.proofs_enabled() {
                                 let mut proof = view_proof_var;
                                 for (i, arg_proof) in arg_proofs.into_iter().enumerate() {
@@ -1754,7 +1870,56 @@ impl<'a> ProofInstrumentor<'a> {
     /// View is always a function (returning Proof or Unit).
     fn update_view(&mut self, fname: &str, args: &[String], proof: &str) -> String {
         let view_name = self.view_name(fname);
+        // Native-merge FD view: keyed on children, eclass is the function OUTPUT.
+        // `args` is `children..., eclass`; emit `(set (@FView children) eclass)`
+        // (the Unit `proof` slot is dropped — there is no proof in native-merge,
+        // term mode only). On an FD conflict the UnionId merge unions the two
+        // eclasses, doing congruence inline.
+        if self.is_native_merge_view(&view_name) {
+            let (eclass, children) = args
+                .split_last()
+                .expect("native-merge view row has columns");
+            return format!(
+                "(set ({view_name} {}) {eclass})",
+                ListDisplay(children, " ")
+            );
+        }
         format!("(set ({view_name} {}) {proof})", ListDisplay(args, " "))
+    }
+
+    /// Body atom that matches a whole view row, binding every column.
+    ///
+    /// - Baseline (all-columns-key) view: the flat atom `(@FView c0 .. cN)` where
+    ///   the trailing column is the Unit/proof output; `cols` is every column.
+    /// - Native-merge FD view (`(children) -> eclass`): the function-output form
+    ///   `(= eclass (@FView children))` (egglog rejects the flat atom for a
+    ///   function — the output must be bound via `(= out (f inputs))`); `cols` is
+    ///   `children..., eclass`.
+    fn view_body_atom(&mut self, fname: &str, cols: &[String]) -> String {
+        let view_name = self.view_name(fname);
+        if self.is_native_merge_view(&view_name) {
+            let (eclass, children) = cols
+                .split_last()
+                .expect("native-merge view row has columns");
+            format!("(= {eclass} ({view_name} {}))", ListDisplay(children, " "))
+        } else {
+            format!("({view_name} {})", ListDisplay(cols, " "))
+        }
+    }
+
+    /// `(delete (@FView ...))` for a whole view row. For a native-merge FD view the
+    /// delete is keyed on the children only (`(delete (@FView children))`); for the
+    /// baseline view it lists every column. `cols` is `children..., eclass`.
+    fn view_delete(&mut self, fname: &str, cols: &[String]) -> String {
+        let view_name = self.view_name(fname);
+        let key = if self.is_native_merge_view(&view_name) {
+            cols.split_last()
+                .expect("native-merge view row has columns")
+                .1
+        } else {
+            cols
+        };
+        format!("(delete ({view_name} {}))", ListDisplay(key, " "))
     }
 
     /// Canonicalize-at-creation for a single eq-sort argument of sort `sort`:

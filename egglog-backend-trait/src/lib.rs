@@ -295,6 +295,16 @@ pub trait Backend: Send + Sync {
     /// rebuild; the dataflow/SQL backends drive their own host-pass rebuild.
     fn register_nativerb_view(&mut self, _uf_func: FunctionId, _view_func: FunctionId) {}
 
+    /// `--native-merge` (term-encoding native-UF, non-proof): associate an
+    /// FD-keyed constructor view (`view_func`, keyed `(children) -> eclass`) with
+    /// the union-find (`uf_func`) that owns its eclass (OUTPUT) column. The view's
+    /// `MergeFn::UnionId` merge then injects a union into this UF on an FD conflict
+    /// (same children, two eclasses) — congruence done INLINE at insert time
+    /// instead of by a self-join rule. The frontend calls this before each run for
+    /// each not-yet-registered native-merge view. Default no-op: only backends
+    /// that inject the union on FD-conflict (currently FlowLog) implement it.
+    fn register_native_merge_view(&mut self, _uf_func: FunctionId, _view_func: FunctionId) {}
+
     /// Register a union-find-backed function (see upstream PR #782).
     ///
     /// The function has schema `(S) S` for an EqSort `S` and records leader

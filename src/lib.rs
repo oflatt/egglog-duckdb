@@ -850,6 +850,17 @@ impl EGraph {
         self
     }
 
+    /// Enable native-merge mode (`--native-merge`): a constructor's view becomes
+    /// an FD view `(children) -> eclass` with a side-effecting `MergeFn::UnionId`
+    /// merge that unions the two eclasses on an FD conflict (congruence inline at
+    /// insert time), and the `@congruence_rule*` self-join rule is not emitted.
+    /// Requires native-UF (the injected union edge goes into the in-core
+    /// union-find); the caller must also enable `with_native_uf`. Term mode only.
+    pub fn with_native_merge(mut self) -> Self {
+        self.proof_state.native_merge = true;
+        self
+    }
+
     /// Enable the fast-rebuild encoding mode on this e-graph (the
     /// `--fast-rebuild` flag) for the native bridge. Drops the always-empty
     /// `δview ⋈ uf_old` rebuild term: relationally, the rebuild rule's view
@@ -1194,12 +1205,23 @@ impl EGraph {
                             FunctionSubtype::Custom => DefaultVal::Fail,
                         }
                     },
-                    merge: match decl.subtype {
-                        FunctionSubtype::Constructor => MergeFn::UnionId,
-                        FunctionSubtype::Custom => match &decl.merge {
-                            None => MergeFn::AssertEq,
-                            Some(expr) => self.translate_expr_to_mergefn(expr)?,
-                        },
+                    // Native-merge (`--native-merge`): the encoder declares a
+                    // CONSTRUCTOR's `@<F>View` FD-keyed `(children) -> eclass` as a
+                    // plain `function` (Custom subtype, no fresh-id minting) but
+                    // records its name here so the backing table gets the
+                    // side-effecting `MergeFn::UnionId` merge — congruence done
+                    // inline at FD-conflict instead of by a self-join rule. Checked
+                    // first so it overrides the Custom `:merge` placeholder.
+                    merge: if self.proof_state.native_merge_views.contains(&*decl.name) {
+                        MergeFn::UnionId
+                    } else {
+                        match decl.subtype {
+                            FunctionSubtype::Constructor => MergeFn::UnionId,
+                            FunctionSubtype::Custom => match &decl.merge {
+                                None => MergeFn::AssertEq,
+                                Some(expr) => self.translate_expr_to_mergefn(expr)?,
+                            },
+                        }
                     },
                     name: decl.name.to_string(),
                     can_subsume,
@@ -1299,6 +1321,41 @@ impl EGraph {
             let uf_id = self.functions[&uf_name].backend_id;
             self.backend.register_nativerb_view(uf_id, view_id);
             self.proof_state.nativerb_registered.insert(view_name);
+        }
+    }
+
+    /// Native-merge (`--native-merge`): tell the backend, for each FD-keyed
+    /// constructor view (`(children) -> eclass`), which union-find its eclass
+    /// (OUTPUT) column belongs to, so the view's `MergeFn::UnionId` merge can
+    /// inject the union on an FD conflict. Run before every `(run ...)` (like
+    /// `register_nativerb_views`) so views declared between runs are registered.
+    /// The backend records the view -> UF association and uses it in the merge.
+    fn register_native_merge_views(&mut self) {
+        let mut to_register: Vec<(String, egglog_bridge::FunctionId, String)> = Vec::new();
+        for func in self.functions.values() {
+            let view_name = func.decl.name.to_string();
+            if !self.proof_state.native_merge_views.contains(&view_name) {
+                continue;
+            }
+            if self
+                .proof_state
+                .native_merge_registered
+                .contains(&view_name)
+            {
+                continue;
+            }
+            // The eclass is the view's OUTPUT column; union into its sort's UF.
+            let out_sort = func.decl.schema.output.clone();
+            if let Some(uf_name) = self.proof_state.uf_function.get(&out_sort)
+                && let Some(uf_func) = self.functions.get(uf_name)
+            {
+                to_register.push((uf_func.name().to_string(), func.backend_id, view_name));
+            }
+        }
+        for (uf_name, view_id, view_name) in to_register {
+            let uf_id = self.functions[&uf_name].backend_id;
+            self.backend.register_native_merge_view(uf_id, view_id);
+            self.proof_state.native_merge_registered.insert(view_name);
         }
     }
 
@@ -2152,6 +2209,9 @@ impl EGraph {
                 // union-bearing ones.
                 if self.proof_state.nativerb {
                     self.register_nativerb_views();
+                }
+                if self.proof_state.native_merge {
+                    self.register_native_merge_views();
                 }
                 if let Some((view, sorts)) = &self.proof_state.nativerb_mixed_sort_view {
                     return Err(Error::BackendError(format!(

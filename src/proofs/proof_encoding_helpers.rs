@@ -419,6 +419,26 @@ impl ProofInstrumentor<'_> {
         self.egraph.proof_state.fast_rebuild
     }
 
+    /// True when native-merge mode is active (`--native-merge`). A CONSTRUCTOR's
+    /// view becomes an FD view `(children) -> eclass` with a UnionId merge that
+    /// does congruence inline at insert time; the `@congruence_rule*` self-join is
+    /// not emitted. Only ever set alongside `native_uf()` in non-proof term mode
+    /// (the injected union edge goes into the in-core union-find). See
+    /// [`EncodingState::native_merge`].
+    pub(crate) fn native_merge(&self) -> bool {
+        self.egraph.proof_state.native_merge
+    }
+
+    /// True when `view_name` is a native-merge FD view (keyed on children, eclass
+    /// as the function output, UnionId merge). Consulted by `update_view` /
+    /// `query_view_and_get_proof` to choose the `(children) -> eclass` form.
+    pub(crate) fn is_native_merge_view(&self, view_name: &str) -> bool {
+        self.egraph
+            .proof_state
+            .native_merge_views
+            .contains(view_name)
+    }
+
     /// True when native-engine-rebuild mode is active (`--nativerb`). Suppresses
     /// the `@rebuild_rule*` rebuild rules; the engine's native table rebuild
     /// re-canonicalizes the views instead (see `EncodingState::nativerb`). Only

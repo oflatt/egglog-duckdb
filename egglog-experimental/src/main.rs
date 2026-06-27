@@ -23,9 +23,13 @@ fn main() {
     // `--native-uf` (PR #782) so the duckdb egraph is built in native-UF mode
     // when either is set — otherwise the `--native-uf` encoding would emit
     // UF-backed functions against a relational duckdb backend.
+    // `--native-merge` does congruence inline via the backend's UnionId merge and
+    // injects the union edge into the in-core union-find, so it REQUIRES native-UF
+    // — provision the backend in native-UF mode when it is set (mirrors cli.rs's
+    // `args.native_uf = true` fold for `--native-merge`).
     let want_native_uf = argv
         .iter()
-        .any(|a| a == "--duck-native-uf" || a == "--native-uf");
+        .any(|a| a == "--duck-native-uf" || a == "--native-uf" || a == "--native-merge");
     // `--fast-rebuild` engages the duckdb backend's delta-scoped rebuild; the
     // pre-built duckdb egraph must carry it so the flag survives cli.rs's
     // short-circuit (mirror `want_native_uf`).
