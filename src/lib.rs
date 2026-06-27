@@ -1266,14 +1266,52 @@ impl EGraph {
                     // native-UF mode, since the sort is declared before its
                     // constructors), fall back to the global `UnionId`.
                     merge: if self.proof_state.native_merge_views.contains(&*decl.name) {
-                        match self
+                        let uf_id = self
                             .proof_state
                             .uf_function
                             .get(&decl.schema.output)
                             .and_then(|uf_name| self.functions.get(uf_name))
-                        {
-                            Some(uf_func) => MergeFn::UnionIntoUf(uf_func.backend_id),
-                            None => MergeFn::UnionId,
+                            .map(|uf_func| uf_func.backend_id);
+                        if self.proof_state.proofs_enabled {
+                            // A2 PROOF-mode native-merge view: TUPLE output
+                            // `(children) -> (eclass, proof)` (col0=eclass,
+                            // col1=proof). The per-column merge does congruence
+                            // INLINE: `UnionIntoUfWithProof` composes the
+                            // congruence edge proof `Trans(larger_pf,
+                            // Sym(smaller_pf))` into the proof-mode `@UF_Sf` (the
+                            // same edge `@congruence_rule*` would have written) and
+                            // returns the surviving (min) eclass; `EclassMinProof`
+                            // keeps the min eclass's view proof. The proof
+                            // constructors must exist (declared with the Proof
+                            // datatype before any constructor's view).
+                            let uf = uf_id.expect(
+                                "native-merge proof view requires the output sort's @UF_Sf \
+                                 (declared before its constructors in native-UF mode)",
+                            );
+                            let trans = self.functions
+                                [&self.proof_state.proof_names.eq_trans_constructor]
+                                .backend_id;
+                            let sym = self.functions
+                                [&self.proof_state.proof_names.eq_sym_constructor]
+                                .backend_id;
+                            MergeFn::Columns(vec![
+                                MergeFn::UnionIntoUfWithProof {
+                                    uf,
+                                    trans,
+                                    sym,
+                                    eclass_col: 0,
+                                    proof_col: 1,
+                                },
+                                MergeFn::EclassMinProof {
+                                    eclass_col: 0,
+                                    proof_col: 1,
+                                },
+                            ])
+                        } else {
+                            match uf_id {
+                                Some(uf_id) => MergeFn::UnionIntoUf(uf_id),
+                                None => MergeFn::UnionId,
+                            }
                         }
                     } else {
                         match decl.subtype {

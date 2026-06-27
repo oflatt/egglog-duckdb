@@ -871,9 +871,20 @@ impl CoreAction {
             }
             CoreAction::Change(span, _change, head, args) => {
                 let mut args = args.clone();
-                // Add a dummy last output argument
-                let var = symbol_gen.fresh(head);
-                args.push(AtomTerm::Var(span.clone(), var));
+                // `delete`/`subsume` are keyed on the function's INPUT columns; the
+                // output column(s) are not provided. Add one dummy per output so
+                // the atom-application arity check (`input.len() + num_outputs()`)
+                // is satisfied. A tuple-output function (e.g. the A2 native-merge
+                // proof view `(children) -> (eclass, proof)`) has `num_outputs() >
+                // 1`, so it needs that many dummies.
+                let num_outputs = typeinfo
+                    .get_func_type(head)
+                    .map(|t| t.num_outputs())
+                    .unwrap_or(1);
+                for _ in 0..num_outputs {
+                    let var = symbol_gen.fresh(head);
+                    args.push(AtomTerm::Var(span.clone(), var));
+                }
 
                 Ok(get_literal_and_global_constraints(&args, typeinfo)
                     .chain(get_atom_application_constraints(

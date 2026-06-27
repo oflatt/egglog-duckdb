@@ -753,11 +753,23 @@ impl EGraph {
     }
 
     fn typecheck_command(&mut self, command: &NCommand) -> Result<ResolvedNCommand, TypeError> {
+        // A2: the encoder-minted native-merge PROOF view is the one and only
+        // tuple-output `term_constructor` view we permit (typechecking otherwise
+        // rejects tuple outputs for views). Discriminate it precisely by its
+        // `native_merge_views` membership (recorded by the encoder before it
+        // declares the view), passed into `typecheck_function` so user-written
+        // tuple constructors/views stay rejected.
+        let native_merge_view = match command {
+            NCommand::Function(fdecl) => self.proof_state.native_merge_views.contains(&fdecl.name),
+            _ => false,
+        };
         let symbol_gen = &mut self.parser.symbol_gen;
 
         let command: ResolvedNCommand = match command {
             NCommand::Function(fdecl) => {
-                let resolved = self.type_info.typecheck_function(symbol_gen, fdecl)?;
+                let resolved =
+                    self.type_info
+                        .typecheck_function(symbol_gen, fdecl, native_merge_view)?;
                 // If this is a let binding, add it to global_sorts
                 // This preserves bahavior for lets after desugaring
                 if resolved.internal_let {
@@ -1128,6 +1140,10 @@ impl TypeInfo {
         &mut self,
         symbol_gen: &mut SymbolGen,
         fdecl: &FunctionDecl,
+        // A2: true only for the encoder-minted native-merge PROOF view, which is
+        // permitted to be a tuple-output `term_constructor` view (otherwise
+        // rejected). Discriminated by the caller via `native_merge_views`.
+        is_native_merge_proof_view: bool,
     ) -> Result<ResolvedFunctionDecl, TypeError> {
         if self.sorts.contains_key(&fdecl.name) {
             return Err(TypeError::SortAlreadyBound(
@@ -1244,7 +1260,15 @@ impl TypeInfo {
         // Tuple outputs are only meaningful for custom functions (which carry a functional
         // dependency from keys to a tuple of values). Constructors and view tables mint/track a
         // single e-class id.
+        //
+        // A2 EXCEPTION: the encoder-minted native-merge PROOF view IS a
+        // tuple-output `term_constructor` view — `(children) -> (eclass, Proof)`
+        // with a `Columns([UnionIntoUfWithProof, EclassMinProof])` merge that does
+        // congruence inline. It is permitted here (and ONLY here, keyed on
+        // `is_native_merge_proof_view`); user-written tuple constructors/views are
+        // still rejected.
         if is_tuple
+            && !is_native_merge_proof_view
             && (fdecl.subtype == FunctionSubtype::Constructor || fdecl.term_constructor.is_some())
         {
             return Err(TypeError::TupleOutputNotAllowed(

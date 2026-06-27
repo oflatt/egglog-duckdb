@@ -440,13 +440,31 @@ impl ProofInstrumentor<'_> {
     }
 
     /// True when `view_name` is a native-merge FD view (keyed on children, eclass
-    /// as the function output, UnionId merge). Consulted by `update_view` /
-    /// `query_view_and_get_proof` to choose the `(children) -> eclass` form.
+    /// as the function output). Consulted by `update_view` /
+    /// `query_view_and_get_proof` to choose the FD `(children) -> ...` form.
+    ///
+    /// TERM mode: a single-output `(children) -> eclass` view with a `UnionId` /
+    /// `UnionIntoUf` merge (congruence inline at FD-conflict).
+    /// PROOF mode: a TUPLE-output `(children) -> (eclass, Proof)` view with a
+    /// `Columns([UnionIntoUfWithProof, EclassMinProof])` merge — the merge both
+    /// composes the congruence edge proof into `@UF_Sf` and keeps the surviving
+    /// (min) eclass's view proof. See `is_native_merge_proof_view`.
     pub(crate) fn is_native_merge_view(&self, view_name: &str) -> bool {
         self.egraph
             .proof_state
             .native_merge_views
             .contains(view_name)
+    }
+
+    /// True when `view_name` is a native-merge FD view AND proofs are enabled —
+    /// i.e. the TUPLE-output `(children) -> (eclass, Proof)` proof view (A2). Its
+    /// row carries an extra trailing `Proof` output column (the view proof,
+    /// proving `eclass = f(children)`); the merge does congruence inline via
+    /// `MergeFn::Columns([UnionIntoUfWithProof, EclassMinProof])`. Consulted by
+    /// the view set/query/delete sites to emit the `(values eclass proof)`
+    /// destructure/construct forms.
+    pub(crate) fn is_native_merge_proof_view(&self, view_name: &str) -> bool {
+        self.proofs_enabled() && self.is_native_merge_view(view_name)
     }
 
     /// True when native-engine-rebuild mode is active (`--nativerb`). Suppresses

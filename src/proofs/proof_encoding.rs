@@ -579,6 +579,29 @@ impl<'a> ProofInstrumentor<'a> {
         cols.push("out".to_string());
         let view_atom = self.view_body_atom(&fdecl.name, &cols);
         let view_del = self.view_delete(&fdecl.name, &cols);
+
+        let delete_rule = format!(
+            "(rule (({to_delete_name} {child_names})
+                    {view_atom})
+                   ({view_del}
+                    (delete ({to_delete_name} {child_names})))
+                    :ruleset {delete_subsume_ruleset}
+                    :name \"{fresh_name}\")"
+        );
+
+        // A2 LIMITATION: the native-merge PROOF view is a TUPLE-output function
+        // `(children) -> (eclass, proof)`. The backend `subsume` operation
+        // (`rule.rs`) is written for single-output functions (it asserts
+        // `entries.len() + 1 == schema.len()` and writes one ret_val), so a
+        // children-keyed subsume of a 2-output view fails at rule-build time. No
+        // proof workload exercises subsume, so we simply do NOT emit the subsume
+        // rule for this view — `(subsume ...)` is inert under
+        // `--proofs --native-merge`. (Term-mode native-merge and the baseline
+        // proof view keep full subsume support.)
+        if self.is_native_merge_proof_view(&view_name) {
+            return delete_rule;
+        }
+
         let view_subsume = if self.is_native_merge_view(&view_name) {
             format!("(subsume ({view_name} {child_names}))")
         } else {
@@ -586,12 +609,7 @@ impl<'a> ProofInstrumentor<'a> {
         };
 
         format!(
-            "(rule (({to_delete_name} {child_names})
-                    {view_atom})
-                   ({view_del}
-                    (delete ({to_delete_name} {child_names})))
-                    :ruleset {delete_subsume_ruleset}
-                    :name \"{fresh_name}\")
+            "{delete_rule}
              (rule (({subsumed_name} {child_names})
                     {view_atom})
                    ({view_subsume})
@@ -788,15 +806,19 @@ impl<'a> ProofInstrumentor<'a> {
             && fdecl.resolved_schema.output().is_eq_sort()
             && !fdecl.schema.input.is_empty()
         {
-            // Native-merge: congruence is done INLINE by the FD view's UnionId
-            // merge (same children + different eclass => union the eclasses at
-            // insert time). The separate `@congruence_rule*` self-join rule is
-            // therefore NOT emitted — this is the rule deletion that makes
-            // native-merge faster than the rule-encoded congruence. Mirrors the
+            // Native-merge: congruence is done INLINE by the FD view's merge
+            // (same children + different eclass => union the eclasses at insert
+            // time). The separate `@congruence_rule*` self-join rule is therefore
+            // NOT emitted — this is the rule deletion that makes native-merge
+            // faster than the rule-encoded congruence. Mirrors the
             // `native_merge_view` gate in `term_and_view` (constructor, eq-sort
-            // output, non-empty inputs, non-proof term mode — `native_merge()` is
-            // only ever set then). 0-input constructors keep the congruence rule
-            // (their view stays the baseline all-columns form).
+            // output, non-empty inputs). In TERM mode the merge is
+            // `UnionId`/`UnionIntoUf`; in PROOF mode (A2) it is
+            // `Columns([UnionIntoUfWithProof, EclassMinProof])`, which ALSO
+            // composes the same `Trans(larger_pf, Sym(smaller_pf))` edge proof
+            // the dropped `@congruence_rule*` would have written into `@UF_Sf`.
+            // 0-input constructors keep the congruence rule (their view stays the
+            // baseline all-columns form).
             String::new()
         } else {
             self.handle_congruence(fdecl, &child_names, &rebuilding_ruleset)
@@ -832,11 +854,16 @@ impl<'a> ProofInstrumentor<'a> {
         // and extraction (reconstructing a term from its input columns) reject —
         // and congruence is trivial there anyway (one term, no children to match).
         // Keep the baseline all-columns view for those.
+        // A2: the native-merge FD view is now emitted in PROOF mode too, as a
+        // TUPLE-output `(children) -> (eclass, Proof)` view whose
+        // `Columns([UnionIntoUfWithProof, EclassMinProof])` merge does congruence
+        // inline (composing the same `Trans(larger_pf, Sym(smaller_pf))` edge
+        // proof the `@congruence_rule*` self-join would). The `proofs_enabled`
+        // case is discriminated downstream via `is_native_merge_proof_view`.
         let native_merge_view = self.native_merge()
             && fdecl.subtype == FunctionSubtype::Constructor
             && fdecl.resolved_schema.output().is_eq_sort()
-            && !schema.input.is_empty()
-            && !self.egraph.proof_state.proofs_enabled;
+            && !schema.input.is_empty();
         if native_merge_view {
             self.egraph
                 .proof_state
@@ -895,15 +922,29 @@ impl<'a> ProofInstrumentor<'a> {
         // Native-merge view declaration (the flag + `native_merge_views` insert
         // happened earlier so the view helpers above already used the FD forms).
         let view_decl = if native_merge_view {
-            // FD view: inputs are the children (`in_sorts`), output is the eclass
-            // (`out_type`). The `:merge old` is a placeholder — lowering substitutes
-            // `MergeFn::UnionId` by name (see `lib.rs`). The view's columns are
-            // unchanged (`children..., eclass`); only the FD key shrinks (children,
-            // not all columns) and the output column becomes the eclass instead of
-            // the Unit/proof slot.
-            format!(
-                "(function {view_name} ({in_sorts}) {out_type} :merge old :internal-term-constructor {name}{view_flags})"
-            )
+            if self.egraph.proof_state.proofs_enabled {
+                // A2 PROOF-mode FD view: TUPLE output `(children) -> (eclass,
+                // Proof)`. The eclass column collapses congruence inline and the
+                // Proof column carries the view proof (`eclass = f(children)`).
+                // The `:merge (values old0 old1)` is a placeholder — lowering
+                // substitutes `MergeFn::Columns([UnionIntoUfWithProof,
+                // EclassMinProof])` by name (see `lib.rs`). It is a tuple-output
+                // `term_constructor` view (normally rejected by typechecking); the
+                // encoder-internal exception is keyed on `native_merge_views`.
+                format!(
+                    "(function {view_name} ({in_sorts}) ({out_type} {proof_type}) :merge (values old0 old1) :internal-term-constructor {name}{view_flags})"
+                )
+            } else {
+                // TERM-mode FD view: single output `(children) -> eclass`. The
+                // `:merge old` is a placeholder — lowering substitutes
+                // `MergeFn::UnionId`/`UnionIntoUf` by name (see `lib.rs`). The
+                // view's columns are unchanged (`children..., eclass`); only the
+                // FD key shrinks (children, not all columns) and the output
+                // column becomes the eclass instead of the Unit/proof slot.
+                format!(
+                    "(function {view_name} ({in_sorts}) {out_type} :merge old :internal-term-constructor {name}{view_flags})"
+                )
+            }
         } else {
             format!(
                 "(function {view_name} ({view_sorts}) {proof_type} :merge old :internal-term-constructor {name}{view_flags})"
@@ -1367,10 +1408,8 @@ impl<'a> ProofInstrumentor<'a> {
         fdecl: &ResolvedFunctionDecl,
         types: &[ArcSort],
     ) -> Vec<Command> {
-        let view_name = self.view_name(&fdecl.name);
         let child = |i: usize| format!("c{i}_");
         let children_vec: Vec<String> = (0..types.len()).map(child).collect();
-        let children = ListDisplay(&children_vec, " ").to_string();
         let rebuilding_ruleset = self.proof_names().rebuilding_ruleset_name.clone();
         let eq_trans_constructor = self.proof_names().eq_trans_constructor.clone();
         let congr_constructor = self.proof_names().congr_constructor.clone();
@@ -1415,6 +1454,10 @@ impl<'a> ProofInstrumentor<'a> {
                 };
 
                 let updated_view = self.update_view(&fdecl.name, &children_updated, &new_proof);
+                // Retract the stale row. For the FD tuple proof view this is
+                // keyed on children-only (`view_delete` drops the eclass column);
+                // for the baseline view it lists every column.
+                let view_del = self.view_delete(&fdecl.name, &children_vec);
 
                 // Guard: column `j` must actually be stale w.r.t. *this* leader
                 // change (`cj != nl_`); otherwise the onchange proof `pf_`
@@ -1427,7 +1470,7 @@ impl<'a> ProofInstrumentor<'a> {
                             (guard (bool-!= {cj} nl_)))
                            ({proof_code}
                             {updated_view}
-                            (delete ({view_name} {children})))
+                            {view_del})
                             :ruleset {rebuilding_ruleset} :name \"{rule_name}\")\n"
                 ));
             }
@@ -1630,10 +1673,20 @@ impl<'a> ProofInstrumentor<'a> {
                         let view_name = self.view_name(&func_type.name);
 
                         let proof = {
-                            // Native-merge FD view: the eclass is the output, so
-                            // query `(= fv (@view children))` (binding `fv`); there
-                            // is no proof column. Baseline view binds a Unit proof.
-                            let view_proof_var = if self.is_native_merge_view(&view_name) {
+                            // Native-merge FD PROOF view (A2): TUPLE output, so
+                            // destructure `(= (values fv pf) (@view children))`,
+                            // binding the eclass `fv` AND the view proof `pf`.
+                            let view_proof_var = if self.is_native_merge_proof_view(&view_name) {
+                                let mut cols = new_args.clone();
+                                cols.push(fv.clone());
+                                let (query, pf_var) =
+                                    self.query_view_and_get_proof(&func_type.name, &cols);
+                                res.push(query);
+                                pf_var
+                            } else if self.is_native_merge_view(&view_name) {
+                                // Native-merge FD TERM view: the eclass is the
+                                // single output, so query `(= fv (@view children))`
+                                // (binding `fv`); no proof column (proofs off).
                                 let mut cols = new_args.clone();
                                 cols.push(fv.clone());
                                 res.push(self.view_body_atom(&func_type.name, &cols));
@@ -1874,11 +1927,25 @@ impl<'a> ProofInstrumentor<'a> {
     /// View is always a function (returning Proof or Unit).
     fn update_view(&mut self, fname: &str, args: &[String], proof: &str) -> String {
         let view_name = self.view_name(fname);
-        // Native-merge FD view: keyed on children, eclass is the function OUTPUT.
-        // `args` is `children..., eclass`; emit `(set (@FView children) eclass)`
-        // (the Unit `proof` slot is dropped — there is no proof in native-merge,
-        // term mode only). On an FD conflict the UnionId merge unions the two
-        // eclasses, doing congruence inline.
+        // Native-merge PROOF FD view (A2): TUPLE output `(children) -> (eclass,
+        // proof)`. `args` is `children..., eclass`; emit
+        // `(set (@FView children) (values eclass proof))`. On an FD conflict the
+        // `Columns([UnionIntoUfWithProof, EclassMinProof])` merge composes the
+        // congruence edge proof into `@UF_Sf` and keeps the min eclass's proof.
+        if self.is_native_merge_proof_view(&view_name) {
+            let (eclass, children) = args
+                .split_last()
+                .expect("native-merge view row has columns");
+            return format!(
+                "(set ({view_name} {}) (values {eclass} {proof}))",
+                ListDisplay(children, " ")
+            );
+        }
+        // Native-merge TERM FD view: keyed on children, eclass is the function
+        // OUTPUT. `args` is `children..., eclass`; emit
+        // `(set (@FView children) eclass)` (the Unit `proof` slot is dropped —
+        // there is no proof in term-mode native-merge). On an FD conflict the
+        // UnionId merge unions the two eclasses, doing congruence inline.
         if self.is_native_merge_view(&view_name) {
             let (eclass, children) = args
                 .split_last()
@@ -1901,7 +1968,20 @@ impl<'a> ProofInstrumentor<'a> {
     ///   `children..., eclass`.
     fn view_body_atom(&mut self, fname: &str, cols: &[String]) -> String {
         let view_name = self.view_name(fname);
-        if self.is_native_merge_view(&view_name) {
+        if self.is_native_merge_proof_view(&view_name) {
+            // TUPLE-output proof view: destructure `(= (values eclass _pf)
+            // (@FView children))`, binding the eclass column. The proof column is
+            // bound to a fresh throwaway var — callers of `view_body_atom`
+            // (delete/subsume) only need the eclass / row existence.
+            let (eclass, children) = cols
+                .split_last()
+                .expect("native-merge view row has columns");
+            let pf = self.fresh_var();
+            format!(
+                "(= (values {eclass} {pf}) ({view_name} {}))",
+                ListDisplay(children, " ")
+            )
+        } else if self.is_native_merge_view(&view_name) {
             let (eclass, children) = cols
                 .split_last()
                 .expect("native-merge view row has columns");
@@ -2246,6 +2326,20 @@ impl<'a> ProofInstrumentor<'a> {
     fn query_view_and_get_proof(&mut self, fname: &str, args: &[String]) -> (String, String) {
         let view_name = self.view_name(fname);
         let pf_var = self.fresh_var();
+        // TUPLE-output proof view (A2): the eclass and the proof are BOTH outputs,
+        // keyed on the children. `args` is `children..., eclass`; destructure
+        // `(= (values eclass pf_var) (@FView children))`, binding the (already
+        // named) eclass column and the fresh proof var.
+        if self.is_native_merge_proof_view(&view_name) {
+            let (eclass, children) = args
+                .split_last()
+                .expect("native-merge view row has columns");
+            let query = format!(
+                "(= (values {eclass} {pf_var}) ({view_name} {}))",
+                ListDisplay(children, " ")
+            );
+            return (query, pf_var);
+        }
         let query = format!("(= {pf_var} ({view_name} {}))", ListDisplay(args, " "));
         (query, pf_var)
     }
