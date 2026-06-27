@@ -6,9 +6,10 @@ use std::path::Path;
 use crate::{
     EGraph, TypeInfo,
     ast::{
-        Command, Expr, Fact, FunctionSubtype, GenericCommand, ResolvedAction, ResolvedCommand,
-        ResolvedExpr, ResolvedFunctionDecl, Schedule,
+        Command, Expr, Fact, FunctionSubtype, GenericCommand, GenericExpr, ResolvedAction,
+        ResolvedCommand, ResolvedExpr, ResolvedFunctionDecl, Schedule,
     },
+    core::ResolvedCall,
     proofs::proof_encoding::ProofInstrumentor,
     util::{FreshGen, HashMap, SymbolGen},
 };
@@ -437,6 +438,51 @@ impl ProofInstrumentor<'_> {
     /// [`EncodingState::native_merge`].
     pub(crate) fn native_merge(&self) -> bool {
         self.egraph.proof_state.native_merge
+    }
+
+    /// True when a CUSTOM `:merge` function's merge body is a pure VALUE-FOLD: a
+    /// fold of PRIMITIVES / literals over `old`/`new` that yields a value, with
+    /// NO constructor / function calls (no e-node creation). Such a merge can run
+    /// natively in the backend's FD-conflict merge callback (lowered to a
+    /// `MergeFn` tree of `Primitive`/`Const`/`Old`/`New`), so we can drop the
+    /// rule-encoded `@merge_rule` + `@merge_cleanup` and FD-key the view on its
+    /// children with the fold as the merge.
+    ///
+    /// A `ResolvedCall::Func` anywhere in the body disqualifies it: a constructor
+    /// call CREATES an e-node (needs `add_term_and_view`'s fresh-id + term/view
+    /// rows + congruence threading, which cannot run inside a merge callback —
+    /// TERM-BUILDING), and a non-constructor function call would need a mid-merge
+    /// table lookup. Both stay rule-encoded. `Values` (tuple merge) is allowed
+    /// only if every column is itself a value-fold.
+    pub(crate) fn merge_is_value_fold(expr: &ResolvedExpr) -> bool {
+        match expr {
+            GenericExpr::Lit(..) => true,
+            GenericExpr::Var(..) => true,
+            GenericExpr::Call(_, ResolvedCall::Func(_), _) => false,
+            GenericExpr::Call(_, ResolvedCall::Primitive(_), args)
+            | GenericExpr::Call(_, ResolvedCall::Values(_), args) => {
+                args.iter().all(Self::merge_is_value_fold)
+            }
+        }
+    }
+
+    /// True when this custom-`:merge` function should run its merge NATIVELY as a
+    /// value-fold instead of via the rule-encoded `@merge_rule`/`@merge_cleanup`.
+    ///
+    /// Gated narrowly: native-merge on, term (NOT proof) mode, the backend can run
+    /// a complex merge callback (`supports_complex_merge()` — bridge only), the
+    /// function is a custom `:merge` whose body is a value-fold, AND the output
+    /// sort is NOT an eq-sort (a value-fold yields a plain value; an eq-sort
+    /// output would imply e-node creation and is handled by congruence/term
+    /// rules). Everything outside this predicate keeps the existing rule encoding
+    /// byte-identical.
+    pub(crate) fn native_value_fold_merge(&self, fdecl: &ResolvedFunctionDecl) -> bool {
+        self.native_merge()
+            && !self.egraph.proof_state.proofs_enabled
+            && self.egraph.backend.supports_complex_merge()
+            && fdecl.subtype == FunctionSubtype::Custom
+            && !fdecl.resolved_schema.output().is_eq_sort()
+            && fdecl.merge.as_ref().is_some_and(Self::merge_is_value_fold)
     }
 
     /// True when `view_name` is a native-merge FD view (keyed on children, eclass

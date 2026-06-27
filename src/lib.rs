@@ -1265,7 +1265,23 @@ impl EGraph {
                     // the output sort has no `@UF_Sf` yet (it always does in
                     // native-UF mode, since the sort is declared before its
                     // constructors), fall back to the global `UnionId`.
-                    merge: if self.proof_state.native_merge_views.contains(&*decl.name) {
+                    merge: if let Some(value_merge) =
+                        self.proof_state.native_value_merge_views.get(&*decl.name)
+                    {
+                        // Native VALUE-FOLD custom `:merge` (`--native-merge`,
+                        // term, non-proof, bridge): the encoder declared this
+                        // `@<F>View` FD-keyed `(children) -> value` and stashed the
+                        // function's merge expr here. Lower it to a `MergeFn` tree
+                        // of `Primitive`/`Const`/`Old`/`New` (the value-fold
+                        // classifier guarantees no `Func` calls) so the fold runs
+                        // NATIVELY in the backend's FD-conflict merge callback,
+                        // replacing the rule-encoded `@merge_rule`/`@merge_cleanup`.
+                        // Checked FIRST: a value-fold view is also in
+                        // `native_merge_views` (for the FD set/query/delete forms),
+                        // but it needs the FOLD merge, not the congruence `UnionId`.
+                        let value_merge = value_merge.clone();
+                        self.translate_expr_to_mergefn(&value_merge)?
+                    } else if self.proof_state.native_merge_views.contains(&*decl.name) {
                         let uf_id = self
                             .proof_state
                             .uf_function
@@ -1451,6 +1467,16 @@ impl EGraph {
         for func in self.functions.values() {
             let view_name = func.decl.name.to_string();
             if !self.proof_state.native_merge_views.contains(&view_name) {
+                continue;
+            }
+            // Value-fold views have a primitive (non-eq-sort) output and no UF to
+            // union into; their fold merge is fully self-contained in the backend
+            // table. Skip the view->UF registration for them.
+            if self
+                .proof_state
+                .native_value_merge_views
+                .contains_key(&view_name)
+            {
                 continue;
             }
             if self

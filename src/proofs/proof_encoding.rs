@@ -86,6 +86,22 @@ pub(crate) struct EncodingState {
     /// the view -> output-sort-UF association (so `register_native_merge_views`
     /// registers only the not-yet-registered views before each run).
     pub native_merge_registered: HashSet<String>,
+    /// Native-merge mode only (term, non-proof, bridge): for a CUSTOM `:merge`
+    /// function whose merge body is a pure VALUE-FOLD (only primitives /
+    /// literals / `old` / `new`, no constructor calls — see
+    /// [`ProofInstrumentor::merge_is_value_fold`]), its `@<F>View` is declared
+    /// FD-keyed `(children) -> value` and the fold runs NATIVELY in the backend's
+    /// FD-conflict merge callback instead of via the rule-encoded
+    /// `@merge_rule` + `@merge_cleanup`. This maps such a view name -> the
+    /// (resolved) merge expression, so `declare_function` (lib.rs) can lower it
+    /// to a `MergeFn` tree (via `translate_expr_to_mergefn`) and install it as the
+    /// view table's merge. Membership ALSO routes the value-fold view through the
+    /// FD `(children) -> value` set/query/delete forms (it is added to
+    /// `native_merge_views` too — `is_native_merge_view` covers both the
+    /// constructor-congruence and the value-fold view shapes, which are
+    /// structurally identical: children key, single trailing output). Empty
+    /// unless `--native-merge` on the bridge in term mode.
+    pub native_value_merge_views: HashMap<String, ResolvedExpr>,
     /// Native-engine-rebuild mode (`--nativerb`, native bridge + term-encoding
     /// native-UF + non-proof only). When on, the per-constructor
     /// `@rebuild_rule*` rebuild rules are NOT emitted; instead each `@<F>View`
@@ -198,6 +214,7 @@ impl EncodingState {
             native_merge: false,
             native_merge_views: HashSet::default(),
             native_merge_registered: HashSet::default(),
+            native_value_merge_views: HashMap::default(),
             nativerb: false,
             nativerb_union_sorts: HashSet::default(),
             nativerb_engine_rebuilt_views: HashSet::default(),
@@ -795,6 +812,22 @@ impl<'a> ProofInstrumentor<'a> {
             if fdecl.merge.is_none() {
                 return String::new();
             }
+            // Native VALUE-FOLD custom `:merge` (term, non-proof, bridge): the
+            // merge runs INLINE in the FD view's merge callback (the fold is
+            // lowered to a `MergeFn` in `declare_function`), so the rule-encoded
+            // `@merge_rule` + `@merge_cleanup` are NOT emitted. `term_and_view`
+            // has already recorded this view in `native_value_merge_views` (and
+            // `native_merge_views`, so the FD `(children) -> value` set/query/
+            // delete forms are used). Mirrors the constructor-congruence branch
+            // below — the rule deletion is what makes the native path faster.
+            if self
+                .egraph
+                .proof_state
+                .native_value_merge_views
+                .contains_key(&view_name)
+            {
+                return String::new();
+            }
             self.handle_merge_fn(
                 fdecl,
                 &child_names,
@@ -860,15 +893,37 @@ impl<'a> ProofInstrumentor<'a> {
         // inline (composing the same `Trans(larger_pf, Sym(smaller_pf))` edge
         // proof the `@congruence_rule*` self-join would). The `proofs_enabled`
         // case is discriminated downstream via `is_native_merge_proof_view`.
-        let native_merge_view = self.native_merge()
+        let native_congruence_view = self.native_merge()
             && fdecl.subtype == FunctionSubtype::Constructor
             && fdecl.resolved_schema.output().is_eq_sort()
             && !schema.input.is_empty();
+        // Native VALUE-FOLD custom `:merge` (term, non-proof, bridge): the
+        // function's merge body is a pure fold of primitives over `old`/`new`
+        // (no e-node creation). Its `@<F>View` becomes an FD view
+        // `(children) -> value` whose merge runs the fold NATIVELY at FD-conflict
+        // (lowered to a `MergeFn` tree in `declare_function`), so the rule-encoded
+        // `@merge_rule` + `@merge_cleanup` are dropped. Recorded BEFORE any view
+        // helper runs so `delete_and_subsume` / the rebuild rules / `update_view`
+        // all emit the FD `(children) -> value` forms (same `is_native_merge_view`
+        // shape as the constructor-congruence view). Empty-input functions cannot
+        // be FD-keyed on children-only (a bare `() -> value` view) — they keep the
+        // baseline encoding (one row, no merge to fold). 0-input value-fold merges
+        // are rare; falling back to rules is always correct.
+        let native_value_fold = self.native_value_fold_merge(fdecl) && !schema.input.is_empty();
+        let native_merge_view = native_congruence_view || native_value_fold;
         if native_merge_view {
             self.egraph
                 .proof_state
                 .native_merge_views
                 .insert(view_name.clone());
+        }
+        if native_value_fold {
+            // Stash the (resolved) merge expr so `declare_function` can lower it
+            // to a `MergeFn` and install it as the view table's merge.
+            self.egraph
+                .proof_state
+                .native_value_merge_views
+                .insert(view_name.clone(), fdecl.merge.clone().unwrap());
         }
 
         let delete_rule = self.delete_and_subsume(fdecl);
