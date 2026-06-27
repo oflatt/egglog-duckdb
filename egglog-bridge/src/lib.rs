@@ -599,6 +599,13 @@ impl EGraph {
         // matches the one already baked into the merge.
         let native_merge_target = match &merge {
             MergeFn::UnionIntoUf(uf_func) => Some(*uf_func),
+            // Proof-mode tuple-output view: the UF target is named by the `col0`
+            // `UnionIntoUfWithProof` inside the top-level `Columns`.
+            MergeFn::Columns(cols) => cols.iter().find_map(|c| match c {
+                MergeFn::UnionIntoUf(uf_func) => Some(*uf_func),
+                MergeFn::UnionIntoUfWithProof { uf, .. } => Some(*uf),
+                _ => None,
+            }),
             _ => None,
         };
         let mut read_deps = IndexSet::<TableId>::new();
@@ -1471,6 +1478,20 @@ fn merge_fn_fill_deps(
             // not the global `$uf` — is the write dependency.
             write_deps.insert(egraph.funcs[*uf_func].table);
         }
+        UnionIntoUfWithProof { uf, trans, sym, .. } => {
+            // `--native-merge` PROOF mode: the proof-carrying congruence edge is
+            // staged into the proof-mode `@UF_Sf`, and composing its edge proof
+            // hash-conses `Trans` / `Sym` rows. All three are write deps; the
+            // Trans/Sym tables are also read deps (the `lookup_or_insert`
+            // hash-cons dedup reads them — same dependency shape as the
+            // leader-change callback in `add_uf_function`).
+            write_deps.insert(egraph.funcs[*uf].table);
+            write_deps.insert(egraph.funcs[*trans].table);
+            write_deps.insert(egraph.funcs[*sym].table);
+            read_deps.insert(egraph.funcs[*trans].table);
+            read_deps.insert(egraph.funcs[*sym].table);
+        }
+        EclassMinProof { .. } => {}
         Columns(cols) => {
             cols.iter()
                 .for_each(|col| merge_fn_fill_deps(col, egraph, read_deps, write_deps));
@@ -1616,6 +1637,30 @@ fn merge_fn_resolve(merge: &MergeFn, function_name: &str, egraph: &mut EGraph) -
         MergeFn::UnionIntoUf(uf_func) => ResolvedMergeFn::UnionId {
             uf_table: egraph.funcs[*uf_func].table,
         },
+        // `--native-merge` PROOF mode (`col0`): stage a proof-carrying congruence
+        // edge into the proof-mode `@UF_Sf`. The `Trans`/`Sym` proof constructors
+        // are interned via `TableAction`s, mirroring `compose_uf_proof`.
+        MergeFn::UnionIntoUfWithProof {
+            uf,
+            trans,
+            sym,
+            eclass_col,
+            proof_col,
+        } => ResolvedMergeFn::UnionIntoUfWithProof {
+            uf_table: egraph.funcs[*uf].table,
+            trans: TableAction::new(egraph, *trans),
+            sym: TableAction::new(egraph, *sym),
+            eclass_col: *eclass_col,
+            proof_col: *proof_col,
+        },
+        // `--native-merge` PROOF mode (`col1`): proof of the surviving min eclass.
+        MergeFn::EclassMinProof {
+            eclass_col,
+            proof_col,
+        } => ResolvedMergeFn::EclassMinProof {
+            eclass_col: *eclass_col,
+            proof_col: *proof_col,
+        },
         // NB: The primitive and function-based merge functions heap allocate a single callback
         // for each layer of nesting. This introduces a bit of overhead, particularly for cases
         // that look like `(f old new)` or `(f new old)`. We could special-case common cases in
@@ -1670,6 +1715,22 @@ enum ResolvedMergeFn {
     UnionId {
         uf_table: TableId,
     },
+    /// `--native-merge` PROOF mode, `col0` (eclass): stage a proof-carrying
+    /// congruence edge into the proof-mode `@UF_Sf` and return the min eclass.
+    /// See [`MergeFn::UnionIntoUfWithProof`].
+    UnionIntoUfWithProof {
+        uf_table: TableId,
+        trans: TableAction,
+        sym: TableAction,
+        eclass_col: usize,
+        proof_col: usize,
+    },
+    /// `--native-merge` PROOF mode, `col1` (proof): the term proof of the
+    /// surviving (min) eclass. See [`MergeFn::EclassMinProof`].
+    EclassMinProof {
+        eclass_col: usize,
+        proof_col: usize,
+    },
     Primitive {
         prim: ExternalFunctionId,
         args: Vec<ResolvedMergeFn>,
@@ -1721,6 +1782,57 @@ impl ResolvedMergeFn {
                     std::cmp::min(cur, new)
                 } else {
                     cur
+                }
+            }
+            ResolvedMergeFn::UnionIntoUfWithProof {
+                uf_table,
+                trans,
+                sym,
+                eclass_col,
+                proof_col,
+            } => {
+                let cur_eclass = cur[n_keys + *eclass_col];
+                let new_eclass = new[n_keys + *eclass_col];
+                if cur_eclass == new_eclass {
+                    return cur_eclass;
+                }
+                let cur_proof = cur[n_keys + *proof_col];
+                let new_proof = new[n_keys + *proof_col];
+                // Match the rule-encoded `@congruence_rule`'s orientation EXACTLY:
+                // it writes `(set (@UF_Sf larger smaller) (Trans larger_pf (Sym
+                // smaller_pf)))`, where `larger = (ordering-max old new)` and the
+                // edge proof carries the larger row's proof first. The proof-mode
+                // UF's `get_proof` consumes the per-edge proof verbatim for a
+                // forward step (`larger -> smaller` IS the leader-change
+                // direction, since the UF tie-break makes `smaller` the leader),
+                // so the stored proof must be the un-Sym'd `Trans(larger, Sym(smaller))`.
+                let (larger, smaller, larger_pf, smaller_pf) = if cur_eclass > new_eclass {
+                    (cur_eclass, new_eclass, cur_proof, new_proof)
+                } else {
+                    (new_eclass, cur_eclass, new_proof, cur_proof)
+                };
+                // edge_proof = Trans(larger_pf, Sym(smaller_pf)), proving
+                // `larger = smaller` (larger = f(children) = smaller).
+                let sym_smaller = sym
+                    .lookup_or_insert(state, &[smaller_pf])
+                    .expect("Sym constructor lookup_or_insert failed in congruence merge");
+                let edge_proof = trans
+                    .lookup_or_insert(state, &[larger_pf, sym_smaller])
+                    .expect("Trans constructor lookup_or_insert failed in congruence merge");
+                // Proof-mode UF writes are 4-column `[lhs, rhs, proof, ts]`.
+                state.stage_insert(*uf_table, &[larger, smaller, edge_proof, ts]);
+                smaller
+            }
+            ResolvedMergeFn::EclassMinProof {
+                eclass_col,
+                proof_col,
+            } => {
+                // The proof of the surviving (min) eclass: matches the eclass kept
+                // by `UnionIntoUfWithProof` (which returns `min`).
+                if cur[n_keys + *eclass_col] <= new[n_keys + *eclass_col] {
+                    cur[n_keys + *proof_col]
+                } else {
+                    new[n_keys + *proof_col]
                 }
             }
             // NB: The primitive and function-based merge functions heap allocate a single callback

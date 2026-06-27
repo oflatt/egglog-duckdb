@@ -163,6 +163,48 @@ pub enum MergeFn {
     /// the native bridge resolves this variant; the dataflow/SQL backends route
     /// the union via their own host-pass `native_merge_uf` association.
     UnionIntoUf(FunctionId),
+    /// `--native-merge` in PROOF mode: the proof-carrying counterpart of
+    /// [`MergeFn::UnionIntoUf`]. Used by the `col0` (eclass) merge of a
+    /// tuple-output FD-keyed constructor view `(children) -> (eclass, proof)`.
+    ///
+    /// On an FD conflict (same children, two `(eclass, proof)` output rows) it
+    /// stages a proof-carrying congruence edge into the named proof-mode
+    /// per-sort `@UF_Sf` (a `DisplacedTableWithProvenance`, 4-column writes
+    /// `[lhs, rhs, proof, ts]`), then returns the surviving (min) eclass. The
+    /// staged edge proof is composed as `Trans(larger_proof, Sym(smaller_proof))`
+    /// over the two rows' proof columns, EXACTLY matching the orientation of the
+    /// rule-encoded `@congruence_rule` it replaces (which writes
+    /// `(set (@UF_Sf larger smaller) (Trans larger_pf (Sym smaller_pf)))`).
+    ///
+    /// Fields:
+    /// - `uf`: the proof-mode `@UF_Sf` UF-backed function to union into.
+    /// - `trans` / `sym`: the `Trans` / `Sym` proof constructors used to compose
+    ///   the edge proof.
+    /// - `eclass_col`: the value-column index of the eclass (this column's own
+    ///   index; the merge resolving `col0`).
+    /// - `proof_col`: the value-column index of the per-row term proof
+    ///   (`eclass = f(children)`).
+    ///
+    /// Only the native bridge resolves this variant; the dataflow/SQL backends
+    /// have no proof-mode native-UF and treat it as unsupported (the proof half
+    /// of native-merge is bridge-only).
+    UnionIntoUfWithProof {
+        uf: FunctionId,
+        trans: FunctionId,
+        sym: FunctionId,
+        eclass_col: usize,
+        proof_col: usize,
+    },
+    /// `--native-merge` in PROOF mode: the `col1` (proof) merge companion of
+    /// [`MergeFn::UnionIntoUfWithProof`]. Returns the term proof
+    /// (`eclass = f(children)`) of the SURVIVING (min) eclass — i.e. the proof of
+    /// whichever row has the smaller eclass value, matching the eclass kept by
+    /// the UF leader tie-break (`min`). This expresses the select-by-min that the
+    /// scalar `Old`/`New` leaves cannot.
+    ///
+    /// `eclass_col` / `proof_col` are the value-column indices of the eclass and
+    /// the proof, respectively. Bridge-only, like its companion.
+    EclassMinProof { eclass_col: usize, proof_col: usize },
     /// The output of a merge is determined by applying the given ExternalFunction to the result
     /// of the argument merge functions.
     Primitive(ExternalFunctionId, Vec<MergeFn>),

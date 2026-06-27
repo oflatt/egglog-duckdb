@@ -114,6 +114,11 @@ fn duck_merge_mode_scalar(
         MergeFn::OldCol(_) => MergeMode::Old,
         MergeFn::NewCol(_) => MergeMode::New,
         MergeFn::Const(_) | MergeFn::Function(_, _) => MergeMode::Old,
+        // Proof-mode native-merge is bridge-only; DuckDB has no proof-mode
+        // native-UF so these tuple-output proof merges never reach it.
+        MergeFn::UnionIntoUfWithProof { .. } | MergeFn::EclassMinProof { .. } => {
+            panic!("DuckDB backend does not support proof-mode native-merge merges")
+        }
         MergeFn::Columns(_) => unreachable!("duck_merge_mode_scalar called on a Columns merge"),
     }
 }

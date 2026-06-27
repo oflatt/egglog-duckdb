@@ -798,6 +798,11 @@ fn merge_mode_for_scalar(merge: &MergeFn) -> MergeMode {
         MergeFn::OldCol(_) => MergeMode::Old,
         MergeFn::NewCol(_) => MergeMode::New,
         MergeFn::Function(_, _) | MergeFn::Const(_) => MergeMode::Old,
+        // Proof-mode native-merge is bridge-only; FlowLog has no proof-mode
+        // native-UF, so these tuple-output proof merges never reach it.
+        MergeFn::UnionIntoUfWithProof { .. } | MergeFn::EclassMinProof { .. } => {
+            panic!("FlowLog backend does not support proof-mode native-merge merges")
+        }
         MergeFn::Columns(_) => {
             unreachable!("merge_mode_for_scalar called on a Columns merge")
         }
