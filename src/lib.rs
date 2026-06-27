@@ -1209,11 +1209,33 @@ impl EGraph {
                     // CONSTRUCTOR's `@<F>View` FD-keyed `(children) -> eclass` as a
                     // plain `function` (Custom subtype, no fresh-id minting) but
                     // records its name here so the backing table gets the
-                    // side-effecting `MergeFn::UnionId` merge — congruence done
-                    // inline at FD-conflict instead of by a self-join rule. Checked
-                    // first so it overrides the Custom `:merge` placeholder.
+                    // side-effecting congruence merge — congruence done inline at
+                    // FD-conflict instead of by a self-join rule. Checked first so
+                    // it overrides the Custom `:merge` placeholder.
+                    //
+                    // The merge names the per-sort UF-backed function (`@UF_Sf`)
+                    // that owns the view's eclass (OUTPUT) column via
+                    // `MergeFn::UnionIntoUf`, so the FD-conflict congruence union
+                    // lands in EXACTLY that union-find (not the global `$uf`) —
+                    // the same view→UF association the uniform
+                    // `register_native_merge_view` contract records. The native
+                    // bridge resolves the named UF directly; the dataflow/SQL
+                    // backends ignore the payload (mapping it to a plain min) and
+                    // route the union via their host-pass `native_merge_uf`
+                    // association populated by `register_native_merge_view`. When
+                    // the output sort has no `@UF_Sf` yet (it always does in
+                    // native-UF mode, since the sort is declared before its
+                    // constructors), fall back to the global `UnionId`.
                     merge: if self.proof_state.native_merge_views.contains(&*decl.name) {
-                        MergeFn::UnionId
+                        match self
+                            .proof_state
+                            .uf_function
+                            .get(&decl.schema.output)
+                            .and_then(|uf_name| self.functions.get(uf_name))
+                        {
+                            Some(uf_func) => MergeFn::UnionIntoUf(uf_func.backend_id),
+                            None => MergeFn::UnionId,
+                        }
                     } else {
                         match decl.subtype {
                             FunctionSubtype::Constructor => MergeFn::UnionId,

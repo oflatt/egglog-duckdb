@@ -571,7 +571,10 @@ impl Backend for EGraph {
                 let merge_mode = match &config.merge {
                     MergeFn::Old | MergeFn::AssertEq => MergeMode::Old,
                     MergeFn::New => MergeMode::New,
-                    MergeFn::UnionId => MergeMode::Min,
+                    // `UnionIntoUf` is the native-bridge-only `--native-merge`
+                    // form; DuckDB does not support native-merge (rejected at the
+                    // CLI), so it never reaches here. Map like `UnionId`.
+                    MergeFn::UnionId | MergeFn::UnionIntoUf(_) => MergeMode::Min,
                     MergeFn::Primitive(ext_id, _) => {
                         match self.backend_external_funcs.name(*ext_id) {
                             Some("ordering-min") => MergeMode::Min,
@@ -603,7 +606,10 @@ impl Backend for EGraph {
                 let merge_mode = match &config.merge {
                     MergeFn::Old | MergeFn::AssertEq => Some(MergeMode::Old),
                     MergeFn::New => Some(MergeMode::New),
-                    MergeFn::UnionId => Some(MergeMode::Min),
+                    // `UnionIntoUf` is the native-bridge-only `--native-merge`
+                    // form; DuckDB does not support native-merge (rejected at the
+                    // CLI), so it never reaches here. Map like `UnionId`.
+                    MergeFn::UnionId | MergeFn::UnionIntoUf(_) => Some(MergeMode::Min),
                     MergeFn::Primitive(ext_id, _) => {
                         // The term encoder emits `:merge (ordering-min
                         // old new)` for the function-form union-find

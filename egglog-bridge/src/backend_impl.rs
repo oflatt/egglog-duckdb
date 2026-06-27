@@ -282,6 +282,10 @@ impl Backend for EGraph {
         EGraph::register_nativerb_view(self, uf_func, view_func)
     }
 
+    fn register_native_merge_view(&mut self, uf_func: FunctionId, view_func: FunctionId) {
+        EGraph::register_native_merge_view(self, uf_func, view_func)
+    }
+
     fn add_uf_function(
         &mut self,
         name: String,

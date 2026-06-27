@@ -812,7 +812,11 @@ impl Backend for EGraph {
             match &config.merge {
                 MergeFn::AssertEq | MergeFn::Old => MergeMode::Old,
                 MergeFn::New => MergeMode::New,
-                MergeFn::UnionId => MergeMode::Min,
+                // `UnionIntoUf` is the native-bridge-only `--native-merge` form;
+                // FlowLog routes its FD-conflict union via the `register_native_
+                // merge_view` `native_merge_uf` association instead, so it only
+                // ever sees `UnionId` here. Treat both as `Min` for safety.
+                MergeFn::UnionId | MergeFn::UnionIntoUf(_) => MergeMode::Min,
                 MergeFn::Primitive(_, _) => MergeMode::Min,
                 MergeFn::Function(_, _) | MergeFn::Const(_) => MergeMode::Old,
             }

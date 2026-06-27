@@ -179,15 +179,15 @@ pub fn cli(mut egraph: EGraph) {
     // `--native-merge` does congruence inline via a native backend merge that
     // injects the union-on-FD-conflict edge into the in-core union-find — so it
     // REQUIRES native-UF (the relational `@UF_S` parent table has no insert-time
-    // merge hook). It is implemented on the FlowLog and Feldera backends (the
-    // backend must inject the union on FD-conflict; other backends still map a
-    // UnionId merge to a plain min-and-drop, which would silently lose the
-    // congruence edge). Enforce flowlog/feldera and fold native-merge into
-    // native-UF so every downstream `args.native_uf` site (term encoding, backend
-    // config) is provisioned correctly.
+    // merge hook). It is implemented on the native BRIDGE (core-relations) and on
+    // the FlowLog and Feldera backends (each injects the union on FD-conflict and
+    // re-canonicalizes the view so congruence collapses; the DuckDB backend does
+    // not, so reject it there). Fold native-merge into native-UF so every
+    // downstream `args.native_uf` site (term encoding, backend config) is
+    // provisioned correctly.
     if args.native_merge {
-        if !args.flowlog_backend && !args.feldera_backend {
-            log::error!("--native-merge is only supported with --flowlog or --feldera");
+        if args.duckdb_backend {
+            log::error!("--native-merge is not supported with --duckdb");
             std::process::exit(1);
         }
         args.native_uf = true;

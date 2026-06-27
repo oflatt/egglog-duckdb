@@ -143,6 +143,25 @@ pub struct EGraph {
     /// [`register_nativerb_view`](EGraph::register_nativerb_view). Empty (and
     /// the rebuild loop is the unchanged `$uf`-only path) when the flag is off.
     nativerb_views: HashMap<FunctionId, Vec<FunctionId>>,
+    /// `--native-merge` (term-encoding native-UF, non-proof, native bridge): maps
+    /// an FD-keyed constructor `@<F>View` view function to the per-sort `@UF_Sf`
+    /// UF-backed function that owns its eclass (OUTPUT) column. Populated by
+    /// [`register_native_merge_view`](EGraph::register_native_merge_view), the
+    /// uniform contract the dataflow/SQL backends use to route the FD-conflict
+    /// congruence union. On the bridge the routing is already baked into the
+    /// view's [`MergeFn::UnionIntoUf`] merge (which names the same `@UF_Sf`); this
+    /// map records the association so the registration can assert the view's merge
+    /// actually targets the registered UF. Empty when the flag is off.
+    native_merge_uf: HashMap<FunctionId, FunctionId>,
+    /// `--native-merge`: the UF-backed function each [`MergeFn::UnionIntoUf`]
+    /// view's merge actually stages its FD-conflict union into, captured at
+    /// `add_table` time. Used to assert the merge target matches the UF the
+    /// frontend later registers via
+    /// [`register_native_merge_view`](EGraph::register_native_merge_view). The
+    /// view's [`FunctionId`] is its position in `funcs` (the value returned by the
+    /// `add_table` that consumed the `UnionIntoUf` merge). Empty when the flag is
+    /// off.
+    native_merge_view_target: HashMap<FunctionId, FunctionId>,
 }
 
 pub type Result<T> = std::result::Result<T, anyhow::Error>;
@@ -240,6 +259,8 @@ impl Default for EGraph {
             report_level: Default::default(),
             action_registry,
             nativerb_views: Default::default(),
+            native_merge_uf: Default::default(),
+            native_merge_view_target: Default::default(),
         }
     }
 }
@@ -571,6 +592,14 @@ impl EGraph {
         let n_args = schema_math.num_keys();
         let n_cols = schema_math.table_columns();
         let next_func_id = self.funcs.next_id();
+        // `--native-merge`: remember which per-sort `@UF_Sf` this view's
+        // FD-conflict congruence union targets (named by the `UnionIntoUf` merge),
+        // so a later `register_native_merge_view` can assert the registered UF
+        // matches the one already baked into the merge.
+        let native_merge_target = match &merge {
+            MergeFn::UnionIntoUf(uf_func) => Some(*uf_func),
+            _ => None,
+        };
         let mut read_deps = IndexSet::<TableId>::new();
         let mut write_deps = IndexSet::<TableId>::new();
         merge_fn_fill_deps(&merge, self, &mut read_deps, &mut write_deps);
@@ -602,6 +631,9 @@ impl EGraph {
             uf_rebuild_rule: None,
         });
         debug_assert_eq!(res, next_func_id);
+        if let Some(uf_func) = native_merge_target {
+            self.native_merge_view_target.insert(res, uf_func);
+        }
         let incremental_rebuild_rules = self.incremental_rebuild_rules(res, &schema);
         let nonincremental_rebuild_rule = self.nonincremental_rebuild(res, &schema);
         let info = &mut self.funcs[res];
@@ -638,6 +670,32 @@ impl EGraph {
             .entry(uf_func)
             .or_default()
             .push(view_func);
+    }
+
+    /// `--native-merge` (term-encoding native-UF, non-proof, native bridge):
+    /// associate an FD-keyed constructor `@<F>View` view function (`view_func`)
+    /// with the per-sort `@UF_Sf` UF-backed function (`uf_func`) that owns its
+    /// eclass (OUTPUT) column. This is the uniform contract the dataflow/SQL
+    /// backends use to route the FD-conflict congruence union into the right
+    /// union-find. On the native bridge the routing is already baked into the
+    /// view's [`MergeFn::UnionIntoUf`] merge (which stages the union directly into
+    /// this `@UF_Sf`), so this method records the association and ASSERTS the
+    /// view's merge actually targets the registered UF — a defensive consistency
+    /// check that the frontend's declare-time UF resolution and its
+    /// schedule-time registration agree. `uf_func` must be a UF-backed function.
+    pub fn register_native_merge_view(&mut self, uf_func: FunctionId, view_func: FunctionId) {
+        assert!(
+            self.funcs[uf_func].is_uf(),
+            "register_native_merge_view: {uf_func:?} is not a UF-backed function"
+        );
+        if let Some(target) = self.native_merge_view_target.get(&view_func) {
+            assert_eq!(
+                *target, uf_func,
+                "register_native_merge_view: view {view_func:?} merge targets UF {target:?} \
+                 but is being registered against UF {uf_func:?}"
+            );
+        }
+        self.native_merge_uf.insert(view_func, uf_func);
     }
 
     /// Register a UF-backed function in this EGraph.
@@ -1390,6 +1448,12 @@ fn merge_fn_fill_deps(
         UnionId => {
             write_deps.insert(egraph.uf_table);
         }
+        UnionIntoUf(uf_func) => {
+            // `--native-merge`: the FD-conflict congruence union is staged into
+            // the named per-sort `@UF_Sf` (a UF-backed function), so that table —
+            // not the global `$uf` — is the write dependency.
+            write_deps.insert(egraph.funcs[*uf_func].table);
+        }
         AssertEq | Old | New | Const(..) => {}
     }
 }
@@ -1450,6 +1514,15 @@ fn merge_fn_resolve(merge: &MergeFn, function_name: &str, egraph: &mut EGraph) -
         },
         MergeFn::UnionId => ResolvedMergeFn::UnionId {
             uf_table: egraph.uf_table,
+        },
+        // `--native-merge`: stage the FD-conflict congruence union directly into
+        // the named per-sort `@UF_Sf`'s union-find (the table that owns this
+        // view's eclass column) instead of the global `$uf`. Resolves to the same
+        // `ResolvedMergeFn::UnionId` runtime form — only the target table differs
+        // — so the staged `[cur, new, ts]` lands in the per-sort UF, whose leader
+        // change drives the view's relational `@rebuild_rule*` re-canonicalization.
+        MergeFn::UnionIntoUf(uf_func) => ResolvedMergeFn::UnionId {
+            uf_table: egraph.funcs[*uf_func].table,
         },
         // NB: The primitive and function-based merge functions heap allocate a single callback
         // for each layer of nesting. This introduces a bit of overhead, particularly for cases

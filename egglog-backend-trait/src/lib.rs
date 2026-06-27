@@ -149,8 +149,20 @@ pub enum DefaultVal {
 pub enum MergeFn {
     /// Panic if the old and new values don't match.
     AssertEq,
-    /// Use congruence to resolve FD conflicts.
+    /// Use congruence to resolve FD conflicts: union the two colliding output
+    /// ids into the GLOBAL union-find (`$uf`). The standard congruence merge.
     UnionId,
+    /// `--native-merge`: like [`MergeFn::UnionId`], but union the two colliding
+    /// output ids directly into the named per-sort UF-backed function's
+    /// union-find (its `@UF_Sf`) instead of the global `$uf`. Used by an FD-keyed
+    /// constructor view `(children) -> eclass` so the FD-conflict congruence
+    /// edge lands in exactly the union-find that owns the view's eclass column,
+    /// whose leader changes the view's relational rebuild then re-canonicalizes.
+    /// The `FunctionId` names that UF-backed function (the same association the
+    /// uniform [`Backend::register_native_merge_view`] contract records). Only
+    /// the native bridge resolves this variant; the dataflow/SQL backends route
+    /// the union via their own host-pass `native_merge_uf` association.
+    UnionIntoUf(FunctionId),
     /// The output of a merge is determined by applying the given ExternalFunction to the result
     /// of the argument merge functions.
     Primitive(ExternalFunctionId, Vec<MergeFn>),
