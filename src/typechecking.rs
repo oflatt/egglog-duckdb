@@ -297,6 +297,118 @@ impl PurePrim for UfCanonPrimitive {
     }
 }
 
+/// Proof-mode find-or-refl primitive for canonicalize-at-creation (output column).
+///
+/// Signature `(S Proof) -> @UFPair_S`. Resolves `(@UF_Sf x)` — the flat UF index
+/// frozen at the last completed rebuild — to its stored `(pair leader proof)`.
+/// On a lookup MISS (a just-minted term whose UF index row does not exist yet),
+/// it returns the *refl pair* `(pair x p)`, where `p` is the caller-supplied
+/// proof of `x = x` (the term's `term_proof`, threaded in as an argument — a
+/// local rule variable — rather than read from the table, since that set may be
+/// staged within the same action block and not yet committed). No row is
+/// inserted, so view tuple counts stay bit-exact with the full-rebuild
+/// reference. The encoder feeds the pair's proof into the view proof via `Sym`.
+#[derive(Clone)]
+struct UfReflPrimitive {
+    name: String,
+    /// The eq-sort `S` (the first argument and the pair's first element).
+    eq_sort: ArcSort,
+    /// The proof sort (the second argument and the pair's second element).
+    proof_sort: ArcSort,
+    /// The `@UFPair_S` sort (the output), used to type the primitive.
+    pair_sort: ArcSort,
+    /// Whether congruence rebuilds the pair's first element (the eq-sort id).
+    do_rebuild_first: bool,
+    /// Whether congruence rebuilds the pair's second element (the proof).
+    do_rebuild_second: bool,
+    /// The flat UF index function name `@UF_Sf`.
+    uf_function: String,
+}
+
+impl Primitive for UfReflPrimitive {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn get_type_constraints(&self, span: &Span) -> Box<dyn TypeConstraint> {
+        SimpleTypeConstraint::new(
+            &self.name,
+            vec![
+                self.eq_sort.clone(),
+                self.proof_sort.clone(),
+                self.pair_sort.clone(),
+            ],
+            span.clone(),
+        )
+        .into_box()
+    }
+}
+
+impl ReadPrim for UfReflPrimitive {
+    fn apply<'a, 'db>(&self, state: ReadState<'a, 'db>, args: &[Value]) -> Option<Value> {
+        use crate::exec_state::{Core, Read};
+        let x = args[0];
+        let fallback_proof = args[1];
+        // Hit: the UF index already has a (leader, proof) pair for x.
+        if let Some(pair) = state.lookup(&self.uf_function, &[x]) {
+            return Some(pair);
+        }
+        // Miss: x is its own leader; build the refl pair (pair x fallback_proof).
+        let mut state = state;
+        Some(state.register_container(crate::sort::PairContainer::new(
+            self.do_rebuild_first,
+            self.do_rebuild_second,
+            x,
+            fallback_proof,
+        )))
+    }
+}
+
+/// Proof-mode find-leader primitive for canonicalize-at-creation (child args).
+///
+/// Signature `(S) -> S`. Resolves `(@UF_Sf x)` to its stored leader
+/// (`pair-first`), or — on a miss — to `x` itself (x is its own leader). No row
+/// is inserted. This is the proof-mode analogue of the term-mode `@UF_Sf`
+/// `DefaultVal::Identity` lookup-or-self: it returns the bare leader id for a
+/// child argument, where only the canonical leader is needed (the view proof
+/// never relates children to their leaders — see `add_term_and_view`).
+#[derive(Clone)]
+struct UfFindLeaderPrimitive {
+    name: String,
+    /// The eq-sort `S` (argument and output).
+    eq_sort: ArcSort,
+    /// The flat UF index function name `@UF_Sf`.
+    uf_function: String,
+}
+
+impl Primitive for UfFindLeaderPrimitive {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn get_type_constraints(&self, span: &Span) -> Box<dyn TypeConstraint> {
+        constraint::AllEqualTypeConstraint::new(&self.name, span.clone())
+            .with_all_arguments_sort(self.eq_sort.clone())
+            .with_exact_length(2)
+            .into_box()
+    }
+}
+
+impl ReadPrim for UfFindLeaderPrimitive {
+    fn apply<'a, 'db>(&self, state: ReadState<'a, 'db>, args: &[Value]) -> Option<Value> {
+        use crate::exec_state::{Core, Read};
+        let x = args[0];
+        // Hit: project the leader (pair-first) from the stored (leader, proof).
+        if let Some(pair) = state.lookup(&self.uf_function, &[x]) {
+            // The pair container's first element is the leader.
+            let container = state.value_to_container::<crate::sort::PairContainer>(pair)?;
+            return Some(container.first);
+        }
+        // Miss: x is its own leader.
+        Some(x)
+    }
+}
+
 /// Stores resolved typechecking information.
 #[derive(Clone, Default)]
 pub struct TypeInfo {
@@ -410,6 +522,59 @@ impl EGraph {
             orig.add_read_primitive(x.clone(), validator.clone());
         }
         self.register_registry_primitive::<T, WrapRead>(x, validator, ReadState::valid_contexts());
+    }
+
+    /// Register a proof-mode `@UFPair_S` pair sort's canonicalize-at-creation
+    /// primitives: `refl_prim` (`(S Proof) -> @UFPair_S`) and `find_leader_prim`
+    /// (`(S) -> S`), both reading the flat UF index `uf_function` (`@UF_Sf`).
+    /// Called from the `Sort` typecheck arm with the names from the sort's
+    /// `:internal-uf-pair-prims` annotation (so it is round-trip safe).
+    fn register_uf_refl_primitives(
+        &mut self,
+        pair_sort_name: &str,
+        uf_function: &str,
+        refl_prim: &str,
+        find_leader_prim: &str,
+    ) {
+        // Idempotent: typecheck may revisit a sort declaration; only register the
+        // primitives once.
+        if self.type_info.is_primitive(refl_prim) {
+            return;
+        }
+        let Some(pair_sort) = self.type_info.get_sort_by_name(pair_sort_name).cloned() else {
+            return;
+        };
+        // The pair's inner sorts are `(S, Proof)`. Derive the per-element rebuild
+        // flags exactly as the `pair` primitive does (`PairSort::make_container`):
+        // congruence rebuilds eq-sort / eq-container-sort elements.
+        let inner = pair_sort.inner_sorts();
+        let [first, second] = inner.as_slice() else {
+            return;
+        };
+        let eq_sort = first.clone();
+        let proof_sort = second.clone();
+        let do_rebuild_first = first.is_eq_sort() || first.is_eq_container_sort();
+        let do_rebuild_second = second.is_eq_sort() || second.is_eq_container_sort();
+        self.add_read_primitive(
+            UfReflPrimitive {
+                name: refl_prim.to_string(),
+                eq_sort: eq_sort.clone(),
+                proof_sort,
+                pair_sort,
+                do_rebuild_first,
+                do_rebuild_second,
+                uf_function: uf_function.to_string(),
+            },
+            None,
+        );
+        self.add_read_primitive(
+            UfFindLeaderPrimitive {
+                name: find_leader_prim.to_string(),
+                eq_sort,
+                uf_function: uf_function.to_string(),
+            },
+            None,
+        );
     }
 
     /// Register a [`FullPrim`]. Pass `None` for the validator if not
@@ -616,6 +781,7 @@ impl EGraph {
                 presort_and_args,
                 uf,
                 proof_func,
+                uf_pair_prims,
                 unionable,
             } => {
                 // Note this is bad since typechecking should be pure and idempotent
@@ -625,12 +791,26 @@ impl EGraph {
                 if !unionable {
                     self.type_info.non_unionable_sorts.insert(name.clone());
                 }
+                // Proof-mode canonicalize-at-creation: if this is a `@UFPair_S`
+                // pair sort (carries `:internal-uf-pair-prims`), the `@UFPair_S`
+                // ArcSort now exists, so register the sort's find-or-refl
+                // primitives. The annotation is in the desugared text, so a
+                // re-parse (desugar round-trip) re-registers them.
+                if let Some((uf_function, refl_prim, find_leader_prim)) = uf_pair_prims {
+                    self.register_uf_refl_primitives(
+                        name,
+                        uf_function,
+                        refl_prim,
+                        find_leader_prim,
+                    );
+                }
                 ResolvedNCommand::Sort {
                     span: span.clone(),
                     name: name.clone(),
                     presort_and_args: presort_and_args.clone(),
                     uf: uf.clone(),
                     proof_func: proof_func.clone(),
+                    uf_pair_prims: uf_pair_prims.clone(),
                     unionable: *unionable,
                 }
             }

@@ -159,12 +159,72 @@ impl ProofInstrumentor<'_> {
     }
 
     /// Returns the name of the Pair sort used to bundle (leader, proof) in the UF function index.
-    /// Only used in proof mode.
+    /// Only used in proof mode. Cached per eq-sort so the find-or-refl primitive
+    /// (`@uf_find_or_refl_S`) and the pair-sort declaration agree on the name.
     pub(crate) fn uf_pair_sort_name(&mut self, sort: &str) -> String {
-        self.egraph
-            .parser
-            .symbol_gen
-            .fresh(&format!("UFPair_{sort}"))
+        if let Some(name) = self.egraph.proof_state.uf_pair_sort.get(sort) {
+            name.clone()
+        } else {
+            let fresh_name = self
+                .egraph
+                .parser
+                .symbol_gen
+                .fresh(&format!("UFPair_{sort}"));
+            self.egraph
+                .proof_state
+                .uf_pair_sort
+                .insert(sort.to_string(), fresh_name.clone());
+            fresh_name
+        }
+    }
+
+    /// Returns the find-or-refl primitive name `@uf_find_or_refl_S` for `sort`
+    /// (proof mode). Signature `(S Proof) -> @UFPair_S`: resolves `(@UF_Sf x)` to
+    /// its stored `(pair leader proof)`, or — on a lookup miss (a just-minted
+    /// term whose UF index row does not exist yet) — to `(pair x p)` where `p` is
+    /// the caller-supplied refl proof (`x = x`). The fallback proof is passed as
+    /// an argument rather than read from `term_proof`, because that set may be
+    /// staged (not yet committed) within the same action block. Used for the
+    /// constructor's OUTPUT column, where the pair's proof feeds the view proof.
+    pub(crate) fn refl_prim_name(&mut self, sort: &str) -> String {
+        if let Some(name) = self.egraph.proof_state.refl_prim.get(sort) {
+            name.clone()
+        } else {
+            let fresh_name = self
+                .egraph
+                .parser
+                .symbol_gen
+                .fresh(&format!("uf_find_or_refl_{sort}"));
+            self.egraph
+                .proof_state
+                .refl_prim
+                .insert(sort.to_string(), fresh_name.clone());
+            fresh_name
+        }
+    }
+
+    /// Returns the find-leader primitive name `@uf_find_leader_S` for `sort`
+    /// (proof mode). Signature `(S) -> S`: resolves `(@UF_Sf x)` to its stored
+    /// leader (`pair-first`), or — on a miss — to `x` itself (then x is its own
+    /// leader). The proof-mode analogue of the term-mode `@UF_Sf`
+    /// `DefaultVal::Identity` lookup-or-self, used for CHILD arguments where only
+    /// the canonical leader is needed (the view proof relates only the output
+    /// representative to the term, never the children — see `add_term_and_view`).
+    pub(crate) fn find_leader_prim_name(&mut self, sort: &str) -> String {
+        if let Some(name) = self.egraph.proof_state.find_leader_prim.get(sort) {
+            name.clone()
+        } else {
+            let fresh_name = self
+                .egraph
+                .parser
+                .symbol_gen
+                .fresh(&format!("uf_find_leader_{sort}"));
+            self.egraph
+                .proof_state
+                .find_leader_prim
+                .insert(sort.to_string(), fresh_name.clone());
+            fresh_name
+        }
     }
 
     pub(crate) fn parse_program(&mut self, input: &str) -> Vec<Command> {
@@ -332,6 +392,23 @@ impl ProofInstrumentor<'_> {
     /// callers can use it directly to switch encoding behavior.
     pub(crate) fn native_uf(&self) -> bool {
         self.egraph.proof_state.native_uf
+    }
+
+    /// True when PROOF-mode canonicalize-at-creation should be emitted.
+    ///
+    /// Enabled only when (a) canon-at-creation is on, (b) proofs are enabled, and
+    /// (c) the backend supports inline table lookups — i.e. the native bridge.
+    /// The proof-mode canon read uses `@uf_find_or_refl_S` / `@uf_find_leader_S`
+    /// ReadPrims that look up `@UF_Sf` mid-rule; the dataflow/SQL backends
+    /// (duckdb/feldera/flowlog) cannot reenter a table lookup mid-rule
+    /// (`supports_inline_table_lookups() == false`) and run proofs without
+    /// canon-at-creation (the rebuild rules canonicalize views), so this is
+    /// gated off there — keeping their proof-mode encoding byte-identical to
+    /// before this feature.
+    pub(crate) fn proof_canon_at_creation(&self) -> bool {
+        self.egraph.proof_state.canon_at_creation
+            && self.egraph.proof_state.proofs_enabled
+            && self.egraph.backend.supports_inline_table_lookups()
     }
 
     /// True when the fast-rebuild encoding mode is active (`--fast-rebuild` on

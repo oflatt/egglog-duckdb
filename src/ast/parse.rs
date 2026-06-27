@@ -267,6 +267,7 @@ impl Parser {
                         presort_and_args: None,
                         uf: None,
                         proof_func: None,
+                        uf_pair_prims: None,
                         unionable: true,
                     }],
                     [name, call @ Sexp::List(..)] => {
@@ -280,6 +281,42 @@ impl Parser {
                             )),
                             uf: None,
                             proof_func: None,
+                            uf_pair_prims: None,
+                            unionable: true,
+                        }]
+                    }
+                    // Container sort with proof-mode pair-prim annotation:
+                    // (sort @UFPair_S (Pair S Proof) :internal-uf-pair-prims <uf> <refl> <leader>)
+                    [name, call @ Sexp::List(..), rest @ ..] => {
+                        let (func, args, _) = call.expect_call("container sort declaration")?;
+                        let mut uf_pair_prims = None;
+                        for (key, val) in self.parse_options(rest)? {
+                            match (key, val) {
+                                (":internal-uf-pair-prims", [uf_func, refl, leader]) => {
+                                    uf_pair_prims = Some((
+                                        uf_func.expect_atom("uf function name")?,
+                                        refl.expect_atom("refl primitive name")?,
+                                        leader.expect_atom("find-leader primitive name")?,
+                                    ));
+                                }
+                                _ => {
+                                    return error!(
+                                        span,
+                                        "usage: (sort <name> (<container sort> <argument sort>*) [:internal-uf-pair-prims <uf> <refl> <leader>])"
+                                    );
+                                }
+                            }
+                        }
+                        vec![Command::Sort {
+                            span,
+                            name: name.expect_atom("sort name")?,
+                            presort_and_args: Some((
+                                func,
+                                map_fallible(args, self, Self::parse_expr)?,
+                            )),
+                            uf: None,
+                            proof_func: None,
+                            uf_pair_prims,
                             unionable: true,
                         }]
                     }
@@ -310,6 +347,7 @@ impl Parser {
                             presort_and_args: None,
                             uf,
                             proof_func,
+                            uf_pair_prims: None,
                             unionable: true,
                         }]
                     }

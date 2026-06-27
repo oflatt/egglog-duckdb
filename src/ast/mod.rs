@@ -60,6 +60,14 @@ where
         /// The name of the proof function for this sort.
         /// Set by proof desugaring to record where proofs are stored for this sort.
         proof_func: Option<String>,
+        /// Proof-mode canonicalize-at-creation metadata for a `@UFPair_S` pair
+        /// sort: `(uf_function, refl_prim, find_leader_prim)`. When set,
+        /// declaring this sort registers the two find-or-refl primitives
+        /// (`refl_prim` of type `(S Proof) -> @UFPair_S`, `find_leader_prim` of
+        /// type `(S) -> S`) against `uf_function` (the flat UF index). Carried in
+        /// the desugared text so a re-parse (e.g. the desugar round-trip test)
+        /// re-registers them. Set by proof encoding's `declare_sort`.
+        uf_pair_prims: Option<(String, String, String)>,
         /// Whether values of this sort can be unioned.
         /// Defaults to true for user-defined sorts.
         /// Set to false for relations and term tables that should not allow union.
@@ -114,6 +122,7 @@ where
                 presort_and_args,
                 uf,
                 proof_func,
+                uf_pair_prims,
                 unionable,
             } => GenericCommand::Sort {
                 span: span.clone(),
@@ -121,6 +130,7 @@ where
                 presort_and_args: presort_and_args.clone(),
                 uf: uf.clone(),
                 proof_func: proof_func.clone(),
+                uf_pair_prims: uf_pair_prims.clone(),
                 unionable: *unionable,
             },
             GenericNCommand::Function(f) => match f.subtype {
@@ -241,6 +251,7 @@ where
                 presort_and_args,
                 uf,
                 proof_func,
+                uf_pair_prims,
                 unionable,
             } => GenericNCommand::Sort {
                 span,
@@ -248,6 +259,7 @@ where
                 presort_and_args,
                 uf,
                 proof_func,
+                uf_pair_prims,
                 unionable,
             },
             GenericNCommand::Function(func) => GenericNCommand::Function(func.visit_exprs(f)),
@@ -557,6 +569,10 @@ where
         /// The name of the proof function for this sort.
         /// Set by proof desugaring to record where proofs are stored for this sort.
         proof_func: Option<String>,
+        /// Proof-mode canonicalize-at-creation metadata for a `@UFPair_S` pair
+        /// sort: `(uf_function, refl_prim, find_leader_prim)`. See the matching
+        /// field on [`GenericNCommand::Sort`].
+        uf_pair_prims: Option<(String, String, String)>,
         /// Whether values of this sort can be unioned.
         /// Defaults to true for user-defined sorts.
         /// Set to false for relations and term tables that should not allow union.
@@ -970,9 +986,19 @@ where
             GenericCommand::Sort {
                 name,
                 presort_and_args: Some((name2, args)),
+                uf_pair_prims,
                 ..
             } => {
-                write!(f, "(sort {name} ({name2} {}))", ListDisplay(args, " "))
+                write!(f, "(sort {name} ({name2} {})", ListDisplay(args, " "))?;
+                if let Some((uf_function, refl_prim, find_leader_prim)) = uf_pair_prims {
+                    // Re-emit the pair-prim annotation so a re-parse re-registers
+                    // the find-or-refl prims (the desugar round-trip relies on it).
+                    write!(
+                        f,
+                        " :internal-uf-pair-prims {uf_function} {refl_prim} {find_leader_prim}"
+                    )?;
+                }
+                write!(f, ")")
             }
             GenericCommand::Function {
                 span: _,
@@ -1645,6 +1671,7 @@ where
                 presort_and_args,
                 uf,
                 proof_func,
+                uf_pair_prims,
                 unionable,
             } => GenericCommand::Sort {
                 span,
@@ -1652,6 +1679,7 @@ where
                 presort_and_args,
                 uf: uf.map(&mut *fun),
                 proof_func: proof_func.map(&mut *fun),
+                uf_pair_prims: uf_pair_prims.map(|(a, b, c)| (fun(a), fun(b), fun(c))),
                 unionable,
             },
             GenericCommand::Datatype {
@@ -1935,6 +1963,7 @@ where
                 presort_and_args,
                 uf,
                 proof_func,
+                uf_pair_prims,
                 unionable,
             } => GenericCommand::Sort {
                 span,
@@ -1942,6 +1971,7 @@ where
                 presort_and_args,
                 uf,
                 proof_func,
+                uf_pair_prims,
                 unionable,
             },
             GenericCommand::Datatype {

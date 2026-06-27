@@ -8,6 +8,27 @@ pub struct PairContainer {
     pub second: Value,
 }
 
+impl PairContainer {
+    /// Build a [`PairContainer`] with explicit per-element rebuild flags.
+    /// `do_rebuild_*` must be `true` exactly when the corresponding element is an
+    /// eq-sort or eq-container-sort (so congruence rebuilds it), matching what
+    /// the `pair` primitive computes. Used by callers (e.g. the proof-mode
+    /// find-or-refl primitive) that build pairs outside the `pair` primitive.
+    pub fn new(
+        do_rebuild_first: bool,
+        do_rebuild_second: bool,
+        first: Value,
+        second: Value,
+    ) -> Self {
+        PairContainer {
+            do_rebuild_first,
+            do_rebuild_second,
+            first,
+            second,
+        }
+    }
+}
+
 impl ContainerValue for PairContainer {
     fn rebuild_contents(&mut self, rebuilder: &dyn Rebuilder) -> bool {
         let mut changed = false;
@@ -46,6 +67,20 @@ impl PairSort {
 
     pub fn second(&self) -> ArcSort {
         self.second.clone()
+    }
+
+    /// Build a [`PairContainer`] for this sort, deriving the per-element
+    /// rebuild flags exactly as the `pair` primitive does. Used by callers that
+    /// must construct a pair value outside the `pair` primitive (e.g. the
+    /// proof-mode find-or-refl primitive) while keeping rebuild behavior
+    /// identical.
+    pub fn make_container(&self, first: Value, second: Value) -> PairContainer {
+        PairContainer::new(
+            self.first.is_eq_sort() || self.first.is_eq_container_sort(),
+            self.second.is_eq_sort() || self.second.is_eq_container_sort(),
+            first,
+            second,
+        )
     }
 }
 

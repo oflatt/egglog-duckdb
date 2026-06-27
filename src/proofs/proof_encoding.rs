@@ -121,6 +121,22 @@ pub(crate) struct EncodingState {
     /// (nonexistent) view access. Keyed by name because `FuncType` (the only
     /// info available at the read sites) does not carry `internal_let`.
     pub pass_through_globals: HashSet<String>,
+    /// Proof mode: maps eq-sort name -> the `@UFPair_S` pair-sort name (cached
+    /// so the find-or-refl primitive and the pair-sort declaration agree).
+    pub uf_pair_sort: HashMap<String, String>,
+    /// Proof mode: maps eq-sort name -> the `@uf_find_or_refl_S` primitive name.
+    pub refl_prim: HashMap<String, String>,
+    /// Proof mode: maps eq-sort name -> the `@uf_find_leader_S` primitive name.
+    pub find_leader_prim: HashMap<String, String>,
+    /// Proof-mode canon-at-creation, transient: maps a freshly-created term's
+    /// variable (`fv` from `add_term_and_view`) to its `term = term` proof var.
+    /// A nested child created earlier in the same action has its `term_proof` set
+    /// by a STAGED write (not committed), so the parent's `@uf_find_or_refl_S`
+    /// read of that child cannot read `term_proof` on a miss; the parent supplies
+    /// this recorded proof var as the (no-op congr) refl fallback instead. Body-
+    /// matched children are absent here — their `term_proof` is committed and read
+    /// directly. Never cleared (fresh var names never collide across actions).
+    pub created_term_proofs: HashMap<String, String>,
     /// Shared `get-size!` size snapshot for backends without an in-memory
     /// `ActionRegistry` (duckdb/flowlog/feldera — `supports_action_registry()
     /// == false`). The `get-size!` ReadPrim's normal path reads table sizes
@@ -163,6 +179,10 @@ impl EncodingState {
             nativerb_registered: HashSet::default(),
             nativerb_mixed_sort_view: None,
             rebuild_view_exclude: HashMap::default(),
+            uf_pair_sort: HashMap::default(),
+            refl_prim: HashMap::default(),
+            find_leader_prim: HashMap::default(),
+            created_term_proofs: HashMap::default(),
             pass_through_globals: HashSet::default(),
             get_size_snapshot: std::sync::Arc::new(std::sync::RwLock::new(HashMap::default())),
         }
@@ -358,9 +378,23 @@ impl<'a> ProofInstrumentor<'a> {
             if self.egraph.proof_state.proofs_enabled {
                 let pair_sort = self.uf_pair_sort_name(sort_name);
                 let proof_fresh = self.egraph.parser.symbol_gen.fresh("uf_idx_proof");
+                // The find-or-refl primitives for proof-mode canonicalize-at-
+                // creation (`@uf_find_or_refl_S` for the output column,
+                // `@uf_find_leader_S` for child args). Their names are emitted in
+                // the pair sort's `:internal-uf-pair-prims` annotation below so the
+                // typecheck-time hook can register them (round-trip safe). Used in
+                // `add_term_and_view`.
+                let refl_prim = self.refl_prim_name(sort_name);
+                let find_leader_prim = self.find_leader_prim_name(sort_name);
                 (
                     pair_sort.clone(),
-                    format!("(sort {pair_sort} (Pair {sort_name} {proof_type}))"),
+                    // The `:internal-uf-pair-prims` annotation makes the pair-sort
+                    // declaration self-describing: re-parsing it (e.g. the desugar
+                    // round-trip test) re-registers the find-or-refl primitives.
+                    format!(
+                        "(sort {pair_sort} (Pair {sort_name} {proof_type}) \
+                         :internal-uf-pair-prims {uf_function_name} {refl_prim} {find_leader_prim})"
+                    ),
                     format!("(= {proof_fresh} ({pname} a b))"),
                     format!("(set ({uf_function_name} a) (pair b {proof_fresh}))"),
                 )
@@ -917,18 +951,24 @@ impl<'a> ProofInstrumentor<'a> {
 
         let updated_view = self.update_view(&fdecl.name, &children_updated, &pf_var);
 
-        // `--fast-rebuild` (term mode only): drop the always-empty
-        // `δview ⋈ uf_old` seminaive variant of this rule. The rebuild join is
-        // `view ⋈ @UF_Sf`; its seminaive derivative is `view⋈δuf` (the real
-        // re-canonicalization work) plus `δview⋈uf_old` (re-checking view rows
-        // born this iteration against the unchanged UF). Under
-        // canonicalize-at-creation new view rows are already canonical, so the
-        // δview term is empty — but seminaive still pays to scan δview each
-        // iteration. We record this rule's view function so `add_rule` can
-        // exclude the view atom from being a delta focus (bridge
-        // `RuleBuilderOps::set_focus_exclude_table`), keeping only `view⋈δuf`.
-        // Bit-exact with the full rebuild; never in proof mode.
-        if self.fast_rebuild() && !self.egraph.proof_state.proofs_enabled {
+        // `--fast-rebuild`: drop the always-empty `δview ⋈ uf_old` seminaive
+        // variant of this rule. The rebuild join is `view ⋈ @UF_Sf`; its
+        // seminaive derivative is `view⋈δuf` (the real re-canonicalization work)
+        // plus `δview⋈uf_old` (re-checking view rows born this iteration against
+        // the unchanged UF). Under canonicalize-at-creation new view rows are
+        // already canonical, so the δview term is empty — but seminaive still
+        // pays to scan δview each iteration. We record this rule's view function
+        // so `add_rule` can exclude the view atom from being a delta focus
+        // (bridge `RuleBuilderOps::set_focus_exclude_table`), keeping only
+        // `view⋈δuf`. Bit-exact with the full rebuild.
+        //
+        // Sound only for views born canonical: term mode canonicalizes every
+        // view at creation; proof mode canonicalizes only CONSTRUCTOR views (see
+        // `add_term_and_view`), so a CUSTOM-function view in proof mode keeps its
+        // δview term (it is NOT excluded) — its new rows may need uf_old.
+        let born_canonical = !self.egraph.proof_state.proofs_enabled
+            || fdecl.subtype == FunctionSubtype::Constructor;
+        if self.fast_rebuild() && born_canonical {
             self.egraph
                 .proof_state
                 .rebuild_view_exclude
@@ -1628,6 +1668,22 @@ impl<'a> ProofInstrumentor<'a> {
         match action {
             ResolvedAction::Let(_span, v, generic_expr) => {
                 let v2 = self.instrument_action_expr(generic_expr, &mut res, justification);
+                // Propagate the created-term-proof entry through the `let` alias:
+                // if `v2` is a freshly-created term, `v.name` now also names it, so
+                // a later constructor canonicalizing `v.name` as a child can find
+                // its (staged) refl proof. (proof mode only; map empty otherwise.)
+                if let Some(pf) = self
+                    .egraph
+                    .proof_state
+                    .created_term_proofs
+                    .get(&v2)
+                    .cloned()
+                {
+                    self.egraph
+                        .proof_state
+                        .created_term_proofs
+                        .insert(v.name.clone(), pf);
+                }
                 res.push(format!("(let {} {})", v.name, v2));
             }
             ResolvedAction::Set(_span, h, generic_exprs, generic_expr) => {
@@ -1701,6 +1757,35 @@ impl<'a> ProofInstrumentor<'a> {
         format!("(set ({view_name} {}) {proof})", ListDisplay(args, " "))
     }
 
+    /// Canonicalize-at-creation for a single eq-sort argument of sort `sort`:
+    /// return the expression for its UF_old leader. Sets `emitted_canon_lookup`
+    /// for the table-read variants (so the rule opts into `:unsafe-seminaive`).
+    ///
+    /// - PROOF mode: `(@uf_find_leader_S a)` — the leader (or `a` on a miss). The
+    ///   child's proof is never needed (the view proof relates only the output
+    ///   representative to the term, not the children).
+    /// - native-UF (term) mode: `(@canon_S a)` find-or-self primitive.
+    /// - relational (term) mode: `(@UF_Sf a)` identity-on-miss lookup.
+    fn canon_arg(&mut self, sort: &str, a: &str) -> String {
+        if self.egraph.proof_state.proofs_enabled {
+            let find_leader_prim = self.find_leader_prim_name(sort);
+            // RHS primitive table read => rule needs :unsafe-seminaive.
+            self.egraph.proof_state.emitted_canon_lookup = true;
+            format!("({find_leader_prim} {a})")
+        } else if self.native_uf() {
+            // Native-UF mode: find-or-self via the `@canon_S` primitive. A
+            // primitive call (not a table lookup), so no :unsafe-seminaive is
+            // needed — leave `emitted_canon_lookup` clear.
+            let canon_prim = self.canon_prim_name(sort);
+            format!("({canon_prim} {a})")
+        } else {
+            let uf_function_name = self.uf_function_name(sort);
+            // RHS function-table lookup => rule needs :unsafe-seminaive.
+            self.egraph.proof_state.emitted_canon_lookup = true;
+            format!("({uf_function_name} {a})")
+        }
+    }
+
     /// Return some code adding to the view and term tables.
     /// For constructors, `args` should not include the eclass of the resulting term (since it may not exist yet).
     /// For custom functions, `args` should include all arguments (including the output for the function).
@@ -1717,18 +1802,22 @@ impl<'a> ProofInstrumentor<'a> {
         let fv = self.fresh_var();
         let mut res = vec![];
 
-        // Canonicalize-at-creation: replace every eq-sort child argument with
-        // its UF_old leader, via an identity-on-miss lookup against the flat UF
-        // index `@UF_Sf` (frozen at the last completed rebuild). The resulting
-        // row is then canonical w.r.t. UF_old, which is what lets the FlowLog DD
-        // backend skip the `δ(constructor) ⋈ UF_old` rebuild join. Always-on for
-        // all term-encoding backends, but skipped in PROOF mode.
-        // TODO(wave2): support canon-at-creation in proof mode — the @UF_Sortf
-        // lookup returns @UFPair_Sort; project pair-first + thread pair-second
-        // into the proof tree (mirror rebuilding_rules).
-        let args: Vec<String> = if self.egraph.proof_state.canon_at_creation
-            && !self.egraph.proof_state.proofs_enabled
-        {
+        let proof_mode = self.egraph.proof_state.proofs_enabled;
+
+        // Canonicalize-at-creation (TERM mode): replace every eq-sort child
+        // argument with its UF_old leader, via an identity-on-miss lookup against
+        // the flat UF index `@UF_Sf` (frozen at the last completed rebuild). The
+        // resulting row is canonical w.r.t. UF_old, which lets the dataflow
+        // backends skip the `δ(constructor) ⋈ UF_old` rebuild join.
+        //
+        // PROOF mode differs: we must NOT change the constructor's hash-cons args
+        // here, because the constructor term `fv` is what the rule's proof claims
+        // to produce (`Rule …` proves `fv = fv`, checked against the rule head
+        // reconstructed from the matched — non-canonical — substitution). So in
+        // proof mode we build `fv` from the ORIGINAL args, and canonicalize the
+        // VIEW columns separately below, threading each child's `child = leader`
+        // proof into the view proof via congruence (mirroring `rebuilding_rules`).
+        let term_args: Vec<String> = if self.egraph.proof_state.canon_at_creation && !proof_mode {
             args.iter()
                 .enumerate()
                 .map(|(i, a)| {
@@ -1741,22 +1830,7 @@ impl<'a> ProofInstrumentor<'a> {
                         Some(&func_type.output)
                     };
                     match sort {
-                        Some(s) if s.is_eq_sort() => {
-                            if self.native_uf() {
-                                // Native-UF mode: find-or-self via the
-                                // `@canon_S` primitive. A primitive call (not
-                                // a table lookup), so no :unsafe-seminaive is
-                                // needed — leave `emitted_canon_lookup` clear.
-                                let canon_prim = self.canon_prim_name(s.name());
-                                format!("({canon_prim} {a})")
-                            } else {
-                                let uf_function_name = self.uf_function_name(s.name());
-                                // RHS function-table lookup => rule needs
-                                // :unsafe-seminaive (set in instrument_rule).
-                                self.egraph.proof_state.emitted_canon_lookup = true;
-                                format!("({uf_function_name} {a})")
-                            }
-                        }
+                        Some(s) if s.is_eq_sort() => self.canon_arg(s.name(), a),
                         _ => a.clone(),
                     }
                 })
@@ -1764,49 +1838,20 @@ impl<'a> ProofInstrumentor<'a> {
         } else {
             args.to_vec()
         };
-        let args = args.as_slice();
+        let term_args = term_args.as_slice();
 
         // TODO might be able to get rid of this intermediate variable in encoding
         res.push(format!(
             "(let {fv} ({} {}))",
             func_type.name,
-            ListDisplay(args, " ")
+            ListDisplay(term_args, " ")
         ));
 
-        let args_with_fv = if func_type.subtype == FunctionSubtype::Constructor {
-            let mut a = args.to_vec();
-            // Canonicalize-at-creation: the constructor hash-cons `(name args)`
-            // returns a possibly-STALE eclass (its output is not kept canonical
-            // when the eclass is later unioned), so the view's representative
-            // column would otherwise reference a non-canonical id. Wrap `fv` in
-            // the same `@UF_Sf` identity-on-miss lookup used for the input args,
-            // so the view row is born canonical in its eclass column too.
-            // Always-on for term-encoding backends, but skipped in PROOF mode.
-            // TODO(wave2): support canon-at-creation in proof mode — the @UF_Sortf
-            // lookup returns @UFPair_Sort; project pair-first + thread pair-second
-            // into the proof tree (mirror rebuilding_rules).
-            if self.egraph.proof_state.canon_at_creation
-                && !self.egraph.proof_state.proofs_enabled
-                && func_type.output.is_eq_sort()
-            {
-                if self.native_uf() {
-                    // Native-UF mode: find-or-self via the `@canon_S`
-                    // primitive (no :unsafe-seminaive needed).
-                    let canon_prim = self.canon_prim_name(func_type.output.name());
-                    a.push(format!("({canon_prim} {fv})"));
-                } else {
-                    let uf_function_name = self.uf_function_name(func_type.output.name());
-                    self.egraph.proof_state.emitted_canon_lookup = true;
-                    a.push(format!("({uf_function_name} {fv})"));
-                }
-            } else {
-                a.push(fv.clone());
-            }
-            a
-        } else {
-            args.to_vec()
-        };
-
+        // The base "this term exists" proof (`view_proof_var : fv = fv`) and the
+        // `term_proof fv` set. This MUST be emitted before any
+        // `@uf_find_or_refl_S` read of `fv` (the output canon below), because on
+        // a UF-index miss the refl fallback reads `term_proof fv`. `term_proof`
+        // is set in `proof_str`, pushed here, ahead of the output canon read.
         let (proof_str, view_proof_var) = if self.egraph.proof_state.proofs_enabled {
             let to_ast = self.fname_to_ast_name(&func_type.name);
             let rule_constructor = &self.proof_names().rule_constructor;
@@ -1832,6 +1877,14 @@ impl<'a> ProofInstrumentor<'a> {
             // add a proof for the constructor if needed
             let term_proof = if func_type.subtype == FunctionSubtype::Constructor {
                 let term_proof_constructor = self.term_proof_name(func_type.output.name());
+                // Record `fv -> proof_var` so a parent constructor canonicalizing
+                // this nested `fv` as a child can use this (staged) `fv = fv`
+                // proof as the refl-fallback (the `term_proof fv` set just below
+                // is not yet committed within the action).
+                self.egraph
+                    .proof_state
+                    .created_term_proofs
+                    .insert(fv.clone(), proof_var.clone());
                 format!("(set ({term_proof_constructor} {fv}) {proof_var})")
             } else {
                 "".to_string()
@@ -1849,7 +1902,142 @@ impl<'a> ProofInstrumentor<'a> {
         };
 
         res.push(proof_str);
-        res.push(self.update_view(&func_type.name, &args_with_fv, &view_proof_var));
+
+        // Compute the VIEW row's columns + proof.
+        //
+        // TERM mode: the view columns are exactly `term_args` (already canonical
+        // via the input canon above) plus the (separately canonicalized) output;
+        // the proof is the Unit `()`.
+        //
+        // PROOF mode + canon-at-creation: `fv` was built from ORIGINAL args, so
+        // we canonicalize the view's child columns here and thread each child's
+        // `child = leader` proof into the view proof via congruence. Starting from
+        // the base `fv = fv` proof, `Congr(base, i, child_pf_i)` rewrites child i
+        // to its leader; after all children we have `cc : fv = (name leaders)`.
+        // The representative column is `fv`'s leader `rep` (via the output canon),
+        // with `rep_pf : fv = rep`; the view proof (which must prove
+        // `rep = (name leaders)`) is `Trans(Sym(rep_pf), cc)`.
+        let canon = self.egraph.proof_state.canon_at_creation;
+        // Proof-mode canon-at-creation is bridge-only (it needs inline table
+        // lookups for the `@uf_find_or_refl_S` ReadPrim). On duckdb/feldera/
+        // flowlog proof runs it is OFF — the view rows are born from the original
+        // args and the rebuild rules canonicalize them (byte-identical to before).
+        // Proof-mode canon-at-creation is restricted to CONSTRUCTORS. Custom
+        // (`:merge`) functions have a separate merge-proof structure over their
+        // value column that the congruence threading here would not match, so
+        // they keep the baseline proof-mode behavior (views canonicalized by the
+        // rebuild rules); `rebuilding_rules` correspondingly does not drop their
+        // δview term under fast-rebuild in proof mode.
+        let proof_canon =
+            self.proof_canon_at_creation() && func_type.subtype == FunctionSubtype::Constructor;
+        // Output (representative-column) canon applies for constructors in:
+        //  - term mode (any backend) when canon is on, or
+        //  - proof mode only on the bridge (`proof_canon`).
+        let do_canon_output = func_type.subtype == FunctionSubtype::Constructor
+            && func_type.output.is_eq_sort()
+            && if proof_mode { proof_canon } else { canon };
+
+        // Build the view child columns (canonicalized) and, in proof mode, the
+        // congruence-chain proof `cc : fv = (name view_children)`.
+        let (view_children, congr_proof): (Vec<String>, String) = if proof_canon {
+            // Start from the base `fv = fv` proof.
+            let mut current_proof = view_proof_var.clone();
+            let mut cols = Vec::with_capacity(args.len());
+            for (i, a) in args.iter().enumerate() {
+                let sort = if i < func_type.input.len() {
+                    &func_type.input[i]
+                } else {
+                    &func_type.output
+                };
+                if sort.is_eq_sort() {
+                    // find-or-refl read for this child, with the child's
+                    // `child = child` proof as the miss fallback (used only in a
+                    // no-op congr step, since a miss means child is its own
+                    // leader). For a nested child created this action use its
+                    // recorded (staged) proof var; for a body child read its
+                    // committed `term_proof`.
+                    let refl_prim = self.refl_prim_name(sort.name());
+                    let fallback = self.child_refl_fallback(sort.name(), a);
+                    let pair_var = self.fresh_var();
+                    res.push(format!("(let {pair_var} ({refl_prim} {a} {fallback}))"));
+                    self.egraph.proof_state.emitted_canon_lookup = true;
+                    let leader = format!("(pair-first {pair_var})");
+                    let child_pf = format!("(pair-second {pair_var})");
+                    // Congr step: rewrite child i to its leader.
+                    let congr = self.proof_names().congr_constructor.clone();
+                    let new_proof = self.fresh_var();
+                    res.push(format!(
+                        "(let {new_proof} ({congr} {current_proof} {i} {child_pf}))"
+                    ));
+                    current_proof = new_proof;
+                    cols.push(leader);
+                } else {
+                    cols.push(a.clone());
+                }
+            }
+            (cols, current_proof)
+        } else {
+            (term_args.to_vec(), view_proof_var.clone())
+        };
+
+        // Canonicalize the constructor's own output (eclass) column. The hash-cons
+        // `(name args)` returns a possibly-STALE eclass, so the view's
+        // representative column would otherwise reference a non-canonical id.
+        let (rep_column, rep_pf_var): (String, Option<String>) = if do_canon_output {
+            if proof_mode {
+                // find-or-refl read; pair-first is the rep, pair-second proves
+                // `fv = rep`. The miss fallback (rep = fv) is `view_proof_var`,
+                // the local `fv = fv` proof (passed as an arg, not read from the
+                // staged `term_proof fv`).
+                let refl_prim = self.refl_prim_name(func_type.output.name());
+                let pair_var = self.fresh_var();
+                res.push(format!(
+                    "(let {pair_var} ({refl_prim} {fv} {view_proof_var}))"
+                ));
+                self.egraph.proof_state.emitted_canon_lookup = true;
+                (
+                    format!("(pair-first {pair_var})"),
+                    Some(format!("(pair-second {pair_var})")),
+                )
+            } else if self.native_uf() {
+                // Native-UF mode: find-or-self via the `@canon_S` primitive
+                // (no :unsafe-seminaive needed).
+                let canon_prim = self.canon_prim_name(func_type.output.name());
+                (format!("({canon_prim} {fv})"), None)
+            } else {
+                let uf_function_name = self.uf_function_name(func_type.output.name());
+                self.egraph.proof_state.emitted_canon_lookup = true;
+                (format!("({uf_function_name} {fv})"), None)
+            }
+        } else {
+            (fv.clone(), None)
+        };
+
+        let args_with_fv = if func_type.subtype == FunctionSubtype::Constructor {
+            let mut a = view_children;
+            a.push(rep_column);
+            a
+        } else {
+            // Custom functions: the trailing arg is the output value; the view
+            // columns are the (canonicalized) args as computed above.
+            view_children
+        };
+
+        // The view-row proof proves `representative = term`. In proof mode with
+        // canon, `term = (name view_children)`; `congr_proof : fv = term` and
+        // `rep_pf : fv = rep`, so the view proof is `Trans(Sym(rep_pf),
+        // congr_proof) : rep = term`. Without output canon the representative is
+        // `fv` and the proof is `congr_proof` (which is `fv = term`). Without
+        // canon entirely it is the plain `fv = fv` proof.
+        let view_proof_expr = match &rep_pf_var {
+            Some(rep_pf) => {
+                let sym = self.proof_names().eq_sym_constructor.clone();
+                let trans = self.proof_names().eq_trans_constructor.clone();
+                format!("({trans} ({sym} {rep_pf}) {congr_proof})")
+            }
+            None => congr_proof,
+        };
+        res.push(self.update_view(&func_type.name, &args_with_fv, &view_proof_expr));
 
         // add to uf table to initialize eclass for constructors
         if func_type.subtype == FunctionSubtype::Constructor {
@@ -1862,6 +2050,26 @@ impl<'a> ProofInstrumentor<'a> {
         }
 
         (res, fv)
+    }
+
+    /// The refl-fallback proof (`child = child`) for a child arg's
+    /// `@uf_find_or_refl_S` read (proof mode). Used ONLY on a UF-index miss,
+    /// where the child is its own leader and the congruence step is a no-op
+    /// (`Congr(base, i, child=child)` leaves child i unchanged). It is evaluated
+    /// eagerly for ANY child (a UF-index hit ignores the value), so it must never
+    /// panic: the canonical `child = child` proof is the child's `term_proof`,
+    /// but for a NESTED child created this action that set is staged (uncommitted)
+    /// and a table read would fail. So:
+    ///  - nested child (recorded in `created_term_proofs`): use its proof var
+    ///    (a local — always evaluable, the real `child = child` proof);
+    ///  - body-matched child (committed `term_proof`): read `(term_proof child)`.
+    fn child_refl_fallback(&mut self, sort: &str, child: &str) -> String {
+        if let Some(pf) = self.egraph.proof_state.created_term_proofs.get(child) {
+            pf.clone()
+        } else {
+            let term_proof = self.term_proof_name(sort);
+            format!("({term_proof} {child})")
+        }
     }
 
     /// Returns a query for (fname args) and a variable for the proof (or Unit) output.
@@ -1933,6 +2141,11 @@ impl<'a> ProofInstrumentor<'a> {
         actions: &[ResolvedAction],
         justification: &Justification,
     ) -> Vec<String> {
+        // `created_term_proofs` records nested-term refl proofs by variable name;
+        // those names are scoped to one action block, so reset per block to avoid
+        // a stale entry (e.g. a `?x` reused across rules) referencing an
+        // out-of-scope proof var.
+        self.egraph.proof_state.created_term_proofs.clear();
         let mut res = vec![];
         for action in actions {
             res.extend(self.instrument_action(action, justification));
@@ -2107,6 +2320,7 @@ impl<'a> ProofInstrumentor<'a> {
                     presort_and_args: presort_and_args.clone(),
                     uf: Some(uf_name),
                     proof_func,
+                    uf_pair_prims: None,
                     unionable: *unionable,
                 });
                 res.extend(self.declare_sort(name));
@@ -2133,6 +2347,8 @@ impl<'a> ProofInstrumentor<'a> {
                 res.extend(self.instrument_rule(rule));
             }
             ResolvedNCommand::CoreAction(action) => {
+                // Top-level action: its own scope for `created_term_proofs`.
+                self.egraph.proof_state.created_term_proofs.clear();
                 let instrumented = self
                     .instrument_action(action, &Justification::Fiat)
                     .join("\n");
