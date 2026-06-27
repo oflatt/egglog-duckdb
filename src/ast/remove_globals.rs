@@ -98,6 +98,7 @@ impl GlobalRemover {
             subtype: self.global_subtype(&var.sort),
             input: vec![],
             output: var.sort.clone(),
+            extra_outputs: vec![],
         })
     }
 
@@ -140,6 +141,7 @@ impl GlobalRemover {
                             subtype: FunctionSubtype::Constructor,
                             input: vec![],
                             output: ty.clone(),
+                            extra_outputs: vec![],
                         });
                         let func_decl = ResolvedFunctionDecl {
                             name: name.name,
@@ -148,6 +150,7 @@ impl GlobalRemover {
                             schema: Schema {
                                 input: vec![],
                                 output: ty.name().to_owned(),
+                                extra_outputs: vec![],
                             },
                             resolved_schema: resolved_call.clone(),
                             merge: None,
@@ -178,6 +181,7 @@ impl GlobalRemover {
                             subtype: FunctionSubtype::Custom,
                             input: vec![],
                             output: ty.clone(),
+                            extra_outputs: vec![],
                         });
                         let func_decl = ResolvedFunctionDecl {
                             name: name.name,
@@ -186,6 +190,7 @@ impl GlobalRemover {
                             schema: Schema {
                                 input: vec![],
                                 output: ty.name().to_owned(),
+                                extra_outputs: vec![],
                             },
                             resolved_schema: resolved_call.clone(),
                             merge: None,

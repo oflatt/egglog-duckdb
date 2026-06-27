@@ -89,6 +89,7 @@ fn desugar_fresh_rule(
         schema: Schema {
             input: schema,
             output: output_sort,
+            extra_outputs: vec![],
         },
         cost: first_opts.cost,
         unextractable: first_opts.unextractable,

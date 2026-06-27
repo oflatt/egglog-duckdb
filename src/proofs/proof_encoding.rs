@@ -1705,6 +1705,10 @@ impl<'a> ProofInstrumentor<'a> {
 
                         (fv.clone(), proof)
                     }
+                    // Tuple-output (`values`) functions are rejected by the term/proof encoding.
+                    ResolvedCall::Values(_) => {
+                        unreachable!("`values` is not supported in proof mode")
+                    }
                 }
             }
         }
@@ -2294,6 +2298,10 @@ impl<'a> ProofInstrumentor<'a> {
                             ListDisplay(args, " ")
                         ));
                         fv
+                    }
+                    // Tuple-output (`values`) functions are rejected by the term/proof encoding.
+                    ResolvedCall::Values(_) => {
+                        unreachable!("`values` is not supported in proof mode")
                     }
                 }
             }

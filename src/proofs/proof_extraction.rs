@@ -30,6 +30,10 @@ impl ProofInstrumentor<'_> {
             ResolvedCall::Primitive(_) => {
                 return Err(ProveExistsError::PrimitivesUnsupported);
             }
+            // `values` is the tuple constructor, not an extractable e-class constructor.
+            ResolvedCall::Values(_) => {
+                return Err(ProveExistsError::RequiresConstructor);
+            }
         };
 
         let function = self

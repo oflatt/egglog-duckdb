@@ -351,16 +351,30 @@ impl Function {
 #[derive(Clone, Debug)]
 pub struct ResolvedSchema {
     pub input: Vec<ArcSort>,
+    /// The first (primary) output sort. See [`ResolvedSchema::outputs`].
     pub output: ArcSort,
+    /// Additional output sorts for tuple-output functions. Empty for ordinary functions.
+    pub extra_outputs: Vec<ArcSort>,
 }
 
 impl ResolvedSchema {
-    /// Get the type at position `index`, counting the `output` sort as at position `input.len()`.
+    /// All output (value-column) sorts: the primary output followed by any extras.
+    pub fn outputs(&self) -> impl Iterator<Item = &ArcSort> {
+        std::iter::once(&self.output).chain(self.extra_outputs.iter())
+    }
+
+    /// Get the type at position `index`, counting the output columns as positions
+    /// `input.len()`, `input.len() + 1`, ...
     pub fn get_by_pos(&self, index: usize) -> Option<&ArcSort> {
-        if self.input.len() == index {
-            Some(&self.output)
-        } else {
+        if index < self.input.len() {
             self.input.get(index)
+        } else {
+            let out_idx = index - self.input.len();
+            if out_idx == 0 {
+                Some(&self.output)
+            } else {
+                self.extra_outputs.get(out_idx - 1)
+            }
         }
     }
 }
@@ -1097,12 +1111,23 @@ impl EGraph {
                 let val = literal_to_value(self.bridge(), literal);
                 Ok(egglog_bridge::MergeFn::Const(val))
             }
-            GenericExpr::Var(span, resolved_var) => match resolved_var.name.as_str() {
-                "old" => Ok(egglog_bridge::MergeFn::Old),
-                "new" => Ok(egglog_bridge::MergeFn::New),
-                // NB: type-checking should already catch unbound variables here.
-                _ => Err(TypeError::Unbound(resolved_var.name.clone(), span.clone()).into()),
-            },
+            GenericExpr::Var(span, resolved_var) => {
+                let name = resolved_var.name.as_str();
+                // Single-output merges use `old`/`new`; tuple-output merges use `old0`, `new0`,
+                // `old1`, ... to refer to the old/new value of a specific output column.
+                if name == "old" {
+                    Ok(egglog_bridge::MergeFn::Old)
+                } else if name == "new" {
+                    Ok(egglog_bridge::MergeFn::New)
+                } else if let Some(i) = name.strip_prefix("old").and_then(|s| s.parse().ok()) {
+                    Ok(egglog_bridge::MergeFn::OldCol(i))
+                } else if let Some(i) = name.strip_prefix("new").and_then(|s| s.parse().ok()) {
+                    Ok(egglog_bridge::MergeFn::NewCol(i))
+                } else {
+                    // NB: type-checking should already catch unbound variables here.
+                    Err(TypeError::Unbound(resolved_var.name.clone(), span.clone()).into())
+                }
+            }
             GenericExpr::Call(_, ResolvedCall::Func(f), args) => {
                 let translated_args = args
                     .iter()
@@ -1146,6 +1171,12 @@ impl EGraph {
                     translated_args,
                 ))
             }
+            // A top-level `(values ...)` tuple merge is decomposed per column in
+            // `declare_function`; reaching here means a `values` was nested inside another merge
+            // expression, which is not supported.
+            GenericExpr::Call(span, ResolvedCall::Values(_), _) => Err(Error::TypeError(
+                TypeError::TupleMergeNotValues("<merge>".to_owned(), span.clone()),
+            )),
         }
     }
 
@@ -1165,6 +1196,13 @@ impl EGraph {
             .map(get_sort)
             .collect::<Result<Vec<_>, _>>()?;
         let output = get_sort(&decl.schema.output)?;
+        let extra_outputs = decl
+            .schema
+            .extra_outputs
+            .iter()
+            .map(get_sort)
+            .collect::<Result<Vec<_>, _>>()?;
+        let num_outputs = 1 + extra_outputs.len();
 
         use egglog_bridge::{DefaultVal, MergeFn};
         let (backend_id, can_subsume) = match &decl.impl_kind {
@@ -1195,6 +1233,7 @@ impl EGraph {
                     schema: input
                         .iter()
                         .chain([&output])
+                        .chain(extra_outputs.iter())
                         .map(|sort| sort.column_ty(&*self.backend))
                         .collect(),
                     default: if is_uf_index {
@@ -1240,8 +1279,21 @@ impl EGraph {
                         match decl.subtype {
                             FunctionSubtype::Constructor => MergeFn::UnionId,
                             FunctionSubtype::Custom => match &decl.merge {
-                                None => MergeFn::AssertEq,
+                                // A tuple-output merge is a `(values e0 e1 ...)` form: each `ei`
+                                // becomes the merge for output column `i`.
+                                Some(GenericExpr::Call(_, ResolvedCall::Values(_), cols)) => {
+                                    MergeFn::Columns(
+                                        cols.iter()
+                                            .map(|e| self.translate_expr_to_mergefn(e))
+                                            .collect::<Result<Vec<_>, _>>()?,
+                                    )
+                                }
                                 Some(expr) => self.translate_expr_to_mergefn(expr)?,
+                                // No merge clause: assert equality per output column.
+                                None if num_outputs > 1 => MergeFn::Columns(
+                                    (0..num_outputs).map(|_| MergeFn::AssertEq).collect(),
+                                ),
+                                None => MergeFn::AssertEq,
                             },
                         }
                     },
@@ -1258,7 +1310,11 @@ impl EGraph {
 
         let function = Function {
             decl: decl.clone(),
-            schema: ResolvedSchema { input, output },
+            schema: ResolvedSchema {
+                input,
+                output,
+                extra_outputs,
+            },
             can_subsume,
             backend_id,
         };
@@ -3551,6 +3607,9 @@ impl<'a> BackendRule<'a> {
                     let (p, args, ty) = self.prim(p, &atom.args, ctx);
                     self.rb.query_prim(p, &args, ty).unwrap()
                 }
+                ResolvedCall::Values(_) => {
+                    unreachable!("`values` is lowered to the underlying function atom before query")
+                }
             }
         }
     }
@@ -3588,6 +3647,9 @@ impl<'a> BackendRule<'a> {
                                 }),
                             )
                         }
+                        ResolvedCall::Values(_) => {
+                            panic!("`values` cannot be bound as a single value")
+                        }
                     };
                     self.entries.insert(v, y);
                 }
@@ -3596,16 +3658,18 @@ impl<'a> BackendRule<'a> {
                     let x = self.entry(x);
                     self.entries.insert(v, x);
                 }
-                core::GenericCoreAction::Set(_, f, xs, y) => match f {
+                core::GenericCoreAction::Set(_, f, xs, ys) => match f {
                     ResolvedCall::Primitive(..) => panic!("runtime primitive set!"),
+                    ResolvedCall::Values(..) => panic!("`values` is not a settable function"),
                     ResolvedCall::Func(f) => {
                         let f = self.func(f);
-                        let args = self.args(xs.iter().chain([y]));
+                        let args = self.args(xs.iter().chain(ys.iter()));
                         self.rb.set(f, &args)
                     }
                 },
                 core::GenericCoreAction::Change(span, change, f, args) => match f {
                     ResolvedCall::Primitive(..) => panic!("runtime primitive change!"),
+                    ResolvedCall::Values(..) => panic!("`values` is not a changeable function"),
                     ResolvedCall::Func(f) => {
                         let name = f.name.clone();
                         let can_subsume = self.functions[&f.name].can_subsume;

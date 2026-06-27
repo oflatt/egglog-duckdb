@@ -189,6 +189,11 @@ fn eval_expr_with_subst(
                     })
                 })?
             }
+            // Tuple-output (`values`) functions are rejected by the term/proof encoding, so they
+            // never appear in proofs.
+            ResolvedCall::Values(_) => {
+                unreachable!("`values` is not supported in proof mode")
+            }
         },
     };
 
@@ -1012,6 +1017,10 @@ impl ProofStore {
                                 );
                             }
                         }
+                    }
+                    // Tuple-output (`values`) functions are rejected by the term/proof encoding.
+                    ResolvedCall::Values(_) => {
+                        unreachable!("`values` is not supported in proof mode")
                     }
                 }
             }
