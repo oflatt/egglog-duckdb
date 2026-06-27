@@ -772,6 +772,74 @@ unsafe impl Send for EGraph {}
 unsafe impl Sync for EGraph {}
 
 // ---------------------------------------------------------------------------
+// Merge-mode recognition (shared by `add_table`)
+// ---------------------------------------------------------------------------
+
+/// Map a *scalar* (single value column) [`MergeFn`] to the FlowLog [`MergeMode`] that resolves
+/// one output column's FD conflict. Recognizes:
+///   - `AssertEq` / `Old`         => keep the old value
+///   - `New`                      => keep the new value
+///   - `UnionId` / `UnionIntoUf`  => lattice-min (the union-find leader). `UnionIntoUf` is the
+///     `--native-merge` form; the *target UF* it names is read separately (see
+///     [`native_merge_target_uf`]) and the union itself is injected by `resolve_merge`, so here it
+///     only governs which value survives the FD collapse — identical to `UnionId` (`Min`).
+///   - `Primitive(_)`             => lattice-min (the term encoder's `@uff` `:merge ordering-min`)
+///   - `OldCol(_)`                => keep the old value
+///   - `NewCol(_)`                => keep the new value
+///   - `Function`/`Const`         => fall back to `Old`
+fn merge_mode_for_scalar(merge: &MergeFn) -> MergeMode {
+    match merge {
+        MergeFn::AssertEq | MergeFn::Old => MergeMode::Old,
+        MergeFn::New => MergeMode::New,
+        MergeFn::UnionId | MergeFn::UnionIntoUf(_) => MergeMode::Min,
+        MergeFn::Primitive(_, _) => MergeMode::Min,
+        // For a single-output table `OldCol(i)`/`NewCol(i)` can only reference column 0, which is
+        // this table's sole value column — i.e. plain old/new.
+        MergeFn::OldCol(_) => MergeMode::Old,
+        MergeFn::NewCol(_) => MergeMode::New,
+        MergeFn::Function(_, _) | MergeFn::Const(_) => MergeMode::Old,
+        MergeFn::Columns(_) => {
+            unreachable!("merge_mode_for_scalar called on a Columns merge")
+        }
+    }
+}
+
+/// Resolve the [`MergeMode`] for a function table with a single output column.
+///
+/// A top-level [`MergeFn::Columns`] of length 1 is the multi-value spelling of a single-output
+/// merge and collapses to its one inner column's mode. FlowLog's relation model carries exactly
+/// one output-column merge mode, so a genuine multi-value `Columns` (len > 1) — a tuple-output
+/// function — cannot be expressed and is a clean, documented error. (Tuple-output views are a
+/// later step; the term encoder does not emit them on FlowLog today.)
+fn merge_mode_for_table(merge: &MergeFn, name: &str) -> MergeMode {
+    match merge {
+        MergeFn::Columns(cols) => match cols.as_slice() {
+            [single] => merge_mode_for_scalar(single),
+            _ => panic!(
+                "FlowLog backend does not support tuple-output (multi-value) merges yet \
+                 (function `{name}` has a {}-column `Columns` merge)",
+                cols.len()
+            ),
+        },
+        other => merge_mode_for_scalar(other),
+    }
+}
+
+/// `--native-merge`: the per-sort UF a view's congruence union targets, named UNIFORMLY by the
+/// `UnionIntoUf(uf_func)` merge variant (top-level, or a single-column `Columns` wrapping it).
+/// `None` for any other merge.
+fn native_merge_target_uf(merge: &MergeFn) -> Option<FunctionId> {
+    match merge {
+        MergeFn::UnionIntoUf(uf_func) => Some(*uf_func),
+        MergeFn::Columns(cols) => match cols.as_slice() {
+            [MergeFn::UnionIntoUf(uf_func)] => Some(*uf_func),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // impl Backend
 // ---------------------------------------------------------------------------
 
@@ -806,20 +874,16 @@ impl Backend for EGraph {
             _ => false,
         });
         let has_output = arity > 0 && !output_is_unit;
+        // `--native-merge`: the UF a view's FD-conflict congruence union targets is named
+        // UNIFORMLY by the `UnionIntoUf(uf_func)` merge variant (the same single source of truth
+        // the native bridge reads). Capture it at `add_table` so every backend reads the target UF
+        // from the same place; `register_native_merge_view` is then only a consistency assertion.
+        // The view is declared after its eq-sort, so the UF's `FunctionId` already resolves here.
+        let native_merge_target = native_merge_target_uf(&config.merge);
         let merge = if !has_output {
             MergeMode::Relation
         } else {
-            match &config.merge {
-                MergeFn::AssertEq | MergeFn::Old => MergeMode::Old,
-                MergeFn::New => MergeMode::New,
-                // `UnionIntoUf` is the native-bridge-only `--native-merge` form;
-                // FlowLog routes its FD-conflict union via the `register_native_
-                // merge_view` `native_merge_uf` association instead, so it only
-                // ever sees `UnionId` here. Treat both as `Min` for safety.
-                MergeFn::UnionId | MergeFn::UnionIntoUf(_) => MergeMode::Min,
-                MergeFn::Primitive(_, _) => MergeMode::Min,
-                MergeFn::Function(_, _) | MergeFn::Const(_) => MergeMode::Old,
-            }
+            merge_mode_for_table(&config.merge, &config.name)
         };
         let identity_on_miss = matches!(config.default, DefaultVal::Identity);
         self.relations.push(RelationInfo {
@@ -830,6 +894,9 @@ impl Backend for EGraph {
             identity_on_miss,
         });
         self.mirror.insert(id, std::rc::Rc::new(HashSet::new()));
+        if let Some(uf_func) = native_merge_target {
+            self.native_merge_uf.insert(id, uf_func);
+        }
         id
     }
 
@@ -908,14 +975,27 @@ impl Backend for EGraph {
     }
 
     fn register_native_merge_view(&mut self, uf_func: FunctionId, view_func: FunctionId) {
-        // `--native-merge`: the view's eclass (OUTPUT) column belongs to `uf_func`.
-        // Record the association so `resolve_merge` injects a union into this UF on
-        // an FD conflict (same children, two eclasses) — inline congruence.
+        // `--native-merge`: the view's eclass (OUTPUT) column belongs to `uf_func`. The view->UF
+        // association is now captured UNIFORMLY at `add_table` from the view's `UnionIntoUf` merge
+        // (the same single source of truth the native bridge reads), so this is a consistency
+        // assertion that the frontend's schedule-time registration agrees with the merge that was
+        // baked in at declare time — not the routing source. `resolve_merge` reads
+        // `native_merge_uf` to inject the union into this UF on an FD conflict.
         debug_assert!(
             self.native_ufs.contains_key(&uf_func),
             "register_native_merge_view: uf_func is not a native union-find"
         );
-        self.native_merge_uf.insert(view_func, uf_func);
+        if let Some(existing) = self.native_merge_uf.get(&view_func) {
+            assert_eq!(
+                *existing, uf_func,
+                "register_native_merge_view: view {view_func:?} merge targets UF {existing:?} \
+                 but is being registered against UF {uf_func:?}"
+            );
+        } else {
+            // Defensive: a view registered without an `UnionIntoUf` merge (should not happen under
+            // the encoder's native-merge lowering) still gets its association recorded.
+            self.native_merge_uf.insert(view_func, uf_func);
+        }
     }
 
     fn table_size(&self, table: FunctionId) -> usize {

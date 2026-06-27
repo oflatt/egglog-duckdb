@@ -169,14 +169,30 @@ pub enum MergeFn {
     /// The output of a merge is determined by looking up the value for the given function and the
     /// given arguments in the egraph.
     Function(FunctionId, Vec<MergeFn>),
-    /// Always return the old value for the given function.
+    /// Always return the old value for *this* value column (the column this merge resolves).
     Old,
-    /// Always return the new value for the given function.
+    /// Always return the new value for *this* value column.
     New,
+    /// The old value of value column `i`. Used by tuple-output (multi-value) merges, where a
+    /// column's merge may reference any output column of the OLD row. For a single-output
+    /// function, `OldCol(0)` is equivalent to [`MergeFn::Old`].
+    OldCol(usize),
+    /// The new value of value column `i`. The multi-value counterpart of [`MergeFn::New`].
+    NewCol(usize),
     /// Always overwrite the new value for the given function with a constant. This is more useful
     /// as a "base case" in a more complicated merge function (e.g. one that clamps a value between
     /// 1 and 100) than it is as a standalone merge function.
     Const(Value),
+    /// A merge for a tuple-output (multi-value) function: one [`MergeFn`] per value (return)
+    /// column. Each inner `MergeFn` produces that column's merged value and may reference any
+    /// output column via [`MergeFn::OldCol`] / [`MergeFn::NewCol`]. Its length determines the
+    /// number of value columns of the function (`n_vals`); `n_keys = schema.len() - n_vals`.
+    ///
+    /// `Columns` must appear only at the top level: a nested `Columns` (e.g. as an argument to a
+    /// [`MergeFn::Primitive`] or inside another `Columns`) is an error. A single-output function
+    /// uses a bare scalar merge (`Old`/`New`/`UnionId`/…), which is exactly a `Columns` of
+    /// length 1.
+    Columns(Vec<MergeFn>),
 }
 
 // ---------------------------------------------------------------------------

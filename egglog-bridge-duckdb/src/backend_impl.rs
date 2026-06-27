@@ -84,6 +84,63 @@ use crate::external_func;
 use crate::{ColumnTy as DuckColumnTy, EGraph, Literal, MergeMode, q};
 
 // ---------------------------------------------------------------------------
+// Merge-mode recognition (shared by `add_table`)
+// ---------------------------------------------------------------------------
+
+/// Map a *scalar* (single value column) [`MergeFn`] to the DuckDB [`MergeMode`] that resolves one
+/// output column's FD conflict (the `ON CONFLICT` clause). Recognizes:
+///   - `Old` / `AssertEq`         => keep the existing value
+///   - `New`                      => keep the new value
+///   - `UnionId` / `UnionIntoUf`  => lattice-min (the union-find leader). DuckDB does not support
+///     `--native-merge` (rejected at the CLI), so `UnionIntoUf` never actually reaches here; it is
+///     mapped like `UnionId` for completeness.
+///   - `Primitive(ordering-min)`  => `Min` (the term encoder's `@UF_<Sort>f` index).
+///   - `OldCol(_)`                => keep the existing value
+///   - `NewCol(_)`                => keep the new value
+///   - everything else            => `Old` (complex merges are gated out by
+///     `supports_complex_merge` = false).
+fn duck_merge_mode_scalar(
+    merge: &MergeFn,
+    funcs: &external_func::DuckdbExternalFuncRegistry,
+) -> MergeMode {
+    match merge {
+        MergeFn::Old | MergeFn::AssertEq => MergeMode::Old,
+        MergeFn::New => MergeMode::New,
+        MergeFn::UnionId | MergeFn::UnionIntoUf(_) => MergeMode::Min,
+        MergeFn::Primitive(ext_id, _) => match funcs.name(*ext_id) {
+            Some("ordering-min") => MergeMode::Min,
+            _ => MergeMode::Old,
+        },
+        MergeFn::OldCol(_) => MergeMode::Old,
+        MergeFn::NewCol(_) => MergeMode::New,
+        MergeFn::Const(_) | MergeFn::Function(_, _) => MergeMode::Old,
+        MergeFn::Columns(_) => unreachable!("duck_merge_mode_scalar called on a Columns merge"),
+    }
+}
+
+/// Resolve the [`MergeMode`] for a function table with a single output column. A top-level
+/// `Columns` of length 1 is the multi-value spelling of a single-output merge and collapses to its
+/// one inner column's mode. DuckDB's `ON CONFLICT` model resolves a single output column, so a
+/// genuine multi-value `Columns` (len > 1) — a tuple-output function — cannot be expressed and is
+/// a clean, documented error. (Tuple-output views are a later step; DuckDB never receives them.)
+fn duck_merge_mode(
+    merge: &MergeFn,
+    funcs: &external_func::DuckdbExternalFuncRegistry,
+) -> MergeMode {
+    match merge {
+        MergeFn::Columns(cols) => match cols.as_slice() {
+            [single] => duck_merge_mode_scalar(single, funcs),
+            _ => panic!(
+                "DuckDB backend does not support tuple-output (multi-value) merges \
+                 (a {}-column `Columns` merge)",
+                cols.len()
+            ),
+        },
+        other => duck_merge_mode_scalar(other, funcs),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // `DuckdbContainerPool` — Commit 13's stub
 // ---------------------------------------------------------------------------
 
@@ -568,21 +625,7 @@ impl Backend for EGraph {
                 // Map the merge mode the same way the Fail/Const arm does; the
                 // term encoder declares `@UF_Sf` with `:merge (ordering-min …)`
                 // (a `Primitive` referencing `ordering-min`) => `MergeMode::Min`.
-                let merge_mode = match &config.merge {
-                    MergeFn::Old | MergeFn::AssertEq => MergeMode::Old,
-                    MergeFn::New => MergeMode::New,
-                    // `UnionIntoUf` is the native-bridge-only `--native-merge`
-                    // form; DuckDB does not support native-merge (rejected at the
-                    // CLI), so it never reaches here. Map like `UnionId`.
-                    MergeFn::UnionId | MergeFn::UnionIntoUf(_) => MergeMode::Min,
-                    MergeFn::Primitive(ext_id, _) => {
-                        match self.backend_external_funcs.name(*ext_id) {
-                            Some("ordering-min") => MergeMode::Min,
-                            _ => MergeMode::Old,
-                        }
-                    }
-                    MergeFn::Const(_) | MergeFn::Function(_, _) => MergeMode::Old,
-                };
+                let merge_mode = duck_merge_mode(&config.merge, &self.backend_external_funcs);
                 let inputs = &duck_cols[..duck_cols.len() - 1];
                 let output = duck_cols[duck_cols.len() - 1];
                 let r = self.add_function(&name, inputs, output, merge_mode);
@@ -603,37 +646,12 @@ impl Backend for EGraph {
                 // trait side we don't have the sort name, only the
                 // `BaseValueId`. Use the pool to compare against the
                 // Unit type id.
-                let merge_mode = match &config.merge {
-                    MergeFn::Old | MergeFn::AssertEq => Some(MergeMode::Old),
-                    MergeFn::New => Some(MergeMode::New),
-                    // `UnionIntoUf` is the native-bridge-only `--native-merge`
-                    // form; DuckDB does not support native-merge (rejected at the
-                    // CLI), so it never reaches here. Map like `UnionId`.
-                    MergeFn::UnionId | MergeFn::UnionIntoUf(_) => Some(MergeMode::Min),
-                    MergeFn::Primitive(ext_id, _) => {
-                        // The term encoder emits `:merge (ordering-min
-                        // old new)` for the function-form union-find
-                        // table (`@UF_<Sort>f`). The frontend lowers
-                        // that to a `Primitive` referencing the
-                        // `ordering-min` external. Without recognizing
-                        // it, the duckdb conflict clause falls back to
-                        // `DO NOTHING`, which silently drops UFf
-                        // upserts and leaves singleparent unable to
-                        // canonicalize — observed as an infinite
-                        // `(8,13) ↔ (13,8)` toggle in @UF_Math while
-                        // @UF_Mathf stays stale at (8,8)/(13,13).
-                        match self.backend_external_funcs.name(*ext_id) {
-                            Some("ordering-min") => Some(MergeMode::Min),
-                            _ => Some(MergeMode::Old),
-                        }
-                    }
-                    MergeFn::Const(_) | MergeFn::Function(_, _) => {
-                        // Per Phase 1 design: complex merges are gated
-                        // out by `supports_complex_merge` (`false`).
-                        // Fall back to Old for unreachable code paths.
-                        Some(MergeMode::Old)
-                    }
-                };
+                // The term encoder emits `:merge (ordering-min old new)` for the
+                // function-form union-find table (`@UF_<Sort>f`), lowered to a
+                // `Primitive` referencing the `ordering-min` external => `Min`.
+                // Without recognizing it the duckdb conflict clause would fall back
+                // to `DO NOTHING`, silently dropping UFf upserts.
+                let merge_mode = Some(duck_merge_mode(&config.merge, &self.backend_external_funcs));
 
                 // Detect Unit output: schema's last entry is
                 // `ColumnTy::Base(id)` where `id` matches the pool's
