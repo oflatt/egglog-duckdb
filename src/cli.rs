@@ -135,8 +135,8 @@ struct Args {
     /// (same children, different output) at insert time, and the separate
     /// congruence rule is dropped from the per-iteration rebuild. This is the
     /// non-proof half of egglog PR #933. Implies `--native-uf` + term encoding
-    /// (the injected union edge goes into the in-core union-find). `--flowlog`
-    /// only for now (the backend must inject the union on FD-conflict). Term mode
+    /// (the injected union edge goes into the in-core union-find). `--flowlog` or
+    /// `--feldera` (the backend must inject the union on FD-conflict). Term mode
     /// only; off by default (the rule-encoded congruence is byte-identical).
     #[clap(long = "native-merge")]
     native_merge: bool,
@@ -179,15 +179,15 @@ pub fn cli(mut egraph: EGraph) {
     // `--native-merge` does congruence inline via a native backend merge that
     // injects the union-on-FD-conflict edge into the in-core union-find — so it
     // REQUIRES native-UF (the relational `@UF_S` parent table has no insert-time
-    // merge hook). It is implemented on the FlowLog backend only for now (the
+    // merge hook). It is implemented on the FlowLog and Feldera backends (the
     // backend must inject the union on FD-conflict; other backends still map a
     // UnionId merge to a plain min-and-drop, which would silently lose the
-    // congruence edge). Enforce flowlog and fold native-merge into native-UF so
-    // every downstream `args.native_uf` site (term encoding, backend config) is
-    // provisioned correctly.
+    // congruence edge). Enforce flowlog/feldera and fold native-merge into
+    // native-UF so every downstream `args.native_uf` site (term encoding, backend
+    // config) is provisioned correctly.
     if args.native_merge {
-        if !args.flowlog_backend {
-            log::error!("--native-merge is only supported with --flowlog");
+        if !args.flowlog_backend && !args.feldera_backend {
+            log::error!("--native-merge is only supported with --flowlog or --feldera");
             std::process::exit(1);
         }
         args.native_uf = true;
@@ -523,11 +523,11 @@ pub fn cli(mut egraph: EGraph) {
                 if args.native_uf && (args.flowlog_backend || args.feldera_backend) {
                     backend_eg = backend_eg.with_native_uf();
                 }
-                // `--native-merge` (flowlog only, enforced above): switch the
+                // `--native-merge` (flowlog/feldera, enforced above): switch the
                 // rebuilt backend egraph's encoder to the FD-keyed view + inline
                 // UnionId merge. Must be set on `backend_eg` (the egraph that
                 // actually runs the program), not the pre-rebuild `egraph`.
-                if args.native_merge && args.flowlog_backend {
+                if args.native_merge && (args.flowlog_backend || args.feldera_backend) {
                     backend_eg = backend_eg.with_native_merge();
                 }
                 backend_eg.parser = std::mem::take(&mut egraph.parser);
