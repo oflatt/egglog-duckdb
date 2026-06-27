@@ -396,19 +396,29 @@ impl ProofInstrumentor<'_> {
 
     /// True when PROOF-mode canonicalize-at-creation should be emitted.
     ///
-    /// Enabled only when (a) canon-at-creation is on, (b) proofs are enabled, and
-    /// (c) the backend supports inline table lookups — i.e. the native bridge.
+    /// Enabled only when (a) canon-at-creation is on, (b) proofs are enabled,
+    /// (c) the backend supports inline table lookups — i.e. the native bridge —
+    /// and (d) the encoding is NOT native-UF.
+    ///
     /// The proof-mode canon read uses `@uf_find_or_refl_S` / `@uf_find_leader_S`
-    /// ReadPrims that look up `@UF_Sf` mid-rule; the dataflow/SQL backends
-    /// (duckdb/feldera/flowlog) cannot reenter a table lookup mid-rule
-    /// (`supports_inline_table_lookups() == false`) and run proofs without
-    /// canon-at-creation (the rebuild rules canonicalize views), so this is
-    /// gated off there — keeping their proof-mode encoding byte-identical to
-    /// before this feature.
+    /// ReadPrims that look up the RELATIONAL union-find `@UF_Sf` (schema
+    /// `(S) Pair(S, Proof)`) mid-rule. Those ReadPrims are registered only by the
+    /// relational `declare_sort` (via the pair sort's `:internal-uf-pair-prims`),
+    /// so under `--native-uf` they are unbound; native-UF's `@UF_Sf` is a
+    /// different `(S S) Proof` displaced-union-find schema anyway. So this
+    /// mechanism is RELATIONAL-UF only: under `--native-uf` proof mode we fall
+    /// back to the pre-STEP-0 path where the rebuild rules
+    /// (`rebuilding_rules_native_uf_proof`) canonicalize the views.
+    ///
+    /// The dataflow/SQL backends (duckdb/feldera/flowlog) likewise cannot reenter
+    /// a table lookup mid-rule (`supports_inline_table_lookups() == false`) and
+    /// run proofs without canon-at-creation, so this is also gated off there —
+    /// keeping their proof-mode encoding byte-identical to before this feature.
     pub(crate) fn proof_canon_at_creation(&self) -> bool {
         self.egraph.proof_state.canon_at_creation
             && self.egraph.proof_state.proofs_enabled
             && self.egraph.backend.supports_inline_table_lookups()
+            && !self.native_uf()
     }
 
     /// True when the fast-rebuild encoding mode is active (`--fast-rebuild` on
