@@ -146,6 +146,7 @@ pub enum DefaultVal {
 }
 
 /// How to resolve FD conflicts for a table.
+#[derive(Clone)]
 pub enum MergeFn {
     /// Panic if the old and new values don't match.
     AssertEq,
@@ -257,6 +258,27 @@ pub enum MergeFn {
     /// uses a bare scalar merge (`Old`/`New`/`UnionId`/…), which is exactly a `Columns` of
     /// length 1.
     Columns(Vec<MergeFn>),
+    /// Insert a row into the given function's table (the `args` evaluate to the
+    /// full row), respecting that table's own merge. Returns the OLD value of the
+    /// resolving column (its return is meant to be discarded inside a
+    /// [`MergeFn::Seq`]). Models a `(set (f ...) v)` action inside a merge;
+    /// declares `f`'s table as a write-dependency so the side write is safe during
+    /// batched merges. Ported from PR #933 (`:merge`-multiple-actions). Bridge-only
+    /// — the dataflow/SQL backends treat it as unsupported.
+    TableInsert(FunctionId, Vec<MergeFn>),
+    /// Evaluate each merge function in order (for their effects) and return the
+    /// value of the last one. Models an action-block merge: the leading entries
+    /// are effects (e.g. [`MergeFn::TableInsert`] / [`MergeFn::Construct`]) and the
+    /// last is the value. Used to lower a term-building custom `:merge` body into a
+    /// single native merge. Ported from PR #933. Bridge-only.
+    Seq(Vec<MergeFn>),
+    /// Mint a pair-valued constructor inside a merge and return its output e-class.
+    /// `args` evaluate to the key (children); the first value column (the output) is
+    /// minted (the table's `FreshId` default) and the remaining value columns are
+    /// written from `value_args` (e.g. the term proof). Used to express a nested
+    /// constructor application inside a term-building custom `:merge` body. Ported
+    /// from PR #933 (FD proof encoding). Bridge-only.
+    Construct(FunctionId, Vec<MergeFn>, Vec<MergeFn>),
 }
 
 // ---------------------------------------------------------------------------

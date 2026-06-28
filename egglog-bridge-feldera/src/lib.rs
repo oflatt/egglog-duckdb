@@ -1059,6 +1059,14 @@ fn merge_mode_for_scalar(merge: &egglog_backend_trait::MergeFn) -> MergeMode {
             panic!("Feldera backend does not support proof-mode native-merge merges")
         }
         MergeFn::Columns(_) => unreachable!("merge_mode_for_scalar called on a Columns merge"),
+        // `Seq` / `TableInsert` / `Construct` are the bridge-only
+        // `:merge`-multiple-actions variants (PR #933); Feldera has no
+        // multi-action merge support, so they never reach this backend.
+        MergeFn::Seq(_) | MergeFn::TableInsert(..) | MergeFn::Construct(..) => {
+            panic!(
+                "Feldera backend does not support multi-action (Seq/TableInsert/Construct) merges"
+            )
+        }
     }
 }
 

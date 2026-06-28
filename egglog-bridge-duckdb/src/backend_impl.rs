@@ -125,6 +125,14 @@ fn duck_merge_mode_scalar(
             panic!("DuckDB backend does not support proof-mode native-merge merges")
         }
         MergeFn::Columns(_) => unreachable!("duck_merge_mode_scalar called on a Columns merge"),
+        // `Seq` / `TableInsert` / `Construct` are the bridge-only
+        // `:merge`-multiple-actions variants (PR #933); DuckDB has no
+        // multi-action merge support, so they never reach this backend.
+        MergeFn::Seq(_) | MergeFn::TableInsert(..) | MergeFn::Construct(..) => {
+            panic!(
+                "DuckDB backend does not support multi-action (Seq/TableInsert/Construct) merges"
+            )
+        }
     }
 }
 

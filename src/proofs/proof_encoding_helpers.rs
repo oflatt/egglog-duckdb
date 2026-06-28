@@ -485,6 +485,62 @@ impl ProofInstrumentor<'_> {
             && fdecl.merge.as_ref().is_some_and(Self::merge_is_value_fold)
     }
 
+    /// True when a CUSTOM `:merge` function's merge body BUILDS TERMS: it contains
+    /// at least one constructor `Func` call (e.g. `(C2 (C1 old new) (C2 old new))`)
+    /// and every leaf is a `Lit` / `Var` / nested constructor / primitive. Unlike
+    /// [`Self::merge_is_value_fold`], a `ResolvedCall::Func` is ALLOWED here (it is
+    /// what distinguishes a term-building merge from a value fold). Used by the
+    /// PR #933 `:merge`-multiple-actions lowering — such a body is re-expressed as a
+    /// `MergeFn::Seq` of `Construct` / `TableInsert` / union variants and runs
+    /// inline in the FD-view merge callback.
+    pub(crate) fn merge_is_term_build(expr: &ResolvedExpr) -> bool {
+        match expr {
+            // A bare `old`/`new`/literal body builds no term — that is a value
+            // fold (or a degenerate `old`/`new` merge), not a term build.
+            GenericExpr::Lit(..) | GenericExpr::Var(..) => false,
+            // A top-level constructor call is a term build. Its arguments may be
+            // vars, literals, or further nested constructor / primitive calls.
+            GenericExpr::Call(_, ResolvedCall::Func(_), args) => {
+                args.iter().all(Self::term_build_arg_ok)
+            }
+            // A `(values ...)` tuple merge is not (yet) a term build; a top-level
+            // primitive whose args build terms is also out of scope for now.
+            GenericExpr::Call(_, ResolvedCall::Primitive(_), _)
+            | GenericExpr::Call(_, ResolvedCall::Values(_), _) => false,
+        }
+    }
+
+    /// Whether an argument of a term-building constructor call is expressible in
+    /// the [`MergeFn::Seq`] lowering: a var (`old`/`new`/`oldN`/`newN`), a literal,
+    /// a nested constructor call, or a primitive over such args.
+    fn term_build_arg_ok(expr: &ResolvedExpr) -> bool {
+        match expr {
+            GenericExpr::Lit(..) | GenericExpr::Var(..) => true,
+            GenericExpr::Call(_, ResolvedCall::Func(_), args) => {
+                args.iter().all(Self::term_build_arg_ok)
+            }
+            GenericExpr::Call(_, ResolvedCall::Primitive(_), args) => {
+                args.iter().all(Self::term_build_arg_ok)
+            }
+            GenericExpr::Call(_, ResolvedCall::Values(_), _) => false,
+        }
+    }
+
+    /// True when this custom-`:merge` function should run its term-building merge
+    /// NATIVELY as a `MergeFn::Seq` instead of via the rule-encoded
+    /// `@merge_rule`/`@merge_cleanup`. Gated like [`Self::native_value_fold_merge`]
+    /// but for an EQ-SORT output (a term-building merge mints e-nodes) whose body
+    /// is a term build. The PR #933 `:merge`-multiple-actions port; bridge + term
+    /// (non-proof) only for now.
+    pub(crate) fn native_term_build_merge(&self, fdecl: &ResolvedFunctionDecl) -> bool {
+        self.native_merge()
+            && !self.egraph.proof_state.proofs_enabled
+            && self.egraph.backend.supports_complex_merge()
+            && fdecl.subtype == FunctionSubtype::Custom
+            && fdecl.resolved_schema.output().is_eq_sort()
+            && fdecl.merge.as_ref().is_some_and(Self::merge_is_term_build)
+    }
+
     /// True when `view_name` is a native-merge FD view (keyed on children, eclass
     /// as the function output). Consulted by `update_view` /
     /// `query_view_and_get_proof` to choose the FD `(children) -> ...` form.

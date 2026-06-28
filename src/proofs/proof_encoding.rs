@@ -102,6 +102,19 @@ pub(crate) struct EncodingState {
     /// structurally identical: children key, single trailing output). Empty
     /// unless `--native-merge` on the bridge in term mode.
     pub native_value_merge_views: HashMap<String, ResolvedExpr>,
+    /// Native-merge mode only (term, non-proof, bridge): for a CUSTOM `:merge`
+    /// function whose merge body BUILDS TERMS (contains constructor `Func` calls,
+    /// e.g. `(C2 (C1 old new) (C2 old new))`), its `@<F>View` is declared FD-keyed
+    /// `(children) -> eclass` and the term-building body runs NATIVELY in the
+    /// backend's FD-conflict merge callback (lowered to a `MergeFn::Seq` of
+    /// `Construct` / `TableInsert` / union variants) instead of via the
+    /// rule-encoded `@merge_rule` + `@merge_cleanup`. This maps such a view name ->
+    /// the (resolved) merge expression, so `declare_function` (lib.rs) can lower it
+    /// to a `Seq`. Like `native_value_merge_views`, membership ALSO routes the view
+    /// through the FD `(children) -> eclass` set/query/delete forms (the view is
+    /// added to `native_merge_views` too). The PR #933 `:merge`-multiple-actions
+    /// port. Empty unless `--native-merge` on the bridge in term mode.
+    pub native_term_build_views: HashMap<String, ResolvedExpr>,
     /// Native-engine-rebuild mode (`--nativerb`, native bridge + term-encoding
     /// native-UF + non-proof only). When on, the per-constructor
     /// `@rebuild_rule*` rebuild rules are NOT emitted; instead each `@<F>View`
@@ -215,6 +228,7 @@ impl EncodingState {
             native_merge_views: HashSet::default(),
             native_merge_registered: HashSet::default(),
             native_value_merge_views: HashMap::default(),
+            native_term_build_views: HashMap::default(),
             nativerb: false,
             nativerb_union_sorts: HashSet::default(),
             nativerb_engine_rebuilt_views: HashSet::default(),
@@ -828,6 +842,19 @@ impl<'a> ProofInstrumentor<'a> {
             {
                 return String::new();
             }
+            // Native TERM-BUILD custom `:merge` (PR #933 multi-action merge): the
+            // term-building body runs INLINE in the FD view's `MergeFn::Seq` merge
+            // callback (lowered in `declare_function`), so the rule-encoded
+            // `@merge_rule` + `@merge_cleanup` are NOT emitted — same gate as the
+            // value-fold path above.
+            if self
+                .egraph
+                .proof_state
+                .native_term_build_views
+                .contains_key(&view_name)
+            {
+                return String::new();
+            }
             self.handle_merge_fn(
                 fdecl,
                 &child_names,
@@ -910,7 +937,15 @@ impl<'a> ProofInstrumentor<'a> {
         // baseline encoding (one row, no merge to fold). 0-input value-fold merges
         // are rare; falling back to rules is always correct.
         let native_value_fold = self.native_value_fold_merge(fdecl) && !schema.input.is_empty();
-        let native_merge_view = native_congruence_view || native_value_fold;
+        // Native TERM-BUILD custom `:merge` (term, non-proof, bridge): the merge
+        // body builds terms (constructor calls). Its `@<F>View` becomes an FD view
+        // `(children) -> eclass` whose merge runs the term-building body NATIVELY
+        // (lowered to a `MergeFn::Seq` in `declare_function`), dropping the
+        // rule-encoded `@merge_rule` + `@merge_cleanup`. The PR #933
+        // `:merge`-multiple-actions port. Empty-input functions cannot be FD-keyed
+        // on children-only, so keep the baseline encoding for those.
+        let native_term_build = self.native_term_build_merge(fdecl) && !schema.input.is_empty();
+        let native_merge_view = native_congruence_view || native_value_fold || native_term_build;
         if native_merge_view {
             self.egraph
                 .proof_state
@@ -923,6 +958,14 @@ impl<'a> ProofInstrumentor<'a> {
             self.egraph
                 .proof_state
                 .native_value_merge_views
+                .insert(view_name.clone(), fdecl.merge.clone().unwrap());
+        }
+        if native_term_build {
+            // Stash the (resolved) term-building merge expr so `declare_function`
+            // can lower it to a `MergeFn::Seq` (PR #933 multi-action merge).
+            self.egraph
+                .proof_state
+                .native_term_build_views
                 .insert(view_name.clone(), fdecl.merge.clone().unwrap());
         }
 

@@ -1502,6 +1502,29 @@ fn merge_fn_fill_deps(
             cols.iter()
                 .for_each(|col| merge_fn_fill_deps(col, egraph, read_deps, write_deps));
         }
+        TableInsert(func, args) => {
+            // The side write makes the target table a write-dependency, so its
+            // buffer is pre-allocated during batched merges (the whole reason
+            // this exists rather than a by-name primitive insert). Ported from
+            // PR #933.
+            write_deps.insert(egraph.funcs[*func].table);
+            args.iter()
+                .for_each(|arg| merge_fn_fill_deps(arg, egraph, read_deps, write_deps));
+        }
+        Seq(items) => {
+            items
+                .iter()
+                .for_each(|item| merge_fn_fill_deps(item, egraph, read_deps, write_deps));
+        }
+        Construct(func, args, value_args) => {
+            // A nested constructor mint inside the merge reads (hash-cons dedup)
+            // and writes the target view table. Ported from PR #933.
+            read_deps.insert(egraph.funcs[*func].table);
+            write_deps.insert(egraph.funcs[*func].table);
+            args.iter()
+                .chain(value_args.iter())
+                .for_each(|arg| merge_fn_fill_deps(arg, egraph, read_deps, write_deps));
+        }
         AssertEq | Old | New | OldCol(..) | NewCol(..) | Const(..) => {}
     }
 }
@@ -1703,6 +1726,7 @@ fn merge_fn_resolve(merge: &MergeFn, function_name: &str, egraph: &mut EGraph) -
                 "Merge function for {function_name} must match function arity for {}",
                 func_info.name
             );
+            let identity_on_miss = matches!(func_info.default_val, DefaultVal::Identity);
             ResolvedMergeFn::Function {
                 func: TableAction::new(egraph, *func),
                 panic: egraph.new_panic(format!(
@@ -1710,6 +1734,49 @@ fn merge_fn_resolve(merge: &MergeFn, function_name: &str, egraph: &mut EGraph) -
                     func_info.name
                 )),
                 args: args
+                    .iter()
+                    .map(|arg| merge_fn_resolve(arg, function_name, egraph))
+                    .collect::<Vec<_>>(),
+                identity_on_miss,
+            }
+        }
+        // `:merge`-multiple-actions variants ported from PR #933.
+        MergeFn::TableInsert(func, args) => ResolvedMergeFn::TableInsert {
+            table: TableAction::new(egraph, *func),
+            args: args
+                .iter()
+                .map(|arg| merge_fn_resolve(arg, function_name, egraph))
+                .collect::<Vec<_>>(),
+        },
+        MergeFn::Seq(items) => ResolvedMergeFn::Seq(
+            items
+                .iter()
+                .map(|item| merge_fn_resolve(item, function_name, egraph))
+                .collect::<Vec<_>>(),
+        ),
+        MergeFn::Construct(func, args, value_args) => {
+            let func_info = &egraph.funcs[*func];
+            let num_values = func_info.schema.len() - func_info.n_keys;
+            debug_assert_eq!(
+                func_info.schema.len(),
+                args.len() + num_values,
+                "Construct for {function_name}: key arity must be schema minus value columns for {}",
+                func_info.name
+            );
+            debug_assert_eq!(
+                value_args.len() + 1,
+                num_values,
+                "Construct for {function_name}: value_args must fill every value column \
+                 except the minted output for {}",
+                func_info.name
+            );
+            ResolvedMergeFn::Construct {
+                table: TableAction::new(egraph, *func),
+                args: args
+                    .iter()
+                    .map(|arg| merge_fn_resolve(arg, function_name, egraph))
+                    .collect::<Vec<_>>(),
+                value_args: value_args
                     .iter()
                     .map(|arg| merge_fn_resolve(arg, function_name, egraph))
                     .collect::<Vec<_>>(),
@@ -1768,6 +1835,30 @@ enum ResolvedMergeFn {
         func: TableAction,
         args: Vec<ResolvedMergeFn>,
         panic: ExternalFunctionId,
+        /// When the looked-up function has a [`DefaultVal::Identity`] default
+        /// (the term-encoder's `@UF_Sf` flat union-find index), a missing key
+        /// returns the (single) lookup argument unchanged ("find-or-self")
+        /// instead of panicking. This expresses the canonicalize-at-creation
+        /// `(__UF_Sf x)` lookup inside a `:merge`-multiple-actions body
+        /// (PR #933 term-build lowering).
+        identity_on_miss: bool,
+    },
+    /// `(set (f ...) v)` inside a merge: insert a full row into `table`,
+    /// respecting that table's own merge. Ported from PR #933.
+    TableInsert {
+        table: TableAction,
+        args: Vec<ResolvedMergeFn>,
+    },
+    /// Run each item in order for its effects; return the value of the last.
+    /// Ported from PR #933.
+    Seq(Vec<ResolvedMergeFn>),
+    /// Mint a pair-valued constructor inside a merge (FreshId output column,
+    /// `value_args` for the remaining value columns) and return its output
+    /// e-class. Ported from PR #933.
+    Construct {
+        table: TableAction,
+        args: Vec<ResolvedMergeFn>,
+        value_args: Vec<ResolvedMergeFn>,
     },
 }
 
@@ -1917,9 +2008,22 @@ impl ResolvedMergeFn {
                     }
                 }
             }
-            ResolvedMergeFn::Function { func, args, panic } => {
+            ResolvedMergeFn::Function {
+                func,
+                args,
+                panic,
+                identity_on_miss,
+            } => {
                 // see github.com/egraphs-good/egglog/pull/287
-                if cur[n_keys + self_col] == new[n_keys + self_col] {
+                //
+                // The `cur == new` short-circuit is only valid when this
+                // `Function` IS the merge resolving `self_col` (the classic
+                // `(f old new)` value-fold case). For an `identity_on_miss`
+                // canon lookup `(__UF_Sf x)` nested inside a `Construct`/`Seq`
+                // (PR #933 term build), the lookup must run unconditionally —
+                // `cur`/`new` here are the conflicting FD rows, not this lookup's
+                // argument.
+                if !identity_on_miss && cur[n_keys + self_col] == new[n_keys + self_col] {
                     return cur[n_keys + self_col];
                 }
 
@@ -1934,10 +2038,60 @@ impl ResolvedMergeFn {
                 // both behaviors; the pure-read `lookup` would skip
                 // constructor minting.
                 func.lookup_or_insert(state, &args).unwrap_or_else(|| {
-                    let res = state.call_external_func(*panic, &[]);
-                    assert_eq!(res, None);
-                    cur[n_keys + self_col]
+                    if *identity_on_miss {
+                        // Find-or-self: a missing key in an `Identity`-default
+                        // `@UF_Sf` index returns the (single) lookup argument
+                        // unchanged, NOT a panic — the canonicalize-at-creation
+                        // `(__UF_Sf x)` semantics.
+                        debug_assert_eq!(
+                            args.len(),
+                            1,
+                            "identity_on_miss canon lookup must be single-arg"
+                        );
+                        args[0]
+                    } else {
+                        let res = state.call_external_func(*panic, &[]);
+                        assert_eq!(res, None);
+                        cur[n_keys + self_col]
+                    }
                 })
+            }
+            // `:merge`-multiple-actions runtime (ported from PR #933).
+            ResolvedMergeFn::TableInsert { table, args } => {
+                let row = args
+                    .iter()
+                    .map(|arg| arg.run(state, cur, new, n_keys, self_col, ts))
+                    .collect::<Vec<_>>();
+                // Insert respects the target table's own merge; the timestamp
+                // column is appended by `TableAction::insert`.
+                table.insert(state, row.into_iter());
+                // Return value is discarded by the enclosing `Seq`.
+                cur[n_keys + self_col]
+            }
+            ResolvedMergeFn::Seq(items) => {
+                let mut result = cur[n_keys + self_col];
+                for item in items {
+                    result = item.run(state, cur, new, n_keys, self_col, ts);
+                }
+                result
+            }
+            ResolvedMergeFn::Construct {
+                table,
+                args,
+                value_args,
+            } => {
+                let key = args
+                    .iter()
+                    .map(|arg| arg.run(state, cur, new, n_keys, self_col, ts))
+                    .collect::<SmallVec<[Value; 4]>>();
+                let vals = value_args
+                    .iter()
+                    .map(|arg| arg.run(state, cur, new, n_keys, self_col, ts))
+                    .collect::<SmallVec<[Value; 4]>>();
+                // Constructor: always mints on miss, so this is `Some`.
+                table
+                    .lookup_or_insert_multi(state, &key, &vals)
+                    .unwrap_or(cur[n_keys + self_col])
             }
         }
     }
@@ -2029,6 +2183,48 @@ impl TableAction {
                         ret_val: Some(default),
                     },
                 );
+                Some(
+                    state.predict_val(self.table, key, merge_vals.iter().copied())
+                        [self.table_math.ret_val_col()],
+                )
+            }
+            None => self.lookup(state, key),
+        }
+    }
+
+    /// Multi-value variant of [`TableAction::lookup_or_insert`] for a pair-valued
+    /// constructor `(children) -> (output, extra...)`: the first value column
+    /// (`output`) is minted (the configured `FreshId` default) and the rest are
+    /// written from `provided_vals` (e.g. the proof). Returns the minted `output`.
+    ///
+    /// Idempotent: an already-present key returns its existing `output` and writes
+    /// nothing, so it can be evaluated more than once and yield the same id. This is
+    /// a write operation, only safe in action/merge contexts. Ported from PR #933.
+    pub fn lookup_or_insert_multi(
+        &self,
+        state: &mut ExecutionState,
+        key: &[Value],
+        provided_vals: &[Value],
+    ) -> Option<Value> {
+        match self.default {
+            Some(default) => {
+                debug_assert_eq!(
+                    self.table_math.n_vals(),
+                    1 + provided_vals.len(),
+                    "lookup_or_insert_multi: provided_vals must fill every value \
+                     column except the minted first one"
+                );
+                let timestamp =
+                    MergeVal::Constant(Value::from_usize(state.read_counter(self.timestamp)));
+                // Non-key columns, in order: [output (minted), provided.., ts, subsume?].
+                let mut merge_vals = SmallVec::<[MergeVal; 4]>::new();
+                merge_vals.push(default);
+                merge_vals.extend(provided_vals.iter().map(|v| MergeVal::Constant(*v)));
+                merge_vals.push(timestamp);
+                if self.table_math.subsume {
+                    merge_vals.push(MergeVal::Constant(NOT_SUBSUMED));
+                }
+                // The first value column (the minted output) is at `ret_val_col()`.
                 Some(
                     state.predict_val(self.table, key, merge_vals.iter().copied())
                         [self.table_math.ret_val_col()],

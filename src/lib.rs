@@ -1106,6 +1106,161 @@ impl EGraph {
         }
     }
 
+    /// Wrap a `MergeFn` in the canonicalize-at-creation `@UF_Sf` find-or-self
+    /// lookup for eq-sort children, EXACTLY as the rule-encoded merge body's
+    /// `canon_arg` does (`(__UF_Sf x)`). In `--native-merge` (relational, no
+    /// `--native-uf`) the `@UF_Sf` index is a plain `function (S) S :merge
+    /// (ordering-min old new)` declared with `DefaultVal::Identity` (lookup-or-self
+    /// on miss). Expressed as a `MergeFn::Function` against that table; the bridge's
+    /// resolved `Function` honors the `Identity` default by returning the looked-up
+    /// key on a miss. Returns the inner `MergeFn` unchanged when the sort has no
+    /// `@UF_Sf` index (non-eq-sort, or proof mode where canon-at-creation is off).
+    fn canon_mergefn(
+        &self,
+        sort_name: &str,
+        inner: egglog_bridge::MergeFn,
+    ) -> egglog_bridge::MergeFn {
+        if !self.proof_state.canon_at_creation || self.proof_state.proofs_enabled {
+            return inner;
+        }
+        match self
+            .proof_state
+            .uf_function
+            .get(sort_name)
+            .and_then(|uf_name| self.functions.get(uf_name))
+        {
+            Some(uf_func) => egglog_bridge::MergeFn::Function(uf_func.backend_id, vec![inner]),
+            None => inner,
+        }
+    }
+
+    /// Lower a term-building custom `:merge` body (e.g. `(C2 (C1 old new) (C2 old
+    /// new))`) into a `MergeFn::Seq` of `Construct` / `TableInsert` / union
+    /// variants — the PR #933 `:merge`-multiple-actions port. This re-expresses the
+    /// SAME action sequence the rule-encoded `@merge_rule` head produced (via
+    /// `add_term_and_view`): for each constructor call it mints the term
+    /// (`Construct`), writes the canonicalized `@<C>View` row (`TableInsert`,
+    /// respecting the view's own congruence merge), and stages the self-union edge,
+    /// returning the minted (canonicalized) eclass. The outermost call's value is
+    /// the last `Seq` element (the merged eclass written into the FD `@<F>View`).
+    fn translate_term_build_merge_to_seq(
+        &self,
+        expr: &ResolvedExpr,
+    ) -> Result<egglog_bridge::MergeFn, Error> {
+        let mut side_effects = Vec::new();
+        let value = self.lower_term_build_expr(expr, &mut side_effects)?;
+        side_effects.push(value);
+        Ok(egglog_bridge::MergeFn::Seq(side_effects))
+    }
+
+    /// Recursively lower one node of a term-building merge body, pushing the
+    /// `@<C>View` `TableInsert` + self-union side-effects (innermost first, matching
+    /// the desugared `add_term_and_view` order) onto `side_effects`, and returning
+    /// the `MergeFn` that EVALUATES TO this node's value (a canonicalized eclass for
+    /// a constructor call, a leaf `MergeFn` for a var/literal/primitive).
+    fn lower_term_build_expr(
+        &self,
+        expr: &ResolvedExpr,
+        side_effects: &mut Vec<egglog_bridge::MergeFn>,
+    ) -> Result<egglog_bridge::MergeFn, Error> {
+        use egglog_bridge::MergeFn;
+        match expr {
+            // Leaves: a var / literal carries the OLD / NEW value (or a constant)
+            // verbatim. A `child` of a constructor is canonicalized by the caller.
+            GenericExpr::Lit(..) | GenericExpr::Var(..) => self.translate_expr_to_mergefn(expr),
+            GenericExpr::Call(_, ResolvedCall::Primitive(_), _) => {
+                // A primitive over (canon-free) leaves: reuse the value-fold
+                // translator (no e-node creation, no side-effects).
+                self.translate_expr_to_mergefn(expr)
+            }
+            GenericExpr::Call(_, ResolvedCall::Func(f), args) => {
+                let func = &self.functions[&f.name];
+                let term_table = func.backend_id;
+                let out_sort = &func.decl.schema.output;
+                // The view function `@<C>View` for this constructor (the FD
+                // `(children) -> eclass` table the merge body's `(set (@CView ...)
+                // ...)` writes). Looked up by the constructor's ORIGINAL name.
+                let view_name = self
+                    .proof_state
+                    .proof_names
+                    .view_name
+                    .get(&*f.name)
+                    .ok_or_else(|| {
+                        Error::BackendError(format!(
+                            "term-build merge: no view table recorded for constructor `{}`",
+                            f.name
+                        ))
+                    })?;
+                let view_table = self.functions[view_name].backend_id;
+
+                // Lower each child first (innermost-first side-effect order),
+                // canonicalizing eq-sort children via `@UF_Sf` find-or-self EXACTLY
+                // as `add_term_and_view`'s `canon_arg` does.
+                let mut canon_args = Vec::with_capacity(args.len());
+                for (i, arg) in args.iter().enumerate() {
+                    let child = self.lower_term_build_expr(arg, side_effects)?;
+                    let child = if i < func.decl.schema.input.len()
+                        && self
+                            .type_info
+                            .get_sort_by_name(&func.decl.schema.input[i])
+                            .is_some_and(|s| s.is_eq_sort())
+                    {
+                        self.canon_mergefn(&func.decl.schema.input[i], child)
+                    } else {
+                        child
+                    };
+                    canon_args.push(child);
+                }
+
+                // Mint the term: `(let fv (C canon_args..))`. `Construct` mints the
+                // FreshId output on miss (idempotent on a present key), returning
+                // the eclass `fv`.
+                let construct = MergeFn::Construct(term_table, canon_args.clone(), vec![]);
+
+                // The view's eclass column is the CANONICALIZED `fv`
+                // (`(__UF_Sf fv)` in the desugared body).
+                let canon_fv = self.canon_mergefn(out_sort, construct.clone());
+
+                // Side-effect 1: write the `@<C>View` row `(set (@CView
+                // canon_args..) canon_fv)` — `TableInsert` respects the view's own
+                // congruence merge, which is the key to the nested-view congruence
+                // resolving correctly (PR #933).
+                let mut view_row = canon_args;
+                view_row.push(canon_fv.clone());
+                side_effects.push(MergeFn::TableInsert(view_table, view_row));
+
+                // Side-effect 2: the self-union edge `(set (@UF_S (max fv fv) (min
+                // fv fv)) ())` — a self-loop edge, mirroring `add_term_and_view`'s
+                // `union(fv, fv)`. Staged into the per-sort RELATIONAL `@UF_S`
+                // parent table via `UnionIntoParentTable` (with `cur == new`, so it
+                // is the inert self-edge the desugared body writes).
+                if let Some(parent_table) = self
+                    .proof_state
+                    .uf_parent
+                    .get(out_sort)
+                    .and_then(|pname| self.functions.get(pname))
+                    .map(|pf| pf.backend_id)
+                {
+                    side_effects.push(MergeFn::TableInsert(
+                        parent_table,
+                        vec![
+                            construct.clone(),
+                            construct.clone(),
+                            MergeFn::Const(self.backend.base_values().get::<()>(())),
+                        ],
+                    ));
+                }
+
+                // This node evaluates to its canonicalized eclass (used as a child
+                // of an enclosing constructor, or as the final merged value).
+                Ok(canon_fv)
+            }
+            GenericExpr::Call(span, ResolvedCall::Values(_), _) => Err(Error::TypeError(
+                TypeError::TupleMergeNotValues("<merge>".to_owned(), span.clone()),
+            )),
+        }
+    }
+
     fn translate_expr_to_mergefn(
         &self,
         expr: &ResolvedExpr,
@@ -1269,7 +1424,23 @@ impl EGraph {
                     // the output sort has no `@UF_Sf` yet (it always does in
                     // native-UF mode, since the sort is declared before its
                     // constructors), fall back to the global `UnionId`.
-                    merge: if let Some(value_merge) =
+                    merge: if let Some(term_build_merge) =
+                        self.proof_state.native_term_build_views.get(&*decl.name)
+                    {
+                        // Native TERM-BUILD custom `:merge` (`--native-merge`, term,
+                        // non-proof, bridge): the encoder declared this `@<F>View`
+                        // FD-keyed `(children) -> eclass` and stashed the
+                        // term-building merge expr here. Lower it to a
+                        // `MergeFn::Seq` of `Construct` / `TableInsert` / union
+                        // variants (PR #933 multi-action merge) so the term build
+                        // runs NATIVELY in the FD-conflict merge callback, replacing
+                        // the rule-encoded `@merge_rule` / `@merge_cleanup`. Checked
+                        // FIRST (a term-build view is also in `native_merge_views`
+                        // for the FD set/query/delete forms, but it needs the Seq
+                        // merge, not the congruence `UnionId`).
+                        let term_build_merge = term_build_merge.clone();
+                        self.translate_term_build_merge_to_seq(&term_build_merge)?
+                    } else if let Some(value_merge) =
                         self.proof_state.native_value_merge_views.get(&*decl.name)
                     {
                         // Native VALUE-FOLD custom `:merge` (`--native-merge`,
