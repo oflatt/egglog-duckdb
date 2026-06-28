@@ -1525,6 +1525,13 @@ fn merge_fn_fill_deps(
                 .chain(value_args.iter())
                 .for_each(|arg| merge_fn_fill_deps(arg, egraph, read_deps, write_deps));
         }
+        IfEq { a, b, then, els } => {
+            // Both branches may run (the condition is data-dependent), so union
+            // the deps of every sub-expression.
+            for m in [a, b, then, els] {
+                merge_fn_fill_deps(m, egraph, read_deps, write_deps);
+            }
+        }
         AssertEq | Old | New | OldCol(..) | NewCol(..) | Const(..) => {}
     }
 }
@@ -1782,6 +1789,12 @@ fn merge_fn_resolve(merge: &MergeFn, function_name: &str, egraph: &mut EGraph) -
                     .collect::<Vec<_>>(),
             }
         }
+        MergeFn::IfEq { a, b, then, els } => ResolvedMergeFn::IfEq {
+            a: Box::new(merge_fn_resolve(a, function_name, egraph)),
+            b: Box::new(merge_fn_resolve(b, function_name, egraph)),
+            then: Box::new(merge_fn_resolve(then, function_name, egraph)),
+            els: Box::new(merge_fn_resolve(els, function_name, egraph)),
+        },
     }
 }
 
@@ -1859,6 +1872,15 @@ enum ResolvedMergeFn {
         table: TableAction,
         args: Vec<ResolvedMergeFn>,
         value_args: Vec<ResolvedMergeFn>,
+    },
+    /// Conditional: if `a`'s value equals `b`'s value, run `then`; else run `els`.
+    /// Returns the value of whichever branch ran. Used to guard a term-building
+    /// merge `Seq` on `old != new`. See [`MergeFn::IfEq`].
+    IfEq {
+        a: Box<ResolvedMergeFn>,
+        b: Box<ResolvedMergeFn>,
+        then: Box<ResolvedMergeFn>,
+        els: Box<ResolvedMergeFn>,
     },
 }
 
@@ -2092,6 +2114,18 @@ impl ResolvedMergeFn {
                 table
                     .lookup_or_insert_multi(state, &key, &vals)
                     .unwrap_or(cur[n_keys + self_col])
+            }
+            ResolvedMergeFn::IfEq { a, b, then, els } => {
+                // Evaluate the (side-effect-free) condition operands first, then
+                // run ONLY the taken branch — so a guarded term-building `Seq`
+                // mints nothing when the values are already equal.
+                let av = a.run(state, cur, new, n_keys, self_col, ts);
+                let bv = b.run(state, cur, new, n_keys, self_col, ts);
+                if av == bv {
+                    then.run(state, cur, new, n_keys, self_col, ts)
+                } else {
+                    els.run(state, cur, new, n_keys, self_col, ts)
+                }
             }
         }
     }

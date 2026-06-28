@@ -279,6 +279,19 @@ pub enum MergeFn {
     /// constructor application inside a term-building custom `:merge` body. Ported
     /// from PR #933 (FD proof encoding). Bridge-only.
     Construct(FunctionId, Vec<MergeFn>, Vec<MergeFn>),
+    /// Conditional merge: evaluate `a` and `b`; if their values are EQUAL run and
+    /// return `then`, otherwise run and return `els`. Used to guard a term-building
+    /// custom `:merge` body (a [`MergeFn::Seq`]) so it only mints helper terms when
+    /// the function's old/new values genuinely differ — mirroring the rule-encoded
+    /// `@merge_rule`'s `(!= old new)` body guard. When `a == b` the rule-encoded
+    /// merge rule never fires, so no helper term is created; this variant reproduces
+    /// that exactly (return the already-equal value, no side effects). Bridge-only.
+    IfEq {
+        a: Box<MergeFn>,
+        b: Box<MergeFn>,
+        then: Box<MergeFn>,
+        els: Box<MergeFn>,
+    },
 }
 
 // ---------------------------------------------------------------------------

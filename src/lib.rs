@@ -1143,14 +1143,42 @@ impl EGraph {
     /// respecting the view's own congruence merge), and stages the self-union edge,
     /// returning the minted (canonicalized) eclass. The outermost call's value is
     /// the last `Seq` element (the merged eclass written into the FD `@<F>View`).
+    ///
+    /// `output_sort` is the merged function's output sort. The whole Seq is guarded
+    /// by `IfEq(canon(old), canon(new), …)`: the rule-encoded `@merge_rule` fires
+    /// only on `(!= old new)` view rows (and its view rows are canonical under
+    /// canon-at-creation), so when `old`/`new` canonicalize to the SAME eclass the
+    /// rule encoding builds NO helper term. Without this guard the native merge
+    /// callback fires on every FD conflict — including ones whose two values later
+    /// collapse to one eclass — and `Construct` over-materializes a spurious
+    /// `(C old old)` helper term that the rule encoding never keeps (e.g.
+    /// `tests/web-demo/rw-analysis.egg`'s `merge-val`). The guard reproduces the
+    /// rule encoding's materialization exactly: equal => return that value, no mint.
     fn translate_term_build_merge_to_seq(
         &self,
         expr: &ResolvedExpr,
+        output_sort: &str,
     ) -> Result<egglog_bridge::MergeFn, Error> {
+        use egglog_bridge::MergeFn;
         let mut side_effects = Vec::new();
         let value = self.lower_term_build_expr(expr, &mut side_effects)?;
         side_effects.push(value);
-        Ok(egglog_bridge::MergeFn::Seq(side_effects))
+        let body = MergeFn::Seq(side_effects);
+
+        // Guard on `canon(old) != canon(new)` for eq-sort outputs (a term-building
+        // merge always has an eq-sort output, but the canon lookup is a no-op for
+        // any sort without a `@UF_Sf` index). The condition operands are the
+        // canonicalized old/new function values; the `then` branch returns
+        // `canon(old)` (== `canon(new)`) without minting, exactly as the
+        // rule-encoded merge rule would (it simply never fires).
+        let canon_old = self.canon_mergefn(output_sort, MergeFn::Old);
+        let canon_new = self.canon_mergefn(output_sort, MergeFn::New);
+        Ok(MergeFn::IfEq {
+            a: Box::new(canon_old.clone()),
+            b: Box::new(canon_new),
+            then: Box::new(canon_old),
+            els: Box::new(body),
+        })
     }
 
     /// Recursively lower one node of a term-building merge body, pushing the
@@ -1439,7 +1467,10 @@ impl EGraph {
                         // for the FD set/query/delete forms, but it needs the Seq
                         // merge, not the congruence `UnionId`).
                         let term_build_merge = term_build_merge.clone();
-                        self.translate_term_build_merge_to_seq(&term_build_merge)?
+                        self.translate_term_build_merge_to_seq(
+                            &term_build_merge,
+                            &decl.schema.output,
+                        )?
                     } else if let Some(value_merge) =
                         self.proof_state.native_value_merge_views.get(&*decl.name)
                     {
