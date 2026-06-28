@@ -130,14 +130,18 @@ struct Args {
     fast_rebuild: bool,
     /// Native-merge: do congruence INLINE via a native backend merge instead of
     /// the rule-encoded `@congruence_rule*` self-join. A constructor's `@<F>View`
-    /// becomes an FD view `(children) -> eclass` with a side-effecting
-    /// `MergeFn::UnionId` merge that unions the two eclasses on an FD conflict
-    /// (same children, different output) at insert time, and the separate
-    /// congruence rule is dropped from the per-iteration rebuild. This is the
-    /// non-proof half of egglog PR #933. Implies `--native-uf` + term encoding
-    /// (the injected union edge goes into the in-core union-find). `--flowlog` or
-    /// `--feldera` (the backend must inject the union on FD-conflict). Term mode
-    /// only; off by default (the rule-encoded congruence is byte-identical).
+    /// becomes an FD view `(children) -> eclass` with a side-effecting merge that
+    /// unions the two eclasses on an FD conflict (same children, different output)
+    /// at insert time, and the separate congruence rule is dropped from the
+    /// per-iteration rebuild. This is the non-proof half of egglog PR #933.
+    /// Implies term encoding. On the native bridge it runs on the RELATIONAL
+    /// union-find by default (`MergeFn::UnionIntoParentTable` writes the union edge
+    /// into the `@UF_S` parent table; the rule-based rebuild canonicalizes it — no
+    /// native-UF onchange re-scan blowup). Add `--native-uf` to route the union
+    /// into the in-core UF-backed `@UF_Sf` instead (the original path). `--flowlog`
+    /// / `--feldera` require and imply `--native-uf` (the backend must inject the
+    /// union on FD-conflict via the UF-backed function). Term mode only; off by
+    /// default (the rule-encoded congruence is byte-identical).
     #[clap(long = "native-merge")]
     native_merge: bool,
     /// Native-engine table rebuild for the term-encoding native-UF rebuild
@@ -177,20 +181,35 @@ pub fn cli(mut egraph: EGraph) {
     let mut args = Args::parse();
 
     // `--native-merge` does congruence inline via a native backend merge that
-    // injects the union-on-FD-conflict edge into the in-core union-find — so it
-    // REQUIRES native-UF (the relational `@UF_S` parent table has no insert-time
-    // merge hook). It is implemented on the native BRIDGE (core-relations) and on
-    // the FlowLog and Feldera backends (each injects the union on FD-conflict and
-    // re-canonicalizes the view so congruence collapses; the DuckDB backend does
-    // not, so reject it there). Fold native-merge into native-UF so every
-    // downstream `args.native_uf` site (term encoding, backend config) is
-    // provisioned correctly.
+    // unions the two colliding eclasses on an FD conflict (same children,
+    // different output) at insert time, and drops the `@congruence_rule*`
+    // self-join. WHERE that union edge goes depends on the union-find backing:
+    //
+    //  - WITHOUT `--native-uf` (the default, RELATIONAL path): the FD view's
+    //    merge (`MergeFn::UnionIntoParentTable`) writes the edge straight into the
+    //    relational `@UF_S` parent table — exactly the row the rule-encoded
+    //    `union()` helper writes — and the relational rule-based rebuild
+    //    canonicalizes it. This is the no-blowup path (the rule-based rebuild
+    //    absorbs congruence cascades in batched seminaive delta passes), and it is
+    //    implemented on the native BRIDGE only.
+    //  - WITH `--native-uf`: the edge goes into the in-core UF-backed `@UF_Sf`
+    //    (the original path), and its onchange relation drives the rebuild. This
+    //    is the path the FlowLog/Feldera backends use (each injects the union on
+    //    FD-conflict via the UF-backed function).
+    //
+    // The DuckDB backend supports neither, so reject it there. The FlowLog and
+    // Feldera backends require the UF-backed routing, so `--native-merge` on those
+    // implies `--native-uf` (their relational-UF native-merge path is not wired
+    // up). On the native bridge, `--native-merge` alone uses the relational UF;
+    // `--native-merge --native-uf` keeps the original UF-backed path intact.
     if args.native_merge {
         if args.duckdb_backend {
             log::error!("--native-merge is not supported with --duckdb");
             std::process::exit(1);
         }
-        args.native_uf = true;
+        if args.flowlog_backend || args.feldera_backend {
+            args.native_uf = true;
+        }
     }
 
     // The experimental backends are mutually exclusive: each swaps in a
@@ -223,9 +242,10 @@ pub fn cli(mut egraph: EGraph) {
         std::process::exit(1);
     }
 
-    // `--native-uf` is a term-encoding-only mode, so it implies term
-    // encoding (enabling it here covers the case where `--term-encoding`
-    // was not also passed).
+    // `--native-uf` and `--native-merge` are term-encoding-only modes, so they
+    // imply term encoding (enabling it here covers the case where
+    // `--term-encoding` was not also passed). `--native-merge` without
+    // `--native-uf` (the relational native-merge path) still needs term encoding.
     //
     // Skip this when the caller already handed us a duckdb/flowlog/feldera-backed
     // egraph (egglog-experimental's `main` pre-builds one so its commands /
@@ -235,7 +255,7 @@ pub fn cli(mut egraph: EGraph) {
     // backends' `clone_boxed` is unimplemented, so cloning panics. Plain
     // `--flowlog`/`--feldera` (no `--native-uf`/`--term-encoding`) never reach
     // here (both flags are false); `--native-uf --flowlog` does, hence the guard.
-    if (args.term_encoding || args.native_uf)
+    if (args.term_encoding || args.native_uf || args.native_merge)
         && !egraph.has_duckdb_backend()
         && !egraph.has_flowlog_backend()
         && !egraph.has_feldera_backend()

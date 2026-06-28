@@ -791,7 +791,12 @@ fn merge_mode_for_scalar(merge: &MergeFn) -> MergeMode {
     match merge {
         MergeFn::AssertEq | MergeFn::Old => MergeMode::Old,
         MergeFn::New => MergeMode::New,
-        MergeFn::UnionId | MergeFn::UnionIntoUf(_) => MergeMode::Min,
+        // `UnionIntoParentTable` is the bridge-only RELATIONAL native-merge merge
+        // (`--native-merge` without `--native-uf`); FlowLog always uses the
+        // UF-backed `UnionIntoUf`, but the surviving value is the min either way.
+        MergeFn::UnionId | MergeFn::UnionIntoUf(_) | MergeFn::UnionIntoParentTable { .. } => {
+            MergeMode::Min
+        }
         MergeFn::Primitive(_, _) => MergeMode::Min,
         // For a single-output table `OldCol(i)`/`NewCol(i)` can only reference column 0, which is
         // this table's sole value column — i.e. plain old/new.

@@ -865,11 +865,15 @@ impl EGraph {
     }
 
     /// Enable native-merge mode (`--native-merge`): a constructor's view becomes
-    /// an FD view `(children) -> eclass` with a side-effecting `MergeFn::UnionId`
-    /// merge that unions the two eclasses on an FD conflict (congruence inline at
-    /// insert time), and the `@congruence_rule*` self-join rule is not emitted.
-    /// Requires native-UF (the injected union edge goes into the in-core
-    /// union-find); the caller must also enable `with_native_uf`. Term mode only.
+    /// an FD view `(children) -> eclass` with a side-effecting merge that unions
+    /// the two eclasses on an FD conflict (congruence inline at insert time), and
+    /// the `@congruence_rule*` self-join rule is not emitted. WHERE the union edge
+    /// goes depends on whether native-UF is also on: WITHOUT `with_native_uf` (the
+    /// relational path) the merge is `MergeFn::UnionIntoParentTable`, writing the
+    /// edge into the relational `@UF_S` parent table (the rule-based rebuild
+    /// canonicalizes it — no native-UF onchange re-scan blowup); WITH
+    /// `with_native_uf` the merge is `MergeFn::UnionIntoUf`, routing into the
+    /// in-core UF-backed `@UF_Sf`. Term mode only.
     pub fn with_native_merge(mut self) -> Self {
         self.proof_state.native_merge = true;
         self
@@ -1323,9 +1327,39 @@ impl EGraph {
                                     proof_col: 1,
                                 },
                             ])
-                        } else {
+                        } else if self.proof_state.native_uf {
+                            // `--native-merge --native-uf` (the original path): the
+                            // FD-conflict congruence union goes into the per-sort
+                            // UF-backed function `@UF_Sf` (its leader-change
+                            // onchange relation drives the rebuild). Falls back to
+                            // the global `$uf` only when the output sort has no
+                            // `@UF_Sf` (it always does in native-UF mode).
                             match uf_id {
                                 Some(uf_id) => MergeFn::UnionIntoUf(uf_id),
+                                None => MergeFn::UnionId,
+                            }
+                        } else {
+                            // `--native-merge` WITHOUT `--native-uf` (relational
+                            // path): write the FD-conflict congruence edge into the
+                            // per-sort RELATIONAL parent table `@UF_S` — exactly the
+                            // row `union()` writes (`(set (@UF_S larger smaller)
+                            // ())`). The relational maintenance + rebuild rulesets
+                            // canonicalize it, so the rule-based rebuild absorbs the
+                            // congruence cascade (no native-UF onchange re-scan
+                            // blowup). `@UF_S` is declared before its constructors
+                            // (the sort's `declare_sort` runs first), so it is
+                            // already in `self.functions`.
+                            let parent_id = self
+                                .proof_state
+                                .uf_parent
+                                .get(&decl.schema.output)
+                                .and_then(|pname| self.functions.get(pname))
+                                .map(|pf| pf.backend_id);
+                            match parent_id {
+                                Some(parent_table) => MergeFn::UnionIntoParentTable {
+                                    parent_table,
+                                    unit: self.backend.base_values().get::<()>(()),
+                                },
                                 None => MergeFn::UnionId,
                             }
                         }
@@ -1463,6 +1497,17 @@ impl EGraph {
     /// `register_nativerb_views`) so views declared between runs are registered.
     /// The backend records the view -> UF association and uses it in the merge.
     fn register_native_merge_views(&mut self) {
+        // The view->UF backend association only exists to route the FD-conflict
+        // congruence union into a UF-BACKED `@UF_Sf` (the `--native-uf` path).
+        // In the RELATIONAL native-merge path (`--native-merge` without
+        // `--native-uf`) the view's merge is `MergeFn::UnionIntoParentTable`,
+        // which writes the union edge straight into the relational `@UF_S` parent
+        // table — fully self-contained, no backend association needed (and
+        // `register_native_merge_view` would assert a non-existent UF-backed
+        // function). So there is nothing to register here.
+        if !self.proof_state.native_uf {
+            return;
+        }
         let mut to_register: Vec<(String, egglog_bridge::FunctionId, String)> = Vec::new();
         for func in self.functions.values() {
             let view_name = func.decl.name.to_string();

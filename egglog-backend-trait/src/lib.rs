@@ -163,6 +163,28 @@ pub enum MergeFn {
     /// the native bridge resolves this variant; the dataflow/SQL backends route
     /// the union via their own host-pass `native_merge_uf` association.
     UnionIntoUf(FunctionId),
+    /// `--native-merge` WITHOUT `--native-uf` (the RELATIONAL union-find path):
+    /// like [`MergeFn::UnionIntoUf`], but the colliding output ids are written as
+    /// a union EDGE into the per-sort RELATIONAL parent table `@UF_S`
+    /// (`(S S) -> Unit :merge old`) — exactly the row the rule-encoded
+    /// `union()` helper writes: `(set (@UF_S larger smaller) ())`, where
+    /// `larger = max(cur, new)` and `smaller = min(cur, new)`. The merge returns
+    /// `min(cur, new)`. The relational maintenance rulesets
+    /// (singleparent / path_compress / uf_function_index) then propagate the edge
+    /// into `@UF_Sf`, and the view's relational `@rebuild_rule*` re-canonicalizes —
+    /// i.e. the rule-based rebuild absorbs the congruence cascade in batched
+    /// seminaive delta passes (no native-UF onchange re-scan blowup).
+    ///
+    /// Fields:
+    /// - `parent_table`: the relational `@UF_S` parent table to write the edge into.
+    /// - `unit`: the interned `Unit` value for the parent table's value column.
+    ///
+    /// Native bridge only (relational native-merge). The dataflow/SQL backends
+    /// keep their `--native-uf`-driven native-merge path.
+    UnionIntoParentTable {
+        parent_table: FunctionId,
+        unit: Value,
+    },
     /// `--native-merge` in PROOF mode: the proof-carrying counterpart of
     /// [`MergeFn::UnionIntoUf`]. Used by the `col0` (eclass) merge of a
     /// tuple-output FD-keyed constructor view `(children) -> (eclass, proof)`.

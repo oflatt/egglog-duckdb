@@ -1045,7 +1045,6 @@ impl<'a> ProofInstrumentor<'a> {
         let view_name = self.view_name(&fdecl.name);
         let child = |i: usize| format!("c{i}_");
         let children_vec: Vec<String> = (0..types.len()).map(child).collect();
-        let children = format!("{}", ListDisplay(&children_vec, " "));
 
         // For each eq-sort column, look up its leader via the UF table.
         // For non-eq-sort columns, the leader is the same as the original.
@@ -1166,6 +1165,13 @@ impl<'a> ProofInstrumentor<'a> {
                 .insert(fresh_name.clone(), view_name.clone());
         }
 
+        // Delete the stale (pre-canonicalization) view row. For a native-merge FD
+        // view this is keyed on the children only (`view_delete` drops the eclass
+        // column); for the baseline view it lists every column. `children_vec` is
+        // every view column (`children..., eclass`), the shape `view_delete`
+        // expects.
+        let delete_view = self.view_delete(&fdecl.name, &children_vec);
+
         // Make a single rule that updates the view when any child's leader differs.
         let rule = format!(
             "(rule ({query_view}
@@ -1175,7 +1181,7 @@ impl<'a> ProofInstrumentor<'a> {
                  (
                   {pf_code}
                   {updated_view}
-                  (delete ({view_name} {children}))
+                  {delete_view}
                  )
                   :ruleset {} :name \"{fresh_name}\")",
             self.proof_names().rebuilding_ruleset_name
@@ -2394,6 +2400,18 @@ impl<'a> ProofInstrumentor<'a> {
                 ListDisplay(children, " ")
             );
             return (query, pf_var);
+        }
+        // Non-proof native-merge FD view (`(children) -> eclass`): match the
+        // function-output form `(= eclass (@FView children))` — the same shape
+        // `view_body_atom` emits. The all-columns flat atom is an arity mismatch
+        // for an FD view (its only inputs are the children). There is no proof
+        // column in term mode, so the proof var is the inert `()`.
+        if self.is_native_merge_view(&view_name) {
+            let (eclass, children) = args
+                .split_last()
+                .expect("native-merge view row has columns");
+            let query = format!("(= {eclass} ({view_name} {}))", ListDisplay(children, " "));
+            return (query, "()".to_string());
         }
         let query = format!("(= {pf_var} ({view_name} {}))", ListDisplay(args, " "));
         (query, pf_var)

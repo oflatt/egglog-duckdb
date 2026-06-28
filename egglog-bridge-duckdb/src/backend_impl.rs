@@ -106,7 +106,12 @@ fn duck_merge_mode_scalar(
     match merge {
         MergeFn::Old | MergeFn::AssertEq => MergeMode::Old,
         MergeFn::New => MergeMode::New,
-        MergeFn::UnionId | MergeFn::UnionIntoUf(_) => MergeMode::Min,
+        // `UnionIntoParentTable` is the bridge-only RELATIONAL native-merge merge
+        // (`--native-merge` without `--native-uf`); DuckDB rejects `--native-merge`
+        // entirely, so this never reaches it, but the surviving value is the min.
+        MergeFn::UnionId | MergeFn::UnionIntoUf(_) | MergeFn::UnionIntoParentTable { .. } => {
+            MergeMode::Min
+        }
         MergeFn::Primitive(ext_id, _) => match funcs.name(*ext_id) {
             Some("ordering-min") => MergeMode::Min,
             _ => MergeMode::Old,

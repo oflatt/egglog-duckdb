@@ -1478,6 +1478,12 @@ fn merge_fn_fill_deps(
             // not the global `$uf` — is the write dependency.
             write_deps.insert(egraph.funcs[*uf_func].table);
         }
+        UnionIntoParentTable { parent_table, .. } => {
+            // `--native-merge` relational path: the FD-conflict congruence edge is
+            // written into the per-sort relational `@UF_S` parent table, so that
+            // table is the write dependency.
+            write_deps.insert(egraph.funcs[*parent_table].table);
+        }
         UnionIntoUfWithProof { uf, trans, sym, .. } => {
             // `--native-merge` PROOF mode: the proof-carrying congruence edge is
             // staged into the proof-mode `@UF_Sf`, and composing its edge proof
@@ -1637,6 +1643,20 @@ fn merge_fn_resolve(merge: &MergeFn, function_name: &str, egraph: &mut EGraph) -
         MergeFn::UnionIntoUf(uf_func) => ResolvedMergeFn::UnionId {
             uf_table: egraph.funcs[*uf_func].table,
         },
+        // `--native-merge` relational path: stage the FD-conflict congruence edge
+        // as a row into the per-sort relational `@UF_S` parent table (a plain
+        // 2-key `(S S) -> Unit` function with `:merge old`), matching the
+        // rule-encoded `(set (@UF_S larger smaller) ())`. We capture the parent
+        // table's schema math so the runtime can shape the `[larger, smaller,
+        // unit, ts]` row.
+        MergeFn::UnionIntoParentTable { parent_table, unit } => {
+            let info = &egraph.funcs[*parent_table];
+            ResolvedMergeFn::UnionIntoParentTable {
+                parent_table: info.table,
+                parent_math: info.schema_math(),
+                unit: *unit,
+            }
+        }
         // `--native-merge` PROOF mode (`col0`): stage a proof-carrying congruence
         // edge into the proof-mode `@UF_Sf`. The `Trans`/`Sym` proof constructors
         // are interned via `TableAction`s, mirroring `compose_uf_proof`.
@@ -1715,6 +1735,14 @@ enum ResolvedMergeFn {
     UnionId {
         uf_table: TableId,
     },
+    /// `--native-merge` relational path (no `--native-uf`): write the FD-conflict
+    /// congruence edge as a `[larger, smaller, unit, ts]` row into the relational
+    /// `@UF_S` parent table. See [`MergeFn::UnionIntoParentTable`].
+    UnionIntoParentTable {
+        parent_table: TableId,
+        parent_math: SchemaMath,
+        unit: Value,
+    },
     /// `--native-merge` PROOF mode, `col0` (eclass): stage a proof-carrying
     /// congruence edge into the proof-mode `@UF_Sf` and return the min eclass.
     /// See [`MergeFn::UnionIntoUfWithProof`].
@@ -1780,6 +1808,41 @@ impl ResolvedMergeFn {
                     // We pick the minimum when unioning. This matches the original egglog
                     // behavior. THIS MUST MATCH THE UNION-FIND IMPLEMENTATION!
                     std::cmp::min(cur, new)
+                } else {
+                    cur
+                }
+            }
+            ResolvedMergeFn::UnionIntoParentTable {
+                parent_table,
+                parent_math,
+                unit,
+            } => {
+                let (cur, new) = (cur[n_keys + self_col], new[n_keys + self_col]);
+                if cur != new {
+                    // Write the union edge into the relational `@UF_S` parent
+                    // table, EXACTLY as the rule-encoded `union()` helper does:
+                    // `(set (@UF_S larger smaller) ())`, where the key is the
+                    // larger id and the value is the smaller id. The relational
+                    // maintenance rulesets (singleparent / path_compress /
+                    // uf_function_index) then propagate this into `@UF_Sf` and the
+                    // rule-based rebuild re-canonicalizes the views. Keeping the
+                    // min as the surviving eclass matches the union-by-min the
+                    // `:merge (ordering-min old new)` index relies on.
+                    let larger = std::cmp::max(cur, new);
+                    let smaller = std::cmp::min(cur, new);
+                    // Row layout for the 2-key `(S S) -> Unit` parent table:
+                    // `[larger, smaller, unit, ts]` (no subsume column).
+                    let mut row: SmallVec<[Value; 4]> = smallvec::smallvec![larger, smaller];
+                    parent_math.write_table_row(
+                        &mut row,
+                        RowVals {
+                            timestamp: ts,
+                            subsume: None,
+                            ret_val: Some(*unit),
+                        },
+                    );
+                    state.stage_insert(*parent_table, &row);
+                    smaller
                 } else {
                     cur
                 }
