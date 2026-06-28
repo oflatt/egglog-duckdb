@@ -133,22 +133,16 @@ fn tuple_merge_arity_mismatch_rejected() {
 }
 
 #[test]
-fn builtin_keywords_are_reserved() {
-    // Built-in keywords (command/action/schedule heads, plus the tuple constructor `values`) may
-    // not be used as function/constructor/relation/variant names or as variables.
+fn values_keyword_is_reserved() {
+    // The tuple constructor `values` is the one keyword that must stay reserved: it is recognized
+    // by head position only later (in type checking), so a bare `values` identifier would be
+    // ambiguous. It may not be used as a function/constructor/relation/variant name or variable.
     for prog in [
-        // `values` (the tuple constructor) in each identifier position
         "(function values (i64) i64 :merge new)",
         "(sort S) (constructor values (i64) S)",
         "(relation values (i64))",
         "(datatype D (values i64))",
         "(relation r (i64)) (rule ((r values)) ())",
-        // a sampling of command/action/schedule keywords
-        "(function set (i64) i64 :merge new)",
-        "(relation union (i64))",
-        "(sort run)",
-        "(datatype D (function i64))",
-        "(relation r (i64)) (rule ((r let)) ())",
     ] {
         let err = run(prog).expect_err(&format!("keyword should be rejected in: {prog}"));
         assert!(
@@ -163,6 +157,27 @@ fn builtin_keywords_are_reserved() {
         err.to_string().contains("`:` prefix is reserved"),
         "expected a colon-prefix error, got: {err}"
     );
+}
+
+#[test]
+fn command_keywords_are_usable_as_names() {
+    // Command/action/schedule heads are recognized by head position, so they remain usable as
+    // ordinary names — matching base egglog. (Regression guard: real programs, e.g. Herbie, use
+    // `rewrite` as a ruleset name.)
+
+    // `rewrite` as a ruleset name (definition + reference in run-schedule / rewrite option).
+    run(r#"
+        (ruleset rewrite)
+        (datatype Math (Num i64))
+        (rewrite (Num 0) (Num 1) :ruleset rewrite)
+        (run-schedule (run rewrite))
+    "#)
+    .unwrap();
+
+    // Other command/action/schedule words usable as definition names and variables.
+    run("(sort run)").unwrap();
+    run("(datatype D (function i64))").unwrap();
+    run("(relation r (i64)) (r 0) (rule ((r let)) ((r (+ let 1)))) (run 1) (check (r 1))").unwrap();
 }
 
 #[test]

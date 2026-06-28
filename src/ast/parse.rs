@@ -39,50 +39,23 @@ macro_rules! error {
 }
 
 /// Names that may not be used as user identifiers (function/sort/constructor/relation/variant
-/// names or variables) because they are built-in keywords of the surface syntax: most command,
-/// action, and schedule heads, plus `values` (the tuple constructor for tuple-output functions).
-/// Keeping these out of the identifier namespace avoids confusing programs where, say, a function
-/// named `set` reads like the `set` action. A few common-word commands (`input`, `output`) are
-/// only partially reserved — see [`COMMAND_ONLY_KEYWORDS`]. Names starting with `:` are reserved
-/// separately (the `:` prefix marks option keywords), see [`Parser::ensure_symbol_not_reserved`].
+/// names or variables) because the surface syntax has no other way to disambiguate them.
+///
+/// This is deliberately tiny. Command/action/schedule heads (`rule`, `rewrite`, `set`, `union`,
+/// `run`, ...) are recognized by *head position* in [`Parser::parse_command`] /
+/// [`Parser::parse_action`] / [`Parser::parse_schedule`], so they do not need to be reserved as
+/// names — and base egglog allows them as names (e.g. real programs use `rewrite` as a ruleset
+/// name). Over-reserving them broke such programs, so only `values` stays reserved: it is the
+/// tuple constructor/destructure head for tuple-output functions (PR #938), which — unlike
+/// commands — is *context-sensitive* (recognized later by `head == "values"` in type checking,
+/// not by a parser dispatch table), so a bare `values` identifier would be genuinely ambiguous.
+///
+/// A few common-word commands (`input`, `output`) are only partially reserved — see
+/// [`COMMAND_ONLY_KEYWORDS`]. Names starting with `:` are reserved separately, but only in *binder*
+/// position (definition names and `let` bindings), see [`Parser::ensure_not_colon_prefixed`]; they
+/// remain usable in expression position so user-defined commands can carry `:`-keyword tokens.
 const RESERVED_KEYWORDS: &[&str] = &[
-    // commands
-    "sort",
-    "datatype",
-    "datatype*",
-    "function",
-    "constructor",
-    "relation",
-    "ruleset",
-    "unstable-combined-ruleset",
-    "rule",
-    "rewrite",
-    "birewrite",
-    "run",
-    "run-schedule",
-    "check",
-    "extract",
-    "push",
-    "pop",
-    "print-function",
-    "print-size",
-    "print-stats",
-    "include",
-    "fail",
-    "prove",
-    "prove-exists",
-    // actions
-    "let",
-    "set",
-    "union",
-    "delete",
-    "subsume",
-    "panic",
-    // schedules
-    "repeat",
-    "saturate",
-    "seq",
-    // tuple-output destructuring/construction
+    // tuple-output destructuring/construction (PR #938)
     "values",
 ];
 
@@ -233,14 +206,6 @@ impl Parser {
                 "`{symbol}` is a reserved keyword and cannot be used as a name"
             );
         }
-        // The leading `:` marks option keywords (`:merge`, `:cost`, `:ruleset`, ...); the parser
-        // uses it to delimit options, so it cannot be the start of a user identifier.
-        if symbol.starts_with(':') {
-            return error!(
-                span.clone(),
-                "`{symbol}` cannot be used as a name: the `:` prefix is reserved for option keywords"
-            );
-        }
         if self.symbol_gen.is_reserved(symbol) {
             return error!(
                 span.clone(),
@@ -251,11 +216,29 @@ impl Parser {
         Ok(())
     }
 
+    /// Reject a `:`-prefixed atom where a fresh *binder* is expected (a definition name or a `let`
+    /// binding). The leading `:` marks option keywords (`:merge`, `:cost`, `:ruleset`, ...), so a
+    /// binder named `:foo` would be confusing. This is intentionally *not* applied in general
+    /// expression position: user-defined commands parse their bodies via [`Parser::parse_expr`] and
+    /// legitimately carry `:`-keyword tokens (e.g. the `run-with ... :until ...` scheduler), so a
+    /// `:`-prefixed atom must remain parseable as a plain variable there (matching base egglog).
+    fn ensure_not_colon_prefixed(&self, symbol: &str, span: &Span) -> Result<(), ParseError> {
+        if self.ensure_no_reserved_symbols && symbol.starts_with(':') {
+            return error!(
+                span.clone(),
+                "`{symbol}` cannot be used as a name: the `:` prefix is reserved for option keywords"
+            );
+        }
+        Ok(())
+    }
+
     /// Check that a name introducing a definition (function/sort/constructor/relation/datatype/
-    /// variant) is allowed: neither a reserved keyword nor a command-only keyword like
-    /// `input`/`output` (which would otherwise create an uncallable table).
+    /// variant) is allowed: neither a reserved keyword, a `:`-prefixed option name, nor a
+    /// command-only keyword like `input`/`output` (which would otherwise create an uncallable
+    /// table).
     fn ensure_definition_name(&self, name: &str, span: &Span) -> Result<(), ParseError> {
         self.ensure_symbol_not_reserved(name, span)?;
+        self.ensure_not_colon_prefixed(name, span)?;
         if self.ensure_no_reserved_symbols && COMMAND_ONLY_KEYWORDS.contains(&name) {
             return error!(
                 span.clone(),
@@ -1027,6 +1010,7 @@ impl Parser {
                     let binding_span = name.span();
                     let binding = name.expect_atom("binding name")?;
                     self.ensure_symbol_not_reserved(&binding, &binding_span)?;
+                    self.ensure_not_colon_prefixed(&binding, &binding_span)?;
                     vec![Action::Let(span, binding, self.parse_expr(value)?)]
                 }
                 _ => return error!(span, "usage: (let <name> <expr>)"),
