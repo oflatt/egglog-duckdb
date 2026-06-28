@@ -874,6 +874,117 @@ fn rhs_only_rule_only_runs_once() {
     assert_eq!(counter.load(Ordering::SeqCst), 1);
 }
 
+/// A self-referential union-find function `@UF_Sf : (Id) -> Id` with the
+/// recursive-parent-union merge used by the relational `--native-merge` encoding.
+/// On an FD conflict `uf(a)=old` vs newly-set `new`, the merge returns
+/// `min(old,new)` AND inserts `(set (@UF_Sf max(old,new)) min(old,new))` into ITS
+/// OWN table (recursive parent-union, respecting its own merge). This guards
+/// (a) the self-`TableInsert` terminates, (b) it works on the `flush_updates` /
+/// `merge_all` path (which uses `merge_simple` for few dirty tables — the
+/// pre-seeded self buffer case), and (c) the orphan case (assert a~b AND a~c ⇒ b~c
+/// must be recorded) collapses correctly.
+#[test]
+fn self_referential_uf_merge() {
+    use crate::ExternalFunctionId;
+
+    fn build(egraph: &mut EGraph) -> FunctionId {
+        // ordering-min / ordering-max over raw Id values (Value is Ord).
+        let min_func: ExternalFunctionId = egraph.register_external_func(Box::new(
+            core_relations::make_external_func(|_state, vals| -> Option<Value> {
+                let [a, b] = vals else { return None };
+                Some(std::cmp::min(*a, *b))
+            }),
+        ));
+        let max_func: ExternalFunctionId = egraph.register_external_func(Box::new(
+            core_relations::make_external_func(|_state, vals| -> Option<Value> {
+                let [a, b] = vals else { return None };
+                Some(std::cmp::max(*a, *b))
+            }),
+        ));
+
+        // Knot-tying: peek the id this `add_table` will return so the merge can
+        // name its own table for the recursive parent-union `TableInsert`.
+        let self_id = egraph.peek_next_function_id();
+        let min = MergeFn::Primitive(min_func, vec![MergeFn::Old, MergeFn::New]);
+        let max = MergeFn::Primitive(max_func, vec![MergeFn::Old, MergeFn::New]);
+        let merge = MergeFn::IfEq {
+            a: Box::new(MergeFn::Old),
+            b: Box::new(MergeFn::New),
+            then: Box::new(MergeFn::Old),
+            els: Box::new(MergeFn::Seq(vec![
+                MergeFn::TableInsert(self_id, vec![max.clone(), min.clone()]),
+                min.clone(),
+            ])),
+        };
+        let uf = egraph.add_table(FunctionConfig {
+            schema: vec![ColumnTy::Id, ColumnTy::Id],
+            default: DefaultVal::Identity,
+            merge,
+            name: "uf_sf".into(),
+            can_subsume: false,
+        });
+        assert_eq!(uf, self_id, "peeked id must match add_table return");
+        uf
+    }
+
+    // find: single identity-on-miss lookup (the encoder reads @UF_Sf flat).
+    fn find(egraph: &EGraph, uf: FunctionId, x: Value) -> Value {
+        egraph.lookup_id(uf, &[x]).unwrap_or(x)
+    }
+
+    // -- Scenario 1: orphan case. Assert a~b and a~c (same key a) ⇒ FD conflict.
+    // The merge must keep min(b,c) as a's leader AND union b,c so the orphan
+    // (max(b,c)) is not left as its own leader.
+    {
+        let mut egraph = EGraph::default();
+        let uf = build(&mut egraph);
+        // Three distinct ids; use large fresh ids so ordering is by id value.
+        let a = egraph.fresh_id();
+        let b = egraph.fresh_id();
+        let c = egraph.fresh_id();
+        // union(a, b) = (set (@UF_Sf a) b); union(a, c) = (set (@UF_Sf a) c).
+        egraph.add_values([(uf, vec![a, b]), (uf, vec![a, c])]);
+        // a's leader is min(b, c). The non-min of {b,c} must point at the min.
+        let lo = std::cmp::min(b, c);
+        let hi = std::cmp::max(b, c);
+        assert_eq!(find(&egraph, uf, a), lo, "a should resolve to min(b,c)");
+        assert_eq!(
+            find(&egraph, uf, hi),
+            lo,
+            "orphan max(b,c) must point at min(b,c) (recursive parent-union)"
+        );
+    }
+
+    // -- Scenario 2: cross-key chain via repeated same-key conflicts. Build a
+    // diamond: union(d,a), union(d,b), union(d,c) so d's three parents collapse.
+    {
+        let mut egraph = EGraph::default();
+        let uf = build(&mut egraph);
+        let d = egraph.fresh_id();
+        let a = egraph.fresh_id();
+        let b = egraph.fresh_id();
+        let c = egraph.fresh_id();
+        egraph.add_values([(uf, vec![d, a]), (uf, vec![d, b]), (uf, vec![d, c])]);
+        let leader = std::cmp::min(std::cmp::min(a, b), c);
+        // Every one of d,a,b,c must resolve to the global min via (possibly
+        // chained) lookups. Do a couple of find hops to flatten any 2-step chain.
+        for &x in &[d, a, b, c] {
+            let mut r = find(&egraph, uf, x);
+            for _ in 0..8 {
+                let n = find(&egraph, uf, r);
+                if n == r {
+                    break;
+                }
+                r = n;
+            }
+            assert_eq!(
+                r, leader,
+                "id should resolve (transitively) to the min leader"
+            );
+        }
+    }
+}
+
 #[test]
 fn mergefn_arithmetic() {
     let mut egraph = EGraph::default();

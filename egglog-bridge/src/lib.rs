@@ -554,6 +554,25 @@ impl EGraph {
         out.non_stale().for_each(|(_, row)| f(row));
     }
 
+    /// Peek at the [`FunctionId`] that the next [`EGraph::add_table`] call will
+    /// return, WITHOUT registering anything.
+    ///
+    /// `add_table` pushes the new `FunctionInfo` at `self.funcs.next_id()` and
+    /// asserts the returned id equals that value (see the `debug_assert_eq!` at
+    /// the end of `add_table`), so this is the id the next table will be given.
+    ///
+    /// Used for "knot-tying": the term-encoder's self-referential union-find
+    /// function `@UF_Sf` needs its OWN id while building its `:merge` (a
+    /// `MergeFn::TableInsert` into itself for the recursive parent-union). The
+    /// caller peeks the id here immediately before `add_table` so the merge can
+    /// name the table being declared. Note that the corresponding `TableId`
+    /// (`Database::next_table_id`) is consumed in lock-step by the same
+    /// `add_table`, so the peeked id stays valid as long as no other table is
+    /// added in between.
+    pub fn peek_next_function_id(&self) -> FunctionId {
+        self.funcs.next_id()
+    }
+
     /// Register a function in this EGraph.
     pub fn add_table(&mut self, config: FunctionConfig) -> FunctionId {
         let FunctionConfig {
@@ -608,6 +627,33 @@ impl EGraph {
             }),
             _ => None,
         };
+        // Knot-tying for a SELF-REFERENTIAL merge (the term-encoder's
+        // `@UF_Sf : (S) -> S`, whose `:merge` does a `MergeFn::TableInsert` into
+        // ITS OWN table for the recursive parent-union): the merge resolution
+        // (`merge_fn_fill_deps` / `merge_fn_to_callback` → `TableAction::new`)
+        // reads `self.funcs[self_id].table` etc., so the new `FunctionInfo` must
+        // already be in `self.funcs` BEFORE the merge is built. We therefore
+        // reserve the table id (deterministic — the next `add_table_named` will
+        // assign exactly this id) and push the `FunctionInfo` up front, then
+        // build the merge and create the backing table. Tables whose merge does
+        // not self-reference resolve identically either way; this ordering is a
+        // strict superset.
+        let name: Arc<str> = name.into();
+        let table_id = self.db.next_table_id();
+        let res = self.funcs.push(FunctionInfo {
+            table: table_id,
+            schema: schema.clone(),
+            n_keys,
+            incremental_rebuild_rules: Default::default(),
+            nonincremental_rebuild_rule: RuleId::new(!0),
+            default_val: default,
+            can_subsume,
+            name: name.clone(),
+            kind: FunctionKind::Table,
+            uf_rebuild_rule: None,
+        });
+        debug_assert_eq!(res, next_func_id);
+
         let mut read_deps = IndexSet::<TableId>::new();
         let mut write_deps = IndexSet::<TableId>::new();
         merge_fn_fill_deps(&merge, self, &mut read_deps, &mut write_deps);
@@ -619,27 +665,13 @@ impl EGraph {
             to_rebuild,
             merge_fn,
         );
-        let name: Arc<str> = name.into();
-        let table_id = self.db.add_table_named(
+        let assigned_table_id = self.db.add_table_named(
             table,
             name.clone(),
             read_deps.iter().copied(),
             write_deps.iter().copied(),
         );
-
-        let res = self.funcs.push(FunctionInfo {
-            table: table_id,
-            schema: schema.clone(),
-            n_keys,
-            incremental_rebuild_rules: Default::default(),
-            nonincremental_rebuild_rule: RuleId::new(!0),
-            default_val: default,
-            can_subsume,
-            name,
-            kind: FunctionKind::Table,
-            uf_rebuild_rule: None,
-        });
-        debug_assert_eq!(res, next_func_id);
+        debug_assert_eq!(assigned_table_id, table_id);
         if let Some(uf_func) = native_merge_target {
             self.native_merge_view_target.insert(res, uf_func);
         }

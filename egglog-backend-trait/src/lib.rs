@@ -413,6 +413,21 @@ pub trait Backend: Send + Sync {
     /// Wraps `egglog_bridge::EGraph::add_table`.
     fn add_table(&mut self, config: FunctionConfig) -> FunctionId;
 
+    /// Peek the [`FunctionId`] the next [`Backend::add_table`] call will return,
+    /// WITHOUT registering anything. Used for "knot-tying" a self-referential
+    /// `:merge`: the relational native-merge union-find function `@UF_Sf` needs
+    /// its OWN id while building its merge (a `MergeFn::TableInsert` into itself
+    /// for the recursive parent-union). The caller peeks the id immediately before
+    /// `add_table`.
+    ///
+    /// Bridge-only (this whole path is `--native-merge` on the native bridge). The
+    /// default panics: the dataflow/SQL backends never declare a self-referential
+    /// merge, matching the inert handling of the other bridge-only merge variants
+    /// (`Seq` / `TableInsert` / `IfEq`).
+    fn peek_next_function_id(&self) -> FunctionId {
+        panic!("peek_next_function_id is only supported on the native bridge backend")
+    }
+
     /// `--nativerb` (native bridge, term-encoding native-UF, non-proof): register
     /// a `@<F>View` view function (`view_func`) to be re-canonicalized by the
     /// engine's native table rebuild against the per-sort `@UF_Sf` UF-backed

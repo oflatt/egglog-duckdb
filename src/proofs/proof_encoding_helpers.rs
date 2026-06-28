@@ -440,6 +440,18 @@ impl ProofInstrumentor<'_> {
         self.egraph.proof_state.native_merge
     }
 
+    /// True for the RELATIONAL native-merge path: `--native-merge` WITHOUT
+    /// `--native-uf`, in term (non-proof) mode. In this mode the union-find is a
+    /// SINGLE self-referential `:merge` function `@UF_Sf : (S) -> S` (no `@UF_S`
+    /// edge table, no `singleparent` / `uf_function_index` rules), and the
+    /// constructor view's congruence union goes into that `@UF_Sf` via the same
+    /// native self-referential merge. Used to gate the `declare_sort` / `union` /
+    /// rebuild-schedule / congruence-target changes so the plain `--term-encoding`,
+    /// proof, and `--native-uf` paths stay byte-identical.
+    pub(crate) fn native_merge_relational(&self) -> bool {
+        self.native_merge() && !self.native_uf() && !self.proofs_enabled()
+    }
+
     /// True when a CUSTOM `:merge` function's merge body is a pure VALUE-FOLD: a
     /// fold of PRIMITIVES / literals over `old`/`new` that yields a value, with
     /// NO constructor / function calls (no e-node creation). Such a merge can run

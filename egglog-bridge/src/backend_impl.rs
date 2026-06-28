@@ -278,6 +278,10 @@ impl Backend for EGraph {
         EGraph::add_table(self, config)
     }
 
+    fn peek_next_function_id(&self) -> FunctionId {
+        EGraph::peek_next_function_id(self)
+    }
+
     fn register_nativerb_view(&mut self, uf_func: FunctionId, view_func: FunctionId) {
         EGraph::register_nativerb_view(self, uf_func, view_func)
     }

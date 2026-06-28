@@ -1134,6 +1134,67 @@ impl EGraph {
         }
     }
 
+    /// Build the self-referential union-find `:merge` for the relational
+    /// `--native-merge` path (`--native-merge` WITHOUT `--native-uf`).
+    ///
+    /// `--native-merge` (no `--native-uf`) replaces the relational `@UF_S` edge
+    /// table + the `singleparent` / `uf_function_index` rules with a SINGLE
+    /// self-referential function `@UF_Sf : (S) -> S` (the WHOLE union-find).
+    /// To union `a, b`: `(set (@UF_Sf a) b)`. On an FD conflict — `@UF_Sf a` is
+    /// already `old`, a new write proposes `new` — the merge must
+    ///   1. return `ordering-min(old, new)` as the surviving leader of `a`, AND
+    ///   2. `(set (@UF_Sf ordering-max(old, new)) ordering-min(old, new))` —
+    ///      union the two parents into ITS OWN table (respecting its own merge),
+    ///      so the displaced `max(old,new)` is NOT orphaned (asserting `a~old`
+    ///      AND `a~new` ⇒ `old~new` must be recorded; otherwise the orphan's
+    ///      identity-on-miss lookup would make it its own leader — WRONG).
+    ///
+    /// This expression is the merge for BOTH `@UF_Sf` itself (the recursive
+    /// parent-union via `TableInsert` into `uf_self_id`) AND a CONSTRUCTOR's
+    /// `@<F>View` eclass column (congruence: on a view FD-conflict the two output
+    /// eclasses are unioned into `@UF_Sf` and the surviving view eclass is the
+    /// min). `uf_self_id` is the backend id of `@UF_Sf` for this sort.
+    ///
+    /// The `ordering-min` / `ordering-max` primitives are resolved to their
+    /// backend `ExternalFunctionId`s via the primitives registry (the `#`
+    /// placeholder overload is sort-generic, doing a plain value comparison), the
+    /// same id `translate_expr_to_mergefn` would produce for a
+    /// `(ordering-min old new)` call.
+    fn build_uf_self_merge(
+        &self,
+        uf_self_id: egglog_bridge::FunctionId,
+    ) -> Result<egglog_bridge::MergeFn, Error> {
+        use egglog_bridge::MergeFn;
+        let resolve = |name: &str| -> Result<ExternalFunctionId, Error> {
+            self.type_info
+                .current_primitive_external_id(name, crate::Context::Write)
+                .ok_or_else(|| {
+                    Error::BackendError(format!(
+                        "native-merge UF merge: primitive `{name}` not resolvable in write context"
+                    ))
+                })
+        };
+        let min_id = resolve("ordering-min")?;
+        let max_id = resolve("ordering-max")?;
+        let min = MergeFn::Primitive(min_id, vec![MergeFn::Old, MergeFn::New]);
+        let max = MergeFn::Primitive(max_id, vec![MergeFn::Old, MergeFn::New]);
+        Ok(MergeFn::IfEq {
+            // old == new: inert, no side write (matches the rule's `(!= old new)`
+            // guard — the singleparent/congruence rule never fires when equal).
+            a: Box::new(MergeFn::Old),
+            b: Box::new(MergeFn::New),
+            then: Box::new(MergeFn::Old),
+            els: Box::new(MergeFn::Seq(vec![
+                // (set (@UF_Sf max) min) — recursive parent-union into ITS OWN
+                // table (respects this very merge); strictly `min < max`, so the
+                // chain of self-inserts is finite (union-by-min, idempotent).
+                MergeFn::TableInsert(uf_self_id, vec![max, min.clone()]),
+                // surviving value of this column = min.
+                min,
+            ])),
+        })
+    }
+
     /// Lower a term-building custom `:merge` body (e.g. `(C2 (C1 old new) (C2 old
     /// new))`) into a `MergeFn::Seq` of `Construct` / `TableInsert` / union
     /// variants — the PR #933 `:merge`-multiple-actions port. This re-expresses the
@@ -1452,7 +1513,23 @@ impl EGraph {
                     // the output sort has no `@UF_Sf` yet (it always does in
                     // native-UF mode, since the sort is declared before its
                     // constructors), fall back to the global `UnionId`.
-                    merge: if let Some(term_build_merge) =
+                    merge: if self
+                        .proof_state
+                        .native_merge_uf_functions
+                        .contains(&*decl.name)
+                    {
+                        // Relational native-merge `@UF_Sf : (S) -> S` (the WHOLE
+                        // union-find). Attach the NATIVE self-referential `:merge`
+                        // (recursive parent-union via `TableInsert` into ITS OWN
+                        // table), overriding the source `:merge (ordering-min old
+                        // new)`. The function's own backend id is needed for the
+                        // self `TableInsert`; it is the id the about-to-run
+                        // `add_table` will return (peeked deterministically). Note:
+                        // `is_uf_index` above also gives `@UF_Sf` the
+                        // `DefaultVal::Identity` lookup-or-self default.
+                        let uf_self_id = self.backend.peek_next_function_id();
+                        self.build_uf_self_merge(uf_self_id)?
+                    } else if let Some(term_build_merge) =
                         self.proof_state.native_term_build_views.get(&*decl.name)
                     {
                         // Native TERM-BUILD custom `:merge` (`--native-merge`, term,
@@ -1542,26 +1619,20 @@ impl EGraph {
                             }
                         } else {
                             // `--native-merge` WITHOUT `--native-uf` (relational
-                            // path): write the FD-conflict congruence edge into the
-                            // per-sort RELATIONAL parent table `@UF_S` — exactly the
-                            // row `union()` writes (`(set (@UF_S larger smaller)
-                            // ())`). The relational maintenance + rebuild rulesets
-                            // canonicalize it, so the rule-based rebuild absorbs the
+                            // path): the union-find is the self-referential function
+                            // `@UF_Sf : (S) -> S`. On a view FD-conflict (same
+                            // children, two output eclasses) union the two eclasses
+                            // into `@UF_Sf` and keep the min as the surviving view
+                            // eclass — EXACTLY the self-referential UF merge (the
+                            // eclass column plays the role of old/new). The
+                            // recursive parent-union and `path_compress` then
+                            // canonicalize, and the rule-based rebuild absorbs the
                             // congruence cascade (no native-UF onchange re-scan
-                            // blowup). `@UF_S` is declared before its constructors
+                            // blowup). `@UF_Sf` is declared before its constructors
                             // (the sort's `declare_sort` runs first), so it is
                             // already in `self.functions`.
-                            let parent_id = self
-                                .proof_state
-                                .uf_parent
-                                .get(&decl.schema.output)
-                                .and_then(|pname| self.functions.get(pname))
-                                .map(|pf| pf.backend_id);
-                            match parent_id {
-                                Some(parent_table) => MergeFn::UnionIntoParentTable {
-                                    parent_table,
-                                    unit: self.backend.base_values().get::<()>(()),
-                                },
+                            match uf_id {
+                                Some(uf_self_id) => self.build_uf_self_merge(uf_self_id)?,
                                 None => MergeFn::UnionId,
                             }
                         }

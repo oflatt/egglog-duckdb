@@ -231,13 +231,13 @@ impl<C: Cost + Ord + Eq + Clone + Debug> Extractor<C> {
             {
                 let func_name = func.0.clone();
                 // For view tables (with term_constructor in proof mode), the e-class is the last input column
-                let output_sort_name = func.1.extraction_output_sort().name();
+                let output_sort_name = func.1.extraction_output_sort(egraph).name();
                 if let Some(v) = rev_index.get_mut(output_sort_name) {
                     v.push(func_name);
                 } else {
                     rev_index.insert(output_sort_name.to_owned(), vec![func_name]);
                     if extract_all_sorts {
-                        rootsorts.push(func.1.extraction_output_sort().clone());
+                        rootsorts.push(func.1.extraction_output_sort(egraph).clone());
                     }
                 }
             }
@@ -270,7 +270,7 @@ impl<C: Cost + Ord + Eq + Clone + Debug> Extractor<C> {
                     if !funcs_set.contains(h) {
                         let func = egraph.functions.get(h).unwrap();
                         // For view tables, children are all but the last input (which is the e-class)
-                        let num_children = func.extraction_num_children();
+                        let num_children = func.extraction_num_children(egraph);
                         for ch in func.schema.input.iter().take(num_children) {
                             let ch_name = ch.name();
                             if !seen.contains(ch_name) {
@@ -293,7 +293,7 @@ impl<C: Cost + Ord + Eq + Clone + Debug> Extractor<C> {
 
         for func_name in funcs.iter() {
             let func = egraph.functions.get(func_name).unwrap();
-            let output_sort_name = func.extraction_output_sort().name();
+            let output_sort_name = func.extraction_output_sort(egraph).name();
             if !costs.contains_key(output_sort_name) {
                 costs.insert(output_sort_name.to_owned(), Default::default());
                 topo_rnk.insert(output_sort_name.to_owned(), Default::default());
@@ -347,7 +347,7 @@ impl<C: Cost + Ord + Eq + Clone + Debug> Extractor<C> {
     ) -> Option<C> {
         let mut ch_costs: Vec<C> = Vec::new();
         let sorts = &func.schema.input;
-        let num_children = func.extraction_num_children();
+        let num_children = func.extraction_num_children(egraph);
         for (value, sort) in row.vals.iter().take(num_children).zip(sorts.iter()) {
             ch_costs.push(self.compute_cost_node(egraph, *value, sort)?);
         }
@@ -384,7 +384,7 @@ impl<C: Cost + Ord + Eq + Clone + Debug> Extractor<C> {
         func: &Function,
     ) -> usize {
         let sorts = &func.schema.input;
-        let num_children = func.extraction_num_children();
+        let num_children = func.extraction_num_children(egraph);
         row.vals
             .iter()
             .take(num_children)
@@ -414,9 +414,9 @@ impl<C: Cost + Ord + Eq + Clone + Debug> Extractor<C> {
 
             for func_name in funcs.iter() {
                 let func = egraph.functions.get(func_name).unwrap();
-                let target_sort = func.extraction_output_sort();
+                let target_sort = func.extraction_output_sort(egraph);
 
-                let output_idx = func.extraction_output_index();
+                let output_idx = func.extraction_output_index(egraph);
                 let mut relax_hyperedge = |row: egglog_bridge::FunctionRow| {
                     if !row.subsumed {
                         let target = &row.vals[output_idx];
@@ -463,8 +463,8 @@ impl<C: Cost + Ord + Eq + Clone + Debug> Extractor<C> {
         // Save the edges for reconstruction
         for func_name in funcs.iter() {
             let func = egraph.functions.get(func_name).unwrap();
-            let target_sort = func.extraction_output_sort();
-            let output_idx = func.extraction_output_index();
+            let target_sort = func.extraction_output_sort(egraph);
+            let output_idx = func.extraction_output_index(egraph);
 
             let mut save_best_parent_edge = |row: egglog_bridge::FunctionRow| {
                 if !row.subsumed {
@@ -544,7 +544,7 @@ impl<C: Cost + Ord + Eq + Clone + Debug> Extractor<C> {
             let func = egraph.functions.get(func_name).unwrap();
             let ch_sorts = &func.schema.input;
 
-            let num_children = func.extraction_num_children();
+            let num_children = func.extraction_num_children(egraph);
             let output_name = func.extraction_term_name();
 
             let mut ch_terms: Vec<TermId> = Vec::new();
@@ -631,6 +631,28 @@ impl<C: Cost + Ord + Eq + Clone + Debug> Extractor<C> {
                 .unwrap_or(value);
         }
 
+        // Relational native-merge (`--native-merge` WITHOUT `--native-uf`,
+        // non-proof): the union-find is the self-referential function `@UF_Sf`
+        // (`(S) -> S`, identity-on-miss), NOT the `@UF_S` edge table. Resolve via
+        // single-key lookups, chasing to a fixpoint (path_compress keeps it flat,
+        // but chaining is robust against any residual chain).
+        if egraph.proof_state.native_merge
+            && !egraph.proof_state.native_uf
+            && !egraph.proof_state.proofs_enabled
+            && let Some(uf_function_name) = egraph.proof_state.uf_function.get(sort.name())
+            && let Some(uf_func) = egraph.functions.get(uf_function_name)
+        {
+            let mut canonical = value;
+            // Bound the walk defensively; a flat table resolves in one hop.
+            for _ in 0..64 {
+                match egraph.backend.lookup_id(uf_func.backend_id, &[canonical]) {
+                    Some(next) if next != canonical => canonical = next,
+                    _ => break,
+                }
+            }
+            return canonical;
+        }
+
         // Check if there's a UF registered for this sort
         let Some(uf_name) = egraph.proof_state.uf_parent.get(sort.name()) else {
             return value;
@@ -685,7 +707,7 @@ impl<C: Cost + Ord + Eq + Clone + Debug> Extractor<C> {
                         .functions
                         .get(func_name)
                         .unwrap()
-                        .extraction_output_sort()
+                        .extraction_output_sort(egraph)
                         .name()
                 {
                     root_funcs.push(func_name.clone());
@@ -694,7 +716,7 @@ impl<C: Cost + Ord + Eq + Clone + Debug> Extractor<C> {
 
             for func_name in root_funcs.iter() {
                 let func = egraph.functions.get(func_name).unwrap();
-                let output_idx = func.extraction_output_index();
+                let output_idx = func.extraction_output_index(egraph);
 
                 let mut find_root_variants = |row: egglog_bridge::FunctionRow| {
                     if !row.subsumed {
@@ -719,7 +741,7 @@ impl<C: Cost + Ord + Eq + Clone + Debug> Extractor<C> {
                 let mut ch_terms: Vec<TermId> = Vec::new();
                 let func = egraph.functions.get(&func_name).unwrap();
                 let ch_sorts = &func.schema.input;
-                let num_children = func.extraction_num_children();
+                let num_children = func.extraction_num_children(egraph);
                 // For view tables, children are all but the last input (which is the e-class)
                 for (value, sort) in hyperedge.iter().zip(ch_sorts.iter()).take(num_children) {
                     ch_terms.push(self.reconstruct_termdag_node_helper(
@@ -785,21 +807,41 @@ impl Function {
         }
     }
 
-    /// For view tables (with term_constructor), the effective output sort is the last input column.
-    /// For regular tables, it's the output sort.
-    /// This is used by extraction to determine which sort a table produces values for.
-    pub(crate) fn extraction_output_sort(&self) -> &ArcSort {
-        if self.decl.term_constructor.is_some() {
+    /// True for a native-merge FD view `(children...) -> eclass` (the
+    /// `--native-merge` view shape, term or proof): the eclass is the OUTPUT
+    /// column rather than the LAST INPUT (the baseline all-columns view
+    /// `(children..., eclass) -> Unit/Proof`). Authoritative membership is the
+    /// encoder's `native_merge_views` set — a schema-only check is ambiguous in
+    /// proof mode (a baseline proof view's `Proof` output is itself an eq-sort).
+    fn is_fd_view(&self, egraph: &EGraph) -> bool {
+        egraph
+            .proof_state
+            .native_merge_views
+            .contains(&self.decl.name)
+    }
+
+    /// For view tables, the effective output sort is the eclass column:
+    /// the native-merge FD view `(children) -> eclass` uses the OUTPUT sort; the
+    /// baseline all-columns view `(children..., eclass) -> Unit/Proof` uses the
+    /// LAST INPUT column. For regular tables, it's the output sort. Used by
+    /// extraction to determine which sort a table produces values for.
+    pub(crate) fn extraction_output_sort(&self, egraph: &EGraph) -> &ArcSort {
+        if self.is_fd_view(egraph) {
+            &self.schema.output
+        } else if self.decl.term_constructor.is_some() {
             self.schema.input.last().unwrap()
         } else {
             &self.schema.output
         }
     }
 
-    /// Returns the number of children for extraction purposes.
-    /// For view tables, this excludes the last column (the e-class).
-    pub(crate) fn extraction_num_children(&self) -> usize {
-        if self.decl.term_constructor.is_some() {
+    /// Returns the number of children for extraction purposes: a native-merge FD
+    /// view has ALL inputs as children; a baseline all-columns view excludes the
+    /// last input (the eclass); a regular table uses all inputs.
+    pub(crate) fn extraction_num_children(&self, egraph: &EGraph) -> usize {
+        if self.is_fd_view(egraph) {
+            self.schema.input.len()
+        } else if self.decl.term_constructor.is_some() {
             self.schema.input.len() - 1
         } else {
             self.schema.input.len()
@@ -815,17 +857,18 @@ impl Function {
             .unwrap_or(&self.decl.name)
     }
 
-    /// Returns the index of the output value in a row for extraction purposes.
-    /// For view tables, the e-class is the last input column (second-to-last in the row).
-    /// For regular tables, it's the last column (the actual output).
-    pub(crate) fn extraction_output_index(&self) -> usize {
-        if self.decl.term_constructor.is_some() {
-            // For view tables: input is [children..., eclass], output is view_sort
-            // Row is [children..., eclass, view_sort]
-            // We want eclass which is at index input.len() - 1
+    /// Returns the index of the eclass value in a row for extraction purposes: a
+    /// native-merge FD view `(children) -> eclass` has the eclass as the OUTPUT at
+    /// index `input.len()` (row `[children..., eclass, ...]`); a baseline
+    /// all-columns view `(children..., eclass) -> Unit/Proof` has the eclass as the
+    /// LAST INPUT at index `input.len() - 1`; a regular table's output is at index
+    /// `input.len()`.
+    pub(crate) fn extraction_output_index(&self, egraph: &EGraph) -> usize {
+        if self.is_fd_view(egraph) {
+            self.schema.input.len()
+        } else if self.decl.term_constructor.is_some() {
             self.schema.input.len() - 1
         } else {
-            // For regular tables: row is [inputs..., output]
             self.schema.input.len()
         }
     }

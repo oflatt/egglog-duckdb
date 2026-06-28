@@ -82,6 +82,17 @@ pub(crate) struct EncodingState {
     /// `(set (@FView children) eclass)` / `(= eclass (@FView children))` forms
     /// (eclass as the function OUTPUT) instead of the all-columns-key form.
     pub native_merge_views: HashSet<String>,
+    /// Relational native-merge path (`--native-merge` without `--native-uf`, term
+    /// non-proof, bridge): the set of per-sort union-find FUNCTION names (`@UF_Sf`)
+    /// declared with the NATIVE self-referential `:merge` (see
+    /// [`EGraph::build_uf_self_merge`]) instead of the egglog-source `:merge
+    /// (ordering-min old new)`. In this mode `@UF_Sf` is the WHOLE union-find (a
+    /// `(S) -> S` function); the relational `@UF_S` edge table and the
+    /// `singleparent` / `uf_function_index` rules are gone. `declare_function`
+    /// (lib.rs) checks membership to attach the native merge. Populated by
+    /// `declare_sort`. Empty unless `--native-merge` (no `--native-uf`) on the
+    /// bridge in term mode.
+    pub native_merge_uf_functions: HashSet<String>,
     /// Native-merge mode only: view names already registered with the backend for
     /// the view -> output-sort-UF association (so `register_native_merge_views`
     /// registers only the not-yet-registered views before each run).
@@ -226,6 +237,7 @@ impl EncodingState {
             fast_rebuild: false,
             native_merge: false,
             native_merge_views: HashSet::default(),
+            native_merge_uf_functions: HashSet::default(),
             native_merge_registered: HashSet::default(),
             native_value_merge_views: HashMap::default(),
             native_term_build_views: HashMap::default(),
@@ -320,6 +332,13 @@ impl<'a> ProofInstrumentor<'a> {
                 format!("(set ({uf_function_name} {lhs}) {rhs})")
             };
         }
+        // Relational native-merge: `@UF_Sf : (S) -> S` is the whole union-find.
+        // Union via `(set (@UF_Sf lhs) rhs)`; the native self-referential merge
+        // resolves orientation (takes the min, unions the displaced parent).
+        if self.native_merge_relational() {
+            let uf_function_name = self.uf_function_name(type_name);
+            return format!("(set ({uf_function_name} {lhs}) {rhs})");
+        }
         let uf_name = self.uf_name(type_name);
         let smaller = format!("(ordering-min {lhs} {rhs})");
         let larger = format!("(ordering-max {lhs} {rhs})");
@@ -361,6 +380,14 @@ impl<'a> ProofInstrumentor<'a> {
         // find-or-self primitive. Only ever set in non-proof term mode.
         if self.native_uf() {
             return self.declare_sort_native_uf(sort_name);
+        }
+        // Relational native-merge path (`--native-merge` WITHOUT `--native-uf`,
+        // term + non-proof): the union-find is a SINGLE self-referential `:merge`
+        // function `@UF_Sf : (S) -> S` (no `@UF_S` edge table, no `singleparent`
+        // / `uf_function_index`). `path_compress` is kept (rewritten on the
+        // function form) to flatten cross-key chains.
+        if self.native_merge_relational() {
+            return self.declare_sort_native_merge_relational(sort_name);
         }
         let pname = self.uf_name(sort_name);
         let uf_function_name = self.uf_function_name(sort_name);
@@ -518,6 +545,57 @@ impl<'a> ProofInstrumentor<'a> {
                  {code}"
             );
         }
+
+        self.parse_program(&code)
+    }
+
+    /// Relational native-merge variant of `declare_sort`
+    /// (`--native-merge` WITHOUT `--native-uf`, term + non-proof).
+    ///
+    /// The whole union-find is a SINGLE self-referential function
+    /// `@UF_Sf : (S) -> S` with a NATIVE self-referential `:merge` (built in
+    /// [`EGraph::build_uf_self_merge`] and attached in `declare_function`). To
+    /// union `a, b`: `(set (@UF_Sf a) b)` (see `union`). On an FD conflict the
+    /// native merge takes the min and unions the two parents back into `@UF_Sf`
+    /// itself (recursive parent-union), so no separate `singleparent` or
+    /// `uf_function_index` ruleset is needed and the `@UF_S` edge table is gone.
+    ///
+    /// `path_compress` is STILL needed (the encoder reads `@UF_Sf` as a SINGLE
+    /// identity-on-miss lookup at constructor-creation time, so the table must be
+    /// flat; cross-key chains `a->b->c` never trigger an FD conflict). It is
+    /// rewritten on the function form:
+    ///   `(rule ((= b (@UF_Sf a)) (= c (@UF_Sf b)) (!= b c)) ((set (@UF_Sf a) c)))`.
+    fn declare_sort_native_merge_relational(&mut self, sort_name: &str) -> Vec<Command> {
+        let uf_function_name = self.uf_function_name(sort_name);
+        let fresh_name = self.egraph.parser.symbol_gen.fresh("uf_path_compress");
+        let path_compress_ruleset_name = self.proof_names().path_compress_ruleset_name.clone();
+
+        // Mark `@UF_Sf` so `declare_function` attaches the native self-referential
+        // merge instead of lowering the source `:merge (ordering-min old new)`.
+        self.egraph
+            .proof_state
+            .native_merge_uf_functions
+            .insert(uf_function_name.clone());
+
+        // `@UF_Sf : (S) -> S`. The source `:merge (ordering-min old new)` is a
+        // valid value-fold (so the function typechecks), but `declare_function`
+        // OVERRIDES it with the native self-referential merge (recursive
+        // parent-union) once `@UF_Sf` is recognized in `native_merge_uf_functions`.
+        // Declared `:unextractable :internal-hidden`, and `declare_function` gives
+        // it `DefaultVal::Identity` (lookup-or-self) because the name is in the
+        // encoder's `uf_function` map.
+        let code = format!(
+            "(function {uf_function_name} ({sort_name}) {sort_name} :merge (ordering-min old new) :unextractable :internal-hidden)
+             ;; path compression: flatten cross-key chains so the single
+             ;; identity-on-miss `@UF_Sf` lookup the encoder emits is canonical.
+             (rule ((= b ({uf_function_name} a))
+                    (= c ({uf_function_name} b))
+                    (!= b c))
+                  ((set ({uf_function_name} a) c))
+                   :ruleset {path_compress_ruleset_name}
+                   :name \"{fresh_name}\")
+                   "
+        );
 
         self.parse_program(&code)
     }
@@ -2625,13 +2703,24 @@ impl<'a> ProofInstrumentor<'a> {
         } else {
             String::new()
         };
+        // Relational native-merge: the `singleparent` and `uf_function_index`
+        // rulesets are empty (the self-referential `@UF_Sf` merge subsumes them),
+        // so drop those saturate steps; `path_compress` is still needed to flatten
+        // cross-key chains. Other modes keep the full maintenance schedule.
+        let maintenance_steps = if self.native_merge_relational() {
+            format!("(saturate {path_compress_ruleset})")
+        } else {
+            format!(
+                "(saturate {single_parent})
+                 (saturate {path_compress_ruleset})
+                 (saturate {uf_function_index})"
+            )
+        };
         self.parse_schedule(format!(
             "(seq
               (saturate
                   {rebuilding_cleanup_ruleset}
-                  (saturate {single_parent})
-                  (saturate {path_compress_ruleset})
-                  (saturate {uf_function_index})
+                  {maintenance_steps}
                   {rebuilding_ruleset})
               {drain_step}
               {delete_ruleset})"
@@ -2691,7 +2780,16 @@ impl<'a> ProofInstrumentor<'a> {
                 unionable,
                 ..
             } => {
-                let uf_name = self.uf_name(name);
+                // Relational native-merge: the union-find is the self-referential
+                // function `@UF_Sf` (no `@UF_S` edge table). Point the sort's `uf`
+                // (consumed for extraction's `find_canonical`) at `@UF_Sf` so the
+                // single-key lookup canonicalizes against the right table; calling
+                // `uf_name` would register a never-declared `@UF_S` name.
+                let uf_name = if self.native_merge_relational() {
+                    self.uf_function_name(name)
+                } else {
+                    self.uf_name(name)
+                };
                 let proof_func = if self.egraph.proof_state.proofs_enabled {
                     Some(self.term_proof_name(name))
                 } else {

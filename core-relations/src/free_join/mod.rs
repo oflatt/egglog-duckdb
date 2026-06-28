@@ -595,7 +595,19 @@ impl Database {
         while !to_merge.is_empty() {
             for table_id in to_merge.iter().copied() {
                 let mut info = self.tables.unwrap_val(table_id);
-                let mut es = ExecutionState::new(self.read_only_view(), Default::default());
+                // Pre-seed the table's OWN buffer so a merge that stages a write
+                // back into its own table (a self-referential merge, e.g. the
+                // term-encoder's `@UF_Sf` recursive parent-union) can stage it:
+                // the table has been `unwrap_val`'d out of `self.tables`, so the
+                // `lazy_init` `new_buffer()` path (which indexes `self.tables`)
+                // would fail for the self id. The buffer writes into the table's
+                // `pending_state`, so the staged rows are picked up on the next
+                // fixpoint iteration of this loop (via the `notify`-driven
+                // `to_merge` refresh). Non-self-referential merges allocate an
+                // empty, never-touched buffer — harmless.
+                let mut bufs = DenseIdMap::default();
+                bufs.insert(table_id, info.table.new_buffer());
+                let mut es = ExecutionState::new(self.read_only_view(), bufs);
                 changed |= info.table.merge(&mut es).added || es.changed;
                 self.tables.insert(table_id, info);
             }
