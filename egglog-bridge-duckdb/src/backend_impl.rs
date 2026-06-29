@@ -215,12 +215,22 @@ fn duck_merge_mode_scalar(
         // DuckDB has no multi-action merge support (term-build `:merge` still
         // rule-encodes via `supports_term_build_merge` = false), so they never
         // reach this backend.
-        MergeFn::Seq(_)
-        | MergeFn::TableInsert(..)
-        | MergeFn::Construct(..)
-        | MergeFn::IfEq { .. } => {
+        // `IfEq` / `Seq` are the top-level shapes of a TERM-BUILD custom `:merge`
+        // (`translate_term_build_merge_to_seq`). DuckDB runs these NATIVELY as a
+        // between-statement set-based SQL pass (`emit_term_build_merges`), NOT in
+        // the `ON CONFLICT` clause (which cannot mint constructors). The view is
+        // registered ALL-COLUMNS keyed with `ON CONFLICT DO NOTHING` (so the two
+        // conflicting writes coexist for the self-join to read), and the tree
+        // itself is retained in `FunctionInfo::merge_tree` by `add_table`. The
+        // mode here is therefore `Old` (the view's `ON CONFLICT DO NOTHING`).
+        MergeFn::Seq(_) | MergeFn::IfEq { .. } => MergeMode::Old,
+        // A bare `TableInsert` / `Construct` cannot appear at the TOP of a view
+        // merge (they are always nested inside a `Seq`); reaching here is a
+        // frontend bug.
+        MergeFn::TableInsert(..) | MergeFn::Construct(..) => {
             panic!(
-                "DuckDB backend does not support multi-action (Seq/TableInsert/Construct/IfEq) merges"
+                "DuckDB backend: a top-level TableInsert/Construct merge is not a \
+                 term-build tree (expected IfEq/Seq)"
             )
         }
     }
@@ -251,6 +261,26 @@ fn duck_merge_mode(
             ),
         },
         other => duck_merge_mode_scalar(other, table, out_col, funcs),
+    }
+}
+
+/// True iff `merge` is a TERM-BUILD custom `:merge` tree — the top-level shape
+/// `translate_term_build_merge_to_seq` produces in TERM (non-proof) mode: an
+/// `IfEq` guard around a `Seq`, or a bare `Seq`. A single-element `Columns`
+/// (the multi-value spelling of a single-output merge) is unwrapped. DuckDB runs
+/// such a tree natively as a between-statement set-based pass
+/// (`emit_term_build_merges`); `add_table` retains the tree on the view's
+/// [`FunctionInfo::merge_tree`] and registers the view all-columns keyed.
+///
+/// Returns `false` for value-fold / congruence / scalar merges (which DuckDB
+/// resolves in-SQL via `ON CONFLICT`), so those keep their existing paths.
+/// (The PROOF-mode term-build merge is a `Columns([eclass, proof])` tuple — not
+/// reachable on DuckDB, which rejects proof-mode native-merge.)
+fn is_term_build_tree(merge: &MergeFn) -> bool {
+    match merge {
+        MergeFn::IfEq { .. } | MergeFn::Seq(_) => true,
+        MergeFn::Columns(cols) => matches!(cols.as_slice(), [single] if is_term_build_tree(single)),
+        _ => false,
     }
 }
 
@@ -791,7 +821,26 @@ impl Backend for EGraph {
                     _ => false,
                 });
 
-                if duck_cols.is_empty() {
+                // TERM-BUILD custom `:merge` view (`--native-merge`): the merge
+                // body builds e-nodes (a top-level `IfEq`/`Seq` of
+                // `Construct`/`TableInsert`). Register the view ALL-COLUMNS keyed
+                // (conflicting writes coexist) and RETAIN the tree so
+                // `emit_term_build_merges` can compile + run it at the iteration
+                // boundary. Checked before `output_is_unit` (a term-build output
+                // is an eq-sort id, never Unit) and before the scalar
+                // `merge_mode` arm (a term-build tree is not a scalar `ON CONFLICT`
+                // merge). Requires a real output column (the eclass).
+                if !duck_cols.is_empty() && !output_is_unit && is_term_build_tree(&config.merge) {
+                    let inputs = &duck_cols[..duck_cols.len() - 1];
+                    let output = duck_cols[duck_cols.len() - 1];
+                    // Unwrap a single-element `Columns` to its inner tree (the
+                    // multi-value spelling of a single-output merge).
+                    let tree = match &config.merge {
+                        MergeFn::Columns(cols) if cols.len() == 1 => cols[0].clone(),
+                        other => other.clone(),
+                    };
+                    self.add_term_build_view_function(&name, inputs, output, tree)
+                } else if duck_cols.is_empty() {
                     // No columns at all: treat as a nullary relation.
                     self.add_relation_with_pname(&name, &[], None)
                 } else if output_is_unit {
@@ -1391,6 +1440,31 @@ impl Backend for EGraph {
     /// panics deriving its `pname`). Returning `false` keeps the congruence rules.
     fn supports_native_congruence_merge(&self) -> bool {
         false
+    }
+
+    /// `--native-merge` TERM-BUILD custom `:merge`: DuckDB runs a term-building
+    /// custom `:merge` (a merge body that mints e-nodes via constructor calls,
+    /// e.g. `(C2 (C1 old new) (C2 old new))`) NATIVELY as INLINE set-based SQL.
+    ///
+    /// The frontend lowers the merge body to a `MergeFn::Seq` term-build tree
+    /// (`IfEq` guard around a `Seq` of `Construct` / `TableInsert` / canon
+    /// `Function` nodes) and installs it as the function's `@<F>View` merge.
+    /// `add_table` retains that tree in [`FunctionInfo::merge_tree`] and registers
+    /// the view ALL-COLUMNS keyed (so two conflicting `(set (@FView key) eclass)`
+    /// writes COEXIST rather than collapsing). At the end of each iteration —
+    /// before [`EGraph::emit_inline_congruence`] — [`EGraph::emit_term_build_merges`]
+    /// detects FD conflicts on each touched term-build view via a self-join,
+    /// compiles the retained tree to a sequence of bulk INSERT/UPDATE statements
+    /// (constructors minted set-based with hash-consing via
+    /// `COALESCE((SELECT MIN(id) … GROUP BY children), nextval(seq))`), and writes
+    /// the merged eclass back to the view. This replaces the rule-encoded
+    /// `@merge_rule`/`@merge_cleanup` (dropped by the frontend when this is true).
+    ///
+    /// `supports_complex_merge()` / `supports_native_congruence_merge()` stay
+    /// `false` (congruence is untouched — it keeps running via the existing
+    /// `emit_inline_congruence`/`@congruence_rule` path).
+    fn supports_term_build_merge(&self) -> bool {
+        true
     }
 
     fn supports_containers(&self) -> bool {

@@ -1427,6 +1427,7 @@ pub mod base_values;
 mod compile;
 mod external_func;
 mod rule_builder;
+mod term_build_merge;
 
 /// Quote a SQL identifier with double quotes, escaping any embedded
 /// double quote. Necessary because egglog identifiers can contain
@@ -1925,6 +1926,18 @@ pub struct FunctionInfo {
     /// share a type. A `Term::FuncCall` against such a function compiles to
     /// `COALESCE((SELECT c1 …), <key>)` in `compile::term_sql`.
     pub identity_on_miss: bool,
+    /// `Some` for a TERM-BUILD custom `:merge` view (`--native-merge`): the
+    /// retained `MergeFn` tree (a top-level `IfEq`/`Seq` of `Construct` /
+    /// `TableInsert` / canon `Function` nodes) lowered by the frontend's
+    /// `translate_term_build_merge_to_seq`. Its presence marks `<self>` as a
+    /// term-build view: the view is registered ALL-COLUMNS keyed (conflicting
+    /// `(set (@FView key) eclass)` writes coexist), and
+    /// [`EGraph::emit_term_build_merges`] resolves FD conflicts at the iteration
+    /// boundary by compiling this tree to a sequence of bulk SQL statements
+    /// (mint constructors set-based with hash-consing, write back the merged
+    /// eclass). `None` for every other table. The tree carries `FunctionId`s
+    /// resolved against `EGraph::backend_function_names`.
+    pub merge_tree: Option<egglog_backend_trait::MergeFn>,
 }
 
 impl FunctionInfo {
@@ -2026,6 +2039,11 @@ pub struct EGraph {
     /// `insert_terms` (which never line up with any `cur`) get
     /// silently skipped.
     last_inline_cong_at: HashMap<String, i64>,
+    /// Per TERM-BUILD view (`merge_tree.is_some()`), the `ts` through which
+    /// `emit_term_build_merges` has already resolved FD conflicts. The conflict
+    /// self-join restricts its "new" side to rows with `ts >= last_termbuild_at`
+    /// so each conflict pair is processed once.
+    last_termbuild_at: HashMap<String, i64>,
     /// Diagnostic counter: total rows pulled into native UFs across
     /// all syncs. Surfaced via `DUCK_PERF_DUMP` (under the native-uf
     /// flag) so we can see the work the SQL → memory bridge is
@@ -2341,6 +2359,7 @@ impl EGraph {
             native_uf_pname: HashMap::new(),
             last_uf_sync_ts: HashMap::new(),
             last_inline_cong_at: HashMap::new(),
+            last_termbuild_at: HashMap::new(),
             native_uf_unions_synced: 0,
             backend_function_names: Vec::new(),
             backend_report_level: egglog_backend_trait::ReportLevel::default(),
@@ -2608,6 +2627,7 @@ impl EGraph {
                 native_uf_udf: None,
                 eq_sort_pname: None,
                 identity_on_miss: false,
+                merge_tree: None,
             },
         )?;
         let uf = Arc::new(Mutex::new(UfTable::new()));
@@ -3678,6 +3698,7 @@ impl EGraph {
                 native_uf_udf: None,
                 eq_sort_pname: pname_resolved,
                 identity_on_miss: false,
+                merge_tree: None,
             },
         )
     }
@@ -3704,6 +3725,45 @@ impl EGraph {
                 native_uf_udf: None,
                 eq_sort_pname: None,
                 identity_on_miss: false,
+                merge_tree: None,
+            },
+        )
+    }
+
+    /// Register a TERM-BUILD custom `:merge` view function (`--native-merge`):
+    /// an FD view `(children) -> eclass` whose merge body builds e-nodes. Unlike
+    /// [`Self::add_function`], its PRIMARY KEY covers ALL columns (children +
+    /// eclass), so two conflicting `(set (@FView key) eclass)` writes COEXIST
+    /// rather than collapsing — [`Self::emit_term_build_merges`] reads the pair
+    /// via a self-join at the iteration boundary, runs the retained `tree` as
+    /// set-based SQL, and writes the merged eclass back. Reads still use the
+    /// function-output form `(= e (@FView key))` (the all-cols PK does not change
+    /// the read SQL; conflicts are resolved before the next iteration reads).
+    /// `tree` is the lowered `MergeFn` (top-level `IfEq`/`Seq`).
+    pub fn add_term_build_view_function(
+        &mut self,
+        name: &str,
+        inputs: &[ColumnTy],
+        output: ColumnTy,
+        tree: egglog_backend_trait::MergeFn,
+    ) -> Result<()> {
+        let mut cols = inputs.to_vec();
+        cols.push(output);
+        self.declare(
+            name,
+            FunctionInfo {
+                cols,
+                inputs_len: inputs.len(),
+                // `Old` => `ON CONFLICT DO NOTHING`; combined with the all-cols PK
+                // (set below by `merge_tree.is_some()` in `declare`/`conflict_clause`)
+                // this keeps every DISTINCT `(key, eclass)` row while de-duping
+                // identical re-inserts.
+                merge: Some(MergeMode::Old),
+                eq_sort_ctor: false,
+                native_uf_udf: None,
+                eq_sort_pname: None,
+                identity_on_miss: false,
+                merge_tree: Some(tree),
             },
         )
     }
@@ -3745,6 +3805,7 @@ impl EGraph {
                 native_uf_udf: None,
                 eq_sort_pname: pname_resolved,
                 identity_on_miss: false,
+                merge_tree: None,
             },
         )?;
         Ok(())
@@ -3764,10 +3825,13 @@ impl EGraph {
         // - relations and eq-sort constructors: cover ALL columns
         //   (eq-sort ctors expect duplicate input keys with distinct
         //   IDs; relations have no output to exclude).
-        // - functions with merge mode: cover input columns only, so
+        // - TERM-BUILD views (`merge_tree.is_some()`): cover ALL columns too, so
+        //   two conflicting `(set (@FView key) eclass)` writes COEXIST for the
+        //   self-join in `emit_term_build_merges` (resolved at the iter boundary).
+        // - other functions with merge mode: cover input columns only, so
         //   ON CONFLICT can update the output.
-        let pk_width = match (&info.merge, info.eq_sort_ctor) {
-            (Some(_), false) => info.inputs_len,
+        let pk_width = match (&info.merge, info.eq_sort_ctor, info.merge_tree.is_some()) {
+            (Some(_), false, false) => info.inputs_len,
             _ => info.cols.len(),
         };
         let pk: Vec<String> = (0..pk_width).map(|i| format!("c{i}")).collect();
@@ -4104,6 +4168,16 @@ impl EGraph {
             )?;
             self.last_run_at.insert(rule.name.clone(), cur);
         }
+        // TERM-BUILD custom `:merge` (`--native-merge`): resolve FD conflicts on
+        // each touched term-build view by running the lowered tree as set-based
+        // SQL (the frontend dropped the `@merge_rule` for these functions). This
+        // is the frontend rule-driver path (the trait `run_rules` calls
+        // `run_iteration_for_indices`), so the term-build pass must run here —
+        // it is watermark-gated, so iterations that touched no term-build view
+        // are ~free.
+        if self.native_uf_enabled {
+            total += self.emit_term_build_merges(cur)?;
+        }
         // A full scan re-canonicalized every row, so the accumulated
         // delta is fully consumed — reset it. Only on gated
         // iterations (see above).
@@ -4251,6 +4325,16 @@ impl EGraph {
         // emit would scan empty `v1` sets repeatedly.
         let should_emit_cong = self.native_uf_enabled
             && (ruleset.is_none() || ruleset.is_some_and(is_rebuilding_ruleset));
+        // TERM-BUILD custom `:merge` (`--native-merge`): resolve FD conflicts on
+        // each touched term-build view by running the lowered tree as set-based
+        // SQL. Run BEFORE `emit_inline_congruence` so the constructor (`@<C>View`)
+        // rows the term-build mints get congruence-collapsed in the SAME
+        // iteration's inline-congruence pass (and across iterations via
+        // `sync_native_ufs`). Same ruleset gate as inline-congruence (only
+        // rulesets that can produce new view rows).
+        if should_emit_cong {
+            total += self.emit_term_build_merges(cur)?;
+        }
         if should_emit_cong {
             total += self.emit_inline_congruence(cur)?;
         }
@@ -4258,6 +4342,152 @@ impl EGraph {
             self.adaptive_reset_changed();
         }
         let _ = synced_displaced;
+        Ok(total)
+    }
+
+    /// Native TERM-BUILD custom `:merge` resolution (`--native-merge`), INLINE as
+    /// set-based SQL. For each term-build view (`merge_tree.is_some()`) whose
+    /// watermark advanced since the last pass:
+    ///
+    ///   1. CONFLICT BATCH: self-join the all-cols-keyed view on its key columns
+    ///      to read every `(keys.., old_eclass, new_eclass)` FD conflict over the
+    ///      seminaive window (`old`/`new` are two different eclasses written for
+    ///      the same key). A deterministic orientation (`old = GREATEST eclass,
+    ///      new = LEAST`) makes the batch order reproducible.
+    ///   2. RUN the compiled tree (see [`term_build_merge`]): a sequence of bulk
+    ///      mint/view INSERTs that build the merge body's constructors set-based
+    ///      with hash-consing, then a write-back of the merged eclass.
+    ///   3. WRITE-BACK: delete the conflicting `(key, old)` / `(key, new)` rows
+    ///      and insert `(key, merged)` — restoring the view's FD before the next
+    ///      iteration reads it.
+    ///
+    /// Returns the number of conflict rows resolved (a saturation signal). The
+    /// minted `@<C>View` rows get congruence-collapsed by the following
+    /// `emit_inline_congruence` / cross-iteration `sync_native_ufs`.
+    fn emit_term_build_merges(&mut self, cur: i64) -> Result<usize> {
+        // Snapshot eligible (view, n_keys) pairs without holding a borrow.
+        let entries: Vec<(String, usize)> = self
+            .functions
+            .iter()
+            .filter_map(|(name, info)| {
+                info.merge_tree.as_ref()?;
+                // Skip if no writes since our last pass (watermark gate).
+                let wm = self.table_watermarks.get(name).copied().unwrap_or(0);
+                let last_at = self.last_termbuild_at.get(name).copied().unwrap_or(0);
+                if wm < last_at {
+                    return None;
+                }
+                // inputs_len = number of key (children) columns; the eclass is the
+                // single output at index inputs_len.
+                Some((name.clone(), info.inputs_len))
+            })
+            .collect();
+
+        let mut total: usize = 0;
+        for (view, n_keys) in entries {
+            let last_at = self.last_termbuild_at.get(&view).copied().unwrap_or(0);
+            let out_col = n_keys; // eclass column index.
+
+            // Compile the retained tree to (statements, merged_expr, guard).
+            let tree = self.functions[&view]
+                .merge_tree
+                .clone()
+                .expect("term-build view");
+            let (compiled, guard) = term_build_merge::compile_term_build(self, &tree, n_keys)?;
+
+            // (1) Build the conflict batch as a TEMP table. Self-join the view on
+            // its key columns. The rule-encoded `@merge_rule` fires with
+            // `(= (ordering-max old new) new)` — i.e. `old = min(old,new)`,
+            // `new = max(old,new)`. Match that orientation so the minted terms
+            // (e.g. `C1(old,new)`) are byte-identical: `old = LEAST eclass,
+            // new = GREATEST` (`v1.c{out} < v2.c{out}`). Each unordered pair
+            // appears once. The seminaive window: at least one side is new
+            // (`ts >= last_at`); no upper bound (term-build writes land at `cur`,
+            // mirroring inline-congruence's `wm`-gated side).
+            let key_join: Vec<String> = (0..n_keys).map(|i| format!("v1.c{i} = v2.c{i}")).collect();
+            let key_proj: Vec<String> = (0..n_keys).map(|i| format!("v1.c{i} AS c{i}")).collect();
+            let batch_sql = format!(
+                "CREATE OR REPLACE TEMP TABLE batch AS \
+                 SELECT {keyproj}, \
+                        v1.c{out_col} AS old, v2.c{out_col} AS new \
+                 FROM {v} v1 JOIN {v} v2 \
+                   ON {keyjoin} AND v1.c{out_col} < v2.c{out_col} \
+                 WHERE v1.ts >= ?1 OR v2.ts >= ?1",
+                keyproj = key_proj.join(", "),
+                v = q(&view),
+                keyjoin = key_join.join(" AND "),
+            );
+            // `exec_bound` string-substitutes `?1`->last_at, `?2`->cur (the
+            // project-wide convention; duckdb-rs numbered params aren't used).
+            exec_bound(&self.conn, &batch_sql, last_at, cur)?;
+            let n_conflicts: i64 = self
+                .conn
+                .query_row("SELECT COUNT(*) FROM batch", [], |r| r.get(0))?;
+            if n_conflicts == 0 {
+                self.last_termbuild_at.insert(view.clone(), cur);
+                continue;
+            }
+
+            // Apply the IfEq guard (filter out canon-equal pairs: those mint
+            // nothing and keep `old`). Rewrite `batch` to the kept rows.
+            if let Some(guard_pred) = &guard {
+                let filtered = format!(
+                    "CREATE OR REPLACE TEMP TABLE batch AS \
+                     SELECT * FROM batch b WHERE {guard_pred}"
+                );
+                exec_bound(&self.conn, &filtered, last_at, cur)?;
+            }
+
+            // (2) Run the compiled mint/view statements (each over `batch b`).
+            for stmt in &compiled.stmts {
+                let n = exec_bound(&self.conn, stmt, last_at, cur)?;
+                self.rules_affected = self.rules_affected.wrapping_add(n as u64);
+            }
+            // Bump the watermark of every table the merge minted into, so the
+            // seminaive skip-gate of downstream rules (the `@<C>View` rebuild /
+            // congruence rules and the user rewrites that read these views)
+            // re-fires on the freshly-minted rows. Without this, those rules'
+            // `run_rule_variants` gate sees a stale watermark and skips them, so
+            // the minted constructors never get congruence-collapsed or rewritten.
+            for t in &compiled.written_tables {
+                self.bump_watermark(t, cur);
+            }
+
+            // (3) Write-back: delete the conflicting view rows and insert
+            // `(keys.., merged)`. The merged eclass = `compiled.merged_expr`.
+            let key_cols: Vec<String> = (0..n_keys).map(|i| format!("c{i}")).collect();
+            let key_sel: Vec<String> = (0..n_keys).map(|i| format!("b.c{i}")).collect();
+            // Delete both conflicting outputs for each batch key.
+            let del_old = format!(
+                "DELETE FROM {v} WHERE ({kc}, c{out_col}) IN (SELECT {ks}, b.old FROM batch b)",
+                v = q(&view),
+                kc = key_cols.join(", "),
+                ks = key_sel.join(", "),
+            );
+            let del_new = format!(
+                "DELETE FROM {v} WHERE ({kc}, c{out_col}) IN (SELECT {ks}, b.new FROM batch b)",
+                v = q(&view),
+                kc = key_cols.join(", "),
+                ks = key_sel.join(", "),
+            );
+            let nd1 = exec_bound(&self.conn, &del_old, last_at, cur)?;
+            let nd2 = exec_bound(&self.conn, &del_new, last_at, cur)?;
+            // Insert the merged row.
+            let ins = format!(
+                "INSERT INTO {v} ({kc}, c{out_col}, ts) \
+                 SELECT {ks}, {merged}, ?2 FROM batch b \
+                 ON CONFLICT DO NOTHING",
+                v = q(&view),
+                kc = key_cols.join(", "),
+                ks = key_sel.join(", "),
+                merged = compiled.merged_expr,
+            );
+            let ni = exec_bound(&self.conn, &ins, last_at, cur)?;
+            self.rules_affected = self.rules_affected.wrapping_add((nd1 + nd2 + ni) as u64);
+            self.bump_watermark(&view, cur);
+            total += n_conflicts as usize;
+            self.last_termbuild_at.insert(view.clone(), cur);
+        }
         Ok(total)
     }
 
@@ -4503,6 +4733,13 @@ pub(crate) fn conflict_clause(info: &FunctionInfo) -> String {
     // of nullary `:no-merge` functions is for `let`-binding
     // globals, and those are set exactly once at declaration time,
     // so this is safe in practice.
+    // TERM-BUILD views are all-cols keyed (see `declare`): their writes coexist
+    // and are resolved by `emit_term_build_merges`, so the conflict clause is a
+    // plain `DO NOTHING` (de-dupe identical re-inserts), NOT a `DO UPDATE` on the
+    // output column.
+    if info.merge_tree.is_some() {
+        return "ON CONFLICT DO NOTHING".to_string();
+    }
     let pk_width = match (&info.merge, info.eq_sort_ctor) {
         (Some(_), false) => info.inputs_len,
         _ => info.cols.len(),
