@@ -754,6 +754,35 @@ pub trait Backend: Send + Sync {
     /// Reference backend: `true`. DuckDB: `false` in v1.
     fn supports_complex_merge(&self) -> bool;
 
+    /// Whether this backend can run a pure VALUE-FOLD custom `:merge` NATIVELY in
+    /// its FD-conflict resolver — a fold of primitives / literals over `old`/`new`
+    /// that yields a plain value (no e-node creation, no cross-table writes), e.g.
+    /// `(from-string (to-string (* new old)))`. Gates
+    /// `EncodeContext::native_value_fold_merge`: when `true` such a merge is lowered
+    /// to a `MergeFn` tree and run host-side; when `false` it is rule-encoded as
+    /// `@merge_rule` / `@merge_cleanup`.
+    ///
+    /// Defaults to [`Backend::supports_complex_merge`] so the bridge/duckdb/feldera
+    /// behavior is unchanged. The flowlog backend overrides this to `true` (it
+    /// evaluates the value-fold tree natively) while keeping `supports_complex_merge`
+    /// / [`Backend::supports_term_build_merge`] `false`.
+    fn supports_value_fold_merge(&self) -> bool {
+        self.supports_complex_merge()
+    }
+
+    /// Whether this backend can run a TERM-BUILDING custom `:merge` NATIVELY — a
+    /// merge body that mints e-nodes via constructor calls (a `MergeFn::Seq` of
+    /// `Construct` / `TableInsert` / union variants), e.g.
+    /// `(C2 (C1 old new) (C2 old new))`. Gates
+    /// `EncodeContext::native_term_build_merge`.
+    ///
+    /// Defaults to [`Backend::supports_complex_merge`] so the bridge/duckdb/feldera
+    /// behavior is unchanged. (The dataflow backends keep this `false`; term-build
+    /// native merge is a later increment.)
+    fn supports_term_build_merge(&self) -> bool {
+        self.supports_complex_merge()
+    }
+
     /// Whether this backend supports `Vec` / `Set` / `Map` / `MultiSet`
     /// container sorts.
     ///

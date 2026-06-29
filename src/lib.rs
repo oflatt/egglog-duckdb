@@ -1356,7 +1356,11 @@ impl EGraph {
     ) -> Result<egglog_bridge::MergeFn, Error> {
         match expr {
             GenericExpr::Lit(_, literal) => {
-                let val = literal_to_value(self.bridge(), literal);
+                // Backend-agnostic: `self.base_values()` resolves on bridge,
+                // duckdb, feldera, AND flowlog (the value-fold native-merge path
+                // builds the `MergeFn` tree on flowlog, where `self.bridge()`
+                // would panic on the downcast).
+                let val = literal_to_value(self.base_values(), literal);
                 Ok(egglog_bridge::MergeFn::Const(val))
             }
             GenericExpr::Var(span, resolved_var) => {
@@ -4120,13 +4124,13 @@ fn literal_to_entry_dyn(backend: &dyn egglog_backend_trait::Backend, l: &Literal
     }
 }
 
-fn literal_to_value(egraph: &egglog_bridge::EGraph, l: &Literal) -> Value {
+fn literal_to_value(base_values: &egglog_core_relations::BaseValues, l: &Literal) -> Value {
     match l {
-        Literal::Int(x) => egraph.base_values().get::<i64>(*x),
-        Literal::Float(x) => egraph.base_values().get::<sort::F>(x.into()),
-        Literal::String(x) => egraph.base_values().get::<sort::S>(sort::S::new(x.clone())),
-        Literal::Bool(x) => egraph.base_values().get::<bool>(*x),
-        Literal::Unit => egraph.base_values().get::<()>(()),
+        Literal::Int(x) => base_values.get::<i64>(*x),
+        Literal::Float(x) => base_values.get::<sort::F>(x.into()),
+        Literal::String(x) => base_values.get::<sort::S>(sort::S::new(x.clone())),
+        Literal::Bool(x) => base_values.get::<bool>(*x),
+        Literal::Unit => base_values.get::<()>(()),
     }
 }
 

@@ -491,7 +491,7 @@ impl ProofInstrumentor<'_> {
     pub(crate) fn native_value_fold_merge(&self, fdecl: &ResolvedFunctionDecl) -> bool {
         self.native_merge()
             && !self.egraph.proof_state.proofs_enabled
-            && self.egraph.backend.supports_complex_merge()
+            && self.egraph.backend.supports_value_fold_merge()
             && fdecl.subtype == FunctionSubtype::Custom
             && !fdecl.resolved_schema.output().is_eq_sort()
             && fdecl.merge.as_ref().is_some_and(Self::merge_is_value_fold)
@@ -547,7 +547,7 @@ impl ProofInstrumentor<'_> {
     pub(crate) fn native_term_build_merge(&self, fdecl: &ResolvedFunctionDecl) -> bool {
         self.native_merge()
             && !self.egraph.proof_state.proofs_enabled
-            && self.egraph.backend.supports_complex_merge()
+            && self.egraph.backend.supports_term_build_merge()
             && fdecl.subtype == FunctionSubtype::Custom
             && fdecl.resolved_schema.output().is_eq_sort()
             && fdecl.merge.as_ref().is_some_and(Self::merge_is_term_build)
