@@ -1581,16 +1581,49 @@ impl EGraph {
                             // col1=proof). The per-column merge does congruence
                             // INLINE: `UnionIntoUfWithProof` composes the
                             // congruence edge proof `Trans(larger_pf,
-                            // Sym(smaller_pf))` into the proof-mode `@UF_Sf` (the
-                            // same edge `@congruence_rule*` would have written) and
-                            // returns the surviving (min) eclass; `EclassMinProof`
-                            // keeps the min eclass's view proof. The proof
-                            // constructors must exist (declared with the Proof
-                            // datatype before any constructor's view).
-                            let uf = uf_id.expect(
-                                "native-merge proof view requires the output sort's @UF_Sf \
-                                 (declared before its constructors in native-UF mode)",
-                            );
+                            // Sym(smaller_pf))` and writes the 4-column edge row
+                            // `[larger, smaller, edge_proof, ts]` (exactly what the
+                            // rule-encoded `@congruence_rule*` would have written via
+                            // `union(new, old, Proof(Trans(prf1, Sym(prf2))))`) into
+                            // the proof-mode union-find, returning the surviving
+                            // (min) eclass; `EclassMinProof` keeps the min eclass's
+                            // view proof.
+                            //
+                            // WHICH 2-key `(S S) -> Proof` table receives the edge
+                            // depends on whether native-UF is on (both share the
+                            // `[larger, smaller, proof, ts]` row shape, so only the
+                            // target id differs):
+                            //   * `--native-uf`: the per-sort `@UF_Sf`
+                            //     (`uf_function`) — a provenance-tracking
+                            //     `displaced-union-find` whose onchange callback
+                            //     drives the rebuild.
+                            //   * WITHOUT `--native-uf` (the relational proof path,
+                            //     e.g. plain `--proofs --native-merge` on the
+                            //     bridge): the relational `@UF_S` PARENT table
+                            //     (`uf_parent`), keyed `(S S) -> Proof :merge old`,
+                            //     which the singleparent / path_compress /
+                            //     uf_function_index rules then canonicalize. (The
+                            //     1-key `@UF_Sf` function index is `(S) -> Pair` and
+                            //     would mis-slot the proof id into its timestamp
+                            //     column — the source of the sort-order panic.)
+                            // The proof constructors must exist (declared with the
+                            // Proof datatype before any constructor's view).
+                            let uf = if self.proof_state.native_uf {
+                                uf_id.expect(
+                                    "native-merge proof view requires the output sort's @UF_Sf \
+                                     (declared before its constructors in native-UF mode)",
+                                )
+                            } else {
+                                self.proof_state
+                                    .uf_parent
+                                    .get(&decl.schema.output)
+                                    .and_then(|uf_name| self.functions.get(uf_name))
+                                    .map(|uf_func| uf_func.backend_id)
+                                    .expect(
+                                        "native-merge proof view requires the output sort's \
+                                         @UF_S parent table (relational proof path)",
+                                    )
+                            };
                             let trans = self.functions
                                 [&self.proof_state.proof_names.eq_trans_constructor]
                                 .backend_id;
