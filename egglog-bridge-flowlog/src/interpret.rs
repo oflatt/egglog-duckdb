@@ -257,12 +257,30 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
         touched_keys.entry(f).or_default().insert(key);
     }
 
+    // `--native-merge` TERM-BUILD scratch: cleared before the resolves so the
+    // view rows a term-build merge mints this iteration are recorded fresh.
+    eg.term_build_view_keys.clear();
+
     // Resolve FD conflicts on every function a head action wrote to (a `set`
     // can introduce two rows sharing a key that must merge per the merge mode).
     let empty_keys: HashSet<Vec<u32>> = HashSet::new();
     for &f in &touched {
         let keys = touched_keys.get(&f).unwrap_or(&empty_keys);
         changed |= eg.resolve_merge(f, keys);
+    }
+
+    // `--native-merge` TERM-BUILD: a term-build merge minted `@<C>View` rows
+    // (recorded in `term_build_view_keys`). Those views carry their OWN congruence
+    // merge, so reconcile their FD conflicts now — exactly the
+    // "TableInsert respects the target table's merge" semantics of the bridge.
+    // Drain to a fixpoint: resolving one view can enqueue unions but writes no new
+    // view rows, so this terminates in one pass in practice; the loop is defensive.
+    while !eg.term_build_view_keys.is_empty() {
+        let pending: Vec<(FunctionId, HashSet<Vec<u32>>)> =
+            eg.term_build_view_keys.drain().collect();
+        for (view, keys) in pending {
+            changed |= eg.resolve_merge(view, &keys);
+        }
     }
 
     // The FULL native-UF rebuild's `δview ⋈ uf_old` seminaive probe is handled
@@ -1232,7 +1250,7 @@ fn resolve(s: &Slot, env: &Env) -> Result<u32> {
 /// a fresh id (eq-sort constructor semantics — mirrors `add_term`). The created
 /// row is written directly into the mirror so subsequent lookups in the same
 /// iteration see it (hash-cons).
-fn lookup_or_create(
+pub(crate) fn lookup_or_create(
     eg: &mut EGraph,
     func: FunctionId,
     key: &[Value],

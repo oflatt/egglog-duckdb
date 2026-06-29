@@ -116,6 +116,17 @@ pub(crate) struct RelationInfo {
     /// resolves to the key itself, with no row inserted. Used by the
     /// canonicalize-at-creation encoding for the flat UF-index `@UF_Sf`.
     pub(crate) identity_on_miss: bool,
+    /// `--native-merge` TERM-BUILD: the retained [`MergeFn`] tree for a custom
+    /// `:merge` whose body BUILDS TERMS (e.g. `(C2 (C1 old new) (C2 old new))`).
+    /// The frontend lowers such a body to an `IfEq{canon(old), canon(new), …,
+    /// Seq[<Construct/TableInsert>…, <value>]}` tree (see
+    /// `translate_term_build_merge_to_seq`); `add_table` retains it here so
+    /// `resolve_merge` can EXECUTE it host-side (`eval_term_build_merge`) — minting
+    /// e-nodes via `lookup_or_create`, writing the `@<C>View` rows, and returning
+    /// the merged eclass — instead of collapsing the merge to a 4-variant
+    /// [`MergeMode`]. `None` for every other merge (the [`merge`](Self::merge)
+    /// `MergeMode` drives those).
+    pub(crate) merge_tree: Option<MergeFn>,
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +322,15 @@ pub struct EGraph {
     /// children key), the loser is `enqueue_union`-ed with the winner into this UF
     /// — congruence done INLINE at insert time instead of by a self-join rule.
     pub(crate) native_merge_uf: HashMap<FunctionId, FunctionId>,
+    /// `--native-merge` TERM-BUILD: per-`run_iteration` scratch — the `@<C>View`
+    /// rows a term-build merge (`eval_term_build_merge`) just minted, by view
+    /// function id and children key. The views carry their OWN congruence merge
+    /// (`native_merge_uf`), so after a term-build resolve writes their rows
+    /// `run_iteration` drains this set through `resolve_merge` (a fixpoint sub-loop)
+    /// to reconcile any FD conflict the new view rows introduced — exactly the
+    /// congruence the bridge's `TableInsert`-respects-target-merge does. Drained
+    /// each iteration; never read across iterations.
+    pub(crate) term_build_view_keys: HashMap<FunctionId, HashSet<Vec<u32>>>,
 }
 
 impl Default for EGraph {
@@ -385,6 +405,7 @@ impl EGraph {
             native_uf_rebuild_dd_ir: HashMap::new(),
             wcoj_enabled: false,
             native_merge_uf: HashMap::new(),
+            term_build_view_keys: HashMap::new(),
         }
     }
 
@@ -647,6 +668,13 @@ impl EGraph {
     /// `Old`/`New` conflicts arriving in the same iteration resolve stably.
     pub(crate) fn resolve_merge(&mut self, f: FunctionId, keys: &HashSet<Vec<u32>>) -> bool {
         let arity = self.info(f).arity;
+        // `--native-merge` TERM-BUILD: a custom `:merge` whose body builds terms
+        // runs its retained `IfEq{…, Seq[…]}` tree host-side, minting e-nodes and
+        // writing `@<C>View` rows. Dispatch to the dedicated interpreter, which
+        // folds the conflicting candidate rows pairwise through the tree.
+        if self.info(f).merge_tree.is_some() {
+            return self.resolve_term_build_merge(f, keys);
+        }
         let merge = self.merge_mode(f);
         if !matches!(merge, MergeMode::Old | MergeMode::New | MergeMode::Min)
             || arity == 0
@@ -758,6 +786,272 @@ impl EGraph {
         }
         true
     }
+
+    /// `--native-merge`: resolve FD conflicts on a custom `:merge` function with a
+    /// retained `MergeFn` tree, by EXECUTING the tree host-side. Handles BOTH native
+    /// merge classes:
+    ///   * VALUE-FOLD — a pure fold of primitives over `old`/`new` (e.g.
+    ///     `(from-string (to-string (* new old)))`): a side-effect-free pairwise
+    ///     fold returning a value.
+    ///   * TERM-BUILD — a body that mints e-nodes (the `IfEq{…, Seq[…]}` tree from
+    ///     `translate_term_build_merge_to_seq`): mints helper e-nodes via
+    ///     `lookup_or_create` and writes the `@<C>View` rows as a side effect.
+    ///
+    /// For each touched key with >1 candidate row, fold the candidates pairwise
+    /// through the tree (`cur` = the chosen-so-far row, `new` = the next candidate),
+    /// taking the tree's returned value as the new chosen output. Drops the losing
+    /// rows and inserts the single winner — the FD shape the rest of the engine
+    /// expects. Mirrors the bridge's `ResolvedMergeFn::run`. The value-fold class
+    /// never touches `term_build_view_keys` (no `TableInsert`/`Construct`), so the
+    /// `run_iteration` view-congruence drain is a no-op for it.
+    ///
+    /// The deterministic per-key fold order (sort) matches the `Old`/`New`/`Min`
+    /// path, so the chosen output is stable across runs. View rows a term-build fold
+    /// mints are reconciled for congruence by the `term_build_view_keys` drain in
+    /// `run_iteration`.
+    fn resolve_term_build_merge(&mut self, f: FunctionId, keys: &HashSet<Vec<u32>>) -> bool {
+        let arity = self.info(f).arity;
+        if arity == 0 || keys.is_empty() {
+            return false;
+        }
+        let inputs_len = arity - 1;
+        // Gather the candidate rows for the touched keys only (matching the
+        // incremental `Old`/`New`/`Min` resolver). Clone out so the tree
+        // interpreter can mutate the egraph (mint / view-write) without holding a
+        // borrow of the mirror.
+        let mut by_key: HashMap<Vec<u32>, Vec<Row>> = HashMap::new();
+        if let Some(set) = self.mirror.get(&f) {
+            for row in set.iter() {
+                let key: Vec<u32> = (0..inputs_len).map(|i| row_col(row, i)).collect();
+                if keys.contains(&key) {
+                    by_key.entry(key).or_default().push(row.clone());
+                }
+            }
+        }
+        // The merge tree (cloned out — the interpreter borrows `&mut self`).
+        let tree = self
+            .info(f)
+            .merge_tree
+            .clone()
+            .expect("resolve_term_build_merge called on a non-term-build function");
+        // A per-call hash-cons index for `lookup_or_create` (lazily built per
+        // function from the mirror — an optimisation, identical results without it).
+        let mut lookup_index: HashMap<FunctionId, HashMap<Box<[u32]>, u32>> = HashMap::new();
+
+        let mut new_rows: Vec<Row> = Vec::new();
+        let mut drop_rows: HashSet<Row> = HashSet::new();
+        // Stable iteration over the touched keys so the mint order (and thus any
+        // run-to-run id assignment) is deterministic. Hash-cons makes the
+        // STRUCTURAL result insensitive to the integer ids, but a stable order
+        // keeps the byte image reproducible across runs.
+        let mut key_list: Vec<Vec<u32>> = by_key.keys().cloned().collect();
+        key_list.sort();
+        for key in &key_list {
+            let mut cands = by_key.remove(key).unwrap();
+            if cands.len() < 2 {
+                continue;
+            }
+            // Deterministic fold order (mirror is a HashSet — arbitrary order).
+            cands.sort();
+            // Fold pairwise: `cur` starts as the first candidate; for each later
+            // candidate run the tree with (cur, new) and take its returned value as
+            // the new `cur` output. The key columns are identical across all
+            // candidates (same FD key), so reuse them.
+            let mut cur: Row = cands[0].clone();
+            for next in &cands[1..] {
+                let merged =
+                    self.eval_term_build_node(&tree, &cur, next, inputs_len, &mut lookup_index);
+                // Build the new `cur` row: same key, merged output.
+                let mut row: Vec<u32> = key.clone();
+                row.push(merged);
+                cur = row.into_boxed_slice();
+            }
+            // The winner is the final folded row; every candidate that differs is
+            // dropped.
+            for row in &cands {
+                if **row != *cur {
+                    drop_rows.insert((*row).clone());
+                }
+            }
+            new_rows.push(cur);
+        }
+
+        // Reconcile the mirror: drop losers, insert winners.
+        let mut changed = false;
+        if !drop_rows.is_empty() || !new_rows.is_empty() {
+            let set = std::rc::Rc::make_mut(self.mirror.entry(f).or_default());
+            for r in &drop_rows {
+                changed |= set.remove(r);
+            }
+            for r in &new_rows {
+                changed |= set.insert(r.clone());
+            }
+        }
+        // Keep the reverse index in sync on the CUSTOM rebuild path.
+        if self.native_uf_enabled && self.fast_rebuild {
+            for r in &drop_rows {
+                self.index_remove_row(f, r);
+            }
+            for r in &new_rows {
+                self.index_insert_row(f, r);
+            }
+        }
+        // Any e-node minted / view row written this resolve is a real change — keep
+        // the saturate loop iterating until congruence + rebuild reach a fixpoint.
+        if !self.term_build_view_keys.is_empty() {
+            changed = true;
+        }
+        // Advancing the fresh-id counter (a mint) is also a real change.
+        changed
+    }
+
+    /// Evaluate one node of a term-build `MergeFn` tree against the two conflicting
+    /// FD rows (`cur` = chosen-so-far, `new` = next candidate), performing the
+    /// node's side effects (mint via `lookup_or_create`, `@<C>View` row writes,
+    /// native-UF self-unions) and returning its value. `inputs_len` is the number
+    /// of key columns, so value column `i` is at `row[inputs_len + i]`; bare
+    /// `Old`/`New` read the sole output column (index 0). Mirrors the bridge's
+    /// `ResolvedMergeFn::run` for the term-build subset.
+    fn eval_term_build_node(
+        &mut self,
+        node: &MergeFn,
+        cur: &[u32],
+        new: &[u32],
+        inputs_len: usize,
+        lookup_index: &mut HashMap<FunctionId, HashMap<Box<[u32]>, u32>>,
+    ) -> u32 {
+        match node {
+            MergeFn::Const(v) => v.rep(),
+            // A single-output term-build function: `Old`/`New` are the sole output
+            // column (index 0), so `Old == OldCol(0)`.
+            MergeFn::Old | MergeFn::OldCol(0) => cur[inputs_len],
+            MergeFn::New | MergeFn::NewCol(0) => new[inputs_len],
+            MergeFn::OldCol(i) => cur[inputs_len + i],
+            MergeFn::NewCol(i) => new[inputs_len + i],
+            MergeFn::Primitive(ext, args) => {
+                let argv: Vec<Value> = args
+                    .iter()
+                    .map(|a| {
+                        Value::new(self.eval_term_build_node(a, cur, new, inputs_len, lookup_index))
+                    })
+                    .collect();
+                self.eval_prim_internal(*ext, &argv)
+                    .unwrap_or_else(|| Value::new(cur[inputs_len]))
+                    .rep()
+            }
+            MergeFn::Function(func, args) => {
+                let argv: Vec<u32> = args
+                    .iter()
+                    .map(|a| self.eval_term_build_node(a, cur, new, inputs_len, lookup_index))
+                    .collect();
+                // A `Function` over a native-UF function is the find-or-self canon
+                // lookup (`@UF_Sf` / identity-on-miss); answer it from the in-core
+                // UF (pure read — no mint, no write). Any other `Function` is a
+                // constructor-style lookup that mints on miss (`lookup_or_create`).
+                if self.native_ufs.contains_key(func) {
+                    debug_assert_eq!(argv.len(), 1, "canon Function lookup must be single-arg");
+                    self.native_uf_find(*func, argv[0])
+                } else {
+                    let key: Vec<Value> = argv.into_iter().map(Value::new).collect();
+                    interpret::lookup_or_create(self, *func, &key, lookup_index).rep()
+                }
+            }
+            MergeFn::Construct(table, key_args, value_args) => {
+                // Mint a constructor e-node (hash-consed; existing key -> its id,
+                // missing -> fresh id + insert), returning its output eclass. In
+                // non-proof TERM mode `value_args` is empty (no extra value
+                // columns), so this is exactly a single-output `lookup_or_create`.
+                let key: Vec<Value> = key_args
+                    .iter()
+                    .map(|a| {
+                        Value::new(self.eval_term_build_node(a, cur, new, inputs_len, lookup_index))
+                    })
+                    .collect();
+                // Evaluate the (currently empty) value args for their effects /
+                // bit-exactness, even though `lookup_or_create` only mints the
+                // single output column; a non-empty `value_args` would be a
+                // multi-value constructor, which FlowLog does not yet support.
+                assert!(
+                    value_args.is_empty(),
+                    "FlowLog term-build merge: multi-value Construct (value_args) not supported"
+                );
+                interpret::lookup_or_create(self, *table, &key, lookup_index).rep()
+            }
+            MergeFn::TableInsert(table, args) => {
+                let row: Vec<u32> = args
+                    .iter()
+                    .map(|a| self.eval_term_build_node(a, cur, new, inputs_len, lookup_index))
+                    .collect();
+                // THE NATIVE-UF/`@UF_S` WRINKLE: a `TableInsert` whose target is a
+                // native-UF function is a UNION edge (`(set (@UF_Sf lhs) rhs)`), not
+                // a raw mirror write — route it into the in-core UF (a self-edge
+                // `lhs == rhs` is a harmless no-op). Under `--native-uf` the
+                // frontend elides the relational `@UF_S` self-union side-effect
+                // entirely (no parent table), so this branch is inert on the tests
+                // that ship today; it is kept for correctness if the lowering ever
+                // emits a UF-targeted insert. Otherwise this is a `@<C>View` row:
+                // mirror-insert it and record its key so `run_iteration` reconciles
+                // the view's own congruence merge.
+                if self.native_ufs.contains_key(table) {
+                    if row.len() >= 2 && row[0] != row[1] {
+                        let (a, b) = (row[0], row[1]);
+                        if let Some(uf) = self.native_ufs.get_mut(table) {
+                            uf.enqueue_union(a as i64, b as i64);
+                        }
+                        let mem = self.native_uf_members.entry(*table).or_default();
+                        mem.insert(a);
+                        mem.insert(b);
+                    }
+                } else {
+                    let view_arity = self.info(*table).arity;
+                    let view_inputs = view_arity.saturating_sub(1);
+                    let key: Vec<u32> = row.iter().take(view_inputs).copied().collect();
+                    self.mirror_insert(*table, row.into_boxed_slice());
+                    self.term_build_view_keys
+                        .entry(*table)
+                        .or_default()
+                        .insert(key);
+                }
+                // The bridge returns the OLD value of the resolving column; the
+                // enclosing `Seq` discards it.
+                cur[inputs_len]
+            }
+            MergeFn::Seq(items) => {
+                let mut result = cur[inputs_len];
+                for item in items {
+                    result = self.eval_term_build_node(item, cur, new, inputs_len, lookup_index);
+                }
+                result
+            }
+            MergeFn::IfEq { a, b, then, els } => {
+                let av = self.eval_term_build_node(a, cur, new, inputs_len, lookup_index);
+                let bv = self.eval_term_build_node(b, cur, new, inputs_len, lookup_index);
+                if av == bv {
+                    self.eval_term_build_node(then, cur, new, inputs_len, lookup_index)
+                } else {
+                    self.eval_term_build_node(els, cur, new, inputs_len, lookup_index)
+                }
+            }
+            MergeFn::Columns(cols) => match cols.as_slice() {
+                [single] => self.eval_term_build_node(single, cur, new, inputs_len, lookup_index),
+                _ => panic!(
+                    "FlowLog term-build merge: multi-value Columns ({} cols) not supported",
+                    cols.len()
+                ),
+            },
+            MergeFn::AssertEq
+            | MergeFn::UnionId
+            | MergeFn::UnionIntoUf(_)
+            | MergeFn::UnionIntoParentTable { .. }
+            | MergeFn::UnionIntoUfWithProof { .. }
+            | MergeFn::EclassMinProof { .. } => {
+                panic!(
+                    "FlowLog term-build merge: unexpected congruence/proof merge variant inside a \
+                     term-build tree (these are not nested in a term build)"
+                )
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -861,6 +1155,66 @@ fn native_merge_target_uf(merge: &MergeFn) -> Option<FunctionId> {
     }
 }
 
+/// `--native-merge` TERM-BUILD: whether `merge` is a term-building custom `:merge`
+/// tree the FlowLog host interpreter runs natively (`eval_term_build_merge`).
+///
+/// The frontend lowers a term-building body (e.g. `(C2 (C1 old new) (C2 old new))`)
+/// to a top-level `IfEq{canon(old), canon(new), then, els: Seq[…]}` guard (see
+/// `translate_term_build_merge_to_seq`); a bare `Seq` (no guard) is also accepted
+/// defensively. These are the only multi-action shapes FlowLog executes; the other
+/// multi-action variants (`TableInsert`/`Construct` at top level) are never emitted
+/// as a top-level merge by the frontend and stay unsupported.
+fn is_term_build_tree(merge: &MergeFn) -> bool {
+    matches!(merge, MergeFn::IfEq { .. } | MergeFn::Seq(_))
+}
+
+/// `--native-merge` VALUE-FOLD: whether `merge` is a pure value-fold custom
+/// `:merge` tree the FlowLog host interpreter runs natively as a pairwise fold
+/// (`eval_term_build_node` over leaves with NO side effects).
+///
+/// The frontend lowers a value-fold body (a fold of primitives / literals over
+/// `old`/`new`, e.g. `(from-string (to-string (* new old)))`) to a `MergeFn` of
+/// `Primitive`/`Const`/`Old`/`New`/`OldCol`/`NewCol` (see
+/// `translate_expr_to_mergefn`); a single-output function may wrap it in a
+/// `Columns([single])`. A value-fold body contains NO `Function` call (a
+/// `ResolvedCall::Func` disqualifies it on the frontend — that is a term build),
+/// and none of the multi-action variants (`Seq`/`TableInsert`/`Construct`/`IfEq`),
+/// so we recognise it structurally as "a tree built only from those pure leaves".
+/// `Old`/`New`/`OldCol`/`NewCol`/`Const` ALONE are degenerate merges the 4-variant
+/// `MergeMode` already expresses (e.g. a bare `old`/`new`), so they are NOT
+/// retained as a tree — only a fold containing at least one `Primitive` is
+/// (everything the plain `MergeMode` cannot express).
+fn is_value_fold_tree(merge: &MergeFn) -> bool {
+    fn is_pure_leaf(m: &MergeFn) -> bool {
+        match m {
+            MergeFn::Const(_)
+            | MergeFn::Old
+            | MergeFn::New
+            | MergeFn::OldCol(_)
+            | MergeFn::NewCol(_) => true,
+            MergeFn::Primitive(_, args) => args.iter().all(is_pure_leaf),
+            _ => false,
+        }
+    }
+    /// Whether the top of the tree is a `Primitive` (i.e. a genuine fold, not a
+    /// bare `old`/`new`/`Const` the plain `MergeMode` already handles). A value-fold
+    /// body's root is the outermost primitive application, so testing the root
+    /// suffices to distinguish a fold from a degenerate leaf merge.
+    fn has_primitive(m: &MergeFn) -> bool {
+        matches!(m, MergeFn::Primitive(..))
+    }
+    match merge {
+        // A single-output function may present the merge wrapped in a one-column
+        // `Columns`; unwrap it (a multi-column `Columns` is a tuple-output merge,
+        // which FlowLog does not support — left to `merge_mode_for_table`).
+        MergeFn::Columns(cols) => match cols.as_slice() {
+            [single] => has_primitive(single) && is_pure_leaf(single),
+            _ => false,
+        },
+        other => has_primitive(other) && is_pure_leaf(other),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // impl Backend
 // ---------------------------------------------------------------------------
@@ -902,11 +1256,28 @@ impl Backend for EGraph {
         // from the same place; `register_native_merge_view` is then only a consistency assertion.
         // The view is declared after its eq-sort, so the UF's `FunctionId` already resolves here.
         let native_merge_target = native_merge_target_uf(&config.merge);
+        // `--native-merge` NATIVE CUSTOM `:merge`: a custom merge whose body either
+        // BUILDS TERMS (a top-level `IfEq{…, Seq[…]}` from
+        // `translate_term_build_merge_to_seq`) or is a pure VALUE-FOLD (a fold of
+        // primitives over `old`/`new`, e.g. `(from-string (to-string (* new
+        // old)))`) cannot collapse to a 4-variant `MergeMode` — the term build mints
+        // e-nodes + writes view rows, and the value fold computes a value no
+        // `Old`/`New`/`Min`/`Relation` mode can express. Retain the lowered tree and
+        // EXECUTE it host-side in `resolve_merge` (`resolve_term_build_merge`, which
+        // handles both: the value fold is the side-effect-free degenerate case). The
+        // function still carries a `MergeMode`, but it is unused for a retained tree
+        // (`resolve_merge` dispatches on `merge_tree.is_some()` first); `New`
+        // keeps a key with >1 candidate eligible.
+        let retain_tree =
+            has_output && (is_term_build_tree(&config.merge) || is_value_fold_tree(&config.merge));
         let merge = if !has_output {
             MergeMode::Relation
+        } else if retain_tree {
+            MergeMode::New
         } else {
             merge_mode_for_table(&config.merge, &config.name)
         };
+        let merge_tree = retain_tree.then(|| config.merge.clone());
         let identity_on_miss = matches!(config.default, DefaultVal::Identity);
         self.relations.push(RelationInfo {
             name: config.name,
@@ -914,6 +1285,7 @@ impl Backend for EGraph {
             has_output,
             merge,
             identity_on_miss,
+            merge_tree,
         });
         self.mirror.insert(id, std::rc::Rc::new(HashSet::new()));
         if let Some(uf_func) = native_merge_target {
@@ -961,6 +1333,7 @@ impl Backend for EGraph {
             has_output: true,
             merge: MergeMode::Min,
             identity_on_miss: false,
+            merge_tree: None,
         });
         self.mirror.insert(id, std::rc::Rc::new(HashSet::new()));
         self.native_ufs.insert(id, uf::UfTable::new());
@@ -982,6 +1355,7 @@ impl Backend for EGraph {
             has_output: false,
             merge: MergeMode::Relation,
             identity_on_miss: false,
+            merge_tree: None,
         });
         self.mirror
             .insert(disp_id, std::rc::Rc::new(HashSet::new()));
@@ -1291,6 +1665,35 @@ impl Backend for EGraph {
 
     fn supports_complex_merge(&self) -> bool {
         false
+    }
+
+    /// `--native-merge` VALUE-FOLD: FlowLog runs a pure value-fold custom `:merge`
+    /// (a fold of primitives / literals over `old`/`new` that yields a plain value,
+    /// e.g. `(from-string (to-string (* new old)))`) NATIVELY in its host-side
+    /// FD-conflict resolver — the frontend lowers the body to a `MergeFn` tree of
+    /// `Primitive`/`Const`/`Old`/`New`/`OldCol`/`NewCol`, `add_table` retains it
+    /// (`RelationInfo::merge_tree`), and `resolve_term_build_merge` folds the
+    /// conflicting rows pairwise through `eval_term_build_node` (the value-fold
+    /// leaves have NO side effects, so the same `&mut` interpreter the term-build
+    /// path uses is a pure fold here). `supports_complex_merge` stays `false` (it
+    /// gates the bridge's value-fold-via-callback path that FlowLog does not use);
+    /// this split capability enables the native value-fold path while leaving
+    /// duckdb/feldera on the rule fallback.
+    fn supports_value_fold_merge(&self) -> bool {
+        true
+    }
+
+    /// `--native-merge` TERM-BUILD: FlowLog runs a term-building custom `:merge`
+    /// (e.g. `(C2 (C1 old new) (C2 old new))`) NATIVELY in its host-side FD-conflict
+    /// resolver — the frontend lowers the body to an `IfEq{…, Seq[…]}` `MergeFn`
+    /// tree, `add_table` retains it (`RelationInfo::merge_tree`), and
+    /// `resolve_term_build_merge` / `eval_term_build_node` EXECUTE it (mint e-nodes,
+    /// write `@<C>View` rows, return the merged eclass). `supports_complex_merge`
+    /// stays `false` (it gates the value-fold-via-callback path that FlowLog does
+    /// not use); this split capability is what enables the native term-build path
+    /// while leaving the duckdb/feldera backends on the rule fallback.
+    fn supports_term_build_merge(&self) -> bool {
+        true
     }
 
     fn supports_containers(&self) -> bool {
