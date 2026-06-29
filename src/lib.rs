@@ -2438,12 +2438,75 @@ impl EGraph {
                 break;
             }
         }
-        let resolved_expr = expr_action.ok_or_else(|| {
+        let mut resolved_expr = expr_action.ok_or_else(|| {
             Error::BackendError("eval_expr: resolver did not produce an expression action".into())
         })?;
+        // Term-encoding `get-size!` redirect. `eval_expr` deliberately resolves
+        // and evaluates the expr WITHOUT term encoding (see the comment above),
+        // so a `get-size!` here would count the user-facing (monotonic hash-cons
+        // TERM) tables instead of the canonical `@<F>View` tables — over-counting
+        // vs the normal backend (this is the bug in `(extract (get-size! "F"))`
+        // and other `eval_expr`-driven contexts). Mirror the fact-path redirect
+        // (`instrument_get_size` in `proof_encoding.rs`) by rewriting the
+        // (string-literal) arguments of any `get-size!` primitive call to the
+        // canonical view names before evaluating. Tightly scoped to `get-size!`;
+        // no effect when term encoding is off.
+        if self.proof_state.original_typechecking.is_some() {
+            self.redirect_get_size_args(&mut resolved_expr);
+        }
         let sort = resolved_expr.output_type();
         let value = self.eval_resolved_expr(span, &resolved_expr)?;
         Ok((sort, value))
+    }
+
+    /// Rewrite the arguments of every `get-size!` primitive call inside `expr`
+    /// to count the canonical `@<F>View` tables instead of the monotonic
+    /// hash-cons TERM tables, matching `instrument_get_size` in the term encoder.
+    /// Recurses into all sub-expressions.
+    ///
+    /// - explicit-filter form `(get-size! "F" ...)`: each user-table name `"F"`
+    ///   with a view becomes `"@FView"`; names without a view (e.g. pass-through
+    ///   globals) are left as-is.
+    /// - no-argument `(get-size!)` (count-all): the runtime primitive sums all
+    ///   non-`@` tables, which under term encoding are the term tables (they
+    ///   over-count). Replace it with an explicit filter listing every view name
+    ///   plus the pass-through globals — the canonical egraph size — so the
+    ///   `@`-view tables are counted despite the usual `@` exclusion.
+    fn redirect_get_size_args(&self, expr: &mut ResolvedExpr) {
+        if let ResolvedExpr::Call(span, ResolvedCall::Primitive(p), args) = expr
+            && p.name() == "get-size!"
+        {
+            let view_of = &self.proof_state.proof_names.view_name;
+            if args.is_empty() {
+                // Count-all: every term-encoded function's canonical view, plus
+                // the pass-through globals (no view; non-`@` tables the normal
+                // backend also counts).
+                let mut names: Vec<String> = view_of
+                    .values()
+                    .cloned()
+                    .chain(self.proof_state.pass_through_globals.iter().cloned())
+                    .collect();
+                names.sort(); // deterministic order
+                *args = names
+                    .into_iter()
+                    .map(|n| ResolvedExpr::Lit(span.clone(), Literal::String(n)))
+                    .collect();
+            } else {
+                for arg in args.iter_mut() {
+                    if let ResolvedExpr::Lit(arg_span, Literal::String(name)) = arg
+                        && let Some(view) = view_of.get(name.as_str())
+                    {
+                        *arg = ResolvedExpr::Lit(arg_span.clone(), Literal::String(view.clone()));
+                    }
+                }
+            }
+            return;
+        }
+        if let ResolvedExpr::Call(_, _, args) = expr {
+            for arg in args.iter_mut() {
+                self.redirect_get_size_args(arg);
+            }
+        }
     }
 
     fn eval_resolved_expr(&mut self, span: Span, expr: &ResolvedExpr) -> Result<Value, Error> {

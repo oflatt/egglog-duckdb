@@ -2578,6 +2578,22 @@ impl<'a> ProofInstrumentor<'a> {
                         fv
                     }
                     ResolvedCall::Primitive(specialized_primitive) => {
+                        // `get-size!` in an ACTION context (a rule action or a
+                        // top-level `(get-size!)` / `(set (g) (get-size!))`
+                        // action) must count the canonical `@<F>View` tables, not
+                        // the monotonic hash-cons TERM tables — the same redirect
+                        // `instrument_fact_expr` applies on the fact path. Without
+                        // it, action-context `get-size!` over-counts (stale /
+                        // congruent term rows) vs the normal backend. The
+                        // `(extract (get-size! ...))` path is separate — egglog-
+                        // experimental routes `extract` through a UserDefined
+                        // command that evaluates via `EGraph::eval_expr`, which is
+                        // redirected there (see `redirect_get_size_args`).
+                        let args = if specialized_primitive.name() == "get-size!" {
+                            self.instrument_get_size(&args)
+                        } else {
+                            args
+                        };
                         let fv = self.fresh_var();
                         res.push(format!(
                             "(let {} ({} {}))",
