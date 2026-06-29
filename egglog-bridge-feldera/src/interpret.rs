@@ -407,10 +407,26 @@ pub fn run_iteration(eg: &mut EGraph, rule_idxs: &[usize]) -> Result<bool> {
     // reports whether it actually collapsed/changed any row (another real
     // change source for the saturation loop).
     let t_merge = std::time::Instant::now();
+    // `--native-merge` TERM-BUILD scratch: cleared before the resolves so the view
+    // rows a term-build merge mints this iteration are recorded fresh.
+    eg.term_build_view_keys.clear();
     let empty_keys: HashSet<Vec<u32>> = HashSet::new();
     for &f in &touched {
         let keys = touched_keys.get(&f).unwrap_or(&empty_keys);
         changed |= eg.resolve_merge(f, keys);
+    }
+    // `--native-merge` TERM-BUILD: a term-build merge minted `@<C>View` rows
+    // (recorded in `term_build_view_keys`). Those views carry their OWN congruence
+    // merge (`native_merge_uf`), so reconcile their FD conflicts now — exactly the
+    // "TableInsert respects the target table's merge" semantics of the bridge.
+    // Drain to a fixpoint: resolving one view can enqueue unions but writes no new
+    // view rows, so this terminates in one pass in practice; the loop is defensive.
+    while !eg.term_build_view_keys.is_empty() {
+        let pending: Vec<(FunctionId, HashSet<Vec<u32>>)> =
+            eg.term_build_view_keys.drain().collect();
+        for (view, keys) in pending {
+            changed |= eg.resolve_merge(view, &keys);
+        }
     }
     if prof {
         eg.prof_merge += t_merge.elapsed();
@@ -1277,7 +1293,7 @@ fn resolve(s: &Slot, env: &Env) -> Result<u32> {
 /// that create many terms per round. We instead build the index lazily once per
 /// function (O(state) the first time it is touched this iteration) and keep it
 /// updated as new rows are hash-consed, so each subsequent lookup is O(1).
-fn lookup_or_create(
+pub(crate) fn lookup_or_create(
     eg: &mut EGraph,
     func: FunctionId,
     key: &[Value],
