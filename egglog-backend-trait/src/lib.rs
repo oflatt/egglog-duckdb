@@ -244,6 +244,13 @@ pub enum MergeFn {
     OldCol(usize),
     /// The new value of value column `i`. The multi-value counterpart of [`MergeFn::New`].
     NewCol(usize),
+    /// The value of KEY (input) column `i` (`cur[i]`). In an FD-conflict merge the
+    /// two rows share the same key, so the old and new key columns are equal —
+    /// hence a single `KeyCol(i)`. Lets a term-building custom `:merge` reference
+    /// the merge's input keys (e.g. to reconstruct the `(f keys merged)` view-term
+    /// proof). Bridge-only — the dataflow/SQL backends have no term-build proof
+    /// merge.
+    KeyCol(usize),
     /// Always overwrite the new value for the given function with a constant. This is more useful
     /// as a "base case" in a more complicated merge function (e.g. one that clamps a value between
     /// 1 and 100) than it is as a standalone merge function.

@@ -1195,6 +1195,45 @@ impl EGraph {
         })
     }
 
+    /// Resolve the backend id of a proof constructor / proof table by its
+    /// (already-declared) name in `self.functions`. The proof header / sort decls
+    /// declare `___Merge`, `___AstS`, `___TreeProof`, `___UF_S` etc. BEFORE any
+    /// constructor's view, so these are always present when a term-build view's
+    /// merge is lowered.
+    fn proof_fn_id(&self, name: &str) -> Result<egglog_bridge::FunctionId, Error> {
+        self.functions
+            .get(name)
+            .map(|f| f.backend_id)
+            .ok_or_else(|| {
+                Error::BackendError(format!(
+                    "term-build merge (proof): proof function `{name}` not declared"
+                ))
+            })
+    }
+
+    /// Build the `MergeFn` evaluating to a `(___Merge "fn_name" old_pf new_pf
+    /// ast)` view-proof term, mirroring `add_term_and_view`'s
+    /// `Justification::Merge` proof. `ast` is the already-built `MergeFn`
+    /// evaluating to the wrapped `(___AstS term)` AST node. `old_pf`/`new_pf` are
+    /// the conflicting view rows' proof columns. The `___Merge` constructor is
+    /// hash-consed via `MergeFn::Function`, the same mint path `UnionIntoUfWithProof`
+    /// uses for `Trans`/`Sym`.
+    fn build_merge_proof(
+        &self,
+        merge_id: egglog_bridge::FunctionId,
+        fn_name: &str,
+        old_pf: egglog_bridge::MergeFn,
+        new_pf: egglog_bridge::MergeFn,
+        ast: egglog_bridge::MergeFn,
+    ) -> egglog_bridge::MergeFn {
+        use egglog_bridge::MergeFn;
+        let name_const = MergeFn::Const(literal_to_value(
+            self.base_values(),
+            &Literal::String(fn_name.into()),
+        ));
+        MergeFn::Function(merge_id, vec![name_const, old_pf, new_pf, ast])
+    }
+
     /// Lower a term-building custom `:merge` body (e.g. `(C2 (C1 old new) (C2 old
     /// new))`) into a `MergeFn::Seq` of `Construct` / `TableInsert` / union
     /// variants — the PR #933 `:merge`-multiple-actions port. This re-expresses the
@@ -1205,9 +1244,10 @@ impl EGraph {
     /// returning the minted (canonicalized) eclass. The outermost call's value is
     /// the last `Seq` element (the merged eclass written into the FD `@<F>View`).
     ///
-    /// `output_sort` is the merged function's output sort. The whole Seq is guarded
-    /// by `IfEq(canon(old), canon(new), …)`: the rule-encoded `@merge_rule` fires
-    /// only on `(!= old new)` view rows (and its view rows are canonical under
+    /// `output_sort` is the merged function's output sort; `fn_name` its ORIGINAL
+    /// name (the view's `:internal-term-constructor`). The whole Seq is guarded by
+    /// `IfEq(canon(old), canon(new), …)`: the rule-encoded `@merge_rule` fires only
+    /// on `(!= old new)` view rows (and its view rows are canonical under
     /// canon-at-creation), so when `old`/`new` canonicalize to the SAME eclass the
     /// rule encoding builds NO helper term. Without this guard the native merge
     /// callback fires on every FD conflict — including ones whose two values later
@@ -1215,12 +1255,121 @@ impl EGraph {
     /// `(C old old)` helper term that the rule encoding never keeps (e.g.
     /// `tests/web-demo/rw-analysis.egg`'s `merge-val`). The guard reproduces the
     /// rule encoding's materialization exactly: equal => return that value, no mint.
+    ///
+    /// PROOF MODE: the view is the A2 TUPLE `(children) -> (eclass, Proof)`. We
+    /// return `MergeFn::Columns([eclass_branch, proof_branch])`:
+    ///   * `eclass_branch` is the guarded eclass `Seq` (col0). Its side-effects also
+    ///     thread the per-constructor `(___Merge "fn" old_pf new_pf (___AstS minted))`
+    ///     view-proof into the inner `@<C>View` tuple proof column, the
+    ///     `(___TreeProof minted)` term-proof, and the `@UF_S` self-edge — exactly
+    ///     what the dropped `@merge_rule` head wrote per `add_term_and_view`.
+    ///   * `proof_branch` is the result view-row proof (col1):
+    ///     `(___Merge "fn" old_pf new_pf (___Ast_fview (fn keys merged_eclass)))`,
+    ///     guarded the same way (equal => keep the surviving old proof column).
+    ///     `merged_eclass` re-evaluates the outermost `Construct` (hash-consed, so
+    ///     it returns the same minted id col0 produced).
     fn translate_term_build_merge_to_seq(
         &self,
         expr: &ResolvedExpr,
         output_sort: &str,
+        fn_name: &str,
     ) -> Result<egglog_bridge::MergeFn, Error> {
         use egglog_bridge::MergeFn;
+
+        if self.proof_state.proofs_enabled {
+            // --- PROOF mode: A2 tuple view `(children) -> (eclass, proof)`. ---
+            // The conflicting rows' proof column is index 1 in the tuple view.
+            let old_pf = MergeFn::OldCol(1);
+            let new_pf = MergeFn::NewCol(1);
+            let merge_id = self.proof_fn_id(&self.proof_state.proof_names.merge_fn_constructor)?;
+
+            // Column 0: the eclass-producing guarded Seq, whose side-effects also
+            // write the proof columns/tables for each minted constructor.
+            let mut side_effects = Vec::new();
+            let (outer_eclass, outer_construct) = self.lower_term_build_expr_proof(
+                expr,
+                &mut side_effects,
+                fn_name,
+                &old_pf,
+                &new_pf,
+            )?;
+            side_effects.push(outer_eclass);
+            let eclass_body = MergeFn::Seq(side_effects);
+
+            let canon_old = self.canon_mergefn(output_sort, MergeFn::Old);
+            let canon_new = self.canon_mergefn(output_sort, MergeFn::New);
+            let eclass_branch = MergeFn::IfEq {
+                a: Box::new(canon_old.clone()),
+                b: Box::new(canon_new.clone()),
+                then: Box::new(canon_old.clone()),
+                els: Box::new(eclass_body),
+            };
+
+            // Column 1: the result view-row proof
+            // `(___Merge "fn" old_pf new_pf (___Ast_fview (fn keys merged_eclass)))`.
+            // The view sort's AST constructor wraps the term-table view application
+            // `(fn keys merged_eclass)` (NOT the bare eclass) — matching the oracle's
+            // `(___Merge "f" ___p12 ___p22 (___Ast___view5 (f c0_ ___v48)))`.
+            let term_table = self
+                .functions
+                .get(fn_name)
+                .map(|f| f.backend_id)
+                .ok_or_else(|| {
+                    Error::BackendError(format!(
+                        "term-build merge (proof): term table `{fn_name}` not declared"
+                    ))
+                })?;
+            let view_sort = self
+                .proof_state
+                .proof_names
+                .fn_to_term_sort
+                .get(fn_name)
+                .ok_or_else(|| {
+                    Error::BackendError(format!(
+                        "term-build merge (proof): no view sort recorded for `{fn_name}`"
+                    ))
+                })?;
+            let ast_view_name = self
+                .proof_state
+                .proof_names
+                .sort_to_ast_constructor
+                .get(view_sort)
+                .ok_or_else(|| {
+                    Error::BackendError(format!(
+                        "term-build merge (proof): no AST constructor for view sort `{view_sort}`"
+                    ))
+                })?;
+            let ast_view_id = self.proof_fn_id(ast_view_name)?;
+
+            // (fn keys merged_eclass): the merge keys are the view's input columns
+            // (OldCol(i)/NewCol(i) agree pre-merge since the FD keys are equal); use
+            // OldCol for each key, then the re-evaluated outermost eclass.
+            // The term table `f` of a CUSTOM function is `(orig_inputs..., output)
+            // -> view_sort` (the original output sort is appended as a key). The
+            // `(f keys merged_eclass)` view term takes the original input keys plus
+            // the merged eclass, so the number of merge keys is the term table's
+            // input arity MINUS that appended output column. The keys are the
+            // MERGE's input (key) columns — read via `KeyCol(i)` (`cur[i]`), NOT
+            // `OldCol`, which indexes the VALUE columns (`cur[n_keys + i]`).
+            let n_keys = self.functions[fn_name].schema.input.len().saturating_sub(1);
+            let mut fview_args: Vec<MergeFn> = (0..n_keys).map(MergeFn::KeyCol).collect();
+            fview_args.push(outer_construct);
+            let fview_term = MergeFn::Function(term_table, fview_args);
+            let ast_view = MergeFn::Function(ast_view_id, vec![fview_term]);
+            let result_pf = self.build_merge_proof(merge_id, fn_name, old_pf, new_pf, ast_view);
+
+            let proof_branch = MergeFn::IfEq {
+                a: Box::new(canon_old),
+                b: Box::new(canon_new),
+                // equal => keep the surviving (old) view-row proof, no new proof.
+                then: Box::new(MergeFn::OldCol(1)),
+                els: Box::new(result_pf),
+            };
+
+            return Ok(MergeFn::Columns(vec![eclass_branch, proof_branch]));
+        }
+
+        // --- TERM (non-proof) mode: single-output view `(children) -> eclass`. ---
         let mut side_effects = Vec::new();
         let value = self.lower_term_build_expr(expr, &mut side_effects)?;
         side_effects.push(value);
@@ -1343,6 +1492,184 @@ impl EGraph {
                 // This node evaluates to its canonicalized eclass (used as a child
                 // of an enclosing constructor, or as the final merged value).
                 Ok(canon_fv)
+            }
+            GenericExpr::Call(span, ResolvedCall::Values(_), _) => Err(Error::TypeError(
+                TypeError::TupleMergeNotValues("<merge>".to_owned(), span.clone()),
+            )),
+        }
+    }
+
+    /// PROOF-mode analogue of [`Self::lower_term_build_expr`]. Recursively lowers
+    /// one node of a term-building merge body, pushing the A2 tuple `@<C>View`
+    /// `TableInsert` + `(___TreeProof minted)` term-proof + `@UF_S` self-edge
+    /// side-effects, and returning a pair `(eclass_mergefn, construct_mergefn)`:
+    ///   * `eclass_mergefn` is the value used as a child of an enclosing
+    ///     constructor / the final merged value.
+    ///   * `construct_mergefn` is the RAW (un-canonicalized) `Construct` for this
+    ///     node — used by the caller to build the `(fn keys construct)` result AST.
+    ///     (`canon_mergefn` is a no-op in proof mode, so the two are equal for a
+    ///     constructor node, but we return the construct explicitly to make the
+    ///     result-AST shape — which wraps the raw minted term — unambiguous.)
+    ///
+    /// Mirrors the dropped `@merge_rule` head (`add_term_and_view` with
+    /// `Justification::Merge`): each minted constructor's view-row proof is
+    /// `(___Merge "fn" old_pf new_pf (___AstS minted))`, written to the inner
+    /// view's tuple proof column, to `(___TreeProof minted)`, and as the `@UF_S`
+    /// self-edge proof. No `Trans`/`Sym`/`Congr` canon-at-creation wrapper is
+    /// emitted: in proof mode `canon_mergefn` is a no-op (children pass through
+    /// raw), so the wrapper the rule oracle emits would collapse to no-op refl
+    /// `Congr`s; the rule-based `@rebuild_rule*` re-canonicalizes the views (and
+    /// composes the congruence edge proofs) after the merge, exactly as for an
+    /// ordinary `add_term_and_view` insert.
+    fn lower_term_build_expr_proof(
+        &self,
+        expr: &ResolvedExpr,
+        side_effects: &mut Vec<egglog_bridge::MergeFn>,
+        fn_name: &str,
+        old_pf: &egglog_bridge::MergeFn,
+        new_pf: &egglog_bridge::MergeFn,
+    ) -> Result<(egglog_bridge::MergeFn, egglog_bridge::MergeFn), Error> {
+        use egglog_bridge::MergeFn;
+        match expr {
+            // A leaf `old`/`new` refers to the OLD/NEW ECLASS — value COLUMN 0 of
+            // the A2 tuple view. Use the column-ABSOLUTE `OldCol(0)`/`NewCol(0)`,
+            // NOT the `self_col`-relative `Old`/`New` (`translate_expr_to_mergefn`
+            // maps `old` -> `Old`): inside the proof column's merge (`self_col` =
+            // 1) `Old` would read the PROOF column, not the eclass. Using the
+            // absolute column makes a `Construct` reusable across both the eclass
+            // and proof columns (so they mint the SAME id).
+            GenericExpr::Var(span, resolved_var) => {
+                let name = resolved_var.name.as_str();
+                let v = if name == "old" {
+                    MergeFn::OldCol(0)
+                } else if name == "new" {
+                    MergeFn::NewCol(0)
+                } else {
+                    return Err(TypeError::Unbound(resolved_var.name.clone(), span.clone()).into());
+                };
+                Ok((v.clone(), v))
+            }
+            GenericExpr::Lit(..) => {
+                let v = self.translate_expr_to_mergefn(expr)?;
+                Ok((v.clone(), v))
+            }
+            GenericExpr::Call(_, ResolvedCall::Primitive(_), _) => {
+                let v = self.translate_expr_to_mergefn(expr)?;
+                Ok((v.clone(), v))
+            }
+            GenericExpr::Call(_, ResolvedCall::Func(f), args) => {
+                let func = &self.functions[&f.name];
+                let term_table = func.backend_id;
+                let out_sort = func.decl.schema.output.clone();
+                let view_name = self
+                    .proof_state
+                    .proof_names
+                    .view_name
+                    .get(&*f.name)
+                    .ok_or_else(|| {
+                        Error::BackendError(format!(
+                            "term-build merge (proof): no view table recorded for constructor `{}`",
+                            f.name
+                        ))
+                    })?
+                    .clone();
+                let view_table = self.functions[&view_name].backend_id;
+
+                // Lower each child first (innermost-first side-effect order). In
+                // proof mode `canon_mergefn` is a no-op, so children pass through
+                // their raw value.
+                let mut child_eclasses = Vec::with_capacity(args.len());
+                for arg in args.iter() {
+                    let (child_eclass, _child_construct) = self.lower_term_build_expr_proof(
+                        arg,
+                        side_effects,
+                        fn_name,
+                        old_pf,
+                        new_pf,
+                    )?;
+                    child_eclasses.push(child_eclass);
+                }
+
+                // Mint the term `(C children..)` (hash-consed, idempotent).
+                let construct = MergeFn::Construct(term_table, child_eclasses.clone(), vec![]);
+
+                // The constructor's view-row proof
+                // `(___Merge "fn" old_pf new_pf (___AstS construct))`.
+                let merge_id =
+                    self.proof_fn_id(&self.proof_state.proof_names.merge_fn_constructor)?;
+                let ast_name = self
+                    .proof_state
+                    .proof_names
+                    .sort_to_ast_constructor
+                    .get(out_sort.as_str())
+                    .ok_or_else(|| {
+                        Error::BackendError(format!(
+                            "term-build merge (proof): no AST constructor for sort `{out_sort}`"
+                        ))
+                    })?
+                    .clone();
+                let ast_id = self.proof_fn_id(&ast_name)?;
+                let ast = MergeFn::Function(ast_id, vec![construct.clone()]);
+                let merge_pf =
+                    self.build_merge_proof(merge_id, fn_name, old_pf.clone(), new_pf.clone(), ast);
+
+                // Side-effect: `(set (___TreeProof construct) merge_pf)`.
+                if let Some(tp_id) = self
+                    .proof_state
+                    .proof_func_parent
+                    .get(out_sort.as_str())
+                    .and_then(|n| self.functions.get(n))
+                    .map(|fdef| fdef.backend_id)
+                {
+                    side_effects.push(MergeFn::TableInsert(
+                        tp_id,
+                        vec![construct.clone(), merge_pf.clone()],
+                    ));
+                }
+
+                // Side-effect: write the A2 tuple `@<C>View` row
+                // `(set (@CView children..) (values construct merge_pf))`.
+                // `TableInsert` runs the view's own
+                // `Columns([UnionIntoUfWithProof, EclassMinProof])` merge — inline
+                // congruence with proof composition — on an FD conflict.
+                let mut view_row = child_eclasses;
+                view_row.push(construct.clone());
+                view_row.push(merge_pf.clone());
+                side_effects.push(MergeFn::TableInsert(view_table, view_row));
+
+                // Side-effect: the `@UF_S` self-edge `(set (@UF_S construct
+                // construct) merge_pf)` — `add_term_and_view`'s `union(fv, fv,
+                // Proof(merge_pf))`, a self-loop that registers `fv` in the
+                // union-find with its term proof.
+                //
+                //   * RELATIONAL proof path (no `--native-uf`): `@UF_S` (the
+                //     `uf_parent` table) is a plain `(S S) -> Proof :merge old`
+                //     function, so the self-edge is a `TableInsert` of `[fv, fv,
+                //     merge_pf]` — byte-for-byte the `(set (@UF_S fv fv) merge_pf)`
+                //     row the rule oracle writes.
+                //   * `--native-uf`: `@UF_Sf` is a `:impl displaced-union-find`
+                //     function — it cannot be `TableInsert`ed (a `TableAction`
+                //     rejects a UF table), and `union(fv, fv)` is a genuine no-op
+                //     for the union-find (same id, no leader change, no onchange
+                //     proof to compose). The id is registered by the UF the first
+                //     time it appears as a leader; the term proof is already in
+                //     `@TreeProof`. So the native-UF self-edge is omitted — it
+                //     would change nothing.
+                if !self.proof_state.native_uf
+                    && let Some(uf_id) = self
+                        .proof_state
+                        .uf_parent
+                        .get(out_sort.as_str())
+                        .and_then(|n| self.functions.get(n))
+                        .map(|fdef| fdef.backend_id)
+                {
+                    side_effects.push(MergeFn::TableInsert(
+                        uf_id,
+                        vec![construct.clone(), construct.clone(), merge_pf],
+                    ));
+                }
+
+                Ok((construct.clone(), construct))
             }
             GenericExpr::Call(span, ResolvedCall::Values(_), _) => Err(Error::TypeError(
                 TypeError::TupleMergeNotValues("<merge>".to_owned(), span.clone()),
@@ -1536,21 +1863,34 @@ impl EGraph {
                     } else if let Some(term_build_merge) =
                         self.proof_state.native_term_build_views.get(&*decl.name)
                     {
-                        // Native TERM-BUILD custom `:merge` (`--native-merge`, term,
-                        // non-proof, bridge): the encoder declared this `@<F>View`
-                        // FD-keyed `(children) -> eclass` and stashed the
-                        // term-building merge expr here. Lower it to a
-                        // `MergeFn::Seq` of `Construct` / `TableInsert` / union
-                        // variants (PR #933 multi-action merge) so the term build
-                        // runs NATIVELY in the FD-conflict merge callback, replacing
-                        // the rule-encoded `@merge_rule` / `@merge_cleanup`. Checked
-                        // FIRST (a term-build view is also in `native_merge_views`
-                        // for the FD set/query/delete forms, but it needs the Seq
-                        // merge, not the congruence `UnionId`).
+                        // Native TERM-BUILD custom `:merge` (`--native-merge`,
+                        // bridge): the encoder declared this `@<F>View` FD-keyed
+                        // `(children) -> eclass` (term) / `(children) -> (eclass,
+                        // Proof)` (A2 proof) and stashed the term-building merge
+                        // expr here. Lower it to a `MergeFn::Seq` of `Construct` /
+                        // `TableInsert` / union variants (PR #933 multi-action
+                        // merge) so the term build runs NATIVELY in the FD-conflict
+                        // merge callback, replacing the rule-encoded `@merge_rule` /
+                        // `@merge_cleanup`. In proof mode the Seq additionally
+                        // threads the `___Merge` view-proof terms (returned as a
+                        // `MergeFn::Columns([eclass, proof])`). Checked FIRST (a
+                        // term-build view is also in `native_merge_views` for the FD
+                        // set/query/delete forms, but it needs the Seq merge, not
+                        // the congruence `UnionId`/A2 congruence merge).
                         let term_build_merge = term_build_merge.clone();
+                        // The ORIGINAL custom-function name (`f`): the view decl's
+                        // `:internal-term-constructor`. It names every `___Merge`
+                        // proof and resolves the result-AST view term `(f keys …)`.
+                        let fn_name = decl.term_constructor.clone().ok_or_else(|| {
+                            Error::BackendError(format!(
+                                "term-build merge: view `{}` has no term_constructor",
+                                decl.name
+                            ))
+                        })?;
                         self.translate_term_build_merge_to_seq(
                             &term_build_merge,
                             &decl.schema.output,
+                            &fn_name,
                         )?
                     } else if let Some(value_merge) =
                         self.proof_state.native_value_merge_views.get(&*decl.name)

@@ -1564,7 +1564,7 @@ fn merge_fn_fill_deps(
                 merge_fn_fill_deps(m, egraph, read_deps, write_deps);
             }
         }
-        AssertEq | Old | New | OldCol(..) | NewCol(..) | Const(..) => {}
+        AssertEq | Old | New | OldCol(..) | NewCol(..) | KeyCol(..) | Const(..) => {}
     }
 }
 
@@ -1685,6 +1685,7 @@ fn merge_fn_resolve(merge: &MergeFn, function_name: &str, egraph: &mut EGraph) -
         MergeFn::New => ResolvedMergeFn::New,
         MergeFn::OldCol(i) => ResolvedMergeFn::OldCol(*i),
         MergeFn::NewCol(i) => ResolvedMergeFn::NewCol(*i),
+        MergeFn::KeyCol(i) => ResolvedMergeFn::KeyCol(*i),
         MergeFn::Columns(_) => {
             panic!("nested Columns merge is not supported (Columns must be top-level)")
         }
@@ -1841,6 +1842,7 @@ enum ResolvedMergeFn {
     New,
     OldCol(usize),
     NewCol(usize),
+    KeyCol(usize),
     AssertEq {
         panic: ExternalFunctionId,
     },
@@ -1938,6 +1940,9 @@ impl ResolvedMergeFn {
             ResolvedMergeFn::New => new[n_keys + self_col],
             ResolvedMergeFn::OldCol(i) => cur[n_keys + i],
             ResolvedMergeFn::NewCol(i) => new[n_keys + i],
+            // Key (input) column `i`. The two FD-conflicting rows share the same
+            // key, so `cur[i] == new[i]`; read `cur`.
+            ResolvedMergeFn::KeyCol(i) => cur[*i],
             ResolvedMergeFn::AssertEq { panic } => {
                 let (cur, new) = (cur[n_keys + self_col], new[n_keys + self_col]);
                 if cur != new {

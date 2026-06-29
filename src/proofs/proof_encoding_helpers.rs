@@ -542,12 +542,25 @@ impl ProofInstrumentor<'_> {
     /// NATIVELY as a `MergeFn::Seq` instead of via the rule-encoded
     /// `@merge_rule`/`@merge_cleanup`. Gated like [`Self::native_value_fold_merge`]
     /// but for an EQ-SORT output (a term-building merge mints e-nodes) whose body
-    /// is a term build. The PR #933 `:merge`-multiple-actions port; bridge + term
-    /// (non-proof) only for now.
+    /// is a term build. The PR #933 `:merge`-multiple-actions port.
+    ///
+    /// Works in BOTH term and proof mode on the bridge. In PROOF mode the
+    /// `MergeFn::Seq` also threads the `Merge` view-proof terms through the A2
+    /// tuple proof views / `___TreeProof` / `@UF_S` self-edges (see
+    /// `lower_term_build_expr`), so it requires the bridge-only A2
+    /// `UnionIntoUfWithProof` toolkit — hence the proof-mode arm gates on
+    /// `supports_complex_merge()` (bridge only) rather than
+    /// `supports_term_build_merge()` (which the flowlog/feldera dataflow backends
+    /// force `true` for the NON-proof term path). Proof + term-build on
+    /// duckdb/feldera/flowlog therefore stays on the rule (`@merge_rule`) path.
     pub(crate) fn native_term_build_merge(&self, fdecl: &ResolvedFunctionDecl) -> bool {
+        let backend_supports = if self.egraph.proof_state.proofs_enabled {
+            self.egraph.backend.supports_complex_merge()
+        } else {
+            self.egraph.backend.supports_term_build_merge()
+        };
         self.native_merge()
-            && !self.egraph.proof_state.proofs_enabled
-            && self.egraph.backend.supports_term_build_merge()
+            && backend_supports
             && fdecl.subtype == FunctionSubtype::Custom
             && fdecl.resolved_schema.output().is_eq_sort()
             && fdecl.merge.as_ref().is_some_and(Self::merge_is_term_build)

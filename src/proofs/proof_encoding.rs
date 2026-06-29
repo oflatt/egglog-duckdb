@@ -1703,12 +1703,22 @@ impl<'a> ProofInstrumentor<'a> {
                 let view_name = self.view_name(head.name());
 
                 // Native-merge FD view (`(children) -> eclass`): the eclass IS the
-                // function output, so query it as `(= eclass (@view children))`
-                // (binding `v`) — there is no separate Unit/proof output column.
-                // The baseline all-columns view binds a fresh proof_var as output.
-                let proof_var = if self.is_native_merge_view(&view_name) {
+                // function output. The shape depends on proof mode:
+                //   * A2 PROOF view (`(children) -> (eclass, Proof)`, e.g. a custom
+                //     function with a native term-build `:merge`): destructure
+                //     `(= (values eclass pf) (@view children))`, binding the eclass
+                //     `v` AND the view proof `pf` — the proof column carries the
+                //     `___Merge`/`___Fiat` view proof the rule path would query.
+                //   * TERM view (`(children) -> eclass`): query `(= eclass (@view
+                //     children))` (binding `v`); no proof column (proofs off).
+                //   * baseline all-columns view: bind a fresh proof_var as output.
+                let proof_var = if self.is_native_merge_proof_view(&view_name) {
+                    let (query, pf_var) = self.query_view_and_get_proof(head.name(), &new_args);
+                    res.push(query);
+                    pf_var
+                } else if self.is_native_merge_view(&view_name) {
                     res.push(self.view_body_atom(head.name(), &new_args));
-                    // No proof column on an FD view; proofs are off in native-merge.
+                    // No proof column on an FD term view; proofs are off.
                     "()".to_string()
                 } else {
                     let args_str = ListDisplay(&new_args, " ");

@@ -1248,7 +1248,11 @@ impl EGraph {
             | MergeFn::UnionIntoUf(_)
             | MergeFn::UnionIntoParentTable { .. }
             | MergeFn::UnionIntoUfWithProof { .. }
-            | MergeFn::EclassMinProof { .. } => {
+            | MergeFn::EclassMinProof { .. }
+            // `KeyCol` is emitted only by the bridge-only proof-mode term-build
+            // merge; Feldera never runs that path (gated on
+            // `supports_complex_merge()`).
+            | MergeFn::KeyCol(_) => {
                 panic!(
                     "Feldera term-build merge: unexpected congruence/proof merge variant inside a \
                      term-build tree (these are not nested in a term build)"
@@ -1350,8 +1354,11 @@ fn merge_mode_for_scalar(merge: &egglog_backend_trait::MergeFn) -> MergeMode {
         MergeFn::NewCol(_) => MergeMode::New,
         MergeFn::Function(_, _) | MergeFn::Const(_) => MergeMode::Old,
         // Proof-mode native-merge is bridge-only; Feldera has no proof-mode
-        // native-UF, so these tuple-output proof merges never reach it.
-        MergeFn::UnionIntoUfWithProof { .. } | MergeFn::EclassMinProof { .. } => {
+        // native-UF, so these tuple-output proof merges (and the `KeyCol` the
+        // proof-mode term-build merge uses) never reach it.
+        MergeFn::UnionIntoUfWithProof { .. }
+        | MergeFn::EclassMinProof { .. }
+        | MergeFn::KeyCol(_) => {
             panic!("Feldera backend does not support proof-mode native-merge merges")
         }
         MergeFn::Columns(_) => unreachable!("merge_mode_for_scalar called on a Columns merge"),
