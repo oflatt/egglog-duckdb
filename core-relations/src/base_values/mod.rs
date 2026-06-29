@@ -173,6 +173,16 @@ impl BaseValues {
             .expect("types must be registered before unwrapping via unwrap_dyn_by_id")
             .unwrap_dyn(v)
     }
+
+    /// Backing intern-table length for a NON-unboxable boxed type (its handle is a
+    /// direct table index), or `None` for an unboxable type. See
+    /// [`DynamicInternTable::intern_table_len`].
+    pub fn intern_table_len_by_id(&self, id: BaseValueId) -> Option<usize> {
+        self.tables
+            .get(id)
+            .expect("types must be registered before querying via intern_table_len_by_id")
+            .intern_table_len()
+    }
 }
 
 /// Dynamic dispatch entry-point used by [`BaseValues`] to manage typed
@@ -191,6 +201,13 @@ pub trait DynamicInternTable: Any + dyn_clone::DynClone + Send + Sync {
     /// Read a value from the table by its `Value` handle, returning a boxed
     /// `dyn Any` whose concrete type is the table's underlying `P`.
     fn unwrap_dyn(&self, v: Value) -> Box<dyn Any + Send + Sync>;
+    /// Number of values interned in the backing table for a NON-unboxable type
+    /// (`Boxed<…>` like `String` / `BigInt`), whose handle is a direct table
+    /// index. `None` for unboxable types (the handle IS the value; there is no
+    /// backing table to bound-check). Used by the DuckDB backend to validate a
+    /// handle before unwrapping rather than panicking on out-of-range memory that
+    /// DuckDB's speculative `ON CONFLICT` evaluation can produce.
+    fn intern_table_len(&self) -> Option<usize>;
 }
 
 // Implements `Clone` for `Box<dyn DynamicInternTable>`.
@@ -237,6 +254,16 @@ impl<P: BaseValue> DynamicInternTable for BaseInternTable<P> {
 
     fn unwrap_dyn(&self, v: Value) -> Box<dyn Any + Send + Sync> {
         Box::new(self.get(v))
+    }
+
+    fn intern_table_len(&self) -> Option<usize> {
+        // Unboxable types encode the value in the handle itself — no backing
+        // table to bound-check. Boxed types index `self.table` directly.
+        if P::MAY_UNBOX {
+            None
+        } else {
+            Some(self.table.len())
+        }
     }
 }
 

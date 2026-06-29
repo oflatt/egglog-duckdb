@@ -1578,7 +1578,7 @@ fn term_sql(t: &Term, binding: &HashMap<String, String>, rule_name: &str) -> Res
     }
 }
 
-fn prim_sql(op: &str, args: &[String], rule_name: &str) -> Result<String> {
+pub(crate) fn prim_sql(op: &str, args: &[String], rule_name: &str) -> Result<String> {
     let binop = |sql_op: &str| -> Result<String> {
         if args.len() != 2 {
             return Err(anyhow!(

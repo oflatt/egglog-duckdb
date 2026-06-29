@@ -1350,6 +1350,47 @@ impl EGraph {
         }
     }
 
+    /// DuckDB native VALUE-FOLD `:merge`: register each primitive in `expr` under
+    /// its sort-specific duck name (`*`->`bigint-mul`, `to-string`->`bigint-to-string`,
+    /// …) in the duckdb registry, so the in-SQL fold built by
+    /// [`Self::translate_expr_to_mergefn`] resolves the SAME UDF/op the rule path
+    /// would. `set_external_func_name` also registers the matching builtin UDF.
+    /// No-op on any non-DuckDB backend (their merge trees keep the original names,
+    /// which their host interpreters resolve directly).
+    fn register_duck_merge_prim_names(&mut self, expr: &ResolvedExpr) {
+        // Collect the (external_id, duck_name) rewrites under an immutable borrow,
+        // then apply them with the mutable downcast — avoids borrow conflicts.
+        let mut renames: Vec<(ExternalFunctionId, String)> = Vec::new();
+        fn collect(expr: &ResolvedExpr, out: &mut Vec<(ExternalFunctionId, String)>) {
+            if let GenericExpr::Call(_, ResolvedCall::Primitive(p), args) = expr {
+                let in0 = p.input().first().map(|s| s.name());
+                if let Some(duck_name) = duck_prim_rename(p.name(), p.output().name(), in0) {
+                    out.push((p.external_id(crate::Context::Write), duck_name.to_owned()));
+                }
+                for a in args {
+                    collect(a, out);
+                }
+            } else if let GenericExpr::Call(_, _, args) = expr {
+                for a in args {
+                    collect(a, out);
+                }
+            }
+        }
+        collect(expr, &mut renames);
+        if renames.is_empty() {
+            return;
+        }
+        if let Some(duck) = self
+            .backend
+            .as_any_mut()
+            .downcast_mut::<egglog_bridge_duckdb::EGraph>()
+        {
+            for (id, name) in renames {
+                duck.set_external_func_name(id, name);
+            }
+        }
+    }
+
     fn translate_expr_to_mergefn(
         &self,
         expr: &ResolvedExpr,
@@ -1481,6 +1522,23 @@ impl EGraph {
                         .uf_function
                         .values()
                         .any(|n| n == &*decl.name);
+                // Native VALUE-FOLD `:merge` on DuckDB: the merge MergeFn tree built
+                // below by `translate_expr_to_mergefn` carries each primitive's
+                // *original* (pre-overload) name in the backend registry. DuckDB
+                // resolves a `:merge` in-SQL (not via a host interpreter), so it
+                // needs the SAME sort-specific names the rule path emits
+                // (`*`->`bigint-mul`, `to-string`->`bigint-to-string`, …) and the
+                // matching UDFs registered. The rule-builder's `rename_prim` hook
+                // never runs for a native (non-rule-encoded) merge, so do that
+                // registration here over the stashed merge expr.
+                if let Some(value_merge) = self
+                    .proof_state
+                    .native_value_merge_views
+                    .get(&*decl.name)
+                    .cloned()
+                {
+                    self.register_duck_merge_prim_names(&value_merge);
+                }
                 let backend_id = self.backend.add_table(egglog_bridge::FunctionConfig {
                     schema: input
                         .iter()
@@ -4004,61 +4062,7 @@ impl<'a> BackendRule<'a> {
         // BigRat operations that have no SQL equivalent — to per-op
         // UDFs registered on demand via
         // `EGraph::set_external_func_name` → `register_builtin_prim_udf`.
-        let duck_name: Option<&str> = match (pname, pout, in0) {
-            ("^", "i64", _) => Some("i64-xor"),
-            ("/", "i64", _) => Some("int-div"),
-            ("+", "String", _) => Some("string-concat"),
-            // `to-string` overloads — duck routes each to a
-            // sort-specific UDF that formats the input and interns
-            // the result string handle.
-            ("to-string", "String", Some("i64")) => Some("i64-to-string"),
-            ("to-string", "String", Some("f64")) => Some("f64-to-string"),
-            ("to-string", "String", Some("BigInt")) => Some("bigint-to-string"),
-            // BigInt arithmetic overloads: `+`, `*`, ... on BigInt have
-            // no SQL equivalent (the operands are pool handles), so route
-            // each to a per-op UDF that unwraps/operates/interns. Match
-            // on the BigInt *output* type to disambiguate from the
-            // i64/f64 overloads of the same op name.
-            ("+", "BigInt", _) => Some("bigint-add"),
-            ("-", "BigInt", _) => Some("bigint-sub"),
-            ("*", "BigInt", _) => Some("bigint-mul"),
-            ("/", "BigInt", _) => Some("bigint-div"),
-            ("%", "BigInt", _) => Some("bigint-rem"),
-            ("&", "BigInt", _) => Some("bigint-and"),
-            ("|", "BigInt", _) => Some("bigint-or"),
-            ("^", "BigInt", _) => Some("bigint-xor"),
-            ("min", "BigInt", _) => Some("bigint-min"),
-            ("max", "BigInt", _) => Some("bigint-max"),
-            // BigRat overloads: dispatch by op name and arg sort.
-            // Comparisons return Unit; arithmetic returns BigRat;
-            // numer/denom return BigInt; to-f64 returns f64. We use
-            // the BigRat *argument* type to disambiguate from i64/f64
-            // overloads of the same op name.
-            ("+", "BigRat", _) => Some("bigrat-add"),
-            ("-", "BigRat", _) => Some("bigrat-sub"),
-            ("*", "BigRat", _) => Some("bigrat-mul"),
-            ("/", "BigRat", _) => Some("bigrat-div"),
-            ("min", "BigRat", _) => Some("bigrat-min"),
-            ("max", "BigRat", _) => Some("bigrat-max"),
-            ("pow", "BigRat", _) => Some("bigrat-pow"),
-            ("neg", "BigRat", _) => Some("bigrat-neg"),
-            ("abs", "BigRat", _) => Some("bigrat-abs"),
-            ("floor", "BigRat", _) => Some("bigrat-floor"),
-            ("ceil", "BigRat", _) => Some("bigrat-ceil"),
-            ("round", "BigRat", _) => Some("bigrat-round"),
-            ("sqrt", "BigRat", _) => Some("bigrat-sqrt"),
-            ("log", "BigRat", _) => Some("bigrat-log"),
-            ("cbrt", "BigRat", _) => Some("bigrat-cbrt"),
-            ("<", "Unit", Some("BigRat")) => Some("bigrat-lt"),
-            (">", "Unit", Some("BigRat")) => Some("bigrat-gt"),
-            ("<=", "Unit", Some("BigRat")) => Some("bigrat-le"),
-            (">=", "Unit", Some("BigRat")) => Some("bigrat-ge"),
-            ("numer", _, Some("BigRat")) => Some("bigrat-numer"),
-            ("denom", _, Some("BigRat")) => Some("bigrat-denom"),
-            ("to-f64", _, Some("BigRat")) => Some("bigrat-to-f64"),
-            _ => None,
-        };
-        if let Some(name) = duck_name {
+        if let Some(name) = duck_prim_rename(pname, pout, in0) {
             self.rb.rename_prim(prim.external_id(ctx), name.to_owned());
         }
 
@@ -4227,6 +4231,73 @@ fn literal_to_value(base_values: &egglog_core_relations::BaseValues, l: &Literal
         Literal::String(x) => base_values.get::<sort::S>(sort::S::new(x.clone())),
         Literal::Bool(x) => base_values.get::<bool>(*x),
         Literal::Unit => base_values.get::<()>(()),
+    }
+}
+
+/// Type-disambiguate a built-in primitive name for the DuckDB backend. Several
+/// egglog primitives share a name across sorts (`^` is XOR for i64 / POWER for
+/// f64; `/` is integer-div for i64 / float-div for f64; `+` is string-concat for
+/// String / numeric add for i64/f64); BigInt/BigRat ops operate on pool handles
+/// with no SQL equivalent. DuckDB's SQL operators / UDFs need one meaning per
+/// symbol, so the duck side maps each `(name, output sort, first input sort)` to a
+/// sort-specific name that `compile::prim_sql` translates. Returns `None` for a
+/// name that needs no rewrite (the bare name already translates).
+///
+/// Shared by the rule-builder's `prim` lowering (which renames the primitive's
+/// `external_id` for SQL emission inside a compiled rule) AND the native
+/// VALUE-FOLD `:merge` MergeFn-tree builder (`translate_expr_to_mergefn`), so the
+/// in-SQL fold resolves the SAME sort-specific UDFs the rule path would.
+fn duck_prim_rename(pname: &str, pout: &str, in0: Option<&str>) -> Option<&'static str> {
+    match (pname, pout, in0) {
+        ("^", "i64", _) => Some("i64-xor"),
+        ("/", "i64", _) => Some("int-div"),
+        ("+", "String", _) => Some("string-concat"),
+        // `to-string` overloads — duck routes each to a sort-specific UDF that
+        // formats the input and interns the result string handle.
+        ("to-string", "String", Some("i64")) => Some("i64-to-string"),
+        ("to-string", "String", Some("f64")) => Some("f64-to-string"),
+        ("to-string", "String", Some("BigInt")) => Some("bigint-to-string"),
+        // BigInt arithmetic overloads: `+`, `*`, ... on BigInt have no SQL
+        // equivalent (the operands are pool handles), so route each to a per-op
+        // UDF that unwraps/operates/interns. Match on the BigInt *output* type to
+        // disambiguate from the i64/f64 overloads of the same op name.
+        ("+", "BigInt", _) => Some("bigint-add"),
+        ("-", "BigInt", _) => Some("bigint-sub"),
+        ("*", "BigInt", _) => Some("bigint-mul"),
+        ("/", "BigInt", _) => Some("bigint-div"),
+        ("%", "BigInt", _) => Some("bigint-rem"),
+        ("&", "BigInt", _) => Some("bigint-and"),
+        ("|", "BigInt", _) => Some("bigint-or"),
+        ("^", "BigInt", _) => Some("bigint-xor"),
+        ("min", "BigInt", _) => Some("bigint-min"),
+        ("max", "BigInt", _) => Some("bigint-max"),
+        // BigRat overloads: dispatch by op name and arg sort. Comparisons return
+        // Unit; arithmetic returns BigRat; numer/denom return BigInt; to-f64
+        // returns f64. We use the BigRat *argument* type to disambiguate from
+        // i64/f64 overloads of the same op name.
+        ("+", "BigRat", _) => Some("bigrat-add"),
+        ("-", "BigRat", _) => Some("bigrat-sub"),
+        ("*", "BigRat", _) => Some("bigrat-mul"),
+        ("/", "BigRat", _) => Some("bigrat-div"),
+        ("min", "BigRat", _) => Some("bigrat-min"),
+        ("max", "BigRat", _) => Some("bigrat-max"),
+        ("pow", "BigRat", _) => Some("bigrat-pow"),
+        ("neg", "BigRat", _) => Some("bigrat-neg"),
+        ("abs", "BigRat", _) => Some("bigrat-abs"),
+        ("floor", "BigRat", _) => Some("bigrat-floor"),
+        ("ceil", "BigRat", _) => Some("bigrat-ceil"),
+        ("round", "BigRat", _) => Some("bigrat-round"),
+        ("sqrt", "BigRat", _) => Some("bigrat-sqrt"),
+        ("log", "BigRat", _) => Some("bigrat-log"),
+        ("cbrt", "BigRat", _) => Some("bigrat-cbrt"),
+        ("<", "Unit", Some("BigRat")) => Some("bigrat-lt"),
+        (">", "Unit", Some("BigRat")) => Some("bigrat-gt"),
+        ("<=", "Unit", Some("BigRat")) => Some("bigrat-le"),
+        (">=", "Unit", Some("BigRat")) => Some("bigrat-ge"),
+        ("numer", _, Some("BigRat")) => Some("bigrat-numer"),
+        ("denom", _, Some("BigRat")) => Some("bigrat-denom"),
+        ("to-f64", _, Some("BigRat")) => Some("bigrat-to-f64"),
+        _ => None,
     }
 }
 

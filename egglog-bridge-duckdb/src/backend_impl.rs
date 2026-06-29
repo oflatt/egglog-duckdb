@@ -87,34 +87,116 @@ use crate::{ColumnTy as DuckColumnTy, EGraph, Literal, MergeMode, q};
 // Merge-mode recognition (shared by `add_table`)
 // ---------------------------------------------------------------------------
 
+/// Walk a VALUE-FOLD [`MergeFn`] tree into a DuckDB SQL scalar expression over the
+/// existing row (`c{out_col}`) and the incoming row (`EXCLUDED.c{out_col}`).
+///
+/// A value-fold body is a pure fold of primitives / literals over `old`/`new`
+/// (e.g. `(from-string (to-string (* new old)))`); the frontend lowers it to a
+/// tree of `Primitive` / `Const` / `Old` / `New` / `OldCol` / `NewCol`. Every
+/// column is a single output, so `Old`/`OldCol(0)` -> `c{out_col}` and
+/// `New`/`NewCol(0)` -> `EXCLUDED.c{out_col}`. Each [`MergeFn::Primitive`] is
+/// translated to its SQL scalar via [`crate::compile::prim_sql`] (the SAME
+/// translation the rule path uses), so anything `prim_sql` knows (arithmetic,
+/// `LEAST`/`GREATEST`, `to-string`/`from-string`, the BigInt/BigRat/string UDFs)
+/// folds directly.
+///
+/// Returns `None` (so the caller falls back to the prior `MergeMode`, never
+/// panicking) for any shape that is NOT a pure value fold: a non-zero
+/// `OldCol`/`NewCol` (a tuple-output reference — single-output DuckDB cannot
+/// express it), a `Function` call (a term build, not a value fold), any
+/// multi-action variant, OR a `Primitive` whose op `prim_sql` cannot translate.
+fn mergefn_to_sql(
+    merge: &MergeFn,
+    table: &str,
+    out_col: usize,
+    funcs: &external_func::DuckdbExternalFuncRegistry,
+) -> Option<String> {
+    match merge {
+        // Single output column: `Old`/`OldCol(0)` is the EXISTING row's value,
+        // `New`/`NewCol(0)` is the INCOMING value. A non-zero column index is a
+        // tuple-output reference DuckDB's single-output `ON CONFLICT` cannot model.
+        //
+        // The existing-column reference MUST be TABLE-QUALIFIED (`"<table>".c{out}`),
+        // not a bare `c{out}`. DuckDB evaluates an `ON CONFLICT DO UPDATE SET` over
+        // the WHOLE inserted chunk — including rows that do NOT conflict, whose
+        // existing-row column is uninitialized — and discards the result for
+        // non-conflicting rows. A bare `c{out}` reads that uninitialized memory
+        // (garbage), which our pool-handle UDFs then treat as a handle and crash on
+        // (out-of-bounds intern-table lookup). Qualifying the column makes DuckDB
+        // yield NULL for the absent existing row instead of garbage, so the UDFs see
+        // a defined value on the discarded rows (built-in SQL ops tolerate the
+        // garbage, which is why only chained pool-handle UDFs hit this).
+        MergeFn::Old | MergeFn::OldCol(0) => Some(format!("{}.c{out_col}", q(table))),
+        MergeFn::New | MergeFn::NewCol(0) => Some(format!("EXCLUDED.c{out_col}")),
+        MergeFn::OldCol(_) | MergeFn::NewCol(_) => None,
+        // A constant is the raw BIGINT handle (the `Value`'s u32 rep widened),
+        // directly comparable to the BIGINT-typed columns.
+        MergeFn::Const(v) => Some((v.rep() as i64).to_string()),
+        MergeFn::Primitive(ext_id, args) => {
+            let op = funcs.name(*ext_id)?;
+            let arg_sqls: Option<Vec<String>> = args
+                .iter()
+                .map(|a| mergefn_to_sql(a, table, out_col, funcs))
+                .collect();
+            // `prim_sql` errors on an op it cannot translate -> fall back to the
+            // prior `MergeMode` (the frontend's `@merge_rule` path) rather than
+            // emitting broken SQL.
+            crate::compile::prim_sql(op, &arg_sqls?, "@merge").ok()
+        }
+        // A `Function` call builds terms (term-build merge, not yet supported on
+        // DuckDB); every other variant is a non-value-fold shape.
+        _ => None,
+    }
+}
+
 /// Map a *scalar* (single value column) [`MergeFn`] to the DuckDB [`MergeMode`] that resolves one
 /// output column's FD conflict (the `ON CONFLICT` clause). Recognizes:
 ///   - `Old` / `AssertEq`         => keep the existing value
 ///   - `New`                      => keep the new value
-///   - `UnionId` / `UnionIntoUf`  => lattice-min (the union-find leader). DuckDB does not support
-///     `--native-merge` (rejected at the CLI), so `UnionIntoUf` never actually reaches here; it is
-///     mapped like `UnionId` for completeness.
+///   - `UnionId` / `UnionIntoUf`  => lattice-min (the union-find leader). Reachable under
+///     `--native-merge --duckdb` only via the constructor congruence view, whose union is routed
+///     through the in-core UF; mapped like `UnionId` for completeness.
 ///   - `Primitive(ordering-min)`  => `Min` (the term encoder's `@UF_<Sort>f` index).
+///   - a VALUE-FOLD `Primitive` tree (`--native-merge`) => `Fold(sql)`, the fold run NATIVELY
+///     in-SQL (see [`mergefn_to_sql`]). Falls back to `Old` if the fold cannot be translated.
 ///   - `OldCol(_)`                => keep the existing value
 ///   - `NewCol(_)`                => keep the new value
 ///   - everything else            => `Old` (complex merges are gated out by
 ///     `supports_complex_merge` = false).
+///
+/// `table` is the function's table name and `out_col` is its output column index
+/// (`inputs_len`); together they reference the existing (`"<table>".c{out_col}`) /
+/// incoming (`EXCLUDED.c{out_col}`) value in a `Fold` (see [`mergefn_to_sql`] for why
+/// the existing reference must be table-qualified).
 fn duck_merge_mode_scalar(
     merge: &MergeFn,
+    table: &str,
+    out_col: usize,
     funcs: &external_func::DuckdbExternalFuncRegistry,
 ) -> MergeMode {
     match merge {
         MergeFn::Old | MergeFn::AssertEq => MergeMode::Old,
         MergeFn::New => MergeMode::New,
         // `UnionIntoParentTable` is the bridge-only RELATIONAL native-merge merge
-        // (`--native-merge` without `--native-uf`); DuckDB rejects `--native-merge`
-        // entirely, so this never reaches it, but the surviving value is the min.
+        // (`--native-merge` without `--native-uf`); DuckDB always pairs
+        // `--native-merge` with `--native-uf`, so this never reaches it, but the
+        // surviving value is the min.
         MergeFn::UnionId | MergeFn::UnionIntoUf(_) | MergeFn::UnionIntoParentTable { .. } => {
             MergeMode::Min
         }
         MergeFn::Primitive(ext_id, _) => match funcs.name(*ext_id) {
+            // `ordering-min` is the term encoder's `@UF_<Sort>f` index: keep the
+            // dedicated `Min` mode (byte-identical UF path), not a `Fold(LEAST(...))`.
             Some("ordering-min") => MergeMode::Min,
-            _ => MergeMode::Old,
+            // Any other top-level primitive is a VALUE-FOLD custom `:merge`. Walk it
+            // into SQL; if every node translates, run it NATIVELY in-SQL via `Fold`.
+            // Otherwise fall back to `Old` (the frontend keeps the rule encoding
+            // when `supports_value_fold_merge` would have produced this only under
+            // `--native-merge`; an untranslatable fold is rare and `Old` is safe).
+            _ => match mergefn_to_sql(merge, table, out_col, funcs) {
+                Some(sql) => MergeMode::Fold(sql),
+                None => MergeMode::Old,
+            },
         },
         MergeFn::OldCol(_) => MergeMode::Old,
         MergeFn::NewCol(_) => MergeMode::New,
@@ -127,8 +209,9 @@ fn duck_merge_mode_scalar(
         MergeFn::Columns(_) => unreachable!("duck_merge_mode_scalar called on a Columns merge"),
         // `Seq` / `TableInsert` / `Construct` / `IfEq` are the bridge-only
         // `:merge`-multiple-actions variants (PR #933 + the term-build guard);
-        // DuckDB has no multi-action merge support, so they never reach this
-        // backend.
+        // DuckDB has no multi-action merge support (term-build `:merge` still
+        // rule-encodes via `supports_term_build_merge` = false), so they never
+        // reach this backend.
         MergeFn::Seq(_)
         | MergeFn::TableInsert(..)
         | MergeFn::Construct(..)
@@ -145,20 +228,26 @@ fn duck_merge_mode_scalar(
 /// one inner column's mode. DuckDB's `ON CONFLICT` model resolves a single output column, so a
 /// genuine multi-value `Columns` (len > 1) — a tuple-output function — cannot be expressed and is
 /// a clean, documented error. (Tuple-output views are a later step; DuckDB never receives them.)
+///
+/// `table` is the function's table name and `out_col` its output column index
+/// (`inputs_len`), threaded so a value-fold merge can reference the existing
+/// (`"<table>".c{out_col}`) / incoming (`EXCLUDED.c{out_col}`) value.
 fn duck_merge_mode(
     merge: &MergeFn,
+    table: &str,
+    out_col: usize,
     funcs: &external_func::DuckdbExternalFuncRegistry,
 ) -> MergeMode {
     match merge {
         MergeFn::Columns(cols) => match cols.as_slice() {
-            [single] => duck_merge_mode_scalar(single, funcs),
+            [single] => duck_merge_mode_scalar(single, table, out_col, funcs),
             _ => panic!(
                 "DuckDB backend does not support tuple-output (multi-value) merges \
                  (a {}-column `Columns` merge)",
                 cols.len()
             ),
         },
-        other => duck_merge_mode_scalar(other, funcs),
+        other => duck_merge_mode_scalar(other, table, out_col, funcs),
     }
 }
 
@@ -647,7 +736,12 @@ impl Backend for EGraph {
                 // Map the merge mode the same way the Fail/Const arm does; the
                 // term encoder declares `@UF_Sf` with `:merge (ordering-min …)`
                 // (a `Primitive` referencing `ordering-min`) => `MergeMode::Min`.
-                let merge_mode = duck_merge_mode(&config.merge, &self.backend_external_funcs);
+                let merge_mode = duck_merge_mode(
+                    &config.merge,
+                    &name,
+                    duck_cols.len() - 1,
+                    &self.backend_external_funcs,
+                );
                 let inputs = &duck_cols[..duck_cols.len() - 1];
                 let output = duck_cols[duck_cols.len() - 1];
                 let r = self.add_function(&name, inputs, output, merge_mode);
@@ -672,8 +766,15 @@ impl Backend for EGraph {
                 // function-form union-find table (`@UF_<Sort>f`), lowered to a
                 // `Primitive` referencing the `ordering-min` external => `Min`.
                 // Without recognizing it the duckdb conflict clause would fall back
-                // to `DO NOTHING`, silently dropping UFf upserts.
-                let merge_mode = Some(duck_merge_mode(&config.merge, &self.backend_external_funcs));
+                // to `DO NOTHING`, silently dropping UFf upserts. The output column
+                // index is `duck_cols.len() - 1`; `saturating_sub` guards the
+                // 0-column (nullary relation) case below, where the mode is unused.
+                let merge_mode = Some(duck_merge_mode(
+                    &config.merge,
+                    &name,
+                    duck_cols.len().saturating_sub(1),
+                    &self.backend_external_funcs,
+                ));
 
                 // Detect Unit output: schema's last entry is
                 // `ColumnTy::Base(id)` where `id` matches the pool's
@@ -1259,6 +1360,33 @@ impl Backend for EGraph {
     }
 
     fn supports_complex_merge(&self) -> bool {
+        false
+    }
+
+    /// `--native-merge` VALUE-FOLD: DuckDB runs a pure value-fold custom `:merge`
+    /// (a fold of primitives / literals over `old`/`new` that yields a plain value,
+    /// e.g. `(from-string (to-string (* new old)))`) NATIVELY in-SQL: the frontend
+    /// lowers the body to a `MergeFn` tree of `Primitive`/`Const`/`Old`/`New`,
+    /// `add_table` walks it into a SQL scalar expression (`mergefn_to_sql`), and the
+    /// table's `ON CONFLICT DO UPDATE SET c{out} = <expr>` resolves the FD conflict
+    /// in-SQL. The output is NOT an eq-sort (a plain value — no congruence cascade),
+    /// so this is pure SQL. `supports_complex_merge` stays `false` (it gates the
+    /// bridge's value-fold-via-callback path that DuckDB does not use) — this split
+    /// capability enables the native value-fold path. Mirrors FlowLog/Feldera (but
+    /// in-SQL, not via a host interpreter).
+    fn supports_value_fold_merge(&self) -> bool {
+        true
+    }
+
+    /// DuckDB has NO native constructor-congruence wiring: it leaves
+    /// `register_native_merge_view` at the no-op default and has no host-pass that
+    /// unions colliding eclasses inline. So under `--native-merge` (which DuckDB
+    /// enables for value-fold merges), constructor congruence must stay RULE-ENCODED
+    /// — otherwise the FD-keyed `@<C>View` would be declared with a `UnionId`/`Min`
+    /// congruence merge that the no-op registration never executes (and, under the
+    /// implied `--native-uf`, the view is mis-registered as a `@UF_Sf` index and
+    /// panics deriving its `pname`). Returning `false` keeps the congruence rules.
+    fn supports_native_congruence_merge(&self) -> bool {
         false
     }
 

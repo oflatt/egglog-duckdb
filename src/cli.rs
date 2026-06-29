@@ -197,19 +197,21 @@ pub fn cli(mut egraph: EGraph) {
     //    is the path the FlowLog/Feldera backends use (each injects the union on
     //    FD-conflict via the UF-backed function).
     //
-    // The DuckDB backend supports neither, so reject it there. The FlowLog and
-    // Feldera backends require the UF-backed routing, so `--native-merge` on those
-    // implies `--native-uf` (their relational-UF native-merge path is not wired
-    // up). On the native bridge, `--native-merge` alone uses the relational UF;
-    // `--native-merge --native-uf` keeps the original UF-backed path intact.
-    if args.native_merge {
-        if args.duckdb_backend {
-            log::error!("--native-merge is not supported with --duckdb");
-            std::process::exit(1);
-        }
-        if args.flowlog_backend || args.feldera_backend {
-            args.native_uf = true;
-        }
+    // The FlowLog, Feldera, AND DuckDB backends require the UF-backed routing for
+    // congruence (their relational-UF native-merge path is not wired up), so
+    // `--native-merge` on those implies `--native-uf`. On the native bridge,
+    // `--native-merge` alone uses the relational UF; `--native-merge --native-uf`
+    // keeps the original UF-backed path intact.
+    //
+    // On DuckDB, `--native-merge` enables a VALUE-FOLD custom `:merge` (a pure
+    // fold of primitives over `old`/`new` that yields a plain value, e.g.
+    // `(from-string (to-string (* new old)))`) to run NATIVELY in-SQL via
+    // `ON CONFLICT DO UPDATE SET c{out} = <fold-expr>` (`supports_value_fold_merge`
+    // = true), instead of downgrading to the rule-encoded `@merge_rule`. Term-build
+    // custom `:merge` (e-node minting on an eq-sort output) is NOT yet supported on
+    // DuckDB and still rule-encodes (`supports_term_build_merge` = false).
+    if args.native_merge && (args.flowlog_backend || args.feldera_backend || args.duckdb_backend) {
+        args.native_uf = true;
     }
 
     // The experimental backends are mutually exclusive: each swaps in a
@@ -436,6 +438,14 @@ pub fn cli(mut egraph: EGraph) {
                 });
                 if args.native_uf {
                     duck_eg = duck_eg.with_native_uf();
+                }
+                // `--native-merge --duckdb`: switch the freshly-built duckdb egraph's
+                // encoder to the FD-keyed view + native value-fold `:merge`. Must be
+                // set on `duck_eg` (the egraph that runs the program). The
+                // egglog-experimental binary instead pre-builds the duckdb egraph and
+                // reaches `with_native_merge` via the `has_duckdb_backend()` path above.
+                if args.native_merge {
+                    duck_eg = duck_eg.with_native_merge();
                 }
                 duck_eg.parser = std::mem::take(&mut egraph.parser);
                 duck_eg.fact_directory.clone_from(&args.fact_directory);
