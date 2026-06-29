@@ -77,6 +77,17 @@ impl<K: Eq + Hash + Clone, V: NumericId> InternTable<K, V> {
         }
     }
 
+    /// Number of interned values. Used by checked-unwrap paths (e.g. the DuckDB
+    /// backend) to validate a handle before indexing rather than panicking.
+    pub fn len(&self) -> usize {
+        self.vals.read().len()
+    }
+
+    /// Whether the table is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn get_cloned(&self, v: V) -> K {
         self.vals.read()[v.index()].clone()
     }

@@ -59,6 +59,23 @@ impl DuckdbBaseValuePool {
     pub fn inner_mut(&mut self) -> &mut BaseValues {
         &mut self.values
     }
+
+    /// Whether `val` is a VALID handle for the boxed (`Boxed<…>`) type `ty` — i.e.
+    /// its raw index is within the backing intern table. Used by the value-fold
+    /// merge UDFs to skip a garbage handle (returning SQL NULL) instead of
+    /// panicking on an out-of-bounds intern-table lookup. DuckDB evaluates an
+    /// `ON CONFLICT DO UPDATE SET` over the WHOLE inserted chunk — including
+    /// non-conflicting rows whose existing-row columns are uninitialized — and
+    /// discards the result for those rows; a chained pool-handle UDF would
+    /// otherwise read that uninitialized memory as a handle and crash. Returns
+    /// `true` for unboxable types (the handle IS the value; no table to bound).
+    pub fn handle_in_range(&self, ty: BaseValueId, val: Value) -> bool {
+        use egglog_numeric_id::NumericId;
+        match self.values.intern_table_len_by_id(ty) {
+            Some(len) => (val.rep() as usize) < len,
+            None => true,
+        }
+    }
 }
 
 impl BaseValuePool for DuckdbBaseValuePool {

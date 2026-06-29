@@ -999,6 +999,7 @@ impl<'a> ProofInstrumentor<'a> {
         // proof the `@congruence_rule*` self-join would). The `proofs_enabled`
         // case is discriminated downstream via `is_native_merge_proof_view`.
         let native_congruence_view = self.native_merge()
+            && self.egraph.backend.supports_native_congruence_merge()
             && fdecl.subtype == FunctionSubtype::Constructor
             && fdecl.resolved_schema.output().is_eq_sort()
             && !schema.input.is_empty();

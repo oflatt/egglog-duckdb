@@ -790,6 +790,25 @@ pub trait Backend: Send + Sync {
         self.supports_complex_merge()
     }
 
+    /// Whether this backend can do CONSTRUCTOR congruence INLINE via a native
+    /// merge — the `--native-merge` FD-keyed `@<C>View (children) -> eclass` whose
+    /// `UnionId`/`UnionIntoUf` merge unions colliding eclasses at insert time,
+    /// dropping the `@congruence_rule*` self-join. Gates
+    /// `EncodeContext::native_congruence_view`: when `false`, constructor congruence
+    /// stays RULE-ENCODED even under `--native-merge` (so a backend can enable
+    /// `--native-merge` purely for value-fold merges without taking the congruence
+    /// path it cannot execute).
+    ///
+    /// Defaults to `true` so the bridge / flowlog / feldera backends are unchanged
+    /// (they wire `register_native_merge_view` + a host-pass rebuild). DuckDB
+    /// overrides this to `false`: it has no native congruence wiring
+    /// (`register_native_merge_view` is the no-op default), so under
+    /// `--native-merge` only value-fold merges run natively; constructor congruence
+    /// keeps the rule encoding.
+    fn supports_native_congruence_merge(&self) -> bool {
+        true
+    }
+
     /// Whether this backend supports `Vec` / `Set` / `Map` / `MultiSet`
     /// container sorts.
     ///

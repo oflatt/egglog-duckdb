@@ -121,12 +121,19 @@ impl VScalar for FromStringScalar {
             let mut results: Vec<Option<i64>> = Vec::with_capacity(n);
             for i in 0..n {
                 let handle = Value::new(in_slice[i] as u32);
+                // A garbage (out-of-range) handle => `None` => SQL NULL for this
+                // row (a discarded speculative `ON CONFLICT` row); real handles
+                // unwrap normally.
+                if !state.pool.handle_in_range(string_ty, handle) {
+                    results.push(None);
+                    continue;
+                }
                 let boxed = state.pool.unwrap_dyn(string_ty, handle);
-                let s_boxed: &egglog_core_relations::Boxed<String> = boxed
-                    .downcast_ref()
-                    .ok_or_else(|| -> Box<dyn std::error::Error> {
-                        "FromStringScalar: handle did not refer to a Boxed<String>".into()
-                    })?;
+                let Some(s_boxed) = boxed.downcast_ref::<egglog_core_relations::Boxed<String>>()
+                else {
+                    results.push(None);
+                    continue;
+                };
                 // Mirror the bridge's `-?>` semantics: parse failure
                 // means the rule firing should not produce a value.
                 // Encode as NULL so downstream actions/filters drop
@@ -801,23 +808,26 @@ fn run_bigint(op: BigintOp, a: &num::BigInt, b: &num::BigInt) -> Option<num::Big
     })
 }
 
-/// Unwrap a `Z`-handle (BIGINT) row into a `BigInt`.
+/// Unwrap a `Z`-handle (BIGINT) row into a `BigInt`. Returns `None` for an
+/// OUT-OF-RANGE handle — a garbage value DuckDB's speculative `ON CONFLICT`
+/// evaluation can hand us for discarded (non-conflicting) rows — so the caller
+/// emits SQL NULL for that row instead of crashing on an out-of-bounds pool
+/// lookup. A legitimately-stored handle is always in range, so real values are
+/// unaffected.
 fn unwrap_bigint(
     pool: &base_values::DuckdbBaseValuePool,
     bigint_ty: egglog_backend_trait::BaseValueId,
     raw: i64,
-) -> std::result::Result<num::BigInt, Box<dyn std::error::Error>> {
+) -> Option<num::BigInt> {
     use egglog_backend_trait::{BaseValuePool, Value};
     use egglog_numeric_id::NumericId;
     let val = Value::new(raw as u32);
+    if !pool.handle_in_range(bigint_ty, val) {
+        return None;
+    }
     let boxed = pool.unwrap_dyn(bigint_ty, val);
-    let z: &egglog_core_relations::Boxed<num::BigInt> =
-        boxed
-            .downcast_ref()
-            .ok_or_else(|| -> Box<dyn std::error::Error> {
-                "expected Boxed<BigInt> from pool".into()
-            })?;
-    Ok(z.0.clone())
+    let z: &egglog_core_relations::Boxed<num::BigInt> = boxed.downcast_ref()?;
+    Some(z.0.clone())
 }
 
 /// UDF for binary `Z × Z → Z` bigint operations. Variants of
@@ -843,14 +853,19 @@ impl VScalar for BigintBinaryScalar {
 
             let mut results: Vec<Option<i64>> = Vec::with_capacity(n);
             for i in 0..n {
-                let a = unwrap_bigint(&state.pool, state.bigint_ty, a_slice[i])?;
-                let b = unwrap_bigint(&state.pool, state.bigint_ty, b_slice[i])?;
-                results.push(run_bigint(state.op, &a, &b).map(|r| {
-                    let boxed = egglog_core_relations::Boxed::new(r);
-                    state
-                        .pool
-                        .intern_dyn(state.bigint_ty, Box::new(boxed))
-                        .rep() as i64
+                // A garbage (out-of-range) handle => `None` => SQL NULL for this
+                // row (a discarded speculative `ON CONFLICT` row); real handles
+                // unwrap normally.
+                let ab = unwrap_bigint(&state.pool, state.bigint_ty, a_slice[i])
+                    .zip(unwrap_bigint(&state.pool, state.bigint_ty, b_slice[i]));
+                results.push(ab.and_then(|(a, b)| {
+                    run_bigint(state.op, &a, &b).map(|r| {
+                        let boxed = egglog_core_relations::Boxed::new(r);
+                        state
+                            .pool
+                            .intern_dyn(state.bigint_ty, Box::new(boxed))
+                            .rep() as i64
+                    })
                 }));
             }
             let mut out_vec = output.flat_vector();
@@ -1170,17 +1185,32 @@ impl VScalar for BigIntToStringScalar {
             let n = input.len();
             let in_vec = input.flat_vector(0);
             let in_slice = in_vec.as_slice_with_len::<i64>(n);
+            // Collect results first: a garbage (out-of-range) handle => `None` =>
+            // SQL NULL (a discarded speculative `ON CONFLICT` row), never a crash.
+            let mut results: Vec<Option<i64>> = Vec::with_capacity(n);
+            for &raw in in_slice.iter().take(n) {
+                let val = Value::new(raw as u32);
+                let r = if state.pool.handle_in_range(bigint_ty, val) {
+                    let boxed = state.pool.unwrap_dyn(bigint_ty, val);
+                    boxed
+                        .downcast_ref::<egglog_core_relations::Boxed<num::BigInt>>()
+                        .map(|z| intern_string(&state.pool, state.string_ty, z.0.to_string()))
+                } else {
+                    None
+                };
+                results.push(r);
+            }
             let mut out_vec = output.flat_vector();
-            let out_slice = out_vec.as_mut_slice::<i64>();
-            for i in 0..n {
-                let val = Value::new(in_slice[i] as u32);
-                let boxed = state.pool.unwrap_dyn(bigint_ty, val);
-                let z: &egglog_core_relations::Boxed<num::BigInt> = boxed
-                    .downcast_ref()
-                    .ok_or_else(|| -> Box<dyn std::error::Error> {
-                        "BigIntToStringScalar: handle not a Boxed<BigInt>".into()
-                    })?;
-                out_slice[i] = intern_string(&state.pool, state.string_ty, z.0.to_string());
+            {
+                let out_slice = out_vec.as_mut_slice::<i64>();
+                for (i, r) in results.iter().enumerate() {
+                    out_slice[i] = r.unwrap_or(0);
+                }
+            }
+            for (i, r) in results.iter().enumerate() {
+                if r.is_none() {
+                    out_vec.set_null(i);
+                }
             }
             Ok(())
         }
@@ -1667,7 +1697,11 @@ impl egglog_core_relations::BaseValue for DuckPairMarker {}
 
 /// Merge mode for functions with outputs. Mirrors egglog's
 /// `:merge old` / `:merge new` keywords.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// No longer `Copy`: the `Fold` variant carries an owned SQL string. All call
+/// sites move or borrow it (the `== Some(MergeMode::Min)` comparison still works
+/// via `PartialEq`).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeMode {
     /// First-set wins. `ON CONFLICT DO NOTHING`.
     Old,
@@ -1678,6 +1712,13 @@ pub enum MergeMode {
     /// smallest known representative for each input, letting
     /// singleparent skip its pairwise self-join.
     Min,
+    /// Native VALUE-FOLD custom `:merge` (`--native-merge`): a pure-primitive fold
+    /// over `old`/`new` (e.g. `(from-string (to-string (* new old)))`) compiled to
+    /// a SQL scalar expression over the existing row (`c{out}`) and the incoming
+    /// row (`EXCLUDED.c{out}`). Resolved in-SQL via
+    /// `ON CONFLICT DO UPDATE SET c{out} = <expr>, ts = EXCLUDED.ts`. The stored
+    /// string is the fully-built `<expr>` (see [`mergefn_to_sql`]).
+    Fold(String),
 }
 
 /// A literal value usable in seed inserts and `check`/`lookup`.
@@ -4476,7 +4517,7 @@ pub(crate) fn conflict_clause(info: &FunctionInfo) -> String {
         // ID), drop quietly.
         return "ON CONFLICT DO NOTHING".to_string();
     }
-    match info.merge {
+    match &info.merge {
         None => "ON CONFLICT DO NOTHING".to_string(),
         Some(MergeMode::Old) => "ON CONFLICT DO NOTHING".to_string(),
         Some(MergeMode::New) => {
@@ -4491,6 +4532,14 @@ pub(crate) fn conflict_clause(info: &FunctionInfo) -> String {
             format!(
                 "ON CONFLICT DO UPDATE SET c{out_col} = LEAST(c{out_col}, EXCLUDED.c{out_col}), ts = EXCLUDED.ts"
             )
+        }
+        Some(MergeMode::Fold(sql)) => {
+            // Native VALUE-FOLD custom `:merge`: the fold expression `sql` was
+            // built by `mergefn_to_sql` over `c{out}` (the existing row) and
+            // `EXCLUDED.c{out}` (the incoming row), so it resolves the FD conflict
+            // in-SQL directly.
+            let out_col = info.inputs_len;
+            format!("ON CONFLICT DO UPDATE SET c{out_col} = {sql}, ts = EXCLUDED.ts")
         }
     }
 }
