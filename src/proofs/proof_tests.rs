@@ -237,6 +237,45 @@ mod tests {
             .unwrap();
     }
 
+    // KNOWN GAP: a container's reflexive `<CSort>Proof` is anchored only during
+    // rebuild, not at creation (unlike eq-sort terms). So a rule body that
+    // produces a *newly-created* container via a primitive and needs its proof
+    // in the same iteration fails -- the action lookup of the container's term
+    // proof has no row yet. Contrast
+    // `proof_mode_allows_eq_container_primitive_results_in_facts`, which uses an
+    // already-anchored container. This test pins the current (failing)
+    // behavior; flip it to assert success once the gap is fixed.
+    #[test]
+    fn proof_mode_new_container_primitive_result_in_fact_is_unsupported() {
+        let mut egraph = EGraph::new_with_proofs();
+        let err = egraph
+            .parse_and_run_program(
+                None,
+                r#"
+                (datatype E (Mk))
+                (sort EqContainer (Vec E))
+                (relation SeedElem (E))
+                (relation Done ())
+
+                (SeedElem (Mk))
+
+                (rule ((SeedElem e)
+                       (= xs (vec-of e)))
+                      ((Done))
+                      :name "new-container-in-body")
+
+                (run 1)
+                (prove (Done))
+                "#,
+            )
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("lookup of function"),
+            "expected a container term-proof lookup failure, got: {msg}"
+        );
+    }
+
     #[test]
     fn doc_example_add_function2() {
         let commands = term_encode(
