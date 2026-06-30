@@ -1,21 +1,20 @@
 # Herbie-generated egglog programs
 
-`dumps.tar.zst` contains **1260 egglog programs** that
+`dumps/` contains **1260 egglog programs** that
 [Herbie 2.3](https://github.com/herbie-fp/herbie/tree/main) emits when
 processing its standard benchmark suite (`bench/`) with the egglog backend
-enabled. Each `.egg` file inside the tarball is one egglog session that
+enabled. Each `.egg` file in the directory is one egglog session that
 Herbie spawned for a single rewriting stage of a single benchmark input.
 
 ```
-$ tar -tf dumps.tar.zst | head -3
-dump-egglog/
-dump-egglog/rewrite0.egg
-dump-egglog/rewrite1.egg
+$ ls dumps/ | head -3
+rewrite0.egg
+rewrite1.egg
+rewrite2.egg
 ```
 
-Compressed size: ~2.8 MB (151 MB uncompressed). The prelude — datatype `M`
-with ~120 constructor declarations and the bulk of the rewrite ruleset — is
-identical across files, so zstd hits ~2% ratio.
+The prelude — datatype `M` with ~120 constructor declarations and the bulk
+of the rewrite ruleset — is identical across files.
 
 ## How they were generated
 
@@ -45,7 +44,7 @@ Herbie hit the per-input 60-second budget (`[TIMEOUT]` / `[CRASH]` lines in
 `herbie-run.log`) — egglog received those programs but the wider Herbie run
 was aborted. Those dumps were dropped (see "Filtering" below) and only the
 **1260** corresponding to the **314 successfully-completed benchmarks** are
-in the tarball.
+in `dumps/`.
 
 ## Filtering
 
@@ -59,7 +58,7 @@ window were kept; everything else (timeouts, crashes, post-last-benchmark
 tail) was discarded.
 
 The Herbie log we used (`herbie-run.log`) is checked in alongside the
-tarball so this reasoning is reproducible.
+dumps so this reasoning is reproducible.
 
 ## ⚠ Compatibility — these are NOT mainline-egglog programs
 
@@ -89,8 +88,7 @@ or run`.
 To run a session through egglog-experimental:
 
 ```bash
-tar -xf dumps.tar.zst -C /tmp/
-egglog-experimental /tmp/dump-egglog/rewrite0.egg
+egglog-experimental dumps/rewrite0.egg
 ```
 
 To run through this repo's mainline egglog the experimental forms have to be

@@ -12,7 +12,7 @@ term-encoding, proofs} grid. Revisit later.
   (see `paper-benchmarks/README.md`: the 2 GB `benchmark-input/` is omitted).
   Panics on the missing file. Out of scope until the inputs are fetched.
 
-- **Herbie dumps** (`herbie/dump-egglog/dumps.tar.zst`, 1260 files) split into
+- **Herbie dumps** (`herbie/dump-egglog/dumps`, 1260 files) split into
   two kinds:
   - **`taylor*`** — no `let`-globals, no `multi-extract` → **run across all 6
     conditions** today. This is the portion that exercises the full grid.
@@ -36,7 +36,7 @@ dump fails with:
 **Repro:**
 ```
 target/debug/egglog-experimental --term-encoding \
-  paper-benchmarks/herbie/dump-egglog/dumps.extracted/dump-egglog/rewrite1050.egg
+  paper-benchmarks/herbie/dump-egglog/dumps/rewrite1050.egg
 ```
 
 **Cause (hypothesis):** the dumps bind globals with `(let $0 (bigrat …))`.
@@ -89,9 +89,9 @@ cover extraction-terminated programs and benchmark proofs on the rest.
 To get clean full-grid numbers now, run a **taylor-only** sample, e.g.:
 
 ```
-# after extracting once, point at a taylor subset:
+# point at the committed dumps dir (or sample100/) for a taylor subset:
 python3 eval/bench_backends.py \
-  paper-benchmarks/herbie/dump-egglog/dumps.extracted/dump-egglog \
+  paper-benchmarks/herbie/dump-egglog/dumps \
   --limit 25   # NOTE: sorted, so this hits rewrite* first; filter to taylor* instead
 ```
 (A `--filter taylor` style option would help — not yet implemented.)

@@ -53,10 +53,13 @@ and emits `errorhist.pdf` / `runtime.pdf`.
 Today's upstream Herbie supports egglog directly via the
 `--enable generate:egglog` flag, and `--enable dump:egglog` makes it write
 every egglog session to a file. We ran Herbie 2.3 over `bench/` with both
-flags and packaged the **1260 sessions from successfully-completed
+flags and committed the **1260 sessions from successfully-completed
 benchmarks** (314 of 730 — Herbie's 60-second per-input budget timed out
-the rest) into
-[`dump-egglog/dumps.tar.zst`](dump-egglog/dumps.tar.zst). See
+the rest) as individual `.egg` files under
+[`dump-egglog/dumps/`](dump-egglog/dumps) (run the full corpus with
+`--path paper-benchmarks/herbie/dump-egglog/dumps`); a curated 100-file
+subset lives in [`sample100/`](sample100) (run it with
+`--path paper-benchmarks/herbie/sample100`). See
 [`dump-egglog/README.md`](dump-egglog/README.md) for regeneration steps and
 the compatibility caveat — these sessions use
 `egglog-experimental` features (`let-scheduler`, `back-off`, `run-with`,

@@ -27,9 +27,10 @@ parse while mainline benchmarks run unchanged.
 ## The paper benchmark corpus
 
 - **math-microbenchmark/math_full.egg** — runs (slow under duckdb/proofs).
-- **herbie dumps** (`herbie/dump-egglog/dumps.tar.zst`, 1260 files) — run via
-  egglog-experimental. Point `--path` at the tarball; it's auto-extracted to a
-  sibling `.extracted/` dir (gitignored). Use `--limit N` to sample.
+- **herbie dumps** (`herbie/dump-egglog/dumps/`, 1260 committed files) — run via
+  egglog-experimental. Point `--path` at the directory. Use `--limit N` to
+  sample, or point `--path` at the curated `herbie/sample100/` subset (100
+  committed files).
 - **pointer-analysis/main.egg** — *excluded*: it `(input …)`s cclyzer++ CSV
   facts that aren't redistributed in this repo, so it can't run standalone.
 
@@ -46,8 +47,11 @@ python3 eval/bench_backends.py tests/ --timeout 300 --runs 3 --warmup 1
 # default corpus is tests/, so this is equivalent and also opens the viewer:
 python3 eval/bench_backends.py --serve
 
-# the Herbie dumps (auto-extracted from the tarball), sampling 20:
-python3 eval/bench_backends.py paper-benchmarks/herbie/dump-egglog/dumps.tar.zst --limit 20
+# the Herbie dumps (1260 committed files), sampling 20:
+python3 eval/bench_backends.py paper-benchmarks/herbie/dump-egglog/dumps --limit 20
+
+# the curated 100-file subset:
+python3 eval/bench_backends.py paper-benchmarks/herbie/sample100
 
 # point it at any file or directory:
 python3 eval/bench_backends.py tests/web-demo --runs 3 --warmup 1
