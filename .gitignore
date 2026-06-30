@@ -18,6 +18,8 @@ _scratch.egg
 *.dot
 *.svg
 *.DS_Store
+# macOS AppleDouble sidecar files (the Herbie dump tarball was created on macOS)
+._*
 
 # racket
 scripts/compiled

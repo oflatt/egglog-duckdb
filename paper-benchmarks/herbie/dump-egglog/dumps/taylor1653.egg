@@ -1,0 +1,2952 @@
+(datatype
+ M
+ (Num BigRat :cost 4294967295)
+ (Var String :cost 4294967295)
+ (Sound-/ M M M :cost 4294967295)
+ (Sound-Log M M :cost 4294967295)
+ (Sound-Pow M M M :cost 4294967295)
+ (Array M M :cost 4294967295)
+ (Array3 M M M :cost 4294967295)
+ (Neq M M :cost 4294967295)
+ (Mul M M :cost 4294967295)
+ (Add M M :cost 4294967295)
+ (Sub M M :cost 4294967295)
+ (Div M M :cost 4294967295)
+ (Lt M M :cost 4294967295)
+ (Lte M M :cost 4294967295)
+ (Eq M M :cost 4294967295)
+ (Gt M M :cost 4294967295)
+ (Gte M M :cost 4294967295)
+ (E :cost 4294967295)
+ (False :cost 4294967295)
+ (Infinity :cost 4294967295)
+ (Nan :cost 4294967295)
+ (Pi :cost 4294967295)
+ (True :cost 4294967295)
+ (Acos M :cost 4294967295)
+ (Acosh M :cost 4294967295)
+ (And M M :cost 4294967295)
+ (Asin M :cost 4294967295)
+ (Asinh M :cost 4294967295)
+ (Assert M :cost 4294967295)
+ (Atan M :cost 4294967295)
+ (Atan2 M M :cost 4294967295)
+ (Atanh M :cost 4294967295)
+ (Cast M :cost 4294967295)
+ (Cbrt M :cost 4294967295)
+ (Ceil M :cost 4294967295)
+ (Copysign M M :cost 4294967295)
+ (Cos M :cost 4294967295)
+ (Cosh M :cost 4294967295)
+ (Erf M :cost 4294967295)
+ (Erfc M :cost 4294967295)
+ (Error M :cost 4294967295)
+ (Exp M :cost 4294967295)
+ (Exp2 M :cost 4294967295)
+ (Expm1 M :cost 4294967295)
+ (Fabs M :cost 4294967295)
+ (Fdim M M :cost 4294967295)
+ (Floor M :cost 4294967295)
+ (Fma M M M :cost 4294967295)
+ (Fmax M M :cost 4294967295)
+ (Fmin M M :cost 4294967295)
+ (Fmod M M :cost 4294967295)
+ (Hypot M M :cost 4294967295)
+ (If M M M :cost 4294967295)
+ (Lgamma M :cost 4294967295)
+ (Log M :cost 4294967295)
+ (Log10 M :cost 4294967295)
+ (Log1p M :cost 4294967295)
+ (Log2 M :cost 4294967295)
+ (Logb M :cost 4294967295)
+ (Neg M :cost 4294967295)
+ (Not M :cost 4294967295)
+ (Or M M :cost 4294967295)
+ (Pow M M :cost 4294967295)
+ (Pow2 M :cost 4294967295)
+ (Ref M M :cost 4294967295)
+ (Remainder M M :cost 4294967295)
+ (Rint M :cost 4294967295)
+ (Round M :cost 4294967295)
+ (Sin M :cost 4294967295)
+ (Sinh M :cost 4294967295)
+ (Sqrt M :cost 4294967295)
+ (Tan M :cost 4294967295)
+ (Tanh M :cost 4294967295)
+ (Tgamma M :cost 4294967295)
+ (Then M :cost 4294967295)
+ (Trunc M :cost 4294967295))
+(datatype
+ MTy
+ (Num_arr_3_sym_binary32 BigRat :cost 375)
+ (Num_arr_2_sym_binary32 BigRat :cost 250)
+ (Num_arr_2_arr_2_sym_binary64 BigRat :cost 250)
+ (Num_arr_3_sym_binary64 BigRat :cost 375)
+ (Num_arr_2_sym_binary64 BigRat :cost 250)
+ (Num_sym_binary64 BigRat :cost 125)
+ (Num_sym_binary32 BigRat :cost 125)
+ (Var_arr_3_sym_binary32 String :cost 0)
+ (Var_arr_2_sym_binary32 String :cost 0)
+ (Var_arr_2_arr_2_sym_binary64 String :cost 0)
+ (Var_sym_bool String :cost 0)
+ (Var_arr_3_sym_binary64 String :cost 0)
+ (Var_arr_2_sym_binary64 String :cost 0)
+ (Var_sym_binary64 String :cost 0)
+ (Var_sym_binary32 String :cost 0)
+ (Approx M MTy)
+ (Atan2f32Ty MTy MTy :cost 2000)
+ (Ef32Ty :cost 125)
+ (Mulf32Ty MTy MTy :cost 250)
+ (Cbrtf64Ty MTy :cost 2000)
+ (Sinhf32Ty MTy :cost 1750)
+ (NotTy MTy :cost 100)
+ (Log10f32Ty MTy :cost 1175)
+ (Asinf32Ty MTy :cost 500)
+ (Ltf32Ty MTy MTy :cost 125)
+ (First-ElementTy MTy :cost 325)
+ (Sqrtf64Ty MTy :cost 250)
+ (Fdimf64Ty MTy MTy :cost 750)
+ (Weighted-ComboTy MTy MTy :cost 1100)
+ (Lgammaf64Ty MTy :cost 2250)
+ (Re_sqrTy MTy MTy :cost 700)
+ (Nested-LiteralTy :cost 1900)
+ (Negf32Ty MTy :cost 125)
+ (Log1pf64Ty MTy :cost 1300)
+ (Fminf32Ty MTy MTy :cost 250)
+ (Pairwise-SumTy MTy MTy :cost 1950)
+ (Copy-VectorTy MTy :cost 900)
+ (Rintf64Ty MTy :cost 300)
+ (Subf32Ty MTy MTy :cost 200)
+ (Array2f64Ty MTy MTy :cost 250)
+ (Array3f64Ty MTy MTy MTy :cost 375)
+ (Cbrtf32Ty MTy :cost 2000)
+ (Fmaxf64Ty MTy MTy :cost 250)
+ (Fmodf64Ty MTy MTy :cost 1750)
+ (Infinityf32Ty :cost 125)
+ (Log10f64Ty MTy :cost 1175)
+ (Cosf64Ty MTy :cost 4200)
+ (Fmaxf32Ty MTy MTy :cost 250)
+ (Sinhf64Ty MTy :cost 1750)
+ (Truncf32Ty MTy :cost 275)
+ (Tanhf64Ty MTy :cost 1000)
+ (Dot-Product-2DTy MTy MTy :cost 2000)
+ (Subf64Ty MTy MTy :cost 200)
+ (Fabsf64Ty MTy :cost 125)
+ (Sinf64Ty MTy :cost 4200)
+ (Tanf32Ty MTy :cost 4750)
+ (Ceilf64Ty MTy :cost 250)
+ (Powf32Ty MTy MTy :cost 2000)
+ (Modulus_sqrTy MTy MTy :cost 700)
+ (Reverse-VectorTy MTy :cost 900)
+ (Bias-AddTy :cost 1850)
+ (Neqf32Ty MTy MTy :cost 125)
+ (Fabsf32Ty MTy :cost 125)
+ (Erfcf64Ty MTy :cost 900)
+ (Vector-SumTy MTy :cost 850)
+ (Im_sqrTy MTy MTy :cost 700)
+ (Atanf32Ty MTy :cost 1100)
+ (Array3f32Ty MTy MTy MTy :cost 375)
+ (Fmodf32Ty MTy MTy :cost 1750)
+ (Exp2f64Ty MTy :cost 1175)
+ (Eqf64Ty MTy MTy :cost 125)
+ (Atanf64Ty MTy :cost 1100)
+ (Powf64Ty MTy MTy :cost 2000)
+ (Coshf32Ty MTy :cost 1250)
+ (Logbf64Ty MTy :cost 350)
+ (Acosf32Ty MTy :cost 500)
+ (Reff32Ty MTy MTy :cost 200)
+ (Expf64Ty MTy :cost 1375)
+ (Refr3f64Ty MTy MTy :cost 200)
+ (Roundf32Ty MTy :cost 875)
+ (Erfcf32Ty MTy :cost 900)
+ (Rintf32Ty MTy :cost 300)
+ (Arrayf32Ty MTy MTy :cost 250)
+ (Acosf64Ty MTy :cost 500)
+ (Asinf64Ty MTy :cost 500)
+ (Coshf64Ty MTy :cost 1650)
+ (Log2f64Ty MTy :cost 850)
+ (Remainderf64Ty MTy MTy :cost 1000)
+ (Tanhf32Ty MTy :cost 1000)
+ (Gtf64Ty MTy MTy :cost 125)
+ (Copysignf32Ty MTy MTy :cost 200)
+ (Erff64Ty MTy :cost 1125)
+ (Remainderf32Ty MTy MTy :cost 1000)
+ (Create-VectorTy MTy MTy :cost 250)
+ (Reff64Ty MTy MTy :cost 200)
+ (Neqf64Ty MTy MTy :cost 125)
+ (Truncf64Ty MTy :cost 250)
+ (Fdimf32Ty MTy MTy :cost 750)
+ (AndTy MTy MTy :cost 100)
+ (TrueTy :cost 100)
+ (Scaled-SumTy MTy MTy :cost 1350)
+ (Fmaf64Ty MTy MTy MTy :cost 375)
+ (FalseTy :cost 100)
+ (Hypotf32Ty MTy MTy :cost 1700)
+ (Erff32Ty MTy :cost 1125)
+ (Logf64Ty MTy :cost 750)
+ (Eqf32Ty MTy MTy :cost 125)
+ (Tanf64Ty MTy :cost 4650)
+ (Logf32Ty MTy :cost 750)
+ (Expm1f32Ty MTy :cost 900)
+ (Exp2f32Ty MTy :cost 1175)
+ (Atanhf64Ty MTy :cost 450)
+ (Arrayf64Ty MTy MTy :cost 250)
+ (Nanf64Ty :cost 125)
+ (Fminf64Ty MTy MTy :cost 250)
+ (Expf32Ty MTy :cost 1375)
+ (Log2f32Ty MTy :cost 875)
+ (Lgammaf32Ty MTy :cost 2250)
+ (Ltef64Ty MTy MTy :cost 125)
+ (Fmaf32Ty MTy MTy MTy :cost 375)
+ (Gravitation-EcefTy MTy :cost 90375)
+ (OrTy MTy MTy :cost 100)
+ (Addf64Ty MTy MTy :cost 200)
+ (Iff64Ty MTy MTy MTy :cost 0)
+ (Tgammaf64Ty MTy :cost 2625)
+ (Sqrtf32Ty MTy :cost 250)
+ (Nanf32Ty :cost 125)
+ (Pif32Ty :cost 125)
+ (Logbf32Ty MTy :cost 375)
+ (Gtef32Ty MTy MTy :cost 125)
+ (Refr3f32Ty MTy MTy :cost 200)
+ (Gtf32Ty MTy MTy :cost 125)
+ (Divf32Ty MTy MTy :cost 350)
+ (Acoshf64Ty MTy :cost 850)
+ (Roundf64Ty MTy :cost 850)
+ (Atan2f64Ty MTy MTy :cost 2000)
+ (Floorf64Ty MTy :cost 300)
+ (Hypotf64Ty MTy MTy :cost 1700)
+ (Asinhf32Ty MTy :cost 1125)
+ (Mean-And-SpanTy MTy :cost 2700)
+ (Mat-Vec-First-RowTy MTy :cost 3000)
+ (Negf64Ty MTy :cost 125)
+ (Refr2f64Ty MTy MTy :cost 200)
+ (Ceilf32Ty MTy :cost 250)
+ (Norm-3Ty MTy :cost 3350)
+ (Ef64Ty :cost 125)
+ (Gtef64Ty MTy MTy :cost 125)
+ (Iff32Ty MTy MTy MTy :cost 0)
+ (Mulf64Ty MTy MTy :cost 250)
+ (Floorf32Ty MTy :cost 250)
+ (Ltef32Ty MTy MTy :cost 125)
+ (Divf64Ty MTy MTy :cost 350)
+ (Tgammaf32Ty MTy :cost 2625)
+ (Log1pf32Ty MTy :cost 1300)
+ (ModulusTy MTy MTy :cost 950)
+ (Expm1f64Ty MTy :cost 900)
+ (Acoshf32Ty MTy :cost 850)
+ (Ltf64Ty MTy MTy :cost 125)
+ (Atanhf32Ty MTy :cost 500)
+ (Copysignf64Ty MTy MTy :cost 200)
+ (Asinhf64Ty MTy :cost 1125)
+ (Addf32Ty MTy MTy :cost 200)
+ (Sinf32Ty MTy :cost 4250)
+ (Pif64Ty :cost 125)
+ (Literal-VectorTy :cost 500)
+ (Cosf32Ty MTy :cost 4250)
+ (InfinityTy :cost 125)
+ (Clmeanoscmap-De1Ty MTy MTy MTy MTy MTy MTy MTy :cost 40925)
+ (Duplicate-ScalarTy MTy :cost 250))
+(constructor do-lower (M String) MTy :unextractable)
+(constructor do-lift (MTy) M :unextractable)
+(ruleset lower)
+(ruleset lift)
+(ruleset unsound)
+(function bad-merge? () bool :merge (or old new))
+(ruleset bad-merge-rule)
+(set (bad-merge?) false)
+(rule
+ ((= (Num c1) (Num c2)) (!= c1 c2))
+ ((set (bad-merge?) true))
+ :ruleset
+ bad-merge-rule)
+(rule
+ ((= e (Var "x")))
+ ((union (do-lower e "sym_binary64") (Var_sym_binary64 "x")))
+ :ruleset
+ lower)
+(rule
+ ((= e (Var "y")))
+ ((union (do-lower e "sym_binary64") (Var_sym_binary64 "y")))
+ :ruleset
+ lower)
+(rule
+ ((= e (Var "z")))
+ ((union (do-lower e "sym_binary64") (Var_sym_binary64 "z")))
+ :ruleset
+ lower)
+(rule
+ ((= e (Var_sym_binary64 "x")))
+ ((union (do-lift e) (Var "x")))
+ :ruleset
+ lift)
+(rule
+ ((= e (Var_sym_binary64 "y")))
+ ((union (do-lift e) (Var "y")))
+ :ruleset
+ lift)
+(rule
+ ((= e (Var_sym_binary64 "z")))
+ ((union (do-lift e) (Var "z")))
+ :ruleset
+ lift)
+(constructor const1 () M :unextractable)
+(constructor const2 () M :unextractable)
+(constructor const3 () M :unextractable)
+(constructor const4 () MTy :unextractable)
+(constructor const5 () MTy :unextractable)
+(constructor const6 () MTy :unextractable)
+(constructor const7 () M :unextractable)
+(constructor const8 () M :unextractable)
+(constructor const9 () M :unextractable)
+(constructor const10 () M :unextractable)
+(constructor const11 () M :unextractable)
+(constructor const12 () M :unextractable)
+(constructor const13 () M :unextractable)
+(constructor const14 () M :unextractable)
+(constructor const15 () M :unextractable)
+(constructor const16 () M :unextractable)
+(constructor const17 () M :unextractable)
+(constructor const18 () M :unextractable)
+(constructor const19 () M :unextractable)
+(constructor const20 () M :unextractable)
+(constructor const21 () M :unextractable)
+(constructor const22 () M :unextractable)
+(constructor const23 () M :unextractable)
+(constructor const24 () M :unextractable)
+(constructor const25 () M :unextractable)
+(constructor const26 () M :unextractable)
+(constructor const27 () M :unextractable)
+(constructor const28 () M :unextractable)
+(constructor const29 () M :unextractable)
+(constructor const30 () M :unextractable)
+(constructor const31 () M :unextractable)
+(constructor const32 () M :unextractable)
+(constructor const33 () M :unextractable)
+(constructor const34 () M :unextractable)
+(constructor const35 () M :unextractable)
+(constructor const36 () M :unextractable)
+(constructor const37 () M :unextractable)
+(constructor const38 () M :unextractable)
+(constructor const39 () M :unextractable)
+(constructor const40 () M :unextractable)
+(constructor const41 () M :unextractable)
+(constructor const42 () M :unextractable)
+(constructor const43 () M :unextractable)
+(constructor const44 () M :unextractable)
+(constructor const45 () M :unextractable)
+(constructor const46 () M :unextractable)
+(constructor const47 () M :unextractable)
+(constructor const48 () M :unextractable)
+(constructor const49 () M :unextractable)
+(constructor const50 () M :unextractable)
+(constructor const51 () M :unextractable)
+(constructor const52 () M :unextractable)
+(constructor const53 () M :unextractable)
+(constructor const54 () M :unextractable)
+(constructor const55 () M :unextractable)
+(constructor const56 () M :unextractable)
+(constructor const57 () M :unextractable)
+(constructor const58 () M :unextractable)
+(constructor const59 () M :unextractable)
+(constructor const60 () M :unextractable)
+(constructor const61 () M :unextractable)
+(constructor const62 () M :unextractable)
+(constructor const63 () M :unextractable)
+(constructor const64 () M :unextractable)
+(constructor const65 () M :unextractable)
+(constructor const66 () M :unextractable)
+(constructor const67 () M :unextractable)
+(constructor const68 () M :unextractable)
+(constructor const69 () M :unextractable)
+(constructor const70 () M :unextractable)
+(constructor const71 () M :unextractable)
+(constructor const72 () M :unextractable)
+(constructor const73 () M :unextractable)
+(constructor const74 () M :unextractable)
+(constructor const75 () M :unextractable)
+(constructor const76 () M :unextractable)
+(constructor const77 () M :unextractable)
+(constructor const78 () M :unextractable)
+(constructor const79 () M :unextractable)
+(constructor const80 () M :unextractable)
+(constructor const81 () M :unextractable)
+(constructor const82 () M :unextractable)
+(constructor const83 () M :unextractable)
+(constructor const84 () M :unextractable)
+(constructor const85 () M :unextractable)
+(constructor const86 () M :unextractable)
+(constructor const87 () M :unextractable)
+(constructor const88 () M :unextractable)
+(constructor const89 () M :unextractable)
+(constructor const90 () M :unextractable)
+(constructor const91 () M :unextractable)
+(constructor const92 () M :unextractable)
+(constructor const93 () M :unextractable)
+(constructor const94 () M :unextractable)
+(constructor const95 () M :unextractable)
+(constructor const96 () M :unextractable)
+(constructor const97 () M :unextractable)
+(constructor const98 () M :unextractable)
+(constructor const99 () M :unextractable)
+(constructor const100 () M :unextractable)
+(constructor const101 () M :unextractable)
+(constructor const102 () M :unextractable)
+(constructor const103 () M :unextractable)
+(constructor const104 () M :unextractable)
+(constructor const105 () M :unextractable)
+(constructor const106 () M :unextractable)
+(constructor const107 () M :unextractable)
+(constructor const108 () M :unextractable)
+(constructor const109 () M :unextractable)
+(constructor const110 () M :unextractable)
+(constructor const111 () M :unextractable)
+(constructor const112 () M :unextractable)
+(constructor const113 () M :unextractable)
+(constructor const114 () M :unextractable)
+(constructor const115 () M :unextractable)
+(constructor const116 () M :unextractable)
+(constructor const117 () M :unextractable)
+(constructor const118 () M :unextractable)
+(constructor const119 () M :unextractable)
+(constructor const120 () M :unextractable)
+(constructor const121 () M :unextractable)
+(constructor const122 () M :unextractable)
+(constructor const123 () M :unextractable)
+(constructor const124 () M :unextractable)
+(constructor const125 () M :unextractable)
+(constructor const126 () M :unextractable)
+(constructor const127 () M :unextractable)
+(constructor const128 () M :unextractable)
+(constructor const129 () M :unextractable)
+(constructor const130 () M :unextractable)
+(constructor const131 () M :unextractable)
+(constructor const132 () M :unextractable)
+(constructor const133 () M :unextractable)
+(constructor const134 () M :unextractable)
+(constructor const135 () M :unextractable)
+(constructor const136 () M :unextractable)
+(constructor const137 () M :unextractable)
+(constructor const138 () M :unextractable)
+(constructor const139 () M :unextractable)
+(constructor const140 () M :unextractable)
+(constructor const141 () M :unextractable)
+(constructor const142 () M :unextractable)
+(constructor const143 () M :unextractable)
+(constructor const144 () M :unextractable)
+(constructor const145 () M :unextractable)
+(constructor const146 () M :unextractable)
+(constructor const147 () M :unextractable)
+(constructor const148 () M :unextractable)
+(constructor const149 () M :unextractable)
+(constructor const150 () M :unextractable)
+(constructor const151 () M :unextractable)
+(constructor const152 () M :unextractable)
+(constructor const153 () M :unextractable)
+(constructor const154 () M :unextractable)
+(constructor const155 () M :unextractable)
+(constructor const156 () M :unextractable)
+(constructor const157 () M :unextractable)
+(constructor const158 () M :unextractable)
+(constructor const159 () M :unextractable)
+(constructor const160 () M :unextractable)
+(constructor const161 () M :unextractable)
+(constructor const162 () M :unextractable)
+(constructor const163 () M :unextractable)
+(constructor const164 () M :unextractable)
+(constructor const165 () M :unextractable)
+(constructor const166 () M :unextractable)
+(constructor const167 () M :unextractable)
+(constructor const168 () M :unextractable)
+(constructor const169 () M :unextractable)
+(constructor const170 () M :unextractable)
+(constructor const171 () M :unextractable)
+(constructor const172 () M :unextractable)
+(constructor const173 () M :unextractable)
+(constructor const174 () M :unextractable)
+(constructor const175 () M :unextractable)
+(constructor const176 () M :unextractable)
+(constructor const177 () M :unextractable)
+(constructor const178 () M :unextractable)
+(constructor const179 () M :unextractable)
+(constructor const180 () M :unextractable)
+(constructor const181 () M :unextractable)
+(constructor const182 () M :unextractable)
+(constructor const183 () M :unextractable)
+(constructor const184 () M :unextractable)
+(constructor const185 () M :unextractable)
+(constructor const186 () M :unextractable)
+(constructor const187 () M :unextractable)
+(constructor const188 () M :unextractable)
+(constructor const189 () M :unextractable)
+(constructor const190 () M :unextractable)
+(constructor const191 () M :unextractable)
+(constructor const192 () M :unextractable)
+(constructor const193 () M :unextractable)
+(constructor const194 () M :unextractable)
+(constructor const195 () M :unextractable)
+(constructor const196 () M :unextractable)
+(constructor const197 () M :unextractable)
+(constructor const198 () M :unextractable)
+(constructor const199 () M :unextractable)
+(constructor const200 () M :unextractable)
+(constructor const201 () M :unextractable)
+(constructor const202 () M :unextractable)
+(constructor const203 () M :unextractable)
+(constructor const204 () M :unextractable)
+(constructor const205 () M :unextractable)
+(constructor const206 () M :unextractable)
+(constructor const207 () M :unextractable)
+(constructor const208 () M :unextractable)
+(constructor const209 () M :unextractable)
+(constructor const210 () M :unextractable)
+(constructor const211 () M :unextractable)
+(constructor const212 () M :unextractable)
+(constructor const213 () M :unextractable)
+(constructor const214 () M :unextractable)
+(constructor const215 () M :unextractable)
+(constructor const216 () M :unextractable)
+(constructor const217 () M :unextractable)
+(constructor const218 () M :unextractable)
+(constructor const219 () M :unextractable)
+(constructor const220 () M :unextractable)
+(constructor const221 () M :unextractable)
+(constructor const222 () M :unextractable)
+(constructor const223 () M :unextractable)
+(constructor const224 () M :unextractable)
+(constructor const225 () M :unextractable)
+(constructor const226 () M :unextractable)
+(constructor const227 () M :unextractable)
+(constructor const228 () M :unextractable)
+(constructor const229 () M :unextractable)
+(constructor const230 () M :unextractable)
+(constructor const231 () M :unextractable)
+(constructor const232 () M :unextractable)
+(constructor const233 () M :unextractable)
+(constructor const234 () M :unextractable)
+(constructor const235 () M :unextractable)
+(constructor const236 () M :unextractable)
+(constructor const237 () M :unextractable)
+(constructor const238 () M :unextractable)
+(constructor const239 () M :unextractable)
+(constructor const240 () M :unextractable)
+(constructor const241 () M :unextractable)
+(constructor const242 () M :unextractable)
+(constructor const243 () M :unextractable)
+(constructor const244 () M :unextractable)
+(constructor const245 () M :unextractable)
+(constructor const246 () M :unextractable)
+(constructor const247 () M :unextractable)
+(constructor const248 () M :unextractable)
+(constructor const249 () M :unextractable)
+(constructor const250 () M :unextractable)
+(constructor const251 () M :unextractable)
+(constructor const252 () M :unextractable)
+(constructor const253 () M :unextractable)
+(constructor const254 () M :unextractable)
+(constructor const255 () M :unextractable)
+(constructor const256 () M :unextractable)
+(constructor const257 () M :unextractable)
+(constructor const258 () M :unextractable)
+(constructor const259 () M :unextractable)
+(constructor const260 () M :unextractable)
+(constructor const261 () M :unextractable)
+(constructor const262 () M :unextractable)
+(constructor const263 () M :unextractable)
+(constructor const264 () M :unextractable)
+(constructor const265 () M :unextractable)
+(constructor const266 () M :unextractable)
+(constructor const267 () M :unextractable)
+(constructor const268 () M :unextractable)
+(constructor const269 () M :unextractable)
+(constructor const270 () M :unextractable)
+(constructor const271 () M :unextractable)
+(constructor const272 () M :unextractable)
+(constructor const273 () M :unextractable)
+(constructor const274 () M :unextractable)
+(constructor const275 () M :unextractable)
+(constructor const276 () M :unextractable)
+(constructor const277 () M :unextractable)
+(constructor const278 () M :unextractable)
+(constructor const279 () M :unextractable)
+(constructor const280 () M :unextractable)
+(constructor const281 () M :unextractable)
+(constructor const282 () M :unextractable)
+(constructor const283 () M :unextractable)
+(constructor const284 () M :unextractable)
+(constructor const285 () M :unextractable)
+(constructor const286 () M :unextractable)
+(constructor const287 () M :unextractable)
+(constructor const288 () M :unextractable)
+(constructor const289 () M :unextractable)
+(constructor const290 () M :unextractable)
+(constructor const291 () M :unextractable)
+(constructor const292 () M :unextractable)
+(constructor const293 () M :unextractable)
+(constructor const294 () M :unextractable)
+(constructor const295 () M :unextractable)
+(constructor const296 () M :unextractable)
+(constructor const297 () M :unextractable)
+(constructor const298 () M :unextractable)
+(constructor const299 () M :unextractable)
+(constructor const300 () M :unextractable)
+(constructor const301 () M :unextractable)
+(constructor const302 () M :unextractable)
+(constructor const303 () M :unextractable)
+(constructor const304 () M :unextractable)
+(constructor const305 () M :unextractable)
+(constructor const306 () M :unextractable)
+(constructor const307 () M :unextractable)
+(constructor const308 () M :unextractable)
+(constructor const309 () M :unextractable)
+(constructor const310 () M :unextractable)
+(constructor const311 () M :unextractable)
+(constructor const312 () M :unextractable)
+(constructor const313 () M :unextractable)
+(constructor const314 () M :unextractable)
+(constructor const315 () M :unextractable)
+(constructor const316 () M :unextractable)
+(constructor const317 () M :unextractable)
+(constructor const318 () M :unextractable)
+(constructor const319 () M :unextractable)
+(constructor const320 () M :unextractable)
+(constructor const321 () M :unextractable)
+(constructor const322 () M :unextractable)
+(constructor const323 () M :unextractable)
+(constructor const324 () M :unextractable)
+(constructor const325 () M :unextractable)
+(constructor const326 () M :unextractable)
+(constructor const327 () M :unextractable)
+(constructor const328 () M :unextractable)
+(constructor const329 () M :unextractable)
+(constructor const330 () M :unextractable)
+(constructor const331 () M :unextractable)
+(constructor const332 () M :unextractable)
+(constructor const333 () M :unextractable)
+(constructor const334 () M :unextractable)
+(constructor const335 () M :unextractable)
+(constructor const336 () M :unextractable)
+(constructor const337 () M :unextractable)
+(constructor const338 () M :unextractable)
+(constructor const339 () M :unextractable)
+(constructor const340 () M :unextractable)
+(constructor const341 () M :unextractable)
+(constructor const342 () M :unextractable)
+(constructor const343 () M :unextractable)
+(constructor const344 () M :unextractable)
+(constructor const345 () M :unextractable)
+(constructor const346 () M :unextractable)
+(constructor const347 () M :unextractable)
+(constructor const348 () M :unextractable)
+(constructor const349 () M :unextractable)
+(constructor const350 () M :unextractable)
+(constructor const351 () M :unextractable)
+(constructor const352 () M :unextractable)
+(constructor const353 () M :unextractable)
+(constructor const354 () M :unextractable)
+(ruleset run-extract-commands)
+(rule
+ ()
+ ((let ?sx (Var "x"))
+  (union (const1) ?sx)
+  (let ?sy (Var "y"))
+  (union (const2) ?sy)
+  (let ?sz (Var "z"))
+  (union (const3) ?sz)
+  (let ?tx (Var_sym_binary64 "x"))
+  (union (const4) ?tx)
+  (let ?ty (Var_sym_binary64 "y"))
+  (union (const5) ?ty)
+  (let ?tz (Var_sym_binary64 "z"))
+  (union (const6) ?tz)
+  (let ?r0 (Num (bigrat (from-string "0") (from-string "1"))))
+  (union (const7) ?r0)
+  (let ?r3 (Add ?sx ?sy))
+  (union (const8) ?r3)
+  (let ?r4 (Num (bigrat (from-string "1") (from-string "2"))))
+  (union (const9) ?r4)
+  (let ?r5 (Mul ?r4 ?sx))
+  (union (const10) ?r5)
+  (let ?r6 (Num (bigrat (from-string "-1") (from-string "1"))))
+  (union (const11) ?r6)
+  (let ?r8 (Sqrt ?sy))
+  (union (const12) ?r8)
+  (let ?r9 (Log ?r8))
+  (union (const13) ?r9)
+  (let ?r10 (Add ?sz ?r9))
+  (union (const14) ?r10)
+  (let ?r11 (Mul ?r6 ?r10))
+  (union (const15) ?r11)
+  (let ?r12 (Sub ?sx ?r10))
+  (union (const16) ?r12)
+  (let ?r13 (Sub ?r5 ?r10))
+  (union (const17) ?r13)
+  (let ?r14 (Log ?sy))
+  (union (const18) ?r14)
+  (let ?r15 (Add ?r4 ?sy))
+  (union (const19) ?r15)
+  (let ?b16 (Mul ?r14 ?r15))
+  (union (const20) ?b16)
+  (let ?b17 (Mul ?r6 ?b16))
+  (union (const21) ?b17)
+  (let ?r18 (Add ?sy ?b17))
+  (union (const22) ?r18)
+  (let ?r19 (Add ?sx ?r18))
+  (union (const23) ?r19)
+  (let ?r20 (Sub ?r18 ?sz))
+  (union (const24) ?r20)
+  (let ?r21 (Sub ?r19 ?sz))
+  (union (const25) ?r21)
+  (let ?r22 (Sub ?sy ?b16))
+  (union (const26) ?r22)
+  (let ?r23 (Sub ?r3 ?b16))
+  (union (const27) ?r23)
+  (let ?b24 (Add ?sz ?b16))
+  (union (const28) ?b24)
+  (let ?r25 (Sub ?sy ?b24))
+  (union (const29) ?r25)
+  (let ?r26 (Sub ?r3 ?b24))
+  (union (const30) ?r26)
+  (let ?b27 (Num (bigrat (from-string "1") (from-string "1"))))
+  (union (const31) ?b27)
+  (let ?b28 (Div ?sy ?sx))
+  (union (const32) ?b28)
+  (let ?b29 (Add ?b27 ?b28))
+  (union (const33) ?b29)
+  (let ?r30 (Mul ?sx ?b29))
+  (union (const34) ?r30)
+  (let ?b31 (Div ?r10 ?sx))
+  (union (const35) ?b31)
+  (let ?b32 (Mul ?r6 ?b31))
+  (union (const36) ?b32)
+  (let ?b33 (Add ?b27 ?b32))
+  (union (const37) ?b33)
+  (let ?r34 (Mul ?sx ?b33))
+  (union (const38) ?r34)
+  (let ?b35 (Add ?r4 ?b32))
+  (union (const39) ?b35)
+  (let ?r36 (Mul ?sx ?b35))
+  (union (const40) ?r36)
+  (let ?b37 (Div ?b16 ?sx))
+  (union (const41) ?b37)
+  (let ?b38 (Mul ?r6 ?b37))
+  (union (const42) ?b38)
+  (let ?b39 (Add ?b38 ?b28))
+  (union (const43) ?b39)
+  (let ?b40 (Add ?b27 ?b39))
+  (union (const44) ?b40)
+  (let ?r41 (Mul ?sx ?b40))
+  (union (const45) ?r41)
+  (let ?b42 (Div ?sz ?sx))
+  (union (const46) ?b42)
+  (let ?b43 (Sub ?b40 ?b42))
+  (union (const47) ?b43)
+  (let ?r44 (Mul ?sx ?b43))
+  (union (const48) ?r44)
+  (let ?b45 (Sub ?b29 ?b37))
+  (union (const49) ?b45)
+  (let ?r46 (Mul ?sx ?b45))
+  (union (const50) ?r46)
+  (let ?b47 (Add ?b42 ?b37))
+  (union (const51) ?b47)
+  (let ?b48 (Sub ?b29 ?b47))
+  (union (const52) ?b48)
+  (let ?r49 (Mul ?sx ?b48))
+  (union (const53) ?r49)
+  (let ?b50 (Mul ?r6 ?b28))
+  (union (const54) ?b50)
+  (let ?b51 (Sub ?b50 ?b27))
+  (union (const55) ?b51)
+  (let ?b52 (Mul ?sx ?b51))
+  (union (const56) ?b52)
+  (let ?r53 (Mul ?r6 ?b52))
+  (union (const57) ?r53)
+  (let ?b54 (Div ?r9 ?sx))
+  (union (const58) ?b54)
+  (let ?b55 (Add ?b42 ?b54))
+  (union (const59) ?b55)
+  (let ?b56 (Sub ?b55 ?b27))
+  (union (const60) ?b56)
+  (let ?b57 (Mul ?sx ?b56))
+  (union (const61) ?b57)
+  (let ?r58 (Mul ?r6 ?b57))
+  (union (const62) ?r58)
+  (let ?b59 (Sub ?b55 ?r4))
+  (union (const63) ?b59)
+  (let ?b60 (Mul ?sx ?b59))
+  (union (const64) ?b60)
+  (let ?r61 (Mul ?r6 ?b60))
+  (union (const65) ?r61)
+  (let ?b62 (Div ?r18 ?sx))
+  (union (const66) ?b62)
+  (let ?b63 (Mul ?r6 ?b62))
+  (union (const67) ?b63)
+  (let ?b64 (Sub ?b63 ?b27))
+  (union (const68) ?b64)
+  (let ?b65 (Mul ?sx ?b64))
+  (union (const69) ?b65)
+  (let ?r66 (Mul ?r6 ?b65))
+  (union (const70) ?r66)
+  (let ?b67 (Div ?r20 ?sx))
+  (union (const71) ?b67)
+  (let ?b68 (Mul ?r6 ?b67))
+  (union (const72) ?b68)
+  (let ?b69 (Sub ?b68 ?b27))
+  (union (const73) ?b69)
+  (let ?b70 (Mul ?sx ?b69))
+  (union (const74) ?b70)
+  (let ?r71 (Mul ?r6 ?b70))
+  (union (const75) ?r71)
+  (let ?b72 (Div ?r22 ?sx))
+  (union (const76) ?b72)
+  (let ?b73 (Mul ?r6 ?b72))
+  (union (const77) ?b73)
+  (let ?b74 (Sub ?b73 ?b27))
+  (union (const78) ?b74)
+  (let ?b75 (Mul ?sx ?b74))
+  (union (const79) ?b75)
+  (let ?r76 (Mul ?r6 ?b75))
+  (union (const80) ?r76)
+  (let ?b77 (Div ?r25 ?sx))
+  (union (const81) ?b77)
+  (let ?b78 (Mul ?r6 ?b77))
+  (union (const82) ?b78)
+  (let ?b79 (Sub ?b78 ?b27))
+  (union (const83) ?b79)
+  (let ?b80 (Mul ?sx ?b79))
+  (union (const84) ?b80)
+  (let ?r81 (Mul ?r6 ?b80))
+  (union (const85) ?r81)
+  (let ?r82 (Div ?r6 ?sy))
+  (union (const86) ?r82)
+  (let ?r83 (Div ?r4 ?sy))
+  (union (const87) ?r83)
+  (let ?r84 (Num (bigrat (from-string "-1") (from-string "2"))))
+  (union (const88) ?r84)
+  (let ?r85 (Mul ?r6 ?sy))
+  (union (const89) ?r85)
+  (let ?r86 (Sub ?r85 ?r4))
+  (union (const90) ?r86)
+  (let ?r87 (Mul ?r84 ?r14))
+  (union (const91) ?r87)
+  (let ?b88 (Mul ?sy ?r14))
+  (union (const92) ?b88)
+  (let ?b89 (Mul ?r6 ?b88))
+  (union (const93) ?b89)
+  (let ?r90 (Add ?b89 ?r87))
+  (union (const94) ?r90)
+  (let ?r91 (Div ?r14 ?sy))
+  (union (const95) ?r91)
+  (let ?b92 (Sub ?b27 ?r14))
+  (union (const96) ?b92)
+  (let ?b93 (Mul ?sy ?b92))
+  (union (const97) ?b93)
+  (let ?r94 (Mul ?r4 ?r14))
+  (union (const98) ?r94)
+  (let ?r95 (Sub ?b93 ?r94))
+  (union (const99) ?r95)
+  (let ?b96 (Log ?r4))
+  (union (const100) ?b96)
+  (let ?b97 (Mul ?r6 ?r14))
+  (union (const101) ?b97)
+  (let ?r98 (Add ?b96 ?b97))
+  (union (const102) ?r98)
+  (let ?r99 (Mul ?r84 ?r91))
+  (union (const103) ?r99)
+  (let ?r100 (Div ?r90 ?sy))
+  (union (const104) ?r100)
+  (let ?r101 (Add ?r94 ?b88))
+  (union (const105) ?r101)
+  (let ?r102 (Mul ?r84 ?r98))
+  (union (const106) ?r102)
+  (let ?b103 (Mul ?sy ?r98))
+  (union (const107) ?b103)
+  (let ?b104 (Mul ?r6 ?b103))
+  (union (const108) ?b104)
+  (let ?r105 (Add ?b104 ?r102))
+  (union (const109) ?r105)
+  (let ?b106 (Num (bigrat (from-string "2") (from-string "1"))))
+  (union (const110) ?b106)
+  (let ?b107 (Log ?b106))
+  (union (const111) ?b107)
+  (let ?b108 (Mul ?r84 ?b107))
+  (union (const112) ?b108)
+  (let ?r109 (Add ?b108 ?r102))
+  (union (const113) ?r109)
+  (let ?b110 (Mul ?r6 ?b107))
+  (union (const114) ?b110)
+  (let ?b111 (Mul ?r6 ?r98))
+  (union (const115) ?b111)
+  (let ?b112 (Add ?b110 ?b111))
+  (union (const116) ?b112)
+  (let ?b113 (Mul ?sy ?b112))
+  (union (const117) ?b113)
+  (let ?b114 (Add ?r102 ?b113))
+  (union (const118) ?b114)
+  (let ?r115 (Add ?b108 ?b114))
+  (union (const119) ?r115)
+  (let ?b116 (Add ?r4 ?b97))
+  (union (const120) ?b116)
+  (let ?b117 (Mul ?sy ?b116))
+  (union (const121) ?b117)
+  (let ?r118 (Add ?r87 ?b117))
+  (union (const122) ?r118)
+  (let ?b119 (Add ?b27 ?b97))
+  (union (const123) ?b119)
+  (let ?b120 (Mul ?sy ?b119))
+  (union (const124) ?b120)
+  (let ?r121 (Add ?r87 ?b120))
+  (union (const125) ?r121)
+  (let ?r122 (Add ?sx ?r87))
+  (union (const126) ?r122)
+  (let ?r123 (Add ?sx ?r121))
+  (union (const127) ?r123)
+  (let ?r124 (Sub ?r122 ?sz))
+  (union (const128) ?r124)
+  (let ?r125 (Sub ?r123 ?sz))
+  (union (const129) ?r125)
+  (let ?r126 (Sub ?sx ?r94))
+  (union (const130) ?r126)
+  (let ?b127 (Add ?sx ?b93))
+  (union (const131) ?b127)
+  (let ?r128 (Sub ?b127 ?r94))
+  (union (const132) ?r128)
+  (let ?b129 (Add ?sz ?r94))
+  (union (const133) ?b129)
+  (let ?r130 (Sub ?sx ?b129))
+  (union (const134) ?r130)
+  (let ?r131 (Sub ?b127 ?b129))
+  (union (const135) ?r131)
+  (let ?r132 (Mul ?r6 ?r109))
+  (union (const136) ?r132)
+  (let ?b133 (Sub ?b27 ?b112))
+  (union (const137) ?b133)
+  (let ?b134 (Mul ?sy ?b133))
+  (union (const138) ?b134)
+  (let ?r135 (Sub ?b134 ?r109))
+  (union (const139) ?r135)
+  (let ?r136 (Mul ?r6 ?sz))
+  (union (const140) ?r136)
+  (let ?b137 (Div ?b27 ?sy))
+  (union (const141) ?b137)
+  (let ?r138 (Log ?b137))
+  (union (const142) ?r138)
+  (let ?r139 (Mul ?r6 ?r138))
+  (union (const143) ?r139)
+  (let ?b140 (Mul ?r4 ?b137))
+  (union (const144) ?b140)
+  (let ?b141 (Add ?b27 ?b140))
+  (union (const145) ?b141)
+  (let ?r142 (Mul ?sy ?b141))
+  (union (const146) ?r142)
+  (let ?r143 (Mul ?r6 ?r142))
+  (union (const147) ?r143)
+  (let ?r144 (Mul ?sy ?r138))
+  (union (const148) ?r144)
+  (let ?b145 (Div ?r138 ?sy))
+  (union (const149) ?b145)
+  (let ?b146 (Mul ?r4 ?b145))
+  (union (const150) ?b146)
+  (let ?r147 (Add ?r138 ?b146))
+  (union (const151) ?r147)
+  (let ?r148 (Mul ?sy ?r147))
+  (union (const152) ?r148)
+  (let ?b149 (Sqrt ?b137))
+  (union (const153) ?b149)
+  (let ?r150 (Mul ?sy ?b149))
+  (union (const154) ?r150)
+  (let ?b151 (Log ?b149))
+  (union (const155) ?b151)
+  (let ?r152 (Add ?b151 ?r139))
+  (union (const156) ?r152)
+  (let ?r153 (Add ?sz ?r152))
+  (union (const157) ?r153)
+  (let ?r154 (Mul ?r4 ?r138))
+  (union (const158) ?r154)
+  (let ?r155 (Mul ?r6 ?b145))
+  (union (const159) ?r155)
+  (let ?b156 (Div ?sx ?sy))
+  (union (const160) ?b156)
+  (let ?b157 (Add ?b27 ?b156))
+  (union (const161) ?b157)
+  (let ?r158 (Mul ?sy ?b157))
+  (union (const162) ?r158)
+  (let ?b159 (Sub ?b27 ?r139))
+  (union (const163) ?b159)
+  (let ?r160 (Mul ?sy ?b159))
+  (union (const164) ?r160)
+  (let ?b161 (Add ?b27 ?b146))
+  (union (const165) ?b161)
+  (let ?b162 (Sub ?b161 ?r139))
+  (union (const166) ?b162)
+  (let ?r163 (Mul ?sy ?b162))
+  (union (const167) ?r163)
+  (let ?r164 (Add ?b96 ?r138))
+  (union (const168) ?r164)
+  (let ?r165 (Mul ?r6 ?r144))
+  (union (const169) ?r165)
+  (let ?b166 (Mul ?r84 ?b145))
+  (union (const170) ?b166)
+  (let ?b167 (Add ?r139 ?b166))
+  (union (const171) ?b167)
+  (let ?r168 (Mul ?sy ?b167))
+  (union (const172) ?r168)
+  (let ?b169 (Mul ?sy ?r164))
+  (union (const173) ?b169)
+  (let ?r170 (Mul ?r6 ?b169))
+  (union (const174) ?r170)
+  (let ?b171 (Mul ?r6 ?r164))
+  (union (const175) ?b171)
+  (let ?b172 (Div ?r164 ?sy))
+  (union (const176) ?b172)
+  (let ?b173 (Mul ?r84 ?b172))
+  (union (const177) ?b173)
+  (let ?b174 (Add ?b171 ?b173))
+  (union (const178) ?b174)
+  (let ?r175 (Mul ?sy ?b174))
+  (union (const179) ?r175)
+  (let ?b176 (Add ?b110 ?b171))
+  (union (const180) ?b176)
+  (let ?r177 (Mul ?sy ?b176))
+  (union (const181) ?r177)
+  (let ?b178 (Div ?b107 ?sy))
+  (union (const182) ?b178)
+  (let ?b179 (Mul ?r84 ?b178))
+  (union (const183) ?b179)
+  (let ?b180 (Add ?b179 ?b173))
+  (union (const184) ?b180)
+  (let ?b181 (Add ?b171 ?b180))
+  (union (const185) ?b181)
+  (let ?b182 (Add ?b110 ?b181))
+  (union (const186) ?b182)
+  (let ?r183 (Mul ?sy ?b182))
+  (union (const187) ?r183)
+  (let ?b184 (Add ?r4 ?r138))
+  (union (const188) ?b184)
+  (let ?r185 (Mul ?sy ?b184))
+  (union (const189) ?r185)
+  (let ?b186 (Add ?r4 ?r147))
+  (union (const190) ?b186)
+  (let ?r187 (Mul ?sy ?b186))
+  (union (const191) ?r187)
+  (let ?b188 (Add ?b27 ?r138))
+  (union (const192) ?b188)
+  (let ?r189 (Mul ?sy ?b188))
+  (union (const193) ?r189)
+  (let ?b190 (Add ?b27 ?r147))
+  (union (const194) ?b190)
+  (let ?r191 (Mul ?sy ?b190))
+  (union (const195) ?r191)
+  (let ?r192 (Sub ?sx ?r153))
+  (union (const196) ?r192)
+  (let ?r193 (Sub ?r5 ?r153))
+  (union (const197) ?r193)
+  (let ?b194 (Add ?b146 ?b156))
+  (union (const198) ?b194)
+  (let ?b195 (Add ?r138 ?b194))
+  (union (const199) ?b195)
+  (let ?b196 (Add ?b27 ?b195))
+  (union (const200) ?b196)
+  (let ?r197 (Mul ?sy ?b196))
+  (union (const201) ?r197)
+  (let ?b198 (Div ?sz ?sy))
+  (union (const202) ?b198)
+  (let ?b199 (Sub ?b196 ?b198))
+  (union (const203) ?b199)
+  (let ?r200 (Mul ?sy ?b199))
+  (union (const204) ?r200)
+  (let ?b201 (Sub ?b157 ?b167))
+  (union (const205) ?b201)
+  (let ?r202 (Mul ?sy ?b201))
+  (union (const206) ?r202)
+  (let ?b203 (Add ?b166 ?b198))
+  (union (const207) ?b203)
+  (let ?b204 (Add ?r139 ?b203))
+  (union (const208) ?b204)
+  (let ?b205 (Sub ?b157 ?b204))
+  (union (const209) ?b205)
+  (let ?r206 (Mul ?sy ?b205))
+  (union (const210) ?r206)
+  (let ?b207 (Sub ?b27 ?b176))
+  (union (const211) ?b207)
+  (let ?r208 (Mul ?sy ?b207))
+  (union (const212) ?r208)
+  (let ?b209 (Mul ?r84 ?r164))
+  (union (const213) ?b209)
+  (let ?b210 (Add ?b108 ?b209))
+  (union (const214) ?b210)
+  (let ?b211 (Div ?b210 ?sy))
+  (union (const215) ?b211)
+  (let ?b212 (Mul ?r6 ?b211))
+  (union (const216) ?b212)
+  (let ?b213 (Add ?b27 ?b212))
+  (union (const217) ?b213)
+  (let ?b214 (Sub ?b213 ?b176))
+  (union (const218) ?b214)
+  (let ?r215 (Mul ?sy ?b214))
+  (union (const219) ?r215)
+  (let ?r216 (Mul ?r6 ?r168))
+  (union (const220) ?r216)
+  (let ?r217 (Mul ?r6 ?r150))
+  (union (const221) ?r217)
+  (let ?b218 (Log ?r82))
+  (union (const222) ?b218)
+  (let ?b219 (Mul ?r6 ?b218))
+  (union (const223) ?b219)
+  (let ?r220 (Add ?b151 ?b219))
+  (union (const224) ?r220)
+  (let ?r221 (Add ?sz ?r220))
+  (union (const225) ?r221)
+  (let ?b222 (Mul ?r6 ?b156))
+  (union (const226) ?b222)
+  (let ?b223 (Sub ?b222 ?b27))
+  (union (const227) ?b223)
+  (let ?b224 (Mul ?sy ?b223))
+  (union (const228) ?b224)
+  (let ?r225 (Mul ?r6 ?b224))
+  (union (const229) ?r225)
+  (let ?b226 (Sub ?b166 ?b188))
+  (union (const230) ?b226)
+  (let ?b227 (Mul ?sy ?b226))
+  (union (const231) ?b227)
+  (let ?r228 (Mul ?r6 ?b227))
+  (union (const232) ?r228)
+  (let ?r229 (Mul ?r6 ?r148))
+  (union (const233) ?r229)
+  (let ?b230 (Mul ?r4 ?b172))
+  (union (const234) ?b230)
+  (let ?b231 (Add ?r138 ?b230))
+  (union (const235) ?b231)
+  (let ?b232 (Add ?b96 ?b231))
+  (union (const236) ?b232)
+  (let ?b233 (Mul ?sy ?b232))
+  (union (const237) ?b233)
+  (let ?r234 (Mul ?r6 ?b233))
+  (union (const238) ?r234)
+  (let ?b235 (Add ?b107 ?r138))
+  (union (const239) ?b235)
+  (let ?b236 (Add ?b96 ?b235))
+  (union (const240) ?b236)
+  (let ?b237 (Mul ?sy ?b236))
+  (union (const241) ?b237)
+  (let ?r238 (Mul ?r6 ?b237))
+  (union (const242) ?r238)
+  (let ?b239 (Add ?r138 ?b212))
+  (union (const243) ?b239)
+  (let ?b240 (Add ?b107 ?b239))
+  (union (const244) ?b240)
+  (let ?b241 (Add ?b96 ?b240))
+  (union (const245) ?b241)
+  (let ?b242 (Mul ?sy ?b241))
+  (union (const246) ?b242)
+  (let ?r243 (Mul ?r6 ?b242))
+  (union (const247) ?r243)
+  (let ?b244 (Sub ?r139 ?r4))
+  (union (const248) ?b244)
+  (let ?b245 (Mul ?sy ?b244))
+  (union (const249) ?b245)
+  (let ?r246 (Mul ?r6 ?b245))
+  (union (const250) ?r246)
+  (let ?b247 (Sub ?b167 ?r4))
+  (union (const251) ?b247)
+  (let ?b248 (Mul ?sy ?b247))
+  (union (const252) ?b248)
+  (let ?r249 (Mul ?r6 ?b248))
+  (union (const253) ?r249)
+  (let ?b250 (Sub ?r139 ?b27))
+  (union (const254) ?b250)
+  (let ?b251 (Mul ?sy ?b250))
+  (union (const255) ?b251)
+  (let ?r252 (Mul ?r6 ?b251))
+  (union (const256) ?r252)
+  (let ?b253 (Sub ?b167 ?b27))
+  (union (const257) ?b253)
+  (let ?b254 (Mul ?sy ?b253))
+  (union (const258) ?b254)
+  (let ?r255 (Mul ?r6 ?b254))
+  (union (const259) ?r255)
+  (let ?r256 (Sub ?sx ?r221))
+  (union (const260) ?r256)
+  (let ?r257 (Sub ?r5 ?r221))
+  (union (const261) ?r257)
+  (let ?b258 (Add ?sx ?r154))
+  (union (const262) ?b258)
+  (let ?b259 (Div ?b258 ?sy))
+  (union (const263) ?b259)
+  (let ?b260 (Mul ?r6 ?b259))
+  (union (const264) ?b260)
+  (let ?b261 (Add ?r139 ?b260))
+  (union (const265) ?b261)
+  (let ?b262 (Sub ?b261 ?b27))
+  (union (const266) ?b262)
+  (let ?b263 (Mul ?sy ?b262))
+  (union (const267) ?b263)
+  (let ?r264 (Mul ?r6 ?b263))
+  (union (const268) ?r264)
+  (let ?b265 (Sub ?b258 ?sz))
+  (union (const269) ?b265)
+  (let ?b266 (Div ?b265 ?sy))
+  (union (const270) ?b266)
+  (let ?b267 (Mul ?r6 ?b266))
+  (union (const271) ?b267)
+  (let ?b268 (Add ?r139 ?b267))
+  (union (const272) ?b268)
+  (let ?b269 (Sub ?b268 ?b27))
+  (union (const273) ?b269)
+  (let ?b270 (Mul ?sy ?b269))
+  (union (const274) ?b270)
+  (let ?r271 (Mul ?r6 ?b270))
+  (union (const275) ?r271)
+  (let ?b272 (Mul ?r84 ?r138))
+  (union (const276) ?b272)
+  (let ?b273 (Sub ?sx ?b272))
+  (union (const277) ?b273)
+  (let ?b274 (Div ?b273 ?sy))
+  (union (const278) ?b274)
+  (let ?b275 (Mul ?r6 ?b274))
+  (union (const279) ?b275)
+  (let ?b276 (Sub ?b275 ?b188))
+  (union (const280) ?b276)
+  (let ?b277 (Mul ?sy ?b276))
+  (union (const281) ?b277)
+  (let ?r278 (Mul ?r6 ?b277))
+  (union (const282) ?r278)
+  (let ?b279 (Add ?sz ?b272))
+  (union (const283) ?b279)
+  (let ?b280 (Sub ?sx ?b279))
+  (union (const284) ?b280)
+  (let ?b281 (Div ?b280 ?sy))
+  (union (const285) ?b281)
+  (let ?b282 (Mul ?r6 ?b281))
+  (union (const286) ?b282)
+  (let ?b283 (Sub ?b282 ?b188))
+  (union (const287) ?b283)
+  (let ?b284 (Mul ?sy ?b283))
+  (union (const288) ?b284)
+  (let ?r285 (Mul ?r6 ?b284))
+  (union (const289) ?r285)
+  (let ?b286 (Add ?b27 ?b236))
+  (union (const290) ?b286)
+  (let ?r287 (Mul ?sy ?b286))
+  (union (const291) ?r287)
+  (let ?b288 (Sub ?b180 ?b286))
+  (union (const292) ?b288)
+  (let ?b289 (Mul ?sy ?b288))
+  (union (const293) ?b289)
+  (let ?r290 (Mul ?r6 ?b289))
+  (union (const294) ?r290)
+  (let ?r291 (Sub ?sx ?r9))
+  (union (const295) ?r291)
+  (let ?b292 (Add ?sx ?r136))
+  (union (const296) ?b292)
+  (let ?r293 (Sub ?b292 ?r9))
+  (union (const297) ?r293)
+  (let ?r294 (Sub ?r5 ?r9))
+  (union (const298) ?r294)
+  (let ?b295 (Add ?r136 ?r5))
+  (union (const299) ?b295)
+  (let ?r296 (Sub ?b295 ?r9))
+  (union (const300) ?r296)
+  (let ?b297 (Add ?r136 ?b17))
+  (union (const301) ?b297)
+  (let ?b298 (Add ?sy ?b297))
+  (union (const302) ?b298)
+  (let ?r299 (Add ?sx ?b298))
+  (union (const303) ?r299)
+  (let ?b300 (Add ?sy ?r136))
+  (union (const304) ?b300)
+  (let ?b301 (Add ?sx ?b300))
+  (union (const305) ?b301)
+  (let ?r302 (Sub ?b301 ?b16))
+  (union (const306) ?r302)
+  (let ?b303 (Sqrt ?r4))
+  (union (const307) ?b303)
+  (let ?b304 (Sqrt ?b106))
+  (union (const308) ?b304)
+  (let ?b305 (Mul ?b303 ?b304))
+  (union (const309) ?b305)
+  (let ?b306 (Mul ?sz ?b305))
+  (union (const310) ?b306)
+  (let ?r307 (Mul ?r6 ?b306))
+  (union (const311) ?r307)
+  (let ?b308 (Div ?r9 ?sz))
+  (union (const312) ?b308)
+  (let ?b309 (Add ?b27 ?b308))
+  (union (const313) ?b309)
+  (let ?r310 (Mul ?sz ?b309))
+  (union (const314) ?r310)
+  (let ?b311 (Div ?sx ?sz))
+  (union (const315) ?b311)
+  (let ?b312 (Sub ?b311 ?b309))
+  (union (const316) ?b312)
+  (let ?r313 (Mul ?sz ?b312))
+  (union (const317) ?r313)
+  (let ?b314 (Mul ?r4 ?b311))
+  (union (const318) ?b314)
+  (let ?b315 (Sub ?b314 ?b309))
+  (union (const319) ?b315)
+  (let ?r316 (Mul ?sz ?b315))
+  (union (const320) ?r316)
+  (let ?b317 (Div ?b16 ?sz))
+  (union (const321) ?b317)
+  (let ?b318 (Mul ?r6 ?b317))
+  (union (const322) ?b318)
+  (let ?b319 (Div ?sy ?sz))
+  (union (const323) ?b319)
+  (let ?b320 (Add ?b311 ?b319))
+  (union (const324) ?b320)
+  (let ?b321 (Add ?b318 ?b320))
+  (union (const325) ?b321)
+  (let ?b322 (Sub ?b321 ?b27))
+  (union (const326) ?b322)
+  (let ?r323 (Mul ?sz ?b322))
+  (union (const327) ?r323)
+  (let ?b324 (Add ?b27 ?b317))
+  (union (const328) ?b324)
+  (let ?b325 (Sub ?b320 ?b324))
+  (union (const329) ?b325)
+  (let ?r326 (Mul ?sz ?b325))
+  (union (const330) ?r326)
+  (let ?b327 (Mul ?r6 ?b308))
+  (union (const331) ?b327)
+  (let ?b328 (Sub ?b327 ?b27))
+  (union (const332) ?b328)
+  (let ?b329 (Mul ?sz ?b328))
+  (union (const333) ?b329)
+  (let ?r330 (Mul ?r6 ?b329))
+  (union (const334) ?r330)
+  (let ?b331 (Div ?r291 ?sz))
+  (union (const335) ?b331)
+  (let ?b332 (Mul ?r6 ?b331))
+  (union (const336) ?b332)
+  (let ?b333 (Add ?b27 ?b332))
+  (union (const337) ?b333)
+  (let ?b334 (Mul ?sz ?b333))
+  (union (const338) ?b334)
+  (let ?r335 (Mul ?r6 ?b334))
+  (union (const339) ?r335)
+  (let ?b336 (Div ?r294 ?sz))
+  (union (const340) ?b336)
+  (let ?b337 (Mul ?r6 ?b336))
+  (union (const341) ?b337)
+  (let ?b338 (Add ?b27 ?b337))
+  (union (const342) ?b338)
+  (let ?b339 (Mul ?sz ?b338))
+  (union (const343) ?b339)
+  (let ?r340 (Mul ?r6 ?b339))
+  (union (const344) ?r340)
+  (let ?b341 (Div ?r19 ?sz))
+  (union (const345) ?b341)
+  (let ?b342 (Mul ?r6 ?b341))
+  (union (const346) ?b342)
+  (let ?b343 (Add ?b27 ?b342))
+  (union (const347) ?b343)
+  (let ?b344 (Mul ?sz ?b343))
+  (union (const348) ?b344)
+  (let ?r345 (Mul ?r6 ?b344))
+  (union (const349) ?r345)
+  (let ?b346 (Div ?r23 ?sz))
+  (union (const350) ?b346)
+  (let ?b347 (Mul ?r6 ?b346))
+  (union (const351) ?b347)
+  (let ?b348 (Add ?b27 ?b347))
+  (union (const352) ?b348)
+  (let ?b349 (Mul ?sz ?b348))
+  (union (const353) ?b349)
+  (let ?r350 (Mul ?r6 ?b349))
+  (union (const354) ?r350))
+ :ruleset
+ run-extract-commands)
+(run-schedule (repeat 1 run-extract-commands))
+(rule
+ ((= e (Atan2 x y))
+  (= tx (do-lower x "sym_binary32"))
+  (= ty (do-lower y "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Atan2f32Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (E)))
+ ((union (do-lower e "sym_binary32") (Ef32Ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Mul x y))
+  (= tx (do-lower x "sym_binary32"))
+  (= ty (do-lower y "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Mulf32Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Cbrt x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Cbrtf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Sinh x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Sinhf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Not x)) (= tx (do-lower x "sym_bool")))
+ ((union (do-lower e "sym_bool") (NotTy tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Log10 x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Log10f32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Asin x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Asinf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Lt x y))
+  (= tx (do-lower x "sym_binary32"))
+  (= ty (do-lower y "sym_binary32")))
+ ((union (do-lower e "sym_bool") (Ltf32Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Ref v (Num (bigrat (from-string "0") (from-string "1")))))
+  (= tv (do-lower v "arr_2_sym_binary64")))
+ ((union (do-lower e "sym_binary64") (First-ElementTy tv)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Sqrt x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Sqrtf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Fdim x y))
+  (= tx (do-lower x "sym_binary64"))
+  (= ty (do-lower y "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Fdimf64Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((=
+   e
+   (Add
+    (Mul w (Ref v (Num (bigrat (from-string "0") (from-string "1")))))
+    (Ref v (Num (bigrat (from-string "1") (from-string "1"))))))
+  (= tw (do-lower w "sym_binary64"))
+  (= tv (do-lower v "arr_2_sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Weighted-ComboTy tw tv)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Lgamma x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Lgammaf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Sub (Mul re re) (Mul im im)))
+  (= tre (do-lower re "sym_binary64"))
+  (= tim (do-lower im "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Re_sqrTy tre tim)))
+ :ruleset
+ lower)
+(rule
+ ((=
+   e
+   (Ref
+    (Ref
+     (Array
+      (Array
+       (Num (bigrat (from-string "2") (from-string "1")))
+       (Num (bigrat (from-string "1") (from-string "2"))))
+      (Array
+       (Num (bigrat (from-string "-1") (from-string "4")))
+       (Num (bigrat (from-string "3") (from-string "2")))))
+     (Num (bigrat (from-string "1") (from-string "1"))))
+    (Num (bigrat (from-string "0") (from-string "1"))))))
+ ((union (do-lower e "sym_binary64") (Nested-LiteralTy)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Neg x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Negf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Log (Add (Num (bigrat (from-string "1") (from-string "1"))) x)))
+  (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Log1pf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Fmin x y))
+  (= tx (do-lower x "sym_binary32"))
+  (= ty (do-lower y "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Fminf32Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((=
+   e
+   (Array
+    (Add
+     (Ref a (Num (bigrat (from-string "0") (from-string "1"))))
+     (Ref b (Num (bigrat (from-string "0") (from-string "1")))))
+    (Add
+     (Ref a (Num (bigrat (from-string "1") (from-string "1"))))
+     (Ref b (Num (bigrat (from-string "1") (from-string "1")))))))
+  (= ta (do-lower a "arr_2_sym_binary64"))
+  (= tb (do-lower b "arr_2_sym_binary64")))
+ ((union (do-lower e "arr_2_sym_binary64") (Pairwise-SumTy ta tb)))
+ :ruleset
+ lower)
+(rule
+ ((=
+   e
+   (Array
+    (Ref v (Num (bigrat (from-string "0") (from-string "1"))))
+    (Ref v (Num (bigrat (from-string "1") (from-string "1"))))))
+  (= tv (do-lower v "arr_2_sym_binary64")))
+ ((union (do-lower e "arr_2_sym_binary64") (Copy-VectorTy tv)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Rint x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Rintf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Sub x y))
+  (= tx (do-lower x "sym_binary32"))
+  (= ty (do-lower y "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Subf32Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Array x y))
+  (= tx (do-lower x "arr_2_sym_binary64"))
+  (= ty (do-lower y "arr_2_sym_binary64")))
+ ((union (do-lower e "arr_2_arr_2_sym_binary64") (Array2f64Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Array3 x y z))
+  (= tx (do-lower x "sym_binary64"))
+  (= ty (do-lower y "sym_binary64"))
+  (= tz (do-lower z "sym_binary64")))
+ ((union (do-lower e "arr_3_sym_binary64") (Array3f64Ty tx ty tz)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Cbrt x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Cbrtf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Fmax x y))
+  (= tx (do-lower x "sym_binary64"))
+  (= ty (do-lower y "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Fmaxf64Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Fmod x y))
+  (= tx (do-lower x "sym_binary64"))
+  (= ty (do-lower y "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Fmodf64Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Infinity)))
+ ((union (do-lower e "sym_binary32") (Infinityf32Ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Log10 x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Log10f64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Cos x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Cosf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Fmax x y))
+  (= tx (do-lower x "sym_binary32"))
+  (= ty (do-lower y "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Fmaxf32Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Sinh x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Sinhf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Trunc x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Truncf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Tanh x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Tanhf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((=
+   e
+   (Add
+    (Mul
+     (Ref a (Num (bigrat (from-string "0") (from-string "1"))))
+     (Ref b (Num (bigrat (from-string "0") (from-string "1")))))
+    (Mul
+     (Ref a (Num (bigrat (from-string "1") (from-string "1"))))
+     (Ref b (Num (bigrat (from-string "1") (from-string "1")))))))
+  (= ta (do-lower a "arr_2_sym_binary64"))
+  (= tb (do-lower b "arr_2_sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Dot-Product-2DTy ta tb)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Sub x y))
+  (= tx (do-lower x "sym_binary64"))
+  (= ty (do-lower y "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Subf64Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Fabs x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Fabsf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Sin x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Sinf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Tan x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Tanf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Ceil x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Ceilf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Pow x y))
+  (= tx (do-lower x "sym_binary32"))
+  (= ty (do-lower y "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Powf32Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Add (Mul re re) (Mul im im)))
+  (= tre (do-lower re "sym_binary64"))
+  (= tim (do-lower im "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Modulus_sqrTy tre tim)))
+ :ruleset
+ lower)
+(rule
+ ((=
+   e
+   (Array
+    (Ref v (Num (bigrat (from-string "1") (from-string "1"))))
+    (Ref v (Num (bigrat (from-string "0") (from-string "1"))))))
+  (= tv (do-lower v "arr_2_sym_binary64")))
+ ((union (do-lower e "arr_2_sym_binary64") (Reverse-VectorTy tv)))
+ :ruleset
+ lower)
+(rule
+ ((=
+   e
+   (Add
+    (Ref
+     (Array
+      (Num (bigrat (from-string "1") (from-string "10")))
+      (Num (bigrat (from-string "-1") (from-string "5"))))
+     (Num (bigrat (from-string "0") (from-string "1"))))
+    (Ref
+     (Array
+      (Num (bigrat (from-string "1") (from-string "10")))
+      (Num (bigrat (from-string "-1") (from-string "5"))))
+     (Num (bigrat (from-string "1") (from-string "1")))))))
+ ((union (do-lower e "sym_binary64") (Bias-AddTy)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Neq x y))
+  (= tx (do-lower x "sym_binary32"))
+  (= ty (do-lower y "sym_binary32")))
+ ((union (do-lower e "sym_bool") (Neqf32Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Fabs x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Fabsf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Sub (Num (bigrat (from-string "1") (from-string "1"))) (Erf x)))
+  (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Erfcf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((=
+   e
+   (Add
+    (Ref v (Num (bigrat (from-string "0") (from-string "1"))))
+    (Ref v (Num (bigrat (from-string "1") (from-string "1"))))))
+  (= tv (do-lower v "arr_2_sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Vector-SumTy tv)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Add (Mul re im) (Mul im re)))
+  (= tre (do-lower re "sym_binary64"))
+  (= tim (do-lower im "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Im_sqrTy tre tim)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Atan x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Atanf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Array3 x y z))
+  (= tx (do-lower x "sym_binary32"))
+  (= ty (do-lower y "sym_binary32"))
+  (= tz (do-lower z "sym_binary32")))
+ ((union (do-lower e "arr_3_sym_binary32") (Array3f32Ty tx ty tz)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Fmod x y))
+  (= tx (do-lower x "sym_binary32"))
+  (= ty (do-lower y "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Fmodf32Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Exp2 x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Exp2f64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Eq x y))
+  (= tx (do-lower x "sym_binary64"))
+  (= ty (do-lower y "sym_binary64")))
+ ((union (do-lower e "sym_bool") (Eqf64Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Atan x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Atanf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Pow x y))
+  (= tx (do-lower x "sym_binary64"))
+  (= ty (do-lower y "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Powf64Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Cosh x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Coshf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Logb x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Logbf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Acos x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Acosf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Ref arr idx))
+  (= tarr (do-lower arr "arr_2_sym_binary32"))
+  (= tidx (do-lower idx "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Reff32Ty tarr tidx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Exp x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Expf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Ref arr idx))
+  (= tarr (do-lower arr "arr_3_sym_binary64"))
+  (= tidx (do-lower idx "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Refr3f64Ty tarr tidx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Round x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Roundf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Sub (Num (bigrat (from-string "1") (from-string "1"))) (Erf x)))
+  (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Erfcf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Rint x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Rintf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Array x y))
+  (= tx (do-lower x "sym_binary32"))
+  (= ty (do-lower y "sym_binary32")))
+ ((union (do-lower e "arr_2_sym_binary32") (Arrayf32Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Acos x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Acosf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Asin x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Asinf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Cosh x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Coshf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Log2 x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Log2f64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Remainder x y))
+  (= tx (do-lower x "sym_binary64"))
+  (= ty (do-lower y "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Remainderf64Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Tanh x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Tanhf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Gt x y))
+  (= tx (do-lower x "sym_binary64"))
+  (= ty (do-lower y "sym_binary64")))
+ ((union (do-lower e "sym_bool") (Gtf64Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Copysign x y))
+  (= tx (do-lower x "sym_binary32"))
+  (= ty (do-lower y "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Copysignf32Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Erf x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Erff64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Remainder x y))
+  (= tx (do-lower x "sym_binary32"))
+  (= ty (do-lower y "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Remainderf32Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Array v0 v1))
+  (= tv0 (do-lower v0 "sym_binary64"))
+  (= tv1 (do-lower v1 "sym_binary64")))
+ ((union (do-lower e "arr_2_sym_binary64") (Create-VectorTy tv0 tv1)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Ref arr idx))
+  (= tarr (do-lower arr "arr_2_sym_binary64"))
+  (= tidx (do-lower idx "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Reff64Ty tarr tidx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Neq x y))
+  (= tx (do-lower x "sym_binary64"))
+  (= ty (do-lower y "sym_binary64")))
+ ((union (do-lower e "sym_bool") (Neqf64Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Trunc x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Truncf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Fdim x y))
+  (= tx (do-lower x "sym_binary32"))
+  (= ty (do-lower y "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Fdimf32Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (And x y))
+  (= tx (do-lower x "sym_bool"))
+  (= ty (do-lower y "sym_bool")))
+ ((union (do-lower e "sym_bool") (AndTy tx ty)))
+ :ruleset
+ lower)
+(rule ((= e (True))) ((union (do-lower e "sym_bool") (TrueTy))) :ruleset lower)
+(rule
+ ((=
+   e
+   (Add
+    (Mul s (Ref v (Num (bigrat (from-string "0") (from-string "1")))))
+    (Mul s (Ref v (Num (bigrat (from-string "1") (from-string "1")))))))
+  (= tv (do-lower v "arr_2_sym_binary64"))
+  (= ts (do-lower s "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Scaled-SumTy tv ts)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Add (Mul x y) z))
+  (= tx (do-lower x "sym_binary64"))
+  (= ty (do-lower y "sym_binary64"))
+  (= tz (do-lower z "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Fmaf64Ty tx ty tz)))
+ :ruleset
+ lower)
+(rule
+ ((= e (False)))
+ ((union (do-lower e "sym_bool") (FalseTy)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Sqrt (Add (Mul x x) (Mul y y))))
+  (= tx (do-lower x "sym_binary32"))
+  (= ty (do-lower y "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Hypotf32Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Erf x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Erff32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Log x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Logf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Eq x y))
+  (= tx (do-lower x "sym_binary32"))
+  (= ty (do-lower y "sym_binary32")))
+ ((union (do-lower e "sym_bool") (Eqf32Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Tan x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Tanf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Log x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Logf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Sub (Exp x) (Num (bigrat (from-string "1") (from-string "1")))))
+  (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Expm1f32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Exp2 x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Exp2f32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Atanh x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Atanhf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Array x y))
+  (= tx (do-lower x "sym_binary64"))
+  (= ty (do-lower y "sym_binary64")))
+ ((union (do-lower e "arr_2_sym_binary64") (Arrayf64Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Nan)))
+ ((union (do-lower e "sym_binary64") (Nanf64Ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Fmin x y))
+  (= tx (do-lower x "sym_binary64"))
+  (= ty (do-lower y "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Fminf64Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Exp x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Expf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Log2 x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Log2f32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Lgamma x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Lgammaf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Lte x y))
+  (= tx (do-lower x "sym_binary64"))
+  (= ty (do-lower y "sym_binary64")))
+ ((union (do-lower e "sym_bool") (Ltef64Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Add (Mul x y) z))
+  (= tx (do-lower x "sym_binary32"))
+  (= ty (do-lower y "sym_binary32"))
+  (= tz (do-lower z "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Fmaf32Ty tx ty tz)))
+ :ruleset
+ lower)
+(rule
+ ((=
+   e
+   (Array3
+    (Mul
+     (Ref r_e (Num (bigrat (from-string "0") (from-string "1"))))
+     (Mul
+      (Div
+       (Neg (Num (bigrat (from-string "398600441800000") (from-string "1"))))
+       (Mul
+        (Mul
+         (Sqrt
+          (Add
+           (Mul
+            (Ref r_e (Num (bigrat (from-string "0") (from-string "1"))))
+            (Ref r_e (Num (bigrat (from-string "0") (from-string "1")))))
+           (Add
+            (Mul
+             (Ref r_e (Num (bigrat (from-string "1") (from-string "1"))))
+             (Ref r_e (Num (bigrat (from-string "1") (from-string "1")))))
+            (Mul
+             (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))
+             (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))))))
+         (Sqrt
+          (Add
+           (Mul
+            (Ref r_e (Num (bigrat (from-string "0") (from-string "1"))))
+            (Ref r_e (Num (bigrat (from-string "0") (from-string "1")))))
+           (Add
+            (Mul
+             (Ref r_e (Num (bigrat (from-string "1") (from-string "1"))))
+             (Ref r_e (Num (bigrat (from-string "1") (from-string "1")))))
+            (Mul
+             (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))
+             (Ref r_e (Num (bigrat (from-string "2") (from-string "1")))))))))
+        (Sqrt
+         (Add
+          (Mul
+           (Ref r_e (Num (bigrat (from-string "0") (from-string "1"))))
+           (Ref r_e (Num (bigrat (from-string "0") (from-string "1")))))
+          (Add
+           (Mul
+            (Ref r_e (Num (bigrat (from-string "1") (from-string "1"))))
+            (Ref r_e (Num (bigrat (from-string "1") (from-string "1")))))
+           (Mul
+            (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))
+            (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))))))))
+      (Sub
+       (Num (bigrat (from-string "1") (from-string "1")))
+       (Mul
+        (Mul
+         (Mul
+          (Num (bigrat (from-string "3") (from-string "2")))
+          (Num (bigrat (from-string "108263") (from-string "100000000"))))
+         (Div
+          (Mul
+           (Num (bigrat (from-string "6378137") (from-string "1")))
+           (Num (bigrat (from-string "6378137") (from-string "1"))))
+          (Mul
+           (Sqrt
+            (Add
+             (Mul
+              (Ref r_e (Num (bigrat (from-string "0") (from-string "1"))))
+              (Ref r_e (Num (bigrat (from-string "0") (from-string "1")))))
+             (Add
+              (Mul
+               (Ref r_e (Num (bigrat (from-string "1") (from-string "1"))))
+               (Ref r_e (Num (bigrat (from-string "1") (from-string "1")))))
+              (Mul
+               (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))
+               (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))))))
+           (Sqrt
+            (Add
+             (Mul
+              (Ref r_e (Num (bigrat (from-string "0") (from-string "1"))))
+              (Ref r_e (Num (bigrat (from-string "0") (from-string "1")))))
+             (Add
+              (Mul
+               (Ref r_e (Num (bigrat (from-string "1") (from-string "1"))))
+               (Ref r_e (Num (bigrat (from-string "1") (from-string "1")))))
+              (Mul
+               (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))
+               (Ref
+                r_e
+                (Num (bigrat (from-string "2") (from-string "1")))))))))))
+        (Sub
+         (Div
+          (Mul
+           (Mul
+            (Num (bigrat (from-string "5") (from-string "1")))
+            (Ref r_e (Num (bigrat (from-string "2") (from-string "1")))))
+           (Ref r_e (Num (bigrat (from-string "2") (from-string "1")))))
+          (Mul
+           (Sqrt
+            (Add
+             (Mul
+              (Ref r_e (Num (bigrat (from-string "0") (from-string "1"))))
+              (Ref r_e (Num (bigrat (from-string "0") (from-string "1")))))
+             (Add
+              (Mul
+               (Ref r_e (Num (bigrat (from-string "1") (from-string "1"))))
+               (Ref r_e (Num (bigrat (from-string "1") (from-string "1")))))
+              (Mul
+               (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))
+               (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))))))
+           (Sqrt
+            (Add
+             (Mul
+              (Ref r_e (Num (bigrat (from-string "0") (from-string "1"))))
+              (Ref r_e (Num (bigrat (from-string "0") (from-string "1")))))
+             (Add
+              (Mul
+               (Ref r_e (Num (bigrat (from-string "1") (from-string "1"))))
+               (Ref r_e (Num (bigrat (from-string "1") (from-string "1")))))
+              (Mul
+               (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))
+               (Ref
+                r_e
+                (Num (bigrat (from-string "2") (from-string "1"))))))))))
+         (Num (bigrat (from-string "1") (from-string "1"))))))))
+    (Mul
+     (Ref r_e (Num (bigrat (from-string "1") (from-string "1"))))
+     (Mul
+      (Div
+       (Neg (Num (bigrat (from-string "398600441800000") (from-string "1"))))
+       (Mul
+        (Mul
+         (Sqrt
+          (Add
+           (Mul
+            (Ref r_e (Num (bigrat (from-string "0") (from-string "1"))))
+            (Ref r_e (Num (bigrat (from-string "0") (from-string "1")))))
+           (Add
+            (Mul
+             (Ref r_e (Num (bigrat (from-string "1") (from-string "1"))))
+             (Ref r_e (Num (bigrat (from-string "1") (from-string "1")))))
+            (Mul
+             (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))
+             (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))))))
+         (Sqrt
+          (Add
+           (Mul
+            (Ref r_e (Num (bigrat (from-string "0") (from-string "1"))))
+            (Ref r_e (Num (bigrat (from-string "0") (from-string "1")))))
+           (Add
+            (Mul
+             (Ref r_e (Num (bigrat (from-string "1") (from-string "1"))))
+             (Ref r_e (Num (bigrat (from-string "1") (from-string "1")))))
+            (Mul
+             (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))
+             (Ref r_e (Num (bigrat (from-string "2") (from-string "1")))))))))
+        (Sqrt
+         (Add
+          (Mul
+           (Ref r_e (Num (bigrat (from-string "0") (from-string "1"))))
+           (Ref r_e (Num (bigrat (from-string "0") (from-string "1")))))
+          (Add
+           (Mul
+            (Ref r_e (Num (bigrat (from-string "1") (from-string "1"))))
+            (Ref r_e (Num (bigrat (from-string "1") (from-string "1")))))
+           (Mul
+            (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))
+            (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))))))))
+      (Sub
+       (Num (bigrat (from-string "1") (from-string "1")))
+       (Mul
+        (Mul
+         (Mul
+          (Num (bigrat (from-string "3") (from-string "2")))
+          (Num (bigrat (from-string "108263") (from-string "100000000"))))
+         (Div
+          (Mul
+           (Num (bigrat (from-string "6378137") (from-string "1")))
+           (Num (bigrat (from-string "6378137") (from-string "1"))))
+          (Mul
+           (Sqrt
+            (Add
+             (Mul
+              (Ref r_e (Num (bigrat (from-string "0") (from-string "1"))))
+              (Ref r_e (Num (bigrat (from-string "0") (from-string "1")))))
+             (Add
+              (Mul
+               (Ref r_e (Num (bigrat (from-string "1") (from-string "1"))))
+               (Ref r_e (Num (bigrat (from-string "1") (from-string "1")))))
+              (Mul
+               (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))
+               (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))))))
+           (Sqrt
+            (Add
+             (Mul
+              (Ref r_e (Num (bigrat (from-string "0") (from-string "1"))))
+              (Ref r_e (Num (bigrat (from-string "0") (from-string "1")))))
+             (Add
+              (Mul
+               (Ref r_e (Num (bigrat (from-string "1") (from-string "1"))))
+               (Ref r_e (Num (bigrat (from-string "1") (from-string "1")))))
+              (Mul
+               (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))
+               (Ref
+                r_e
+                (Num (bigrat (from-string "2") (from-string "1")))))))))))
+        (Sub
+         (Div
+          (Mul
+           (Mul
+            (Num (bigrat (from-string "5") (from-string "1")))
+            (Ref r_e (Num (bigrat (from-string "2") (from-string "1")))))
+           (Ref r_e (Num (bigrat (from-string "2") (from-string "1")))))
+          (Mul
+           (Sqrt
+            (Add
+             (Mul
+              (Ref r_e (Num (bigrat (from-string "0") (from-string "1"))))
+              (Ref r_e (Num (bigrat (from-string "0") (from-string "1")))))
+             (Add
+              (Mul
+               (Ref r_e (Num (bigrat (from-string "1") (from-string "1"))))
+               (Ref r_e (Num (bigrat (from-string "1") (from-string "1")))))
+              (Mul
+               (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))
+               (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))))))
+           (Sqrt
+            (Add
+             (Mul
+              (Ref r_e (Num (bigrat (from-string "0") (from-string "1"))))
+              (Ref r_e (Num (bigrat (from-string "0") (from-string "1")))))
+             (Add
+              (Mul
+               (Ref r_e (Num (bigrat (from-string "1") (from-string "1"))))
+               (Ref r_e (Num (bigrat (from-string "1") (from-string "1")))))
+              (Mul
+               (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))
+               (Ref
+                r_e
+                (Num (bigrat (from-string "2") (from-string "1"))))))))))
+         (Num (bigrat (from-string "1") (from-string "1"))))))))
+    (Mul
+     (Mul
+      (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))
+      (Div
+       (Neg (Num (bigrat (from-string "398600441800000") (from-string "1"))))
+       (Mul
+        (Mul
+         (Sqrt
+          (Add
+           (Mul
+            (Ref r_e (Num (bigrat (from-string "0") (from-string "1"))))
+            (Ref r_e (Num (bigrat (from-string "0") (from-string "1")))))
+           (Add
+            (Mul
+             (Ref r_e (Num (bigrat (from-string "1") (from-string "1"))))
+             (Ref r_e (Num (bigrat (from-string "1") (from-string "1")))))
+            (Mul
+             (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))
+             (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))))))
+         (Sqrt
+          (Add
+           (Mul
+            (Ref r_e (Num (bigrat (from-string "0") (from-string "1"))))
+            (Ref r_e (Num (bigrat (from-string "0") (from-string "1")))))
+           (Add
+            (Mul
+             (Ref r_e (Num (bigrat (from-string "1") (from-string "1"))))
+             (Ref r_e (Num (bigrat (from-string "1") (from-string "1")))))
+            (Mul
+             (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))
+             (Ref r_e (Num (bigrat (from-string "2") (from-string "1")))))))))
+        (Sqrt
+         (Add
+          (Mul
+           (Ref r_e (Num (bigrat (from-string "0") (from-string "1"))))
+           (Ref r_e (Num (bigrat (from-string "0") (from-string "1")))))
+          (Add
+           (Mul
+            (Ref r_e (Num (bigrat (from-string "1") (from-string "1"))))
+            (Ref r_e (Num (bigrat (from-string "1") (from-string "1")))))
+           (Mul
+            (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))
+            (Ref r_e (Num (bigrat (from-string "2") (from-string "1")))))))))))
+     (Sub
+      (Num (bigrat (from-string "1") (from-string "1")))
+      (Mul
+       (Mul
+        (Mul
+         (Num (bigrat (from-string "3") (from-string "2")))
+         (Num (bigrat (from-string "108263") (from-string "100000000"))))
+        (Div
+         (Mul
+          (Num (bigrat (from-string "6378137") (from-string "1")))
+          (Num (bigrat (from-string "6378137") (from-string "1"))))
+         (Mul
+          (Sqrt
+           (Add
+            (Mul
+             (Ref r_e (Num (bigrat (from-string "0") (from-string "1"))))
+             (Ref r_e (Num (bigrat (from-string "0") (from-string "1")))))
+            (Add
+             (Mul
+              (Ref r_e (Num (bigrat (from-string "1") (from-string "1"))))
+              (Ref r_e (Num (bigrat (from-string "1") (from-string "1")))))
+             (Mul
+              (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))
+              (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))))))
+          (Sqrt
+           (Add
+            (Mul
+             (Ref r_e (Num (bigrat (from-string "0") (from-string "1"))))
+             (Ref r_e (Num (bigrat (from-string "0") (from-string "1")))))
+            (Add
+             (Mul
+              (Ref r_e (Num (bigrat (from-string "1") (from-string "1"))))
+              (Ref r_e (Num (bigrat (from-string "1") (from-string "1")))))
+             (Mul
+              (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))
+              (Ref
+               r_e
+               (Num (bigrat (from-string "2") (from-string "1")))))))))))
+       (Sub
+        (Div
+         (Mul
+          (Mul
+           (Num (bigrat (from-string "5") (from-string "1")))
+           (Ref r_e (Num (bigrat (from-string "2") (from-string "1")))))
+          (Ref r_e (Num (bigrat (from-string "2") (from-string "1")))))
+         (Mul
+          (Sqrt
+           (Add
+            (Mul
+             (Ref r_e (Num (bigrat (from-string "0") (from-string "1"))))
+             (Ref r_e (Num (bigrat (from-string "0") (from-string "1")))))
+            (Add
+             (Mul
+              (Ref r_e (Num (bigrat (from-string "1") (from-string "1"))))
+              (Ref r_e (Num (bigrat (from-string "1") (from-string "1")))))
+             (Mul
+              (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))
+              (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))))))
+          (Sqrt
+           (Add
+            (Mul
+             (Ref r_e (Num (bigrat (from-string "0") (from-string "1"))))
+             (Ref r_e (Num (bigrat (from-string "0") (from-string "1")))))
+            (Add
+             (Mul
+              (Ref r_e (Num (bigrat (from-string "1") (from-string "1"))))
+              (Ref r_e (Num (bigrat (from-string "1") (from-string "1")))))
+             (Mul
+              (Ref r_e (Num (bigrat (from-string "2") (from-string "1"))))
+              (Ref
+               r_e
+               (Num (bigrat (from-string "2") (from-string "1"))))))))))
+        (Num (bigrat (from-string "3") (from-string "1")))))))))
+  (= tr_e (do-lower r_e "arr_3_sym_binary64")))
+ ((union (do-lower e "arr_3_sym_binary64") (Gravitation-EcefTy tr_e)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Or x y)) (= tx (do-lower x "sym_bool")) (= ty (do-lower y "sym_bool")))
+ ((union (do-lower e "sym_bool") (OrTy tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Add x y))
+  (= tx (do-lower x "sym_binary64"))
+  (= ty (do-lower y "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Addf64Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (If c t f))
+  (= tc (do-lower c "sym_bool"))
+  (= tt (do-lower t "sym_binary64"))
+  (= tf (do-lower f "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Iff64Ty tc tt tf)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Tgamma x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Tgammaf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Sqrt x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Sqrtf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Nan)))
+ ((union (do-lower e "sym_binary32") (Nanf32Ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Pi)))
+ ((union (do-lower e "sym_binary32") (Pif32Ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Logb x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Logbf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Gte x y))
+  (= tx (do-lower x "sym_binary32"))
+  (= ty (do-lower y "sym_binary32")))
+ ((union (do-lower e "sym_bool") (Gtef32Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Ref arr idx))
+  (= tarr (do-lower arr "arr_3_sym_binary32"))
+  (= tidx (do-lower idx "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Refr3f32Ty tarr tidx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Gt x y))
+  (= tx (do-lower x "sym_binary32"))
+  (= ty (do-lower y "sym_binary32")))
+ ((union (do-lower e "sym_bool") (Gtf32Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Div x y))
+  (= tx (do-lower x "sym_binary32"))
+  (= ty (do-lower y "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Divf32Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Acosh x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Acoshf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Round x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Roundf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Atan2 x y))
+  (= tx (do-lower x "sym_binary64"))
+  (= ty (do-lower y "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Atan2f64Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Floor x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Floorf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Sqrt (Add (Mul x x) (Mul y y))))
+  (= tx (do-lower x "sym_binary64"))
+  (= ty (do-lower y "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Hypotf64Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Asinh x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Asinhf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((=
+   e
+   (Array
+    (Mul
+     (Num (bigrat (from-string "1") (from-string "2")))
+     (Add
+      (Ref v (Num (bigrat (from-string "0") (from-string "1"))))
+      (Ref v (Num (bigrat (from-string "1") (from-string "1"))))))
+    (Mul
+     (Num (bigrat (from-string "1") (from-string "2")))
+     (Sub
+      (Ref v (Num (bigrat (from-string "0") (from-string "1"))))
+      (Ref v (Num (bigrat (from-string "1") (from-string "1"))))))))
+  (= tv (do-lower v "arr_2_sym_binary64")))
+ ((union (do-lower e "arr_2_sym_binary64") (Mean-And-SpanTy tv)))
+ :ruleset
+ lower)
+(rule
+ ((=
+   e
+   (Add
+    (Mul
+     (Ref
+      (Array
+       (Num (bigrat (from-string "3") (from-string "2")))
+       (Num (bigrat (from-string "-3") (from-string "4"))))
+      (Num (bigrat (from-string "0") (from-string "1"))))
+     (Ref v (Num (bigrat (from-string "0") (from-string "1")))))
+    (Mul
+     (Ref
+      (Array
+       (Num (bigrat (from-string "3") (from-string "2")))
+       (Num (bigrat (from-string "-3") (from-string "4"))))
+      (Num (bigrat (from-string "1") (from-string "1"))))
+     (Ref v (Num (bigrat (from-string "1") (from-string "1")))))))
+  (= tv (do-lower v "arr_2_sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Mat-Vec-First-RowTy tv)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Neg x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Negf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Ref arr idx))
+  (= tarr (do-lower arr "arr_2_arr_2_sym_binary64"))
+  (= tidx (do-lower idx "sym_binary64")))
+ ((union (do-lower e "arr_2_sym_binary64") (Refr2f64Ty tarr tidx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Ceil x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Ceilf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((=
+   e
+   (Sqrt
+    (Add
+     (Mul
+      (Ref a (Num (bigrat (from-string "0") (from-string "1"))))
+      (Ref a (Num (bigrat (from-string "0") (from-string "1")))))
+     (Add
+      (Mul
+       (Ref a (Num (bigrat (from-string "1") (from-string "1"))))
+       (Ref a (Num (bigrat (from-string "1") (from-string "1")))))
+      (Mul
+       (Ref a (Num (bigrat (from-string "2") (from-string "1"))))
+       (Ref a (Num (bigrat (from-string "2") (from-string "1")))))))))
+  (= ta (do-lower a "arr_3_sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Norm-3Ty ta)))
+ :ruleset
+ lower)
+(rule
+ ((= e (E)))
+ ((union (do-lower e "sym_binary64") (Ef64Ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Gte x y))
+  (= tx (do-lower x "sym_binary64"))
+  (= ty (do-lower y "sym_binary64")))
+ ((union (do-lower e "sym_bool") (Gtef64Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (If c t f))
+  (= tc (do-lower c "sym_bool"))
+  (= tt (do-lower t "sym_binary32"))
+  (= tf (do-lower f "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Iff32Ty tc tt tf)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Mul x y))
+  (= tx (do-lower x "sym_binary64"))
+  (= ty (do-lower y "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Mulf64Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Floor x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Floorf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Lte x y))
+  (= tx (do-lower x "sym_binary32"))
+  (= ty (do-lower y "sym_binary32")))
+ ((union (do-lower e "sym_bool") (Ltef32Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Div x y))
+  (= tx (do-lower x "sym_binary64"))
+  (= ty (do-lower y "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Divf64Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Tgamma x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Tgammaf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Log (Add (Num (bigrat (from-string "1") (from-string "1"))) x)))
+  (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Log1pf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Sqrt (Add (Mul re re) (Mul im im))))
+  (= tre (do-lower re "sym_binary64"))
+  (= tim (do-lower im "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (ModulusTy tre tim)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Sub (Exp x) (Num (bigrat (from-string "1") (from-string "1")))))
+  (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Expm1f64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Acosh x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Acoshf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Lt x y))
+  (= tx (do-lower x "sym_binary64"))
+  (= ty (do-lower y "sym_binary64")))
+ ((union (do-lower e "sym_bool") (Ltf64Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Atanh x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Atanhf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Copysign x y))
+  (= tx (do-lower x "sym_binary64"))
+  (= ty (do-lower y "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Copysignf64Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Asinh x)) (= tx (do-lower x "sym_binary64")))
+ ((union (do-lower e "sym_binary64") (Asinhf64Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Add x y))
+  (= tx (do-lower x "sym_binary32"))
+  (= ty (do-lower y "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Addf32Ty tx ty)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Sin x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Sinf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Pi)))
+ ((union (do-lower e "sym_binary64") (Pif64Ty)))
+ :ruleset
+ lower)
+(rule
+ ((=
+   e
+   (Array
+    (Num (bigrat (from-string "1") (from-string "1")))
+    (Num (bigrat (from-string "-1") (from-string "1"))))))
+ ((union (do-lower e "arr_2_sym_binary64") (Literal-VectorTy)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Cos x)) (= tx (do-lower x "sym_binary32")))
+ ((union (do-lower e "sym_binary32") (Cosf32Ty tx)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Infinity)))
+ ((union (do-lower e "sym_binary64") (InfinityTy)))
+ :ruleset
+ lower)
+(rule
+ ((=
+   e
+   (Mul
+    (Mul
+     (Mul
+      (Div
+       (Div
+        (Mul
+         (Div (Mul sgn J2) (Num (bigrat (from-string "2") (from-string "1"))))
+         (Pow (Div req a) (Num (bigrat (from-string "2") (from-string "1")))))
+        (Pow
+         (Sqrt
+          (Sub
+           (Num (bigrat (from-string "1") (from-string "1")))
+           (Pow e (Num (bigrat (from-string "2") (from-string "1"))))))
+         (Num (bigrat (from-string "4") (from-string "1")))))
+       (Num (bigrat (from-string "8") (from-string "1"))))
+      e)
+     (Pow
+      (Sqrt
+       (Sub
+        (Num (bigrat (from-string "1") (from-string "1")))
+        (Pow e (Num (bigrat (from-string "2") (from-string "1"))))))
+      (Num (bigrat (from-string "2") (from-string "1")))))
+    (Mul
+     (Add
+      (Sub
+       (Num (bigrat (from-string "1") (from-string "1")))
+       (Mul
+        (Num (bigrat (from-string "11") (from-string "1")))
+        (Pow (Cos i) (Num (bigrat (from-string "2") (from-string "1"))))))
+      (Neg
+       (Div
+        (Mul
+         (Num (bigrat (from-string "40") (from-string "1")))
+         (Pow (Cos i) (Num (bigrat (from-string "4") (from-string "1")))))
+        (Sub
+         (Num (bigrat (from-string "1") (from-string "1")))
+         (Mul
+          (Num (bigrat (from-string "5") (from-string "1")))
+          (Pow (Cos i) (Num (bigrat (from-string "2") (from-string "1")))))))))
+     (Cos (Mul (Num (bigrat (from-string "2") (from-string "1"))) omega)))))
+  (= te (do-lower e "sym_binary64"))
+  (= ti (do-lower i "sym_binary64"))
+  (= tomega (do-lower omega "sym_binary64"))
+  (= tsgn (do-lower sgn "sym_binary64"))
+  (= tJ2 (do-lower J2 "sym_binary64"))
+  (= treq (do-lower req "sym_binary64"))
+  (= ta (do-lower a "sym_binary64")))
+ ((union
+   (do-lower e "sym_binary64")
+   (Clmeanoscmap-De1Ty te ti tomega tsgn tJ2 treq ta)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Array s s)) (= ts (do-lower s "sym_binary64")))
+ ((union (do-lower e "arr_2_sym_binary64") (Duplicate-ScalarTy ts)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Num n)))
+ ((union (do-lower e "arr_3_sym_binary32") (Num_arr_3_sym_binary32 n)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Num n)))
+ ((union (do-lower e "arr_2_sym_binary32") (Num_arr_2_sym_binary32 n)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Num n)))
+ ((union
+   (do-lower e "arr_2_arr_2_sym_binary64")
+   (Num_arr_2_arr_2_sym_binary64 n)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Num n)))
+ ((union (do-lower e "arr_3_sym_binary64") (Num_arr_3_sym_binary64 n)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Num n)))
+ ((union (do-lower e "arr_2_sym_binary64") (Num_arr_2_sym_binary64 n)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Num n)))
+ ((union (do-lower e "sym_binary64") (Num_sym_binary64 n)))
+ :ruleset
+ lower)
+(rule
+ ((= e (Num n)))
+ ((union (do-lower e "sym_binary32") (Num_sym_binary32 n)))
+ :ruleset
+ lower)
+(run-schedule (saturate lower))
+(multi-extract
+ 1
+ (do-lower (const7) "sym_binary64")
+ (do-lower (const1) "sym_binary64")
+ (do-lower (const2) "sym_binary64")
+ (do-lower (const8) "sym_binary64")
+ (do-lower (const10) "sym_binary64")
+ (do-lower (const15) "sym_binary64")
+ (do-lower (const16) "sym_binary64")
+ (do-lower (const17) "sym_binary64")
+ (do-lower (const22) "sym_binary64")
+ (do-lower (const23) "sym_binary64")
+ (do-lower (const24) "sym_binary64")
+ (do-lower (const25) "sym_binary64")
+ (do-lower (const26) "sym_binary64")
+ (do-lower (const27) "sym_binary64")
+ (do-lower (const29) "sym_binary64")
+ (do-lower (const30) "sym_binary64")
+ (do-lower (const34) "sym_binary64")
+ (do-lower (const38) "sym_binary64")
+ (do-lower (const40) "sym_binary64")
+ (do-lower (const45) "sym_binary64")
+ (do-lower (const48) "sym_binary64")
+ (do-lower (const50) "sym_binary64")
+ (do-lower (const53) "sym_binary64")
+ (do-lower (const57) "sym_binary64")
+ (do-lower (const62) "sym_binary64")
+ (do-lower (const65) "sym_binary64")
+ (do-lower (const70) "sym_binary64")
+ (do-lower (const75) "sym_binary64")
+ (do-lower (const80) "sym_binary64")
+ (do-lower (const85) "sym_binary64")
+ (do-lower (const18) "sym_binary64")
+ (do-lower (const86) "sym_binary64")
+ (do-lower (const87) "sym_binary64")
+ (do-lower (const88) "sym_binary64")
+ (do-lower (const90) "sym_binary64")
+ (do-lower (const91) "sym_binary64")
+ (do-lower (const94) "sym_binary64")
+ (do-lower (const12) "sym_binary64")
+ (do-lower (const13) "sym_binary64")
+ (do-lower (const14) "sym_binary64")
+ (do-lower (const95) "sym_binary64")
+ (do-lower (const9) "sym_binary64")
+ (do-lower (const19) "sym_binary64")
+ (do-lower (const99) "sym_binary64")
+ (do-lower (const102) "sym_binary64")
+ (do-lower (const11) "sym_binary64")
+ (do-lower (const103) "sym_binary64")
+ (do-lower (const104) "sym_binary64")
+ (do-lower (const98) "sym_binary64")
+ (do-lower (const105) "sym_binary64")
+ (do-lower (const106) "sym_binary64")
+ (do-lower (const109) "sym_binary64")
+ (do-lower (const113) "sym_binary64")
+ (do-lower (const119) "sym_binary64")
+ (do-lower (const122) "sym_binary64")
+ (do-lower (const125) "sym_binary64")
+ (do-lower (const126) "sym_binary64")
+ (do-lower (const127) "sym_binary64")
+ (do-lower (const128) "sym_binary64")
+ (do-lower (const129) "sym_binary64")
+ (do-lower (const130) "sym_binary64")
+ (do-lower (const132) "sym_binary64")
+ (do-lower (const134) "sym_binary64")
+ (do-lower (const135) "sym_binary64")
+ (do-lower (const136) "sym_binary64")
+ (do-lower (const139) "sym_binary64")
+ (do-lower (const140) "sym_binary64")
+ (do-lower (const143) "sym_binary64")
+ (do-lower (const89) "sym_binary64")
+ (do-lower (const147) "sym_binary64")
+ (do-lower (const148) "sym_binary64")
+ (do-lower (const152) "sym_binary64")
+ (do-lower (const154) "sym_binary64")
+ (do-lower (const156) "sym_binary64")
+ (do-lower (const157) "sym_binary64")
+ (do-lower (const158) "sym_binary64")
+ (do-lower (const159) "sym_binary64")
+ (do-lower (const162) "sym_binary64")
+ (do-lower (const146) "sym_binary64")
+ (do-lower (const164) "sym_binary64")
+ (do-lower (const167) "sym_binary64")
+ (do-lower (const168) "sym_binary64")
+ (do-lower (const142) "sym_binary64")
+ (do-lower (const151) "sym_binary64")
+ (do-lower (const169) "sym_binary64")
+ (do-lower (const172) "sym_binary64")
+ (do-lower (const174) "sym_binary64")
+ (do-lower (const179) "sym_binary64")
+ (do-lower (const181) "sym_binary64")
+ (do-lower (const187) "sym_binary64")
+ (do-lower (const189) "sym_binary64")
+ (do-lower (const191) "sym_binary64")
+ (do-lower (const193) "sym_binary64")
+ (do-lower (const195) "sym_binary64")
+ (do-lower (const196) "sym_binary64")
+ (do-lower (const197) "sym_binary64")
+ (do-lower (const201) "sym_binary64")
+ (do-lower (const204) "sym_binary64")
+ (do-lower (const206) "sym_binary64")
+ (do-lower (const210) "sym_binary64")
+ (do-lower (const212) "sym_binary64")
+ (do-lower (const219) "sym_binary64")
+ (do-lower (const220) "sym_binary64")
+ (do-lower (const221) "sym_binary64")
+ (do-lower (const224) "sym_binary64")
+ (do-lower (const225) "sym_binary64")
+ (do-lower (const229) "sym_binary64")
+ (do-lower (const232) "sym_binary64")
+ (do-lower (const233) "sym_binary64")
+ (do-lower (const238) "sym_binary64")
+ (do-lower (const242) "sym_binary64")
+ (do-lower (const247) "sym_binary64")
+ (do-lower (const250) "sym_binary64")
+ (do-lower (const253) "sym_binary64")
+ (do-lower (const256) "sym_binary64")
+ (do-lower (const259) "sym_binary64")
+ (do-lower (const260) "sym_binary64")
+ (do-lower (const261) "sym_binary64")
+ (do-lower (const268) "sym_binary64")
+ (do-lower (const275) "sym_binary64")
+ (do-lower (const282) "sym_binary64")
+ (do-lower (const289) "sym_binary64")
+ (do-lower (const291) "sym_binary64")
+ (do-lower (const294) "sym_binary64")
+ (do-lower (const3) "sym_binary64")
+ (do-lower (const295) "sym_binary64")
+ (do-lower (const297) "sym_binary64")
+ (do-lower (const298) "sym_binary64")
+ (do-lower (const300) "sym_binary64")
+ (do-lower (const303) "sym_binary64")
+ (do-lower (const306) "sym_binary64")
+ (do-lower (const311) "sym_binary64")
+ (do-lower (const314) "sym_binary64")
+ (do-lower (const317) "sym_binary64")
+ (do-lower (const320) "sym_binary64")
+ (do-lower (const327) "sym_binary64")
+ (do-lower (const330) "sym_binary64")
+ (do-lower (const334) "sym_binary64")
+ (do-lower (const339) "sym_binary64")
+ (do-lower (const344) "sym_binary64")
+ (do-lower (const349) "sym_binary64")
+ (do-lower (const354) "sym_binary64"))
