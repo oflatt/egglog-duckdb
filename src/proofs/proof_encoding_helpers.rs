@@ -679,6 +679,21 @@ impl ProofInstrumentor<'_> {
         self.is_native_merge_proof_view(view_name) && !self.supports_tuple_output_views()
     }
 
+    /// True when `view_name` is a 2-TABLE proof view rendered in the all-columns
+    /// COEXIST shape (DuckDB): the eclass view keeps the BASELINE all-columns shape
+    /// `(children..., eclass) -> Unit` (rows for different eclasses COEXIST, all-cols
+    /// PK) instead of the single-output FD `(children) -> eclass` shape, paired with
+    /// the same `@<F>ViewProof` side-table `(children..., eclass) -> proof`. The view
+    /// gets a plain `:merge old` (no `UnionIntoParentTableWithProof` lowering); the
+    /// FD conflict is resolved by the backend's between-statement host pass
+    /// (`emit_native_congruence_proof`), which self-joins the coexisting view, reads
+    /// both proofs from the side-table, composes `Trans(larger_pf, Sym(smaller_pf))`,
+    /// and writes the proof-carrying union edge into the relational `@UF_S`. The
+    /// rebuild / delete / subsume key on the FULL row (see `native_merge_views_coexist`).
+    pub(crate) fn is_native_merge_proof_view_2table_coexist(&self, view_name: &str) -> bool {
+        self.is_native_merge_proof_view_2table(view_name) && self.native_merge_views_coexist()
+    }
+
     /// The proof SIDE-TABLE name for a function (2-table proof-congruence). Fresh
     /// per function, paired with its `@<F>View` eclass view; deterministic.
     pub(crate) fn proof_side_table_name(&mut self, name: &str) -> String {

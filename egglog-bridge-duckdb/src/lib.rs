@@ -1957,6 +1957,36 @@ pub struct FunctionInfo {
     /// into `uf_table` — exactly what the dropped rule did. `None` for every other
     /// table.
     pub native_congruence_uf: Option<String>,
+    /// `Some(cfg)` for a PROOF-mode NATIVE-CONGRUENCE constructor view (`--proofs
+    /// --native-merge`): the `@<C>View` of an eq-sort constructor, declared in the
+    /// all-columns COEXIST shape `(children..., eclass) -> Proof` (so its rows
+    /// COEXIST — the function's all-input PK over `(children, eclass)` only de-dupes
+    /// identical `(children, eclass)` rows). Set by
+    /// [`Backend::register_native_merge_proof_view`] AFTER `declare`. Carries the
+    /// relational proof-UF `@UF_S` parent table, the `@<F>ViewProof` side-table, and
+    /// the `Trans` / `Sym` proof constructors — everything
+    /// [`EGraph::emit_native_congruence_proof`] needs to compose the congruence edge
+    /// proof `Trans(larger_pf, Sym(smaller_pf))` in SQL and write the proof-carrying
+    /// union edge into `@UF_S`. `None` for every other table (and for the non-proof
+    /// `native_congruence_uf` path).
+    pub native_congruence_proof: Option<NativeCongruenceProof>,
+}
+
+/// Proof-congruence config for a `--proofs --native-merge` constructor view on
+/// DuckDB (see [`FunctionInfo::native_congruence_proof`]). All names are DuckDB
+/// table names (resolved from backend `FunctionId`s at registration time).
+#[derive(Clone, Debug)]
+pub struct NativeCongruenceProof {
+    /// The relational proof-UF `@UF_S` (`(S S) -> Proof :merge old`): the composed
+    /// congruence edge `(larger, smaller, edge_proof)` is INSERTed here.
+    pub parent_table: String,
+    /// The `@<F>ViewProof` side-table (`(children..., eclass) -> proof`): the per-row
+    /// view proofs are read from here (joined on `(children, eclass)`).
+    pub side_table: String,
+    /// The `Trans` proof constructor term table (`(Proof Proof) -> Proof`).
+    pub trans_table: String,
+    /// The `Sym` proof constructor term table (`(Proof) -> Proof`).
+    pub sym_table: String,
 }
 
 impl FunctionInfo {
@@ -2654,6 +2684,7 @@ impl EGraph {
                 identity_on_miss: false,
                 merge_tree: None,
                 native_congruence_uf: None,
+                native_congruence_proof: None,
             },
         )?;
         let uf = Arc::new(Mutex::new(UfTable::new()));
@@ -3726,6 +3757,7 @@ impl EGraph {
                 identity_on_miss: false,
                 merge_tree: None,
                 native_congruence_uf: None,
+                native_congruence_proof: None,
             },
         )
     }
@@ -3754,6 +3786,7 @@ impl EGraph {
                 identity_on_miss: false,
                 merge_tree: None,
                 native_congruence_uf: None,
+                native_congruence_proof: None,
             },
         )
     }
@@ -3793,6 +3826,7 @@ impl EGraph {
                 identity_on_miss: false,
                 merge_tree: Some(tree),
                 native_congruence_uf: None,
+                native_congruence_proof: None,
             },
         )
     }
@@ -3836,6 +3870,7 @@ impl EGraph {
                 identity_on_miss: false,
                 merge_tree: None,
                 native_congruence_uf: None,
+                native_congruence_proof: None,
             },
         )?;
         Ok(())
@@ -4223,6 +4258,19 @@ impl EGraph {
             // ~free); the resulting `@UF_S` edges are drained by `sync_native_ufs`
             // and the views re-canonicalized by `@rebuild_rule*` next iteration.
             total += self.emit_native_congruence(cur)?;
+        }
+        // PROOF-mode native CONSTRUCTOR-CONGRUENCE (`--proofs --native-merge`):
+        // resolve FD conflicts on each touched proof-native-congruence view
+        // (`native_congruence_proof.is_some()`) by composing the congruence edge
+        // proof `Trans(larger_pf, Sym(smaller_pf))` in SQL and writing the
+        // proof-carrying union edge into the relational proof-UF `@UF_S`. The proof
+        // path runs WITHOUT `--native-uf` (the CLI decouples it), so it is gated on
+        // the per-view config rather than `native_uf_enabled`. Watermark-gated, so
+        // iterations touching no such view are ~free; the resulting `@UF_S` edges are
+        // canonicalized by the relational singleparent / path_compress rules and the
+        // views re-canonicalized by `@rebuild_rule*` next iteration.
+        if self.proofs_enabled {
+            total += self.emit_native_congruence_proof(cur)?;
         }
         // A full scan re-canonicalized every row, so the accumulated
         // delta is fully consumed — reset it. Only on gated
@@ -4676,6 +4724,210 @@ impl EGraph {
             self.last_native_cong_at.insert(view.clone(), cur);
         }
         Ok(total)
+    }
+
+    /// PROOF-mode native CONSTRUCTOR-CONGRUENCE resolution (`--proofs
+    /// --native-merge` with `supports_native_congruence_merge()` true), INLINE as
+    /// set-based SQL. The proof-carrying sibling of [`EGraph::emit_native_congruence`]
+    /// — the host pass that REPLACES the dropped `@congruence_rule*` self-join rule in
+    /// PROOF mode, composing the congruence edge proof in SQL.
+    ///
+    /// The encoder declares each constructor's `@<C>View` in the all-columns COEXIST
+    /// shape `(children..., eclass) -> Proof` (so two `(set (@<C>View children eclass)
+    /// proof)` writes with the same children but different eclasses COEXIST — the
+    /// function's all-input PK over `(children, eclass)` only de-dupes identical
+    /// `(children, eclass)` rows), paired with a single-output proof SIDE-TABLE
+    /// `@<F>ViewProof : (children..., eclass) -> proof :merge old` (canon-at-creation:
+    /// the per-row view proof is written there when the row is born). The view -> proof
+    /// config association is recorded on `FunctionInfo::native_congruence_proof` by
+    /// `register_native_merge_proof_view`.
+    ///
+    /// For each proof-native-congruence view whose watermark advanced since the last
+    /// pass:
+    ///   1. SELF-JOIN the view on its children columns to read every `(children, e1,
+    ///      e2)` FD conflict (same children, two eclasses) over the seminaive window
+    ///      (`v1` is the delta `ts ∈ [last, cur)`, `v2` is any `ts < cur`), orienting
+    ///      `loser = GREATEST`, `winner = LEAST` — the same delta semantics and
+    ///      orientation as the dropped `@congruence_rule*` (which requires
+    ///      `ordering-max(old, new) = new`, i.e. `larger = new`).
+    ///   2. JOIN the side-table TWICE to read `larger_pf` (for the loser/GREATEST
+    ///      eclass) and `smaller_pf` (for the winner/LEAST eclass).
+    ///   3. MINT `Sym(smaller_pf)` then `Trans(larger_pf, Sym(smaller_pf))` as e-nodes
+    ///      SET-BASED with hash-consing (the same `COALESCE((existing MIN id),
+    ///      nextval)` mint codegen `emit_term_build_merges` uses), recovering the
+    ///      composed edge proof id per conflict row.
+    ///   4. INSERT the proof-carrying union edge `(GREATEST=larger, LEAST=smaller,
+    ///      edge_proof)` into the relational proof-UF `@UF_S` (`parent_table`) with
+    ///      `ON CONFLICT DO NOTHING` (`:merge old` — the first composed proof per
+    ///      `(larger, smaller)` key wins) — byte-for-byte the row the dropped
+    ///      `@congruence_rule*` wrote via `(set (@UF_S larger smaller) (Trans prf1
+    ///      (Sym prf2)))`. The relational singleparent / path_compress rules then
+    ///      canonicalize the proof-UF, and `@rebuild_rule*` re-canonicalizes the views.
+    ///
+    /// Returns the number of conflict rows resolved (a saturation signal). Like
+    /// `emit_native_congruence`, it does NOT delete the loser view row — the
+    /// `@rebuild_rule*` retracts it once the leader change propagates (full
+    /// `(children, eclass)` key, the coexist lifecycle).
+    fn emit_native_congruence_proof(&mut self, cur: i64) -> Result<usize> {
+        // Snapshot eligible (view, cfg, n_keys) triples without holding a borrow.
+        let entries: Vec<(String, NativeCongruenceProof, usize)> = self
+            .functions
+            .iter()
+            .filter_map(|(name, info)| {
+                let cfg = info.native_congruence_proof.clone()?;
+                // COEXIST proof view `(children..., eclass) -> Proof`: `inputs_len`
+                // counts children + eclass; the eclass is at index `inputs_len - 1`
+                // and the proof is the output `c{inputs_len}`. Need >=1 child column.
+                if info.inputs_len < 2 {
+                    return None;
+                }
+                let n_keys = info.inputs_len - 1; // children count.
+                let wm = self.table_watermarks.get(name).copied().unwrap_or(0);
+                let last_at = self.last_native_cong_at.get(name).copied().unwrap_or(0);
+                if wm < last_at {
+                    return None;
+                }
+                Some((name.clone(), cfg, n_keys))
+            })
+            .collect();
+
+        let mut total: usize = 0;
+        for (view, cfg, n_keys) in entries {
+            let last_at = self.last_native_cong_at.get(&view).copied().unwrap_or(0);
+            let out_col = n_keys; // eclass column index (last INPUT column).
+            let side_out = self.functions[&cfg.side_table].inputs_len; // proof column.
+
+            // (1)+(2) Build the conflict batch as a TEMP table. Self-join the
+            // all-cols view on its children columns. Orientation `v1.c{out} <
+            // v2.c{out}` keeps `winner = LEAST` (= `v1`, the kept min eclass) and
+            // `loser = GREATEST` (= `v2`), so `larger = GREATEST`, `smaller = LEAST`
+            // — matching the dropped `@congruence_rule*` (`larger = new = GREATEST`).
+            // Seminaive window mirrors that rule: `v1` is the NEW-since-last-pass
+            // delta, `v2` covers everything earlier-or-equal. Then join the proof
+            // SIDE-TABLE twice on `(children, eclass)`: `sl` for the GREATEST eclass
+            // (`larger_pf`), `ss` for the LEAST eclass (`smaller_pf`). Each unordered
+            // pair appears once per (v1,v2) orientation; the proof reads pin a single
+            // `(larger_pf, smaller_pf)` per conflict, and `ON CONFLICT DO NOTHING`
+            // on `@UF_S` dedupes the same `(larger, smaller)` edge from a swapped
+            // (v1,v2) appearance.
+            let key_join: Vec<String> = (0..n_keys).map(|i| format!("v1.c{i} = v2.c{i}")).collect();
+            let key_proj: Vec<String> = (0..n_keys).map(|i| format!("v1.c{i} AS c{i}")).collect();
+            // Side-table join predicates on (children, eclass).
+            let sl_child_join: Vec<String> =
+                (0..n_keys).map(|i| format!("sl.c{i} = v1.c{i}")).collect();
+            let ss_child_join: Vec<String> =
+                (0..n_keys).map(|i| format!("ss.c{i} = v1.c{i}")).collect();
+            let batch_sql = format!(
+                "CREATE OR REPLACE TEMP TABLE native_cong_proof_batch AS \
+                 SELECT {keyproj}, \
+                        v2.c{out_col} AS larger, \
+                        v1.c{out_col} AS smaller, \
+                        sl.c{side_out} AS larger_pf, \
+                        ss.c{side_out} AS smaller_pf \
+                 FROM {v} v1 JOIN {v} v2 \
+                   ON {keyjoin} AND v1.c{out_col} < v2.c{out_col} \
+                 JOIN {side} sl ON {sl_join} AND sl.c{out_col} = v2.c{out_col} \
+                 JOIN {side} ss ON {ss_join} AND ss.c{out_col} = v1.c{out_col} \
+                 WHERE v1.ts < ?2 AND v2.ts < ?2 \
+                   AND (v1.ts >= ?1 OR v2.ts >= ?1)",
+                keyproj = key_proj.join(", "),
+                v = q(&view),
+                keyjoin = key_join.join(" AND "),
+                side = q(&cfg.side_table),
+                sl_join = sl_child_join.join(" AND "),
+                ss_join = ss_child_join.join(" AND "),
+            );
+            exec_bound(&self.conn, &batch_sql, last_at, cur)?;
+            let n_conflicts: i64 =
+                self.conn
+                    .query_row("SELECT COUNT(*) FROM native_cong_proof_batch", [], |r| {
+                        r.get(0)
+                    })?;
+            if n_conflicts == 0 {
+                self.last_native_cong_at.insert(view.clone(), cur);
+                continue;
+            }
+
+            // (3) MINT the composed edge proof `Trans(larger_pf, Sym(smaller_pf))`
+            // SET-BASED over the batch, hash-consed (the `emit_term_build_merges`
+            // mint codegen). First `Sym(smaller_pf)`, then `Trans(larger_pf, sym)`.
+            // `sym_id`/`edge_id` are the SQL scalar exprs reading back the minted id.
+            let sym_id = self.mint_proof_term_batch(
+                &cfg.sym_table,
+                &["b.smaller_pf".to_string()],
+                "native_cong_proof_batch",
+                cur,
+            )?;
+            let edge_id = self.mint_proof_term_batch(
+                &cfg.trans_table,
+                &["b.larger_pf".to_string(), sym_id.clone()],
+                "native_cong_proof_batch",
+                cur,
+            )?;
+
+            // (4) INSERT the proof-carrying union edge `(larger, smaller, edge_proof)`
+            // into the relational proof-UF `@UF_S` (`(S S) -> Proof`, output col c2).
+            // `:merge old` => `ON CONFLICT DO NOTHING` (first proof per key wins).
+            let ins_edge = format!(
+                "INSERT INTO {u} (c0, c1, c2, ts) \
+                 SELECT b.larger, b.smaller, {edge}, ?2 FROM native_cong_proof_batch b \
+                 ON CONFLICT DO NOTHING",
+                u = q(&cfg.parent_table),
+                edge = edge_id,
+            );
+            let ne = exec_bound(&self.conn, &ins_edge, last_at, cur)?;
+            if ne > 0 {
+                self.rules_affected = self.rules_affected.wrapping_add(ne as u64);
+                self.bump_watermark(&cfg.parent_table, cur);
+            }
+            total += n_conflicts as usize;
+            self.last_native_cong_at.insert(view.clone(), cur);
+        }
+        Ok(total)
+    }
+
+    /// Emit a SET-BASED hash-cons mint of proof constructor `table` over the conflict
+    /// `batch` temp table: `INSERT INTO <table> SELECT <children>, COALESCE((existing
+    /// MIN id), nextval), ts FROM batch ON CONFLICT DO NOTHING`. `children` are SQL
+    /// exprs over the batch alias `b` (may themselves be hash-cons read-backs of a
+    /// previously minted nested proof term). Returns the SQL scalar that reads the
+    /// minted/hash-consed (MIN) id for a batch row — the same `COALESCE`-mint /
+    /// `(SELECT MIN(id) … WHERE children=…)` read-back `term_build_merge.rs` uses,
+    /// kept local here to avoid threading the term-build `Ctx`.
+    fn mint_proof_term_batch(
+        &mut self,
+        table: &str,
+        children: &[String],
+        batch: &str,
+        cur: i64,
+    ) -> Result<String> {
+        let info = self.functions.get(table).ok_or_else(|| {
+            anyhow::anyhow!("proof-congruence mint: table `{table}` not registered")
+        })?;
+        let out_col = info.inputs_len; // constructor id column.
+        let conds: Vec<String> = children
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("c{i} = {s}"))
+            .collect();
+        let id_read = format!(
+            "(SELECT MIN(c{out_col}) FROM {} WHERE {})",
+            q(table),
+            conds.join(" AND ")
+        );
+        let child_cols: Vec<String> = (0..children.len()).map(|i| format!("c{i}")).collect();
+        let stmt = format!(
+            "INSERT INTO {tbl} ({cols}, c{out_col}, ts) \
+             SELECT {sel}, COALESCE({id_read}, nextval('__egglog_eqsort_seq')), ?2 \
+             FROM {batch} b \
+             ON CONFLICT DO NOTHING",
+            tbl = q(table),
+            cols = child_cols.join(", "),
+            sel = children.join(", "),
+        );
+        exec_bound(&self.conn, &stmt, 0, cur)?;
+        self.bump_watermark(table, cur);
+        Ok(id_read)
     }
 
     /// For each EqSort constructor with a registered pname whose

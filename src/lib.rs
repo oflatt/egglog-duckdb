@@ -1967,14 +1967,16 @@ impl EGraph {
                         let value_merge = value_merge.clone();
                         self.translate_expr_to_mergefn(&value_merge)?
                     } else if self.proof_state.native_merge_views.contains(&*decl.name)
-                        // A `native_merge_views_coexist()` backend (DuckDB) in TERM
-                        // mode renders a constructor-congruence view in the BASELINE
-                        // all-columns Unit shape with a plain `:merge old` (congruence
-                        // is done by the host pass `emit_native_congruence`), so it
-                        // falls through to the baseline merge below rather than taking
-                        // the FD `UnionId`/`UnionIntoUf` congruence merge here.
-                        && (self.proof_state.proofs_enabled
-                            || !self.backend.native_merge_views_coexist())
+                        // A `native_merge_views_coexist()` backend (DuckDB) renders a
+                        // constructor-congruence view in the BASELINE all-columns shape
+                        // with a plain `:merge old` (congruence is done by the host
+                        // pass `emit_native_congruence` in term mode /
+                        // `emit_native_congruence_proof` in proof mode — which reads the
+                        // `@<F>ViewProof` side-table and writes the relational `@UF_S`),
+                        // so it falls through to the baseline merge below in BOTH term
+                        // and proof mode rather than taking the FD `UnionId` /
+                        // `UnionIntoUf` / `UnionIntoParentTableWithProof` merge here.
+                        && !self.backend.native_merge_views_coexist()
                     {
                         let uf_id = self
                             .proof_state
@@ -2284,7 +2286,16 @@ impl EGraph {
         // which writes the union edge straight into the relational `@UF_S` parent
         // table — fully self-contained, no backend association needed (and
         // `register_native_merge_view` would assert a non-existent UF-backed
-        // function). So there is nothing to register here.
+        // function). So there is nothing to register here — UNLESS this is the
+        // proof-mode COEXIST path (DuckDB `--proofs --native-merge`): there the view
+        // keeps the all-columns COEXIST shape with a plain `:merge old`, so the
+        // backend host pass (`emit_native_congruence_proof`) needs the
+        // proof-congruence config (relational `@UF_S` parent, `@<F>ViewProof`
+        // side-table, Trans/Sym) registered explicitly. Handle that first.
+        if self.proof_state.proofs_enabled && self.backend.native_merge_views_coexist() {
+            self.register_native_merge_proof_views();
+            return;
+        }
         if !self.proof_state.native_uf {
             return;
         }
@@ -2336,6 +2347,102 @@ impl EGraph {
         for (uf_name, view_id, view_name) in to_register {
             let uf_id = self.functions[&uf_name].backend_id;
             self.backend.register_native_merge_view(uf_id, view_id);
+            self.proof_state.native_merge_registered.insert(view_name);
+        }
+    }
+
+    /// `--proofs --native-merge` on a `native_merge_views_coexist()` single-output
+    /// backend (DuckDB): register each constructor-congruence view's proof-congruence
+    /// config so the backend's between-statement host pass can resolve FD conflicts.
+    /// The view keeps the all-columns COEXIST shape `(children..., eclass) -> Proof`
+    /// with a paired `@<F>ViewProof` side-table; the host pass reads both colliding
+    /// rows' proofs from the side-table, composes `Trans(larger_pf, Sym(smaller_pf))`,
+    /// and writes the proof-carrying union edge into the relational proof-UF `@UF_S`.
+    fn register_native_merge_proof_views(&mut self) {
+        // The proof constructors are shared across all sorts; resolve once.
+        let trans_name = self.proof_state.proof_names.eq_trans_constructor.clone();
+        let sym_name = self.proof_state.proof_names.eq_sym_constructor.clone();
+        let (Some(trans_func), Some(sym_func)) = (
+            self.functions.get(&trans_name),
+            self.functions.get(&sym_name),
+        ) else {
+            return;
+        };
+        let trans_id = trans_func.backend_id;
+        let sym_id = sym_func.backend_id;
+
+        let mut to_register: Vec<(
+            egglog_bridge::FunctionId,
+            egglog_bridge::FunctionId,
+            egglog_bridge::FunctionId,
+            String,
+        )> = Vec::new();
+        for func in self.functions.values() {
+            let view_name = func.decl.name.to_string();
+            if !self.proof_state.native_merge_views.contains(&view_name) {
+                continue;
+            }
+            // Value-fold views have a primitive output and no congruence UF to write
+            // into — skip them (their fold runs in the backend table directly).
+            if self
+                .proof_state
+                .native_value_merge_views
+                .contains_key(&view_name)
+            {
+                continue;
+            }
+            // Term-build views mint terms in the host pass; they are not
+            // proof-congruence views — skip.
+            if self
+                .proof_state
+                .native_term_build_views
+                .contains_key(&view_name)
+            {
+                continue;
+            }
+            if self
+                .proof_state
+                .native_merge_registered
+                .contains(&view_name)
+            {
+                continue;
+            }
+            // COEXIST proof shape `(children..., eclass) -> Proof`: the eclass is the
+            // LAST INPUT column. The relational proof-UF `@UF_S` is keyed by the
+            // eclass sort (`uf_parent`).
+            let Some(eclass_sort) = func.decl.schema.input.last().cloned() else {
+                continue;
+            };
+            let Some(parent_name) = self.proof_state.uf_parent.get(&eclass_sort).cloned() else {
+                continue;
+            };
+            let Some(parent_func) = self.functions.get(&parent_name) else {
+                continue;
+            };
+            let parent_id = parent_func.backend_id;
+            // The side-table is keyed by the ORIGINAL function name (the view's
+            // `:internal-term-constructor`).
+            let Some(orig_name) = func.decl.term_constructor.clone() else {
+                continue;
+            };
+            let Some(side_name) = self
+                .proof_state
+                .proof_names
+                .proof_side_table_name
+                .get(&orig_name)
+                .cloned()
+            else {
+                continue;
+            };
+            let Some(side_func) = self.functions.get(&side_name) else {
+                continue;
+            };
+            let side_id = side_func.backend_id;
+            to_register.push((func.backend_id, parent_id, side_id, view_name));
+        }
+        for (view_id, parent_id, side_id, view_name) in to_register {
+            self.backend
+                .register_native_merge_proof_view(view_id, parent_id, side_id, trans_id, sym_id);
             self.proof_state.native_merge_registered.insert(view_name);
         }
     }

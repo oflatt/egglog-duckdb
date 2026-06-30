@@ -1129,7 +1129,22 @@ impl<'a> ProofInstrumentor<'a> {
         // happened earlier so the view helpers above already used the FD forms).
         let view_decl = if native_merge_view {
             if self.egraph.proof_state.proofs_enabled {
-                if two_table_proof {
+                if two_table_proof && self.native_merge_views_coexist() {
+                    // 2-TABLE PROOF COEXIST view (DuckDB): keep the BASELINE
+                    // all-columns shape `(children..., eclass) -> Proof` (rows for
+                    // different eclasses COEXIST, all-cols PK) so the host pass can
+                    // self-join colliding rows. The per-row view proof lives in the
+                    // `@<F>ViewProof` side-table (declared above). `:merge old` is a
+                    // real merge here (NOT a placeholder): the FD conflict is
+                    // resolved by the backend host pass `emit_native_congruence_proof`
+                    // (lowering leaves it `old` — see `lib.rs`), which reads the
+                    // side-table proofs, composes the congruence edge proof, and
+                    // writes the relational `@UF_S`. Identical shape to the
+                    // non-proof coexist / `native_merge_view == false` baseline.
+                    format!(
+                        "(function {view_name} ({view_sorts}) {proof_type} :merge old :internal-term-constructor {name}{view_flags})"
+                    )
+                } else if two_table_proof {
                     // 2-TABLE PROOF FD view: SINGLE output `(children) -> eclass`
                     // (same shape as the term FD view). The per-row view proof
                     // lives in the `@<F>ViewProof` side-table, not a 2nd output
@@ -2187,6 +2202,24 @@ impl<'a> ProofInstrumentor<'a> {
         // `UnionIntoParentTableWithProof` merge reads the side-table proofs,
         // composes the congruence edge proof into the relational `@UF_S`, and keeps
         // the min eclass.
+        if self.is_native_merge_proof_view_2table_coexist(&view_name) {
+            // 2-TABLE COEXIST view (DuckDB): the eclass view keeps the BASELINE
+            // all-columns shape `(children..., eclass) -> Proof` (the proof is the
+            // output column, like the rule-mode baseline), and the per-row view
+            // proof is ALSO written to the `@<F>ViewProof` side-table so the host
+            // pass (`emit_native_congruence_proof`) can read both colliding rows'
+            // proofs by `(children, eclass)` key. `args` is `children..., eclass`.
+            let side = self.proof_side_table_name(fname);
+            let (eclass, children) = args
+                .split_last()
+                .expect("native-merge view row has columns");
+            let children_s = ListDisplay(children, " ");
+            return format!(
+                "(set ({view_name} {args_s}) {proof})
+                 (set ({side} {children_s} {eclass}) {proof})",
+                args_s = ListDisplay(args, " ")
+            );
+        }
         if self.is_native_merge_proof_view_2table(&view_name) {
             let (eclass, children) = args
                 .split_last()
@@ -2613,6 +2646,15 @@ impl<'a> ProofInstrumentor<'a> {
         // view proof from the side-table `(= pf_var (@FViewProof children eclass))`.
         // `args` is `children..., eclass` (the eclass is already named by the
         // caller). The two atoms join on the shared eclass var.
+        if self.is_native_merge_proof_view_2table_coexist(&view_name) {
+            // 2-TABLE COEXIST view (DuckDB): the eclass view is the BASELINE
+            // all-columns shape `(children..., eclass) -> Proof`, so the per-row view
+            // proof is the view's OWN output column — read it with the flat atom
+            // `(= pf_var (@FView children eclass))`. (The side-table holds the same
+            // proof for the host pass; the rebuild rule reads the view directly.)
+            let query = format!("(= {pf_var} ({view_name} {}))", ListDisplay(args, " "));
+            return (query, pf_var);
+        }
         if self.is_native_merge_proof_view_2table(&view_name) {
             let (eclass, children) = args
                 .split_last()

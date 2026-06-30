@@ -489,6 +489,34 @@ pub trait Backend: Send + Sync {
     /// that inject the union on FD-conflict (currently FlowLog) implement it.
     fn register_native_merge_view(&mut self, _uf_func: FunctionId, _view_func: FunctionId) {}
 
+    /// `--native-merge --proofs` on a `native_merge_views_coexist()` + single-output
+    /// backend (DuckDB): associate a constructor view (`view_func`, the all-columns
+    /// COEXIST shape `(children..., eclass) -> Proof`) with everything its
+    /// between-statement proof-congruence host pass needs. `parent_table` is the
+    /// RELATIONAL proof-UF `@UF_S` (`(S S) -> Proof :merge old`) the composed
+    /// congruence edge is written into; `proof_side_table` is the `@<F>ViewProof`
+    /// side-table `(children..., eclass) -> proof` the per-row view proofs are read
+    /// from; `trans` / `sym` are the `Trans` / `Sym` proof constructors used to
+    /// compose the congruence edge proof `Trans(larger_pf, Sym(smaller_pf))`.
+    ///
+    /// On an FD conflict (same children, two eclasses) the host pass self-joins the
+    /// coexisting view, reads both rows' proofs from the side-table, mints the edge
+    /// proof, and writes `(larger, smaller, edge_proof)` into `parent_table` — exactly
+    /// the row the dropped `@congruence_rule*` wrote. The frontend calls this before
+    /// each run for each not-yet-registered proof-mode native-merge view. Default
+    /// no-op: only DuckDB (the between-statement proof-congruence host pass)
+    /// implements it; the bridge / FlowLog / Feldera resolve the proof merge in their
+    /// own `UnionIntoParentTableWithProof` / tuple-merge path.
+    fn register_native_merge_proof_view(
+        &mut self,
+        _view_func: FunctionId,
+        _parent_table: FunctionId,
+        _proof_side_table: FunctionId,
+        _trans: FunctionId,
+        _sym: FunctionId,
+    ) {
+    }
+
     /// Register a union-find-backed function (see upstream PR #782).
     ///
     /// The function has schema `(S) S` for an EqSort `S` and records leader

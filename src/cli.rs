@@ -211,18 +211,22 @@ pub fn cli(mut egraph: EGraph) {
     // custom `:merge` (e-node minting on an eq-sort output) is NOT yet supported on
     // DuckDB and still rule-encodes (`supports_term_build_merge` = false).
     //
-    // PROOF-MODE EXCEPTION (FlowLog / Feldera): `--flowlog --proofs --native-merge`
-    // and `--feldera --proofs --native-merge` do NOT force `--native-uf`. Proof-mode
-    // native-UF needs a provenance-tracking `@UF_Sf` that both backends'
-    // `add_uf_function` rejects, AND neither can host the bridge's tuple-output (A2)
-    // proof view. Instead they use the RELATIONAL proof-UF (`@UF_S : (S S) -> Proof
-    // :merge old`, TableInsert-able and already maintained by the
-    // path_compress/singleparent rules that run on both) plus a single-output proof
-    // SIDE-TABLE — the 2-table proof-congruence encoding. So leave `native_uf` off
-    // for those combinations. DuckDB proof + native-merge is unchanged (it keeps
-    // forcing native_uf and rejects it on its own clean error path).
+    // PROOF-MODE EXCEPTION (FlowLog / Feldera / DuckDB): `--flowlog --proofs
+    // --native-merge`, `--feldera --proofs --native-merge`, and `--duckdb --proofs
+    // --native-merge` do NOT force `--native-uf`. Proof-mode native-UF needs a
+    // provenance-tracking `@UF_Sf` that all three backends' `add_uf_function`
+    // rejects, AND none can host the bridge's tuple-output (A2) proof view. Instead
+    // they use the RELATIONAL proof-UF (`@UF_S : (S S) -> Proof :merge old`,
+    // TableInsert-able and already maintained by the path_compress/singleparent
+    // rules that run on all of them) plus a single-output proof SIDE-TABLE — the
+    // 2-table proof-congruence encoding. DuckDB resolves the FD conflict in a
+    // between-statement host pass (`emit_native_congruence_proof`): self-join the
+    // coexisting view, read both proofs from the side-table, MINT `Trans(larger_pf,
+    // Sym(smaller_pf))` in SQL, write the edge into `@UF_S`. So leave `native_uf`
+    // off for these combinations.
     let single_output_proof_native_merge =
-        (args.flowlog_backend || args.feldera_backend) && (args.proofs || args.proof_testing);
+        (args.flowlog_backend || args.feldera_backend || args.duckdb_backend)
+            && (args.proofs || args.proof_testing);
     if args.native_merge
         && (args.flowlog_backend || args.feldera_backend || args.duckdb_backend)
         && !single_output_proof_native_merge

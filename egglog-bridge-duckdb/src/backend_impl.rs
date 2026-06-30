@@ -901,6 +901,40 @@ impl Backend for EGraph {
         }
     }
 
+    /// `--proofs --native-merge` CONSTRUCTOR-CONGRUENCE: associate a constructor view
+    /// (`view_func`, the all-columns COEXIST shape `(children..., eclass) -> Proof`)
+    /// with its proof-congruence config (relational proof-UF `@UF_S` =
+    /// `parent_table`, the `@<F>ViewProof` side-table, and the `Trans`/`Sym` proof
+    /// constructors). [`EGraph::emit_native_congruence_proof`] then resolves each FD
+    /// conflict on the view via a self-join: it reads both colliding rows' proofs
+    /// from the side-table, MINTS `Trans(larger_pf, Sym(smaller_pf))` in SQL, and
+    /// INSERTs the proof-carrying union edge `(larger, smaller, edge_proof)` into
+    /// `@UF_S` — exactly the row the dropped `@congruence_rule*` wrote via
+    /// `union(new, old, Trans(prf1, Sym(prf2)))`. The relational singleparent /
+    /// path_compress rules then canonicalize the proof-UF.
+    fn register_native_merge_proof_view(
+        &mut self,
+        view_func: FunctionId,
+        parent_table: FunctionId,
+        proof_side_table: FunctionId,
+        trans: FunctionId,
+        sym: FunctionId,
+    ) {
+        let view_name = self.name_for_function_id(view_func).to_string();
+        let parent = self.name_for_function_id(parent_table).to_string();
+        let side = self.name_for_function_id(proof_side_table).to_string();
+        let trans_table = self.name_for_function_id(trans).to_string();
+        let sym_table = self.name_for_function_id(sym).to_string();
+        if let Some(info) = self.functions.get_mut(&view_name) {
+            info.native_congruence_proof = Some(crate::NativeCongruenceProof {
+                parent_table: parent,
+                side_table: side,
+                trans_table,
+                sym_table,
+            });
+        }
+    }
+
     fn add_uf_function(
         &mut self,
         name: String,
@@ -1471,28 +1505,46 @@ impl Backend for EGraph {
     /// the historical wrong-results bug (the `UnionId`/`Min` FD merge collapsing
     /// colliding eclasses at insert time WITHOUT emitting a union edge).
     ///
-    /// PROOF-mode native-merge is still unsupported: the proof-view forms need
-    /// tuple-output (A2) or a proof side-table (2-table) DuckDB does not host, and
-    /// `duck_merge_mode_scalar` panics on the proof merges. So this returns `false`
-    /// in proof mode — proof-mode congruence stays RULE-ENCODED (exactly the prior
-    /// behavior; the encoder's `native_congruence_view` gate reads this), and only
-    /// non-proof (term-mode) congruence goes native. `proofs_enabled` is set by
+    /// PROOF-mode native-merge IS now supported, via the 2-table proof-congruence
+    /// encoding rendered in the all-columns COEXIST shape: the constructor's
+    /// `@<C>View` keeps the BASELINE all-columns shape `(children..., eclass) ->
+    /// Proof` and a paired `@<F>ViewProof` SIDE-TABLE holds the per-row view proof.
+    /// On an FD conflict the host pass [`EGraph::emit_native_congruence_proof`]
+    /// reads both colliding rows' proofs from the side-table, MINTS the congruence
+    /// edge proof `Trans(larger_pf, Sym(smaller_pf))` in SQL, and writes the
+    /// proof-carrying union edge `(larger, smaller, edge_proof)` into the relational
+    /// proof-UF `@UF_S` — byte-for-byte the row the dropped `@congruence_rule*`
+    /// wrote via `union(new, old, Trans(prf1, Sym(prf2)))`. So this returns `true`
+    /// in both term mode (proof-free congruence into `@UF_Sf`) and proof mode (the
+    /// proof-carrying congruence into `@UF_S`). `proofs_enabled` is set by
     /// `enable_proofs` at construction, before the encoder queries this.
     fn supports_native_congruence_merge(&self) -> bool {
-        !self.proofs_enabled
+        true
     }
 
     /// DuckDB renders a CONSTRUCTOR-congruence native-merge view in the BASELINE
-    /// all-columns Unit-relation shape (rows COEXIST), NOT the FD `(children) ->
-    /// eclass` function shape. The rebuild / delete / subsume then key on the FULL
-    /// `(children, eclass)` row — a children-only delete on coexisting rows would
-    /// self-wipe the canonical row, and a full-key delete can't be expressed on an
-    /// FD function. Congruence is resolved by the `emit_native_congruence` host pass.
-    /// VALUE-FOLD / TERM-BUILD views are unaffected (they keep the FD shape — see
-    /// `uses_fd_native_merge_view`). Gated on `!proofs_enabled` to match
-    /// `supports_native_congruence_merge` (proof mode keeps congruence rule-encoded).
+    /// all-columns shape (rows COEXIST), NOT the FD `(children) -> eclass` function
+    /// shape. The rebuild / delete / subsume then key on the FULL `(children,
+    /// eclass)` row — a children-only delete on coexisting rows would self-wipe the
+    /// canonical row, and a full-key delete can't be expressed on an FD function.
+    /// Congruence is resolved by the `emit_native_congruence` (term mode) /
+    /// `emit_native_congruence_proof` (proof mode) host pass. VALUE-FOLD / TERM-BUILD
+    /// views are unaffected (they keep the FD shape — see `uses_fd_native_merge_view`).
+    /// `true` in BOTH term and proof mode: the proof path reuses the same coexisting
+    /// view (now `(children..., eclass) -> Proof`) plus the `@<F>ViewProof` side-table.
     fn native_merge_views_coexist(&self) -> bool {
-        !self.proofs_enabled
+        true
+    }
+
+    /// DuckDB cannot host a TUPLE-output (multi-value) function table — its
+    /// `ON CONFLICT` model resolves a single output column. Returning `false`
+    /// selects the 2-TABLE proof-view encoding (single-output eclass view +
+    /// `@<F>ViewProof` side-table) instead of the A2 tuple proof view
+    /// `(children) -> (eclass, Proof)`, which DuckDB cannot represent. The 2-table
+    /// view is then further rendered in the all-columns COEXIST shape (see
+    /// `native_merge_views_coexist`) so the host pass can self-join colliding rows.
+    fn supports_tuple_output_views(&self) -> bool {
+        false
     }
 
     /// `--native-merge` TERM-BUILD custom `:merge`: DuckDB runs a term-building
