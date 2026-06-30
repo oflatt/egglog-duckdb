@@ -11,20 +11,36 @@ def _mean(xs):
     return sum(xs) / len(xs) if xs else 0.0
 
 
+def cell_label(row):
+    """Compute a cell's condition label from its stored axis columns
+    (backend, mode, native_uf, fast_rebuild, wcoj). The label is no longer
+    stored in result rows -- it is derived here, matching bench_backends.py's
+    cell_label() byte-for-byte (suffix order nuf, fastrb, wcoj)."""
+    label = f"{row['backend']}-{row['mode']}"
+    if row.get("native_uf"):
+        label += "+nuf"
+    if row.get("fast_rebuild"):
+        label += "+fastrb"
+    if row.get("wcoj"):
+        label += "+wcoj"
+    return label
+
+
 def _by_bench_cond(data):
     """{benchmark: {condition: mean_time}}."""
     from collections import defaultdict
     out = defaultdict(dict)
     for row in data.get("timings", []):
-        out[row["benchmark"]][row["condition"]] = _mean(row.get("timing_list", []))
+        out[row["benchmark"]][cell_label(row)] = _mean(row.get("timing_list", []))
     return out
 
 
 def _all_conditions(data):
     conds = []
     for row in data.get("timings", []):
-        if row["condition"] not in conds:
-            conds.append(row["condition"])
+        label = cell_label(row)
+        if label not in conds:
+            conds.append(label)
     return sorted(conds)
 
 
@@ -119,7 +135,7 @@ def completion_cdf(data):
     for row in data.get("timings", []):
         tl = row.get("timing_list", [])
         if tl:
-            times_by_cond[row["condition"]].append(_mean(tl))
+            times_by_cond[cell_label(row)].append(_mean(tl))
 
     fig, ax = plt.subplots(figsize=(8, 5))
     for cond in conds:
@@ -172,7 +188,7 @@ def _by_bench_cond_field(data, field, transform=lambda x: x):
     out = defaultdict(dict)
     for row in data.get("timings", []):
         if field in row and row[field] is not None:
-            out[row["benchmark"]][row["condition"]] = transform(row[field])
+            out[row["benchmark"]][cell_label(row)] = transform(row[field])
     return out
 
 
@@ -217,17 +233,29 @@ def peak_memory_table(data):
 
 # --- Correctness / parity ---------------------------------------------------
 
+def _parity_mismatches(data):
+    """Set of (benchmark, condition-label) cells that mismatched their family
+    reference -- derived from the ERRORS table (the `parity` field is gone): a
+    cell mismatched iff there is an error row with kind == "parity" for it."""
+    out = set()
+    for row in data.get("errors", []):
+        if row.get("kind") == "parity":
+            out.add((row["benchmark"], cell_label(row)))
+    return out
+
+
 def parity_table(data):
     """Pivot: one row per benchmark, a column per condition. Each cell is the
-    tuple-count parity vs the bridge-normal oracle: OK / MISMATCH / (blank if
-    the cell errored or has no parity result)."""
+    tuple-count parity vs the family reference, DERIVED from the errors table:
+    MISMATCH if an error row with kind="parity" matches it, OK if the cell has a
+    timing row (and no parity error), blank if the cell never ran."""
     from collections import defaultdict
+    mism = _parity_mismatches(data)
     by_bench = defaultdict(dict)
     for row in data.get("timings", []):
-        p = row.get("parity")
-        if p is None:
-            continue
-        by_bench[row["benchmark"]][row["condition"]] = "OK" if p else "MISMATCH"
+        bench = row["benchmark"]
+        cond = cell_label(row)
+        by_bench[bench][cond] = "MISMATCH" if (bench, cond) in mism else "OK"
     conds = _all_conditions(data)
     rows = []
     for bench in sorted(by_bench.keys()):
@@ -239,21 +267,22 @@ def parity_table(data):
 
 
 def parity_summary(data):
-    """One row per condition: how many benchmarks matched / mismatched the
-    bridge-normal oracle (tuple-count parity)."""
+    """One row per condition: how many benchmarks matched / mismatched their
+    family reference (tuple-count parity), DERIVED from the errors table (a
+    kind="parity" error == a mismatch)."""
     from collections import defaultdict
+    mism = _parity_mismatches(data)
     ok = defaultdict(int)
     bad = defaultdict(int)
     bad_files = defaultdict(list)
     for row in data.get("timings", []):
-        p = row.get("parity")
-        if p is None:
-            continue
-        if p:
-            ok[row["condition"]] += 1
+        bench = row["benchmark"]
+        cond = cell_label(row)
+        if (bench, cond) in mism:
+            bad[cond] += 1
+            bad_files[cond].append(bench.split("/")[-1])
         else:
-            bad[row["condition"]] += 1
-            bad_files[row["condition"]].append(row["benchmark"].split("/")[-1])
+            ok[cond] += 1
     rows = []
     for cond in _all_conditions(data):
         if cond not in ok and cond not in bad:
@@ -325,7 +354,7 @@ def _collect_phase_cells(data):
         rt = _cell_ruleset_times(row)
         if not rt:
             continue
-        label = f"{row['benchmark'].split('/')[-1]}\n{row['condition']}"
+        label = f"{row['benchmark'].split('/')[-1]}\n{cell_label(row)}"
         cells.append((label, rt, _cell_wall(row)))
     return cells
 
@@ -446,12 +475,14 @@ def filter_by_benchmark_basename(filtered_rows, data):
 
 def filter_by_condition(filtered_rows, data):
     """Keep only raw rows whose `condition` survives the table filter. Used by
-    per-condition tables (e.g. parity_summary). `skipped` rows carry no
-    `condition`, so they are left untouched rather than dropped."""
+    per-condition tables (e.g. parity_summary). Computed table rows carry a
+    `condition` column; raw timing/error/warning rows store the cell axes
+    instead, so their label is recomputed via cell_label(). `skipped` rows have
+    no axes, so they are left untouched rather than dropped."""
     keep = {r["condition"] for r in filtered_rows if "condition" in r}
     return {
         **data,
-        **{k: [r for r in data.get(k, []) if r.get("condition") in keep]
+        **{k: [r for r in data.get(k, []) if cell_label(r) in keep]
            for k in ("timings", "errors", "warnings")},
     }
 

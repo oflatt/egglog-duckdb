@@ -119,12 +119,30 @@ REFERENCE_BY_FAMILY = {
 }
 
 
-def _encoding_family(condition):
-    """Encoding family of a condition label, for picking its parity reference.
-    The `+nuf` / `+fastrb` axis suffixes don't change the family."""
-    if "proofs" in condition:
+def cell_label(backend, mode, native_uf, fast_rebuild, wcoj):
+    """Single source of truth for a cell's label string. Returns
+    `f"{backend}-{mode}"` with the axis suffixes appended IN THIS ORDER:
+    `+nuf` (native-UF), `+fastrb` (fast-rebuild), `+wcoj` (worst-case-optimal
+    join). Reproduces the condition strings exactly (e.g.
+    `flowlog-term-encoding+nuf+fastrb+wcoj`, `bridge-normal`,
+    `duckdb-proofs+fastrb`). The label flows INTERNALLY (gating, oracle
+    matching, console) but is no longer STORED in the JSON result rows."""
+    label = f"{backend}-{mode}"
+    if native_uf:
+        label += "+nuf"
+    if fast_rebuild:
+        label += "+fastrb"
+    if wcoj:
+        label += "+wcoj"
+    return label
+
+
+def _encoding_family(mode):
+    """Encoding family of an encoding MODE, for picking its parity reference.
+    The `+nuf` / `+fastrb` / `+wcoj` axes don't change the family."""
+    if mode == "proofs":
         return "proofs"
-    if "term-encoding" in condition:
+    if mode == "term-encoding":
         return "term-encoding"
     return "normal"
 
@@ -286,15 +304,21 @@ class BenchDB:
         # "parallel-Njobs" (fast coverage, contended -> inflated wall-times).
         self.timing_mode = timing_mode
 
-    def add_timing(self, benchmark, backend, mode, condition, timing_list,
-                   rss=None, phases=None, parity=None, parity_diff=None,
-                   sizes=None, command=None):
+    def add_timing(self, benchmark, backend, mode, native_uf, fast_rebuild,
+                   wcoj, timing_list, rss=None, phases=None, sizes=None,
+                   command=None):
+        # The cell axes are stored as COLUMNS (native_uf/fast_rebuild/wcoj),
+        # not as a `condition` label string -- the label is COMPUTABLE from
+        # them via cell_label(). Parity is no longer a stored field; a parity
+        # mismatch is recorded as an error (kind="parity") instead.
         row = {
             "benchmark": benchmark,
             "suite": suite_of(benchmark),
             "backend": backend,
             "mode": mode,
-            "condition": condition,
+            "native_uf": native_uf,
+            "fast_rebuild": fast_rebuild,
+            "wcoj": wcoj,
             "command": command,
             "timing_list": timing_list,
         }
@@ -305,40 +329,46 @@ class BenchDB:
         # per-source profile under "raw").
         if phases is not None:
             row["phases"] = phases
-        # Tuple-count parity vs the bridge-normal oracle.
-        if parity is not None:
-            row["parity"] = parity
-        if parity_diff:
-            row["parity_diff"] = parity_diff
         # The captured per-function (Name, size) counts (sorted list of pairs).
         if sizes is not None:
             row["sizes"] = sizes
         self.timings.append(row)
 
-    def add_error(self, benchmark, backend, mode, condition, error, command=None):
+    def add_error(self, benchmark, backend, mode, native_uf, fast_rebuild,
+                  wcoj, error, kind="runtime", command=None):
+        # `kind` is "runtime" (a real failure/crash) or "parity" (a
+        # tuple-count parity mismatch vs the cell's family reference). The cell
+        # axes are stored as columns; the label is computable via cell_label().
         self.errors.append({
             "benchmark": benchmark,
             "suite": suite_of(benchmark),
             "backend": backend,
             "mode": mode,
-            "condition": condition,
+            "native_uf": native_uf,
+            "fast_rebuild": fast_rebuild,
+            "wcoj": wcoj,
             "command": command,
             "error": error,
+            "kind": kind,
         })
 
     def add_skip(self, benchmark, reason):
         self.skipped.append({"benchmark": benchmark, "suite": suite_of(benchmark),
                              "reason": reason})
 
-    def add_warning(self, benchmark, backend, mode, condition, reason):
+    def add_warning(self, benchmark, backend, mode, native_uf, fast_rebuild,
+                    wcoj, reason):
         # A cell that failed for an EXPECTED, non-bug reason: a timeout, or a
         # feature the backend/encoding does not support (push/pop, proofs-
         # incompatible commands, etc.). Kept OUT of `errors` so that table shows
         # only unexpected failures (real bugs); surfaced as a warnings table.
+        # The cell axes are stored as columns; the label is computable via
+        # cell_label().
         self.warnings.append({
             "benchmark": benchmark, "suite": suite_of(benchmark),
             "backend": backend, "mode": mode,
-            "condition": condition, "reason": reason,
+            "native_uf": native_uf, "fast_rebuild": fast_rebuild,
+            "wcoj": wcoj, "reason": reason,
         })
 
     def to_dict(self):
@@ -1048,6 +1078,9 @@ def bench_cell(binary, bench, rel, condition, backend, mode, flags,
     # ONLY for the timed runs -- the profile block pollutes stderr that the
     # `(print-size)` parity run scrapes (e.g. duckdb's per-rule dump can emit a
     # stray `(Const 2)`), so the parity run must run profile-free.
+    # The WCOJ axis is carried in the cell's flags (flowlog-only `--wcoj`);
+    # derive the column from there so it can be stored alongside the other axes.
+    wcoj = "--wcoj" in flags
     rebuild_env = {}
     if fast_rebuild:
         knob = FAST_REBUILD_ENV.get(backend)
@@ -1099,7 +1132,8 @@ def bench_cell(binary, bench, rel, condition, backend, mode, flags,
                            capture_phases_for=backend)
             if "error" in out:
                 return {"benchmark": rel, "backend": backend, "mode": mode,
-                        "condition": condition, "command": command,
+                        "native_uf": native_uf, "fast_rebuild": fast_rebuild,
+                        "wcoj": wcoj, "condition": condition, "command": command,
                         "error": out["error"]}
             timings.append(round(out["elapsed"], 6))
             if out.get("rss"):
@@ -1108,7 +1142,8 @@ def bench_cell(binary, bench, rel, condition, backend, mode, flags,
                 phase_runs.append(out["phases_raw"])
 
         result = {"benchmark": rel, "backend": backend, "mode": mode,
-                  "condition": condition, "command": command,
+                  "native_uf": native_uf, "fast_rebuild": fast_rebuild,
+                  "wcoj": wcoj, "condition": condition, "command": command,
                   "timing_list": timings}
         if rss_vals:
             # Peak RSS = max observed across timed runs (bytes).
@@ -1187,18 +1222,25 @@ def classify_unsupported(error_text):
 def apply_cell_result(result, db, oracle_sizes):
     """Fold a cell result into the DB and log it. `oracle_sizes` is
     {(benchmark, encoding-family): sorted [name, count] list}; a cell's parity
-    is its size-set vs the bridge reference of ITS OWN encoding family."""
+    is its size-set vs the bridge reference of ITS OWN encoding family. The cell
+    axes (native_uf/fast_rebuild/wcoj) are STORED; the label is used internally
+    for the oracle/reference lookup and console display only."""
     rel = result["benchmark"]
     backend = result["backend"]
     mode = result["mode"]
     condition = result["condition"]
+    native_uf = result["native_uf"]
+    fast_rebuild = result["fast_rebuild"]
+    wcoj = result["wcoj"]
     if "error" in result:
         reason = classify_unsupported(result["error"])
         if reason is not None:
-            db.add_warning(rel, backend, mode, condition, reason)
+            db.add_warning(rel, backend, mode, native_uf, fast_rebuild, wcoj,
+                           reason)
             print(f"    {rel}: {condition:28} warning ({reason})", flush=True)
         else:
-            db.add_error(rel, backend, mode, condition, result["error"],
+            db.add_error(rel, backend, mode, native_uf, fast_rebuild, wcoj,
+                         result["error"], kind="runtime",
                          command=result.get("command"))
             print(f"    {rel}: {condition:28} ERROR: {result['error']}", flush=True)
         return
@@ -1211,31 +1253,29 @@ def apply_cell_result(result, db, oracle_sizes):
     # Correctness: compare against the bridge reference of THIS cell's encoding
     # family. Non-proof treatments (term/native-uf/fast-rebuild) reproduce
     # normal-mode counts, so they target bridge-normal (files.rs shared
-    # snapshot); proofs target bridge-proofs.
-    parity = None
+    # snapshot); proofs target bridge-proofs. A MISMATCH becomes an error
+    # (kind="parity") in addition to keeping the timing datapoint.
     parity_diff = None
-    ref_label = REFERENCE_BY_FAMILY.get(_encoding_family(condition))
+    ref_label = REFERENCE_BY_FAMILY.get(_encoding_family(mode))
     oracle = oracle_sizes.get((rel, ref_label))
     # Require NON-EMPTY sizes on both sides: an unparseable `(print-size)` block
-    # returns [], and `[] == []` would be a vacuous false-pass (parity=True with
-    # nothing compared). Leave parity=None when there are no real counts to
-    # compare -- mirrors files.rs, which refuses to assert on an empty snapshot.
-    if sizes:
-        if condition == ref_label:
-            parity = True  # this cell IS its family's reference
-        elif oracle:
-            parity = (sizes == oracle)
-            if not parity:
-                parity_diff = _size_diff(oracle, sizes)
+    # returns [], and `[] == []` would be a vacuous false-pass (parity with
+    # nothing compared). No error when there are no real counts to compare --
+    # mirrors files.rs, which refuses to assert on an empty snapshot. This cell
+    # IS its family's reference (condition == ref_label) -> nothing to diff.
+    if sizes and condition != ref_label and oracle and sizes != oracle:
+        parity_diff = _size_diff(oracle, sizes)
+        db.add_error(rel, backend, mode, native_uf, fast_rebuild, wcoj,
+                     f"parity mismatch vs {ref_label}: {parity_diff}",
+                     kind="parity", command=result.get("command"))
 
-    db.add_timing(rel, backend, mode, condition, timings,
-                  rss=rss, phases=phases, parity=parity,
-                  parity_diff=parity_diff, sizes=sizes,
+    db.add_timing(rel, backend, mode, native_uf, fast_rebuild, wcoj, timings,
+                  rss=rss, phases=phases, sizes=sizes,
                   command=result.get("command"))
 
     mean = sum(timings) / len(timings)
     rss_mb = f"{rss / 1e6:7.1f}MB" if rss else "      ?MB"
-    par = "" if parity is None else (" parity=OK" if parity else " parity=MISMATCH")
+    par = " parity=MISMATCH" if parity_diff else ""
     print(f"    {rel}: {condition:28} mean {mean:8.3f}s  rss {rss_mb}{par}",
           flush=True)
     if phases:
