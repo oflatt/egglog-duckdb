@@ -28,6 +28,11 @@ lcov.info
 # eval: extracted benchmark corpora (e.g. Herbie dumps)
 *.extracted/
 
+# eval: stray harness temp benchmark files (the bench runner writes
+# `tmp<random>.egg` next to a benchmark and unlinks on clean exit; a killed
+# run can leave them, and they must never be committed into the corpus)
+tmp*.egg
+
 # Python virtualenv (local eval/eval-live tooling)
 venv/
 /.perf-wt/
