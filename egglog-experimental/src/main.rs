@@ -38,13 +38,35 @@ fn main() {
     let want_proofs_early = argv
         .iter()
         .any(|a| a == "--proofs" || a == "--proof-testing");
-    let single_output_proof_native_merge = (want_flowlog || want_feldera)
-        && want_proofs_early
-        && argv.iter().any(|a| a == "--native-merge");
-    let want_native_uf = !single_output_proof_native_merge
-        && argv
-            .iter()
-            .any(|a| a == "--duck-native-uf" || a == "--native-uf" || a == "--native-merge");
+    // FLIP: native `:merge` is the DEFAULT for the term encoding. These
+    // experimental backends always term-encode, so native-merge is ON unless
+    // `--no-native-merge` (an explicit `--native-merge` is honored too, but
+    // redundant). This MUST mirror cli.rs's flip so the pre-built backend's
+    // native-UF mode agrees with the encoding cli.rs emits.
+    let any_experimental = want_duckdb || want_flowlog || want_feldera;
+    let explicit_native_uf = argv
+        .iter()
+        .any(|a| a == "--duck-native-uf" || a == "--native-uf");
+    // Mirror cli.rs's flip: native-merge auto-ons for an experimental backend
+    // UNLESS `--no-native-merge` or an EXPLICIT `--native-uf` (which selects the
+    // rule-encoded + native-uf path — native-merge + native-uf conflict on these
+    // backends, esp. proofs which need the relational proof-UF). An explicit
+    // `--native-merge` still force-enables it.
+    let effective_native_merge =
+        (any_experimental && !argv.iter().any(|a| a == "--no-native-merge") && !explicit_native_uf)
+            || argv.iter().any(|a| a == "--native-merge");
+    // Proof-mode native-merge on the dataflow/SQL backends (flowlog/feldera/DUCKDB)
+    // uses the RELATIONAL proof-UF + a proof side-table (the 2-table encoding), NOT
+    // the displaced native-UF (which their `add_uf_function` rejects in proof mode).
+    // So native-merge must NOT imply native-UF there. (duckdb included — it now has
+    // native-merge proof congruence via `emit_native_congruence_proof`.)
+    let single_output_proof_native_merge =
+        any_experimental && want_proofs_early && effective_native_merge;
+    // Explicit `--native-uf` always wins; otherwise non-proof native-merge on
+    // these backends injects the union via the in-core UF-backed function, so it
+    // REQUIRES native-UF (and the proof carve-out keeps it OFF for proof mode).
+    let want_native_uf =
+        explicit_native_uf || (!single_output_proof_native_merge && effective_native_merge);
     // `--fast-rebuild` engages the duckdb backend's delta-scoped rebuild; the
     // pre-built duckdb egraph must carry it so the flag survives cli.rs's
     // short-circuit (mirror `want_native_uf`).

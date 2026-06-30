@@ -140,10 +140,22 @@ struct Args {
     /// native-UF onchange re-scan blowup). Add `--native-uf` to route the union
     /// into the in-core UF-backed `@UF_Sf` instead (the original path). `--flowlog`
     /// / `--feldera` require and imply `--native-uf` (the backend must inject the
-    /// union on FD-conflict via the UF-backed function). Term mode only; off by
-    /// default (the rule-encoded congruence is byte-identical).
+    /// union on FD-conflict via the UF-backed function). Term mode only.
+    ///
+    /// Native `:merge` is now the DEFAULT whenever term encoding is active (any
+    /// experimental backend flag, `--term-encoding`, `--proofs`/`--proof-testing`,
+    /// or `--native-uf`) — it is the working path on all four backends and is
+    /// ~4.5x faster than the rule encoding on Herbie. Pass `--no-native-merge` to
+    /// force the rule-encoded path (the bit-exact oracle). The bridge `--native-uf`
+    /// non-proof combo is EXCLUDED from the default (native-uf + native-merge is
+    /// the known-broken/blowup path there); this explicit flag still force-enables.
     #[clap(long = "native-merge")]
     native_merge: bool,
+    /// Disable native `:merge` and force the rule-encoded `@congruence_rule*` /
+    /// `@merge_rule` path (the bit-exact oracle). Native `:merge` is the default
+    /// for the term encoding; use this to A/B native vs rule, or to opt out.
+    #[clap(long = "no-native-merge")]
+    no_native_merge: bool,
     /// Native-engine table rebuild for the term-encoding native-UF rebuild
     /// (`--nativerb`, native bridge only). Replaces the per-column
     /// `@rebuild_rule*` rebuild rules with the ENGINE's native table rebuild
@@ -179,6 +191,44 @@ pub fn cli(mut egraph: EGraph) {
         .init();
 
     let mut args = Args::parse();
+
+    // FLIP: native `:merge` is the DEFAULT for the term encoding. Enable it
+    // automatically whenever term encoding is active — it is the working path on
+    // all four backends (congruence + custom :merge + proofs) and ~4.5x faster
+    // than the rule encoding on Herbie. Conditions that mean "term encoding is
+    // active": an experimental backend flag (each implies term encoding),
+    // `--term-encoding`, `--proofs`/`--proof-testing` (proofs desugar onto the
+    // term encoding), or `--native-uf`. Bridge-NORMAL (none of these) is left
+    // untouched — it stays the non-term-encoded oracle/baseline.
+    //
+    // EXCLUSION: the bridge `--native-uf` (no experimental backend) combo keeps
+    // the rule path. native-uf + native-merge on the bridge is the known-broken
+    // blowup path (the robust bridge native-merge path is the RELATIONAL UF, used
+    // when --native-uf is absent). flowlog/feldera/duckdb native-merge implies
+    // --native-uf and is correct, so they are NOT excluded. `--no-native-merge`
+    // forces the rule path everywhere; an explicit `--native-merge` is honored
+    // as-is (the user opted in).
+    let any_experimental_backend =
+        args.duckdb_backend || args.feldera_backend || args.flowlog_backend;
+    let term_encoding_active = args.term_encoding
+        || args.native_uf
+        || args.proofs
+        || args.proof_testing
+        || any_experimental_backend;
+    // EXCLUSION: do NOT auto-enable native-merge when `--native-uf` is EXPLICIT.
+    // At this point (before the native_uf-forcing fold below) `args.native_uf`
+    // reflects ONLY an explicit `--native-uf` flag. native-merge + native-uf
+    // conflict in the cases the matrix exercises: bridge non-proof native-uf is
+    // the broken blowup path, and on the dataflow/SQL backends native-merge
+    // PROOFS use the relational proof-UF (the 2-table / between-statement path),
+    // not the engine displaced native-UF. So an explicit `--native-uf` selects
+    // the rule-encoded + native-uf path; native-merge auto-ons only when
+    // native-uf is NOT explicitly requested. (An explicit `--native-merge` still
+    // force-enables it — e.g. the bridge A2 `--proofs --native-merge --native-uf`
+    // path — since this only SETS, never clears, `args.native_merge`.)
+    if term_encoding_active && !args.no_native_merge && !args.native_uf {
+        args.native_merge = true;
+    }
 
     // `--native-merge` does congruence inline via a native backend merge that
     // unions the two colliding eclasses on an FD conflict (same children,

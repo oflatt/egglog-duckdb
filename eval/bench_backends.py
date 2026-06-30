@@ -1375,6 +1375,14 @@ def main():
                              "egglog-experimental binary is always built fresh "
                              "(ONE serial `cargo build -p egglog-experimental`) "
                              "since there is no prebuilt experimental binary.")
+    parser.add_argument("--append-flag", action="append", default=[],
+                        metavar="FLAG", dest="append_flag",
+                        help="append FLAG to EVERY matrix cell's CLI invocation "
+                             "(repeatable). Used for the rule-encoding comparison "
+                             "run: `--append-flag --no-native-merge` forces the "
+                             "rule path on all cells (native :merge is the default "
+                             "as of the flip). Output to a separate --output file "
+                             "and diff against the default (native) run.")
     parser.add_argument("--paper", action="store_true",
                         help="PAPER MODE: force strictly SEQUENTIAL (jobs=1) for "
                              "uncontended, paper-quality timings/RSS. Use for the "
@@ -1442,6 +1450,14 @@ def main():
         benchmarks = benchmarks[:args.limit]
 
     conds = list(conditions())
+    # `--append-flag` (e.g. `--no-native-merge` for the rule-encoding comparison
+    # run): append to EVERY cell's flags. Labels/references are left unchanged so
+    # the run stays internally consistent (all cells get the same appended flag);
+    # write to a separate --output and diff against the default (native) run.
+    if args.append_flag:
+        conds = [(c[0], c[1], c[2], list(c[3]) + list(args.append_flag), c[4], c[5])
+                 for c in conds]
+        print(f"  appending to every cell: {' '.join(args.append_flag)}", flush=True)
     if MEM_CAP_BYTES:
         cap_note = f"{args.mem_cap_gb} GiB/process"
     elif args.mem_cap_gb <= 0:
