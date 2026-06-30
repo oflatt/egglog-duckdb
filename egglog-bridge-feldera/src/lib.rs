@@ -433,6 +433,16 @@ pub struct EGraph {
     /// children key), the loser is `enqueue_union`-ed with the winner into this UF
     /// — congruence done INLINE at insert time instead of by a self-join rule.
     pub(crate) native_merge_uf: HashMap<FunctionId, FunctionId>,
+    /// `--native-merge` PROOF mode (2-table): maps an FD-keyed CONSTRUCTOR view's
+    /// [`FunctionId`] to the proof-congruence config (the relational proof-UF
+    /// `@UF_S`, the `@<F>ViewProof` side-table, and the `Trans`/`Sym` proof
+    /// constructors). Captured at [`Backend::add_table`] from the view's
+    /// `MergeFn::UnionIntoParentTableWithProof`. When such a view has an FD conflict
+    /// (`resolve_merge` finds two eclasses for one children key),
+    /// `resolve_proof_congruence_merge` reads both rows' view proofs from the
+    /// side-table, composes `Trans(larger_pf, Sym(smaller_pf))`, and writes the
+    /// proof-carrying union edge into `@UF_S` — congruence + proof INLINE.
+    pub(crate) native_merge_proof: HashMap<FunctionId, NativeMergeProof>,
     /// `--native-merge` TERM-BUILD: per-`run_iteration` scratch — the `@<C>View`
     /// rows a term-build merge (`eval_term_build_node`) just minted, by view
     /// function id and children key. The views carry their OWN congruence merge
@@ -442,6 +452,24 @@ pub struct EGraph {
     /// congruence the bridge's `TableInsert`-respects-target-merge does. Drained
     /// each iteration; never read across iterations.
     pub(crate) term_build_view_keys: HashMap<FunctionId, HashSet<Vec<u32>>>,
+}
+
+/// `--native-merge` PROOF mode (2-table): the per-view proof-congruence config
+/// resolved by [`EGraph::resolve_proof_congruence_merge`]. See
+/// [`EGraph::native_merge_proof`].
+#[derive(Clone, Copy)]
+pub(crate) struct NativeMergeProof {
+    /// The relational proof-UF `@UF_S : (S S) -> Proof :merge old`. The composed
+    /// congruence edge `[larger, smaller, edge_proof]` is written here.
+    pub(crate) parent_table: FunctionId,
+    /// The proof SIDE-TABLE `@<F>ViewProof : (children..., eclass) -> proof`. Each
+    /// colliding row's view proof is READ from here (canon-at-creation guarantees a
+    /// hit — see [`EGraph::read_side_table_proof`]).
+    pub(crate) proof_side_table: FunctionId,
+    /// The `Trans` proof constructor (`edge = Trans(larger_pf, sym_smaller)`).
+    pub(crate) trans: FunctionId,
+    /// The `Sym` proof constructor (`sym_smaller = Sym(smaller_pf)`).
+    pub(crate) sym: FunctionId,
 }
 
 impl Default for EGraph {
@@ -496,6 +524,7 @@ impl EGraph {
             native_uf_view_cols: HashMap::new(),
             native_uf_prev_displaced: HashMap::new(),
             native_merge_uf: HashMap::new(),
+            native_merge_proof: HashMap::new(),
             term_build_view_keys: HashMap::new(),
         }
     }
@@ -886,6 +915,13 @@ impl EGraph {
         if self.info(f).merge_tree.is_some() {
             return self.resolve_term_build_merge(f, keys);
         }
+        // `--native-merge` PROOF mode (2-table): a single-output eclass view whose
+        // FD conflict means the two eclasses are congruent. Compose the congruence
+        // edge proof from the side-table and write it (with the union edge) into the
+        // relational proof-UF `@UF_S`. Dispatch to the dedicated resolver.
+        if self.native_merge_proof.contains_key(&f) {
+            return self.resolve_proof_congruence_merge(f, keys);
+        }
         let merge = self.merge_mode(f);
         if !matches!(merge, MergeMode::Old | MergeMode::New | MergeMode::Min)
             || arity == 0
@@ -991,6 +1027,198 @@ impl EGraph {
             }
         }
         true
+    }
+
+    /// `--native-merge` PROOF mode (2-table): resolve an FD conflict on a
+    /// single-output eclass view `(children) -> eclass` by composing the congruence
+    /// edge proof from the proof SIDE-TABLE and writing it (with the union edge)
+    /// into the relational proof-UF `@UF_S`.
+    ///
+    /// For each touched key with >1 candidate eclass, fold the candidates pairwise
+    /// (matching the bridge's `UnionIntoUfWithProof`, egglog-bridge `run`):
+    ///   * read each row's view proof from the side-table (`children..., eclass`);
+    ///   * `larger = max(cur, new)`, `smaller = min(cur, new)`, with the matching
+    ///     `larger_pf` / `smaller_pf`;
+    ///   * `edge = Trans(larger_pf, Sym(smaller_pf))` — EXACTLY the orientation of
+    ///     the rule-encoded `@congruence_rule`
+    ///     (`(set (@UF_S larger smaller) (Trans larger_pf (Sym smaller_pf)))`);
+    ///   * write `[larger, smaller, edge]` into `@UF_S` (respecting its `:merge old`
+    ///     — first proof per `(larger, smaller)` key wins, so the insert is
+    ///     idempotent), and keep `smaller` as the surviving (min) view eclass.
+    ///
+    /// The relational singleparent / path_compress rules then canonicalize the
+    /// proof-UF on the next iteration; the view's rebuild rules re-canonicalize any
+    /// other rows holding the loser eclass.
+    fn resolve_proof_congruence_merge(&mut self, f: FunctionId, keys: &HashSet<Vec<u32>>) -> bool {
+        let arity = self.info(f).arity;
+        if arity == 0 || keys.is_empty() {
+            return false;
+        }
+        let cfg = *self.native_merge_proof.get(&f).expect(
+            "resolve_proof_congruence_merge called on a function with no proof-congruence config",
+        );
+        let inputs_len = arity - 1;
+        // Gather candidate rows for the touched keys only (clone out — the proof
+        // composition below mints `Trans`/`Sym` e-nodes and writes `@UF_S`, so it
+        // cannot hold a borrow of the view mirror).
+        let mut by_key: HashMap<Vec<u32>, Vec<Row>> = HashMap::new();
+        if let Some(set) = self.mirror.get(&f) {
+            for row in set.iter() {
+                let key: Vec<u32> = (0..inputs_len).map(|i| row_col(row, i)).collect();
+                if keys.contains(&key) {
+                    by_key.entry(key).or_default().push(row.clone());
+                }
+            }
+        }
+        // A per-call hash-cons index for `lookup_or_create` (the `Trans`/`Sym`
+        // mints), lazily built per function — an optimisation, identical results.
+        let mut lookup_index: HashMap<FunctionId, HashMap<Box<[u32]>, u32>> = HashMap::new();
+
+        let mut new_rows: Vec<Row> = Vec::new();
+        let mut drop_rows: HashSet<Row> = HashSet::new();
+        // Stable iteration over touched keys so the `Trans`/`Sym` mint order is
+        // deterministic (run-to-run reproducible byte image).
+        let mut key_list: Vec<Vec<u32>> = by_key.keys().cloned().collect();
+        key_list.sort();
+        for key in &key_list {
+            let mut cands = by_key.remove(key).unwrap();
+            if cands.len() < 2 {
+                continue;
+            }
+            // Deterministic fold order (mirror is a HashSet — arbitrary order).
+            cands.sort();
+            // Fold pairwise: `cur_eclass`/`cur_pf` start at the first candidate; for
+            // each later candidate compose the congruence edge and keep the min.
+            let mut cur_eclass = row_col(&cands[0], inputs_len);
+            let mut cur_pf = self.read_side_table_proof(cfg.proof_side_table, key, cur_eclass);
+            for next in &cands[1..] {
+                let new_eclass = row_col(next, inputs_len);
+                if cur_eclass == new_eclass {
+                    continue;
+                }
+                let new_pf = self.read_side_table_proof(cfg.proof_side_table, key, new_eclass);
+                // Orientation byte-for-byte with the bridge's `UnionIntoUfWithProof`
+                // and the rule-encoded `@congruence_rule`.
+                let (larger, smaller, larger_pf, smaller_pf) = if cur_eclass > new_eclass {
+                    (cur_eclass, new_eclass, cur_pf, new_pf)
+                } else {
+                    (new_eclass, cur_eclass, new_pf, cur_pf)
+                };
+                // edge_proof = Trans(larger_pf, Sym(smaller_pf)).
+                let sym_smaller = interpret::lookup_or_create(
+                    self,
+                    cfg.sym,
+                    &[Value::new(smaller_pf)],
+                    &mut lookup_index,
+                )
+                .rep();
+                let edge_proof = interpret::lookup_or_create(
+                    self,
+                    cfg.trans,
+                    &[Value::new(larger_pf), Value::new(sym_smaller)],
+                    &mut lookup_index,
+                )
+                .rep();
+                // Write the proof-carrying union edge into `@UF_S` (`:merge old` —
+                // skip if a row for this `(larger, smaller)` key already exists).
+                self.insert_proof_uf_edge(cfg.parent_table, larger, smaller, edge_proof);
+                // The surviving eclass is the min; its proof is the min's proof.
+                cur_eclass = smaller;
+                cur_pf = smaller_pf;
+            }
+            // The winner row: same children key, surviving (min) eclass.
+            let mut winner: Vec<u32> = key.clone();
+            winner.push(cur_eclass);
+            let winner: Row = winner.into_boxed_slice();
+            for row in &cands {
+                if **row != *winner {
+                    drop_rows.insert((*row).clone());
+                }
+            }
+            new_rows.push(winner);
+        }
+
+        // Reconcile the view mirror: drop losers, insert winners.
+        let mut changed = false;
+        if !drop_rows.is_empty() || !new_rows.is_empty() {
+            let set = std::rc::Rc::make_mut(self.mirror.entry(f).or_default());
+            for r in &drop_rows {
+                changed |= set.remove(r);
+            }
+            for r in &new_rows {
+                changed |= set.insert(r.clone());
+            }
+        }
+        // Keep the `fast_rebuild` reverse index consistent with the drop-losers /
+        // insert-winner edits (no-op unless `native_uf_enabled` and `f` is a view —
+        // `native_uf_index_*` gate internally, matching the plain `resolve_merge`).
+        for r in &drop_rows {
+            self.native_uf_index_remove(f, r);
+        }
+        for r in &new_rows {
+            self.native_uf_index_insert(f, r);
+        }
+        // Returning `true` whenever an edge was composed keeps the saturate loop
+        // iterating until the proof-UF maintenance rules + rebuild reach a fixpoint
+        // (the relational signal for the dropped `@congruence_rule`). A no-op key
+        // (single candidate) changes nothing and returns `changed` (false).
+        changed
+    }
+
+    /// Read the view proof for `(children..., eclass)` from the proof SIDE-TABLE.
+    /// CANON-AT-CREATION guarantees a hit: every view row's proof is written to the
+    /// side-table when the row is born (see `update_view` in the encoder). A miss
+    /// would mean a broken invariant — `debug_assert` it rather than fabricate a
+    /// proof. NEVER routes through `lookup_or_create` (which would MINT a junk row
+    /// on a miss), so a release build returns the (sentinel) eclass id on a miss
+    /// instead of silently corrupting the proof-UF.
+    fn read_side_table_proof(&self, side_table: FunctionId, children: &[u32], eclass: u32) -> u32 {
+        let arity = self.info(side_table).arity;
+        let inputs_len = arity - 1; // children..., eclass
+        if let Some(set) = self.mirror.get(&side_table) {
+            for row in set.iter() {
+                if row.len() != arity {
+                    continue;
+                }
+                // Key columns are `children..., eclass`; the proof is the output.
+                if row_col(row, inputs_len - 1) == eclass
+                    && (0..children.len()).all(|i| row_col(row, i) == children[i])
+                {
+                    return row_col(row, inputs_len);
+                }
+            }
+        }
+        debug_assert!(
+            false,
+            "2-table proof-congruence: side-table proof miss for key (children={children:?}, \
+             eclass={eclass}) — canon-at-creation invariant broken (would fabricate a proof)"
+        );
+        eclass
+    }
+
+    /// Write a proof-carrying congruence edge `[larger, smaller, edge_proof]` into
+    /// the relational proof-UF `@UF_S` (`(S S) -> Proof :merge old`). Respects
+    /// `:merge old`: if a row for the `(larger, smaller)` key already exists, keep
+    /// it (idempotent — the first composed proof wins, exactly as the rule-encoded
+    /// `(set (@UF_S larger smaller) …)` with `:merge old` would).
+    fn insert_proof_uf_edge(
+        &mut self,
+        parent_table: FunctionId,
+        larger: u32,
+        smaller: u32,
+        edge_proof: u32,
+    ) {
+        if let Some(set) = self.mirror.get(&parent_table) {
+            // `:merge old` — an existing edge for this key wins; do not overwrite.
+            let exists = set.iter().any(|row| {
+                row.len() >= 2 && row_col(row, 0) == larger && row_col(row, 1) == smaller
+            });
+            if exists {
+                return;
+            }
+        }
+        let row: Row = vec![larger, smaller, edge_proof].into_boxed_slice();
+        self.mirror_insert(parent_table, row);
     }
 
     /// `--native-merge`: resolve FD conflicts on a custom `:merge` function with a
@@ -1354,15 +1582,21 @@ fn merge_mode_for_scalar(merge: &egglog_backend_trait::MergeFn) -> MergeMode {
         MergeFn::OldCol(_) => MergeMode::Old,
         MergeFn::NewCol(_) => MergeMode::New,
         MergeFn::Function(_, _) | MergeFn::Const(_) => MergeMode::Old,
-        // Proof-mode native-merge is not wired on Feldera (the 2-table
-        // `UnionIntoParentTableWithProof` and the bridge's tuple-output proof
-        // merges, plus the `KeyCol` the proof-mode term-build merge uses), so these
-        // never reach it.
-        MergeFn::UnionIntoParentTableWithProof { .. }
-        | MergeFn::UnionIntoUfWithProof { .. }
+        // `--native-merge` PROOF mode 2-table congruence (Feldera's single-output
+        // proof view): the surviving value is the min eclass (the UF leader),
+        // identical to the term-mode `UnionIntoUf`. The proof side-effect (reading
+        // the side-table, composing the edge proof, writing `@UF_S`) is handled by
+        // `resolve_proof_congruence_merge` via the `native_merge_proof` map, which
+        // is captured separately at `add_table`; here we only govern which value
+        // survives the FD collapse.
+        MergeFn::UnionIntoParentTableWithProof { .. } => MergeMode::Min,
+        // The TUPLE-output proof merges (`UnionIntoUfWithProof` / `EclassMinProof`)
+        // and the proof-mode term-build `KeyCol` are bridge-only; Feldera uses the
+        // 2-table form above instead, so these never reach it.
+        MergeFn::UnionIntoUfWithProof { .. }
         | MergeFn::EclassMinProof { .. }
         | MergeFn::KeyCol(_) => {
-            panic!("Feldera backend does not support proof-mode native-merge merges")
+            panic!("Feldera backend does not support tuple-output proof-mode native-merge merges")
         }
         MergeFn::Columns(_) => unreachable!("merge_mode_for_scalar called on a Columns merge"),
         // `Seq` / `TableInsert` / `Construct` / `IfEq` are the bridge-only
@@ -1414,6 +1648,37 @@ fn native_merge_target_uf(merge: &egglog_backend_trait::MergeFn) -> Option<Funct
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// `--native-merge` PROOF mode (2-table): the proof-congruence config a view's
+/// FD-conflict merge targets, named by the `UnionIntoParentTableWithProof` merge
+/// variant (top-level, or a single-column `Columns` wrapping it). `None` for any
+/// other merge.
+fn native_merge_proof_target(merge: &egglog_backend_trait::MergeFn) -> Option<NativeMergeProof> {
+    use egglog_backend_trait::MergeFn;
+    fn from_variant(merge: &MergeFn) -> Option<NativeMergeProof> {
+        match merge {
+            MergeFn::UnionIntoParentTableWithProof {
+                parent_table,
+                proof_side_table,
+                trans,
+                sym,
+            } => Some(NativeMergeProof {
+                parent_table: *parent_table,
+                proof_side_table: *proof_side_table,
+                trans: *trans,
+                sym: *sym,
+            }),
+            _ => None,
+        }
+    }
+    match merge {
+        MergeFn::Columns(cols) => match cols.as_slice() {
+            [single] => from_variant(single),
+            _ => None,
+        },
+        other => from_variant(other),
     }
 }
 
@@ -1516,6 +1781,12 @@ impl Backend for EGraph {
         // same place; `register_native_merge_view` is then only a consistency assertion. The view
         // is declared after its eq-sort, so the UF's `FunctionId` already resolves here.
         let native_merge_target = native_merge_target_uf(&config.merge);
+        // `--native-merge` PROOF mode (2-table): a single-output eclass view whose
+        // merge is `UnionIntoParentTableWithProof` carries the proof-congruence
+        // config (relational `@UF_S`, the `@<F>ViewProof` side-table, Trans/Sym).
+        // Captured here so `resolve_proof_congruence_merge` reads it from the same
+        // single source of truth as every other native-merge association.
+        let native_merge_proof = native_merge_proof_target(&config.merge);
         // `--native-merge` NATIVE CUSTOM `:merge`: a custom merge whose body either
         // BUILDS TERMS (a top-level `IfEq{…, Seq[…]}` from
         // `translate_term_build_merge_to_seq`) or is a pure VALUE-FOLD (a fold of
@@ -1565,6 +1836,9 @@ impl Backend for EGraph {
         self.mirror.insert(id, std::rc::Rc::new(HashSet::new()));
         if let Some(uf_func) = native_merge_target {
             self.native_merge_uf.insert(id, uf_func);
+        }
+        if let Some(proof) = native_merge_proof {
+            self.native_merge_proof.insert(id, proof);
         }
         self.invalidate_circuit();
         id

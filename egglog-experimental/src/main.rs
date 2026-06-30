@@ -28,18 +28,20 @@ fn main() {
     // — provision the backend in native-UF mode when it is set (mirrors cli.rs's
     // `args.native_uf = true` fold for `--native-merge`).
     //
-    // PROOF-MODE EXCEPTION (FlowLog): `--flowlog --proofs --native-merge` uses the
-    // RELATIONAL proof-UF + a proof side-table (the 2-table proof-congruence
-    // encoding), NOT the displaced native-UF (which FlowLog's `add_uf_function`
-    // rejects in proof mode). So `--native-merge` must NOT imply native-UF there.
-    // Mirror cli.rs's identical Step-0 carve-out so the pre-built backend egraph
-    // agrees with what cli.rs computes.
+    // PROOF-MODE EXCEPTION (FlowLog / Feldera): `--flowlog --proofs --native-merge`
+    // and `--feldera --proofs --native-merge` use the RELATIONAL proof-UF + a proof
+    // side-table (the 2-table proof-congruence encoding), NOT the displaced
+    // native-UF (which both backends' `add_uf_function` reject in proof mode). So
+    // `--native-merge` must NOT imply native-UF there. Mirror cli.rs's identical
+    // Step-0 carve-out so the pre-built backend egraph agrees with what cli.rs
+    // computes.
     let want_proofs_early = argv
         .iter()
         .any(|a| a == "--proofs" || a == "--proof-testing");
-    let flowlog_proof_native_merge =
-        want_flowlog && want_proofs_early && argv.iter().any(|a| a == "--native-merge");
-    let want_native_uf = !flowlog_proof_native_merge
+    let single_output_proof_native_merge = (want_flowlog || want_feldera)
+        && want_proofs_early
+        && argv.iter().any(|a| a == "--native-merge");
+    let want_native_uf = !single_output_proof_native_merge
         && argv
             .iter()
             .any(|a| a == "--duck-native-uf" || a == "--native-uf" || a == "--native-merge");
