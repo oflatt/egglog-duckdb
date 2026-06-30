@@ -29,6 +29,7 @@ pub(crate) struct EncodingNames {
     pub(crate) eq_sym_constructor: String,
     pub(crate) congr_constructor: String,
     pub(crate) container_normalize_constructor: String,
+    pub(crate) eval_constructor: String,
     /// For a given function symbol, the name of the function that converts to the AST type.
     pub(crate) sort_to_ast_constructor: HashMap<String, String>,
     pub(crate) fn_to_term_sort: HashMap<String, String>,
@@ -71,6 +72,7 @@ impl EncodingNames {
             eq_sym_constructor: symbol_gen.fresh("Sym"),
             congr_constructor: symbol_gen.fresh("Congr"),
             container_normalize_constructor: symbol_gen.fresh("ContainerNormalize"),
+            eval_constructor: symbol_gen.fresh("Eval"),
             sort_to_ast_constructor: HashMap::default(),
             fn_to_term_sort: HashMap::default(),
             single_parent_ruleset_name: symbol_gen.fresh("single_parent"),
@@ -367,6 +369,7 @@ impl ProofInstrumentor<'_> {
             ref eq_sym_constructor,
             ref congr_constructor,
             ref container_normalize_constructor,
+            ref eval_constructor,
             ref pcons,
             ref pnil,
             ..
@@ -409,6 +412,10 @@ impl ProofInstrumentor<'_> {
 ;; t1 = normalize(c) (the container's canonicalization: sort/dedup for sets,
 ;; last-write-wins for maps, sort for multisets)
 (constructor  {container_normalize_constructor} ({proof_datatype}) {proof_datatype} :internal-hidden)
+
+;; marks the proof of a container side condition. Carries nothing: the side
+;; condition is re-evaluated against the rule body when checked.
+(constructor  {eval_constructor} () {proof_datatype} :internal-hidden)
                 "
         )
     }
@@ -445,6 +452,10 @@ pub enum ProofEncodingUnsupportedReason {
         "action contains a function lookup. Finding the output of a function is only supported in queries."
     )]
     FunctionLookupInAction,
+    #[error(
+        "a container constructed in the query (a container-producing primitive result) is used in the actions. A query-built container is a side condition with no carryable proof, so it cannot be carried into an action."
+    )]
+    ContainerCreatedInQueryUsedInAction,
     #[error(
         "sort has a presort (custom sort container implementation). Custom sorts are not supported by proof encoding."
     )]
@@ -551,7 +562,6 @@ pub(crate) fn command_supports_proof_encoding(
     {
         return Err(ProofEncodingUnsupportedReason::NaiveEqSortPrimitiveFact);
     }
-
     // Check all expressions for primitives without validators
     let mut all_primitives_have_validators = true;
     command.clone().visit_exprs(&mut |expr| {
@@ -576,6 +586,46 @@ pub(crate) fn command_supports_proof_encoding(
 
     if has_function_lookup_in_action {
         return Err(ProofEncodingUnsupportedReason::FunctionLookupInAction);
+    }
+
+    // A container built by a primitive in the query is a side condition with no
+    // carryable proof, so it can't be used in an action. Reject a rule that binds
+    // such a container to a variable used in its actions.
+    if let GenericCommand::Rule { rule } = command {
+        let mut constructed: Vec<String> = Vec::new();
+        for fact in &rule.body {
+            if let ResolvedFact::Eq(_, lhs, rhs) = fact {
+                for (var_side, call_side) in [(lhs, rhs), (rhs, lhs)] {
+                    if let ResolvedExpr::Var(_, v) = var_side
+                        && let ResolvedExpr::Call(_, ResolvedCall::Primitive(prim), _) = call_side
+                        && prim.output().is_eq_container_sort()
+                    {
+                        constructed.push(v.name.clone());
+                    }
+                }
+            }
+        }
+        if !constructed.is_empty() {
+            let mut used_in_action = false;
+            for action in &rule.head.0 {
+                action.clone().visit_exprs(&mut |expr| {
+                    expr.walk(
+                        &mut |e| {
+                            if let ResolvedExpr::Var(_, v) = e
+                                && constructed.contains(&v.name)
+                            {
+                                used_in_action = true;
+                            }
+                        },
+                        &mut |_| {},
+                    );
+                    expr
+                });
+            }
+            if used_in_action {
+                return Err(ProofEncodingUnsupportedReason::ContainerCreatedInQueryUsedInAction);
+            }
+        }
     }
 
     // Now check command-specific constraints

@@ -237,18 +237,13 @@ mod tests {
             .unwrap();
     }
 
-    // KNOWN GAP: a container's reflexive `<CSort>Proof` is anchored only during
-    // rebuild, not at creation (unlike eq-sort terms). So a rule body that
-    // produces a *newly-created* container via a primitive and needs its proof
-    // in the same iteration fails -- the action lookup of the container's term
-    // proof has no row yet. Contrast
-    // `proof_mode_allows_eq_container_primitive_results_in_facts`, which uses an
-    // already-anchored container. This test pins the current (failing)
-    // behavior; flip it to assert success once the gap is fixed.
+    // A container constructed in the query body and not used in an action: the
+    // binding fact's proof is the container's reflexive `Eval`, which the rule
+    // check re-derives with the typed primitive.
     #[test]
-    fn proof_mode_new_container_primitive_result_in_fact_is_unsupported() {
+    fn proof_mode_query_constructed_container_not_used_in_action() {
         let mut egraph = EGraph::new_with_proofs();
-        let err = egraph
+        egraph
             .parse_and_run_program(
                 None,
                 r#"
@@ -268,11 +263,40 @@ mod tests {
                 (prove (Done))
                 "#,
             )
+            .unwrap();
+    }
+
+    // A container constructed in the query is a side condition with no carryable
+    // proof (just an `Eval` marker), so it can't be used in an action. Proof mode
+    // rejects such a rule rather than producing an unsound proof.
+    #[test]
+    fn proof_support_rejects_query_constructed_container_used_in_action() {
+        let mut egraph = EGraph::new_with_proofs();
+        let err = egraph
+            .parse_and_run_program(
+                None,
+                r#"
+                (datatype E (Mk))
+                (sort EqContainer (Vec E))
+                (relation SeedElem (E))
+                (relation Out (EqContainer))
+
+                (rule ((SeedElem e)
+                       (= xs (vec-of e)))
+                      ((Out xs))
+                      :name "new-container-in-action")
+                "#,
+            )
             .unwrap_err();
-        let msg = format!("{err}");
         assert!(
-            msg.contains("lookup of function"),
-            "expected a container term-proof lookup failure, got: {msg}"
+            matches!(
+                err,
+                Error::UnsupportedProofCommand {
+                    reason: ProofEncodingUnsupportedReason::ContainerCreatedInQueryUsedInAction,
+                    ..
+                }
+            ),
+            "expected ContainerCreatedInQueryUsedInAction, got {err:?}"
         );
     }
 

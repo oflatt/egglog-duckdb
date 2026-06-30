@@ -1,5 +1,6 @@
 ---
 source: tests/files.rs
+assertion_line: 88
 expression: snapshot_content_across_treatments
 ---
 (let prf0 (Fiat (= (B) (A))))
@@ -22,12 +23,19 @@ expression: snapshot_content_across_treatments
   (premises
     (Fiat (= (A) (A)))
     prf0
+    (Eval)
     prf0
+    (Eval)
     (Trans
       (= (Holds (set-of (A))) (Holds (set-of (A))))
       (Sym (= (Holds (set-of (A))) t0) prf1)
       prf1))
-  (substitution (@v35 (A)) (@v34 (A)) (@v33 (A))))
+  (substitution
+    (@v34 (A))
+    (@v35 (set-of (A)))
+    (@v36 (A))
+    (@v37 (set-of (A)))
+    (@v33 (A))))
 ((A 1)
  (B 1)
  (Holds 1))

@@ -340,6 +340,8 @@ impl ProofStore {
                     changed = true;
                 }
             }
+            // No sub-proofs to remap; the result lives in the proposition.
+            Justification::Eval => return proof_id,
         }
 
         if !changed {
@@ -382,6 +384,8 @@ impl Proof {
             Justification::Trans(_, _) => {}
             Justification::Sym(_) => {}
             Justification::ContainerNormalize { proof: _ } => {}
+            // The only term (the result) lives in the proposition, already mapped.
+            Justification::Eval => {}
         }
     }
 }
