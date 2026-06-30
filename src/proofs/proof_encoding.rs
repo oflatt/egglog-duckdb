@@ -941,6 +941,7 @@ impl<'a> ProofInstrumentor<'a> {
                 &rebuilding_ruleset,
             )
         } else if self.native_merge()
+            && self.egraph.backend.supports_native_congruence_merge()
             && fdecl.resolved_schema.output().is_eq_sort()
             && !fdecl.schema.input.is_empty()
         {
@@ -949,12 +950,20 @@ impl<'a> ProofInstrumentor<'a> {
             // time). The separate `@congruence_rule*` self-join rule is therefore
             // NOT emitted — this is the rule deletion that makes native-merge
             // faster than the rule-encoded congruence. Mirrors the
-            // `native_merge_view` gate in `term_and_view` (constructor, eq-sort
-            // output, non-empty inputs). In TERM mode the merge is
-            // `UnionId`/`UnionIntoUf`; in PROOF mode (A2) it is
-            // `Columns([UnionIntoUfWithProof, EclassMinProof])`, which ALSO
-            // composes the same `Trans(larger_pf, Sym(smaller_pf))` edge proof
-            // the dropped `@congruence_rule*` would have written into `@UF_Sf`.
+            // `native_congruence_view` gate in `term_and_view` (constructor,
+            // eq-sort output, non-empty inputs) — they MUST agree: this branch
+            // drops the rule, and `native_congruence_view` creates the inline FD
+            // view that replaces it. Both are gated on
+            // `supports_native_congruence_merge()`, so a backend that cannot
+            // execute the inline congruence merge (DuckDB returns `false`) KEEPS
+            // the rule-encoded congruence here — otherwise congruence would be
+            // dropped with no replacement (the `--duckdb --native-merge`
+            // wrong-results bug: the rule was dropped but the FD view was never
+            // created). In TERM mode the merge is `UnionId`/`UnionIntoUf`; in
+            // PROOF mode (A2) it is `Columns([UnionIntoUfWithProof,
+            // EclassMinProof])`, which ALSO composes the same
+            // `Trans(larger_pf, Sym(smaller_pf))` edge proof the dropped
+            // `@congruence_rule*` would have written into `@UF_Sf`.
             // 0-input constructors keep the congruence rule (their view stays the
             // baseline all-columns form).
             String::new()
