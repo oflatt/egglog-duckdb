@@ -844,6 +844,28 @@ pub trait Backend: Send + Sync {
         true
     }
 
+    /// Whether this backend's native-merge FD view (`(children) -> eclass`) keeps
+    /// CONFLICTING `(children, eclass)` rows COEXISTING until a host pass resolves
+    /// them, rather than collapsing children -> eclass at insert time inside the
+    /// merge.
+    ///
+    /// The reference bridge / FlowLog / Feldera resolve the FD conflict INSIDE the
+    /// merge (the `UnionId`/`UnionIntoUf` merge unions the eclasses and keeps one
+    /// row per children), so there is only ever one row per children — the rebuild
+    /// can safely delete the stale row by CHILDREN ONLY. They return `false`.
+    ///
+    /// DuckDB registers the view ALL-COLUMNS keyed so two `(set (@<C>View children)
+    /// eclass)` writes with different eclasses COEXIST until `emit_native_congruence`
+    /// resolves them at the iteration boundary. A children-only rebuild delete would
+    /// wipe BOTH coexisting rows (destroying the conflict before the host pass sees
+    /// it), so DuckDB returns `true` and the encoder keys the rebuild / delete /
+    /// subsume of a native-merge view on the FULL `(children, eclass)` row instead.
+    /// Only consulted when `supports_native_congruence_merge()` is also true; gates
+    /// `view_delete` (and the related view body / subsume forms) in the encoder.
+    fn native_merge_views_coexist(&self) -> bool {
+        false
+    }
+
     /// Whether this backend can host a TUPLE-output (multi-value) function table —
     /// a function whose row has more than one output column, resolved by a
     /// [`MergeFn::Columns`] of length > 1.

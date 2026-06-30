@@ -712,7 +712,7 @@ impl<'a> ProofInstrumentor<'a> {
             return delete_rule;
         }
 
-        let view_subsume = if self.is_native_merge_view(&view_name) {
+        let view_subsume = if self.uses_fd_native_merge_view(&view_name) {
             format!("(subsume ({view_name} {child_names}))")
         } else {
             format!("(subsume ({view_name} {child_names} out))")
@@ -1153,7 +1153,7 @@ impl<'a> ProofInstrumentor<'a> {
                         "(function {view_name} ({in_sorts}) ({out_type} {proof_type}) :merge (values old0 old1) :internal-term-constructor {name}{view_flags})"
                     )
                 }
-            } else {
+            } else if self.uses_fd_native_merge_view(&view_name) {
                 // TERM-mode FD view: single output `(children) -> eclass`. The
                 // `:merge old` is a placeholder — lowering substitutes
                 // `MergeFn::UnionId`/`UnionIntoUf` by name (see `lib.rs`). The
@@ -1162,6 +1162,20 @@ impl<'a> ProofInstrumentor<'a> {
                 // column becomes the eclass instead of the Unit/proof slot.
                 format!(
                     "(function {view_name} ({in_sorts}) {out_type} :merge old :internal-term-constructor {name}{view_flags})"
+                )
+            } else {
+                // `native_merge_views_coexist()` backend (DuckDB), term mode: keep the
+                // BASELINE all-columns Unit-relation view shape `(function @<C>View
+                // (children..., eclass) Unit :merge old)`. The view is STILL in
+                // `native_merge_views` (so the `@congruence_rule*` is dropped and the
+                // view -> UF association is registered via `register_native_merge_view`),
+                // but its rows COEXIST and the rebuild / delete / subsume key on the
+                // FULL row. Congruence is done by the backend host pass
+                // `emit_native_congruence`, which reads this all-cols view exactly as
+                // the dropped rule would. Identical to the `native_merge_view == false`
+                // baseline declaration below.
+                format!(
+                    "(function {view_name} ({view_sorts}) {proof_type} :merge old :internal-term-constructor {name}{view_flags})"
                 )
             }
         } else {
@@ -2203,7 +2217,10 @@ impl<'a> ProofInstrumentor<'a> {
         // `(set (@FView children) eclass)` (the Unit `proof` slot is dropped —
         // there is no proof in term-mode native-merge). On an FD conflict the
         // UnionId merge unions the two eclasses, doing congruence inline.
-        if self.is_native_merge_view(&view_name) {
+        // `native_merge_views_coexist()` backends (DuckDB) keep the BASELINE
+        // all-columns Unit-view shape instead (handled by the fall-through below),
+        // so this FD-set form is gated on `uses_fd_native_merge_view`.
+        if self.uses_fd_native_merge_view(&view_name) {
             let (eclass, children) = args
                 .split_last()
                 .expect("native-merge view row has columns");
@@ -2238,11 +2255,13 @@ impl<'a> ProofInstrumentor<'a> {
                 "(= (values {eclass} {pf}) ({view_name} {}))",
                 ListDisplay(children, " ")
             )
-        } else if self.is_native_merge_view(&view_name) {
+        } else if self.uses_fd_native_merge_view(&view_name) {
             // 2-TABLE proof view AND term FD view: single-output
             // `(= eclass (@FView children))`. The 2-table proof side-table is read
             // separately where the proof is actually needed (`query_view_and_get_proof`);
             // delete/subsume only need the eclass / row existence here.
+            // `native_merge_views_coexist()` backends (DuckDB) use the BASELINE flat
+            // all-columns atom (the fall-through below) instead.
             let (eclass, children) = cols
                 .split_last()
                 .expect("native-merge view row has columns");
@@ -2252,12 +2271,14 @@ impl<'a> ProofInstrumentor<'a> {
         }
     }
 
-    /// `(delete (@FView ...))` for a whole view row. For a native-merge FD view the
-    /// delete is keyed on the children only (`(delete (@FView children))`); for the
-    /// baseline view it lists every column. `cols` is `children..., eclass`.
+    /// `(delete (@FView ...))` for a whole view row. For an FD-shaped native-merge
+    /// view (`uses_fd_native_merge_view`) the delete is keyed on the children only
+    /// (`(delete (@FView children))`); for the baseline view — including a
+    /// `native_merge_views_coexist()` backend's all-columns native-merge view — it
+    /// lists every column. `cols` is `children..., eclass`.
     fn view_delete(&mut self, fname: &str, cols: &[String]) -> String {
         let view_name = self.view_name(fname);
-        let key = if self.is_native_merge_view(&view_name) {
+        let key = if self.uses_fd_native_merge_view(&view_name) {
             cols.split_last()
                 .expect("native-merge view row has columns")
                 .1

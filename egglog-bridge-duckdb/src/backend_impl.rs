@@ -880,6 +880,27 @@ impl Backend for EGraph {
         id
     }
 
+    /// `--native-merge` CONSTRUCTOR-CONGRUENCE: associate an `@<C>View` constructor
+    /// view (`view_func`) with the union-find function (`uf_func`, the `@UF_Sf`) that
+    /// owns its eclass column. The frontend calls this (via `register_native_merge_views`)
+    /// once per native-merge view before the first run.
+    ///
+    /// On DuckDB the view keeps the BASELINE all-columns Unit-relation shape (rows
+    /// coexist; `native_merge_views_coexist()` is true) and the `@congruence_rule*`
+    /// has been dropped by the encoder. We record the UF function table on the view's
+    /// [`FunctionInfo::native_congruence_uf`]; [`EGraph::emit_native_congruence`] then
+    /// reads each FD conflict on the view via a self-join and writes the
+    /// `(larger, smaller)` union edge into that `@UF_Sf` — exactly what the dropped
+    /// rule did — and the existing `@rebuild_rule*` re-canonicalizes the views.
+    /// `sync_native_ufs` drains the `@UF_Sf` edges into the in-core UF.
+    fn register_native_merge_view(&mut self, uf_func: FunctionId, view_func: FunctionId) {
+        let uf_table = self.name_for_function_id(uf_func).to_string();
+        let view_name = self.name_for_function_id(view_func).to_string();
+        if let Some(info) = self.functions.get_mut(&view_name) {
+            info.native_congruence_uf = Some(uf_table);
+        }
+    }
+
     fn add_uf_function(
         &mut self,
         name: String,
@@ -1433,16 +1454,45 @@ impl Backend for EGraph {
         true
     }
 
-    /// DuckDB has NO native constructor-congruence wiring: it leaves
-    /// `register_native_merge_view` at the no-op default and has no host-pass that
-    /// unions colliding eclasses inline. So under `--native-merge` (which DuckDB
-    /// enables for value-fold merges), constructor congruence must stay RULE-ENCODED
-    /// — otherwise the FD-keyed `@<C>View` would be declared with a `UnionId`/`Min`
-    /// congruence merge that the no-op registration never executes (and, under the
-    /// implied `--native-uf`, the view is mis-registered as a `@UF_Sf` index and
-    /// panics deriving its `pname`). Returning `false` keeps the congruence rules.
+    /// `--native-merge` CONSTRUCTOR-CONGRUENCE: DuckDB does congruence INLINE via a
+    /// set-based host pass instead of the rule-encoded `@congruence_rule*`. Returning
+    /// `true` makes the encoder DROP the `@congruence_rule*` self-join (proof_encoding
+    /// `handle_merge_or_congruence`) and record the view -> output-sort-UF association
+    /// (via `register_native_merge_view`). Combined with `native_merge_views_coexist()`
+    /// = `true`, the constructor's `@<C>View` keeps the BASELINE all-columns
+    /// Unit-relation shape `(children..., eclass) -> Unit` (NOT the FD `(children) ->
+    /// eclass` function shape the collapse-at-insert backends use), so its rows
+    /// COEXIST and the existing `@rebuild_rule*` retracts stale rows by the full
+    /// `(children, eclass)` key. At the iteration boundary
+    /// [`EGraph::emit_native_congruence`] self-joins the view, finds each FD conflict
+    /// (same children, two eclasses), and writes the `(larger, smaller)` union edge
+    /// into the eclass sort's `@UF_Sf` — exactly the row the dropped rule wrote;
+    /// `sync_native_ufs` drains it and `@rebuild_rule*` re-canonicalizes. This avoids
+    /// the historical wrong-results bug (the `UnionId`/`Min` FD merge collapsing
+    /// colliding eclasses at insert time WITHOUT emitting a union edge).
+    ///
+    /// PROOF-mode native-merge is still unsupported: the proof-view forms need
+    /// tuple-output (A2) or a proof side-table (2-table) DuckDB does not host, and
+    /// `duck_merge_mode_scalar` panics on the proof merges. So this returns `false`
+    /// in proof mode — proof-mode congruence stays RULE-ENCODED (exactly the prior
+    /// behavior; the encoder's `native_congruence_view` gate reads this), and only
+    /// non-proof (term-mode) congruence goes native. `proofs_enabled` is set by
+    /// `enable_proofs` at construction, before the encoder queries this.
     fn supports_native_congruence_merge(&self) -> bool {
-        false
+        !self.proofs_enabled
+    }
+
+    /// DuckDB renders a CONSTRUCTOR-congruence native-merge view in the BASELINE
+    /// all-columns Unit-relation shape (rows COEXIST), NOT the FD `(children) ->
+    /// eclass` function shape. The rebuild / delete / subsume then key on the FULL
+    /// `(children, eclass)` row — a children-only delete on coexisting rows would
+    /// self-wipe the canonical row, and a full-key delete can't be expressed on an
+    /// FD function. Congruence is resolved by the `emit_native_congruence` host pass.
+    /// VALUE-FOLD / TERM-BUILD views are unaffected (they keep the FD shape — see
+    /// `uses_fd_native_merge_view`). Gated on `!proofs_enabled` to match
+    /// `supports_native_congruence_merge` (proof mode keeps congruence rule-encoded).
+    fn native_merge_views_coexist(&self) -> bool {
+        !self.proofs_enabled
     }
 
     /// `--native-merge` TERM-BUILD custom `:merge`: DuckDB runs a term-building

@@ -1938,6 +1938,25 @@ pub struct FunctionInfo {
     /// eclass). `None` for every other table. The tree carries `FunctionId`s
     /// resolved against `EGraph::backend_function_names`.
     pub merge_tree: Option<egglog_backend_trait::MergeFn>,
+    /// `Some(uf_table)` for a NATIVE-CONGRUENCE constructor view (`--native-merge`
+    /// with `supports_native_congruence_merge()` true): the `@<C>View` of an eq-sort
+    /// constructor, declared in the BASELINE all-columns Unit-relation shape
+    /// `(children..., eclass) -> Unit` (so its rows COEXIST — the relation's all-cols
+    /// PK only de-dupes identical rows). Set by [`Backend::register_native_merge_view`]
+    /// AFTER `declare` (the encoder dropped the view's `@congruence_rule*` and records
+    /// the view -> UF association). `uf_table` is the per-sort UF-backed function
+    /// (`@UF_Sf`) of the view's eclass column sort — the same table the dropped
+    /// `@congruence_rule*` wrote union edges into (via `(set (@UF_Sf larger) smaller)`),
+    /// and the table `sync_native_ufs` scans `(c0, c1, ts)` edges out of (its
+    /// `native_uf_pname` maps it to ITSELF; there is no separate `@UF_S` parent on
+    /// DuckDB).
+    ///
+    /// Its presence marks the view as native-congruence: at the iteration boundary
+    /// [`EGraph::emit_native_congruence`] reads each FD conflict (same children, two
+    /// eclasses) via a self-join and inserts the `(GREATEST, LEAST, ts)` union edge
+    /// into `uf_table` — exactly what the dropped rule did. `None` for every other
+    /// table.
+    pub native_congruence_uf: Option<String>,
 }
 
 impl FunctionInfo {
@@ -2044,6 +2063,11 @@ pub struct EGraph {
     /// self-join restricts its "new" side to rows with `ts >= last_termbuild_at`
     /// so each conflict pair is processed once.
     last_termbuild_at: HashMap<String, i64>,
+    /// Per NATIVE-CONGRUENCE view (`native_congruence_uf.is_some()`), the `ts`
+    /// through which `emit_native_congruence` has already resolved FD conflicts.
+    /// The conflict self-join restricts its window to rows with
+    /// `ts >= last_native_cong_at` so each conflict pair is processed once.
+    last_native_cong_at: HashMap<String, i64>,
     /// Diagnostic counter: total rows pulled into native UFs across
     /// all syncs. Surfaced via `DUCK_PERF_DUMP` (under the native-uf
     /// flag) so we can see the work the SQL → memory bridge is
@@ -2360,6 +2384,7 @@ impl EGraph {
             last_uf_sync_ts: HashMap::new(),
             last_inline_cong_at: HashMap::new(),
             last_termbuild_at: HashMap::new(),
+            last_native_cong_at: HashMap::new(),
             native_uf_unions_synced: 0,
             backend_function_names: Vec::new(),
             backend_report_level: egglog_backend_trait::ReportLevel::default(),
@@ -2628,6 +2653,7 @@ impl EGraph {
                 eq_sort_pname: None,
                 identity_on_miss: false,
                 merge_tree: None,
+                native_congruence_uf: None,
             },
         )?;
         let uf = Arc::new(Mutex::new(UfTable::new()));
@@ -3699,6 +3725,7 @@ impl EGraph {
                 eq_sort_pname: pname_resolved,
                 identity_on_miss: false,
                 merge_tree: None,
+                native_congruence_uf: None,
             },
         )
     }
@@ -3726,6 +3753,7 @@ impl EGraph {
                 eq_sort_pname: None,
                 identity_on_miss: false,
                 merge_tree: None,
+                native_congruence_uf: None,
             },
         )
     }
@@ -3764,6 +3792,7 @@ impl EGraph {
                 eq_sort_pname: None,
                 identity_on_miss: false,
                 merge_tree: Some(tree),
+                native_congruence_uf: None,
             },
         )
     }
@@ -3806,6 +3835,7 @@ impl EGraph {
                 eq_sort_pname: pname_resolved,
                 identity_on_miss: false,
                 merge_tree: None,
+                native_congruence_uf: None,
             },
         )?;
         Ok(())
@@ -3830,6 +3860,10 @@ impl EGraph {
         //   self-join in `emit_term_build_merges` (resolved at the iter boundary).
         // - other functions with merge mode: cover input columns only, so
         //   ON CONFLICT can update the output.
+        // (NATIVE-CONGRUENCE views need no special case here: they are registered as
+        // BASELINE all-columns Unit relations — `merge: None` — which already cover
+        // all columns; `register_native_merge_view` tags them with
+        // `native_congruence_uf` AFTER `declare`.)
         let pk_width = match (&info.merge, info.eq_sort_ctor, info.merge_tree.is_some()) {
             (Some(_), false, false) => info.inputs_len,
             _ => info.cols.len(),
@@ -4177,6 +4211,18 @@ impl EGraph {
         // are ~free.
         if self.native_uf_enabled {
             total += self.emit_term_build_merges(cur)?;
+            // Native CONSTRUCTOR-CONGRUENCE (`--native-merge` with
+            // `supports_native_congruence_merge()` true): resolve FD conflicts on
+            // each touched native-congruence view (`native_congruence_uf.is_some()`)
+            // by emitting `(larger, smaller)` union edges into the view's relational
+            // UF (`@UF_S`) and deleting the loser rows. This is the host pass that
+            // replaces the dropped `@congruence_rule*`. Run AFTER term-build so the
+            // constructor (`@<C>View`) rows a term-build merge minted this iteration
+            // also get their FD conflicts congruence-collapsed in the same pass. It
+            // is watermark-gated (iterations touching no native-congruence view are
+            // ~free); the resulting `@UF_S` edges are drained by `sync_native_ufs`
+            // and the views re-canonicalized by `@rebuild_rule*` next iteration.
+            total += self.emit_native_congruence(cur)?;
         }
         // A full scan re-canonicalized every row, so the accumulated
         // delta is fully consumed — reset it. Only on gated
@@ -4491,6 +4537,147 @@ impl EGraph {
         Ok(total)
     }
 
+    /// Native CONSTRUCTOR-CONGRUENCE resolution (`--native-merge` with
+    /// `supports_native_congruence_merge()` true), INLINE as set-based SQL. This is
+    /// the host pass that REPLACES the dropped `@congruence_rule*` self-join rule.
+    ///
+    /// The encoder declares each constructor's `@<C>View` in the BASELINE all-columns
+    /// Unit-relation shape `(children..., eclass) -> Unit` (NOT the FD `(children) ->
+    /// eclass` function shape the collapse-at-insert backends use — see
+    /// `native_merge_views_coexist` / `uses_fd_native_merge_view`), so two
+    /// `(set (@<C>View children eclass))` writes with the same children but different
+    /// eclasses COEXIST as distinct rows (the relation's all-cols PK only de-dupes
+    /// identical rows). The `@congruence_rule*` is dropped and the view -> UF
+    /// association is recorded on `FunctionInfo::native_congruence_uf` by
+    /// `register_native_merge_view`.
+    ///
+    /// For each native-congruence view (`native_congruence_uf.is_some()`) whose
+    /// watermark advanced since the last pass:
+    ///   1. SELF-JOIN the view on its children columns to read every `(children, e1,
+    ///      e2)` FD conflict (same children, two eclasses) over the seminaive window
+    ///      (`v1` is the delta `ts ∈ [last, cur)`, `v2` is any `ts < cur`) — the same
+    ///      delta semantics as the dropped `@congruence_rule*` / `emit_inline_congruence`.
+    ///   2. INSERT the union edge `(GREATEST(e1,e2), LEAST(e1,e2), cur)` into the
+    ///      view's per-sort UF-backed function (`native_congruence_uf`, i.e.
+    ///      `@UF_Sf`) — exactly the `(larger, smaller)` row the dropped
+    ///      `@congruence_rule*` wrote (via `(set (@UF_Sf larger) smaller)`) — with
+    ///      `ON CONFLICT DO NOTHING` to dedupe. `sync_native_ufs` then drains these
+    ///      edges into the in-core UF on the next iteration, and the existing
+    ///      `@rebuild_rule*` re-canonicalizes the views (its full-`(children, eclass)`
+    ///      delete retracts the stale non-leader row — no eager delete needed here,
+    ///      mirroring the rule encoding's lifecycle exactly so bounded `(run N)` is
+    ///      bit-exact).
+    ///
+    /// Returns the number of conflict rows resolved (a saturation signal, like
+    /// `emit_term_build_merges`). Reuses `emit_inline_congruence`'s self-join +
+    /// `GREATEST`/`LEAST` edge SQL and `emit_term_build_merges`'s TEMP-table batch +
+    /// watermark gate/bump structure.
+    fn emit_native_congruence(&mut self, cur: i64) -> Result<usize> {
+        // Snapshot eligible (view, uf_table, n_keys) triples without a borrow held.
+        let entries: Vec<(String, String, usize)> = self
+            .functions
+            .iter()
+            .filter_map(|(name, info)| {
+                let uf_table = info.native_congruence_uf.clone()?;
+                // The native-congruence view is the BASELINE all-columns Unit
+                // relation `@<C>View (children..., eclass)`: every column is a "key"
+                // column (`inputs_len == cols.len()`), the LAST being the eclass. So
+                // `n_keys` (the children count) is `inputs_len - 1` and the eclass
+                // sits at index `inputs_len - 1`. Need at least one child column to
+                // form an FD conflict.
+                if info.inputs_len < 2 {
+                    return None;
+                }
+                let n_keys = info.inputs_len - 1;
+                // Skip if no writes since our last pass (watermark gate).
+                let wm = self.table_watermarks.get(name).copied().unwrap_or(0);
+                let last_at = self.last_native_cong_at.get(name).copied().unwrap_or(0);
+                if wm < last_at {
+                    return None;
+                }
+                Some((name.clone(), uf_table, n_keys))
+            })
+            .collect();
+
+        let mut total: usize = 0;
+        for (view, uf_table, n_keys) in entries {
+            let last_at = self.last_native_cong_at.get(&view).copied().unwrap_or(0);
+            let out_col = n_keys; // eclass column index.
+
+            // (1) Build the conflict batch as a TEMP table. Self-join the all-cols-
+            // keyed view on its key (children) columns. Orientation `v1.c{out} <
+            // v2.c{out}` keeps the winner = min eclass (matching union-by-min) and
+            // names the loser = max eclass (`v2`); each unordered pair appears once.
+            // Seminaive window mirroring the dropped `@congruence_rule*` (and
+            // `emit_inline_congruence`): `v1` is the NEW-since-last-pass delta
+            // (`ts >= ?1 AND ts < ?2`) and `v2` covers everything earlier-or-equal
+            // (`ts < ?2`). The current iteration's freshly-inserted rows are the
+            // delta side `v1`; `v2 < cur` covers ALL prior rows. The pair is oriented
+            // by value (NOT by which side is `v1`): `loser = GREATEST(eclasses)`,
+            // `winner = LEAST` — so a conflict is caught whether the smaller- or the
+            // larger-eclass row is the new delta. `v1.c{out} <> v2.c{out}` filters
+            // equal-eclass self-joins. A pair where BOTH sides are new appears twice
+            // (v1/v2 swapped) but yields the same `(GREATEST, LEAST)` edge, deduped
+            // by the UF table's `ON CONFLICT DO NOTHING`. This matches the rule
+            // encoding's delta semantics exactly, so the same conflicts are found in
+            // the same iterations and the bounded-`(run N)` fixpoint is identical.
+            let key_join: Vec<String> = (0..n_keys).map(|i| format!("v1.c{i} = v2.c{i}")).collect();
+            let key_proj: Vec<String> = (0..n_keys).map(|i| format!("v1.c{i} AS c{i}")).collect();
+            let batch_sql = format!(
+                "CREATE OR REPLACE TEMP TABLE native_cong_batch AS \
+                 SELECT {keyproj}, \
+                        GREATEST(v1.c{out_col}, v2.c{out_col}) AS loser, \
+                        LEAST(v1.c{out_col}, v2.c{out_col}) AS winner \
+                 FROM {v} v1 JOIN {v} v2 \
+                   ON {keyjoin} AND v1.c{out_col} <> v2.c{out_col} \
+                 WHERE v1.ts >= ?1 AND v1.ts < ?2 AND v2.ts < ?2",
+                keyproj = key_proj.join(", "),
+                v = q(&view),
+                keyjoin = key_join.join(" AND "),
+            );
+            exec_bound(&self.conn, &batch_sql, last_at, cur)?;
+            let n_conflicts: i64 =
+                self.conn
+                    .query_row("SELECT COUNT(*) FROM native_cong_batch", [], |r| r.get(0))?;
+            if n_conflicts == 0 {
+                self.last_native_cong_at.insert(view.clone(), cur);
+                continue;
+            }
+
+            // (2) Insert the union edges into the per-sort UF-backed function
+            // (`@UF_Sf`): `(GREATEST=loser, LEAST=winner, cur)` — the `(larger,
+            // smaller)` row the dropped `@congruence_rule*` wrote (via
+            // `(set (@UF_Sf larger) smaller)`). `ON CONFLICT DO NOTHING` dedupes
+            // against its all-cols `(c0, c1)` PK; `sync_native_ufs` drains
+            // `(c0, c1, ts)` into the in-core UF.
+            let ins_edge = format!(
+                "INSERT INTO {u} (c0, c1, ts) \
+                 SELECT b.loser, b.winner, ?2 FROM native_cong_batch b \
+                 ON CONFLICT DO NOTHING",
+                u = q(&uf_table),
+            );
+            let ne = exec_bound(&self.conn, &ins_edge, last_at, cur)?;
+            if ne > 0 {
+                self.rules_affected = self.rules_affected.wrapping_add(ne as u64);
+                self.bump_watermark(&uf_table, cur);
+            }
+
+            // NOTE: we do NOT delete the loser view row here. This pass is a faithful
+            // replica of the dropped `@congruence_rule*`, which ONLY emits the union
+            // edge — it leaves both conflicting `(children, e1)`/`(children, e2)`
+            // rows in place and lets the `@rebuild_rule*` retract the stale
+            // (non-leader) row once the leader change propagates (the same lifecycle
+            // the native-UF rule encoding uses, where this view is all-cols keyed and
+            // the rebuild's now-DELETE-before-INSERT order — see
+            // `native_merge_views_coexist` — re-canonicalizes without self-wiping).
+            // Eagerly deleting the loser here desynchronizes from that lifecycle and
+            // under-merges within a bounded `(run N)`.
+            total += n_conflicts as usize;
+            self.last_native_cong_at.insert(view.clone(), cur);
+        }
+        Ok(total)
+    }
+
     /// For each EqSort constructor with a registered pname whose
     /// table watermark advanced this iter, INSERT into the pname any
     /// same-input/different-id pair as a `(max, min, cur)` union
@@ -4736,7 +4923,9 @@ pub(crate) fn conflict_clause(info: &FunctionInfo) -> String {
     // TERM-BUILD views are all-cols keyed (see `declare`): their writes coexist
     // and are resolved by `emit_term_build_merges`, so the conflict clause is a
     // plain `DO NOTHING` (de-dupe identical re-inserts), NOT a `DO UPDATE` on the
-    // output column.
+    // output column. (NATIVE-CONGRUENCE views are BASELINE all-columns Unit
+    // relations with `merge: None`, which already yield `DO NOTHING` via the
+    // `None` arm below — no special case needed.)
     if info.merge_tree.is_some() {
         return "ON CONFLICT DO NOTHING".to_string();
     }

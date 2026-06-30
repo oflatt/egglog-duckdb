@@ -1966,7 +1966,16 @@ impl EGraph {
                         // but it needs the FOLD merge, not the congruence `UnionId`.
                         let value_merge = value_merge.clone();
                         self.translate_expr_to_mergefn(&value_merge)?
-                    } else if self.proof_state.native_merge_views.contains(&*decl.name) {
+                    } else if self.proof_state.native_merge_views.contains(&*decl.name)
+                        // A `native_merge_views_coexist()` backend (DuckDB) in TERM
+                        // mode renders a constructor-congruence view in the BASELINE
+                        // all-columns Unit shape with a plain `:merge old` (congruence
+                        // is done by the host pass `emit_native_congruence`), so it
+                        // falls through to the baseline merge below rather than taking
+                        // the FD `UnionId`/`UnionIntoUf` congruence merge here.
+                        && (self.proof_state.proofs_enabled
+                            || !self.backend.native_merge_views_coexist())
+                    {
                         let uf_id = self
                             .proof_state
                             .uf_function
@@ -2302,9 +2311,23 @@ impl EGraph {
             {
                 continue;
             }
-            // The eclass is the view's OUTPUT column; union into its sort's UF.
-            let out_sort = func.decl.schema.output.clone();
-            if let Some(uf_name) = self.proof_state.uf_function.get(&out_sort)
+            // The eclass column's sort owns the UF to union into. For the FD-shaped
+            // view `(children) -> eclass` (collapse-at-insert backends) the eclass is
+            // the view's OUTPUT. For a `native_merge_views_coexist()` backend (DuckDB)
+            // the view keeps the BASELINE all-columns Unit-relation shape `(children...,
+            // eclass) -> Unit`, so the eclass is the LAST INPUT column (output is Unit).
+            let eclass_sort =
+                if self.backend.native_merge_views_coexist() && !self.proof_state.proofs_enabled {
+                    func.decl
+                        .schema
+                        .input
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| func.decl.schema.output.clone())
+                } else {
+                    func.decl.schema.output.clone()
+                };
+            if let Some(uf_name) = self.proof_state.uf_function.get(&eclass_sort)
                 && let Some(uf_func) = self.functions.get(uf_name)
             {
                 to_register.push((uf_func.name().to_string(), func.backend_id, view_name));

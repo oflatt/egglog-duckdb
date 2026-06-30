@@ -589,6 +589,48 @@ impl ProofInstrumentor<'_> {
             .contains(view_name)
     }
 
+    /// True when `view_name` is a native-merge view AND it is rendered with the
+    /// FD-keyed `(children) -> eclass` view SHAPE (function output). Gates the view
+    /// DECLARATION + the children-keyed `view_delete` / function-output
+    /// `view_body_atom` / children-keyed `view_subsume` / `set_view` forms.
+    ///
+    /// Returns `false` ONLY for a pure CONSTRUCTOR-CONGRUENCE view on a
+    /// `native_merge_views_coexist()` backend (DuckDB): such a view keeps the
+    /// BASELINE all-columns Unit-relation shape — `(function @<C>View (children...,
+    /// eclass) Unit :merge old)` — so its rows COEXIST and the rebuild / delete /
+    /// subsume key on the FULL `(children, eclass)` row (a children-only delete on
+    /// coexisting rows would self-wipe the canonical row, and a full-key delete can't
+    /// be expressed on an FD function). It STAYS in `native_merge_views` (so the
+    /// `@congruence_rule*` is still dropped and the view -> UF association is still
+    /// registered), and congruence is done by the host pass `emit_native_congruence`.
+    ///
+    /// VALUE-FOLD and TERM-BUILD views ALWAYS keep the FD shape (even on DuckDB):
+    /// their merge does real work at the FD conflict (a fold / e-node minting) and is
+    /// resolved natively in-SQL by `mergefn_to_sql` / `emit_term_build_merges`, which
+    /// REQUIRE the `(children) -> value`/`eclass` function form. So this returns
+    /// `true` for them regardless of `native_merge_views_coexist()`.
+    pub(crate) fn uses_fd_native_merge_view(&self, view_name: &str) -> bool {
+        if !self.is_native_merge_view(view_name) {
+            return false;
+        }
+        // VALUE-FOLD / TERM-BUILD views always use the FD shape.
+        let is_value_fold = self
+            .egraph
+            .proof_state
+            .native_value_merge_views
+            .contains_key(view_name);
+        let is_term_build = self
+            .egraph
+            .proof_state
+            .native_term_build_views
+            .contains_key(view_name);
+        if is_value_fold || is_term_build {
+            return true;
+        }
+        // Pure constructor-congruence view: FD shape unless the backend coexists.
+        !self.native_merge_views_coexist()
+    }
+
     /// True when `view_name` is a native-merge FD view AND proofs are enabled —
     /// i.e. the TUPLE-output `(children) -> (eclass, Proof)` proof view (A2). Its
     /// row carries an extra trailing `Proof` output column (the view proof,
@@ -606,6 +648,18 @@ impl ProofInstrumentor<'_> {
     /// proof-view encoding instead of the A2 tuple proof view.
     pub(crate) fn supports_tuple_output_views(&self) -> bool {
         self.egraph.backend.supports_tuple_output_views()
+    }
+
+    /// True when the backend's native-merge FD view keeps conflicting
+    /// `(children, eclass)` rows COEXISTING until a host pass resolves them (DuckDB),
+    /// rather than collapsing children -> eclass inside the merge (bridge / FlowLog /
+    /// Feldera). When true, the rebuild / delete / subsume of a native-merge view
+    /// keys on the FULL `(children, eclass)` row instead of children-only — a
+    /// children-only delete would wipe a coexisting different-eclass row before the
+    /// host pass (`emit_native_congruence`) sees the FD conflict. See
+    /// [`Backend::native_merge_views_coexist`].
+    pub(crate) fn native_merge_views_coexist(&self) -> bool {
+        self.egraph.backend.native_merge_views_coexist()
     }
 
     /// True when `view_name` is a proof-mode native-merge view rendered as the A2
