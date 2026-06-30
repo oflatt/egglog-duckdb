@@ -186,6 +186,41 @@ pub enum MergeFn {
         parent_table: FunctionId,
         unit: Value,
     },
+    /// `--native-merge` PROOF mode on a SINGLE-OUTPUT backend (FlowLog/Feldera):
+    /// the proof-carrying, relational-UF counterpart of
+    /// [`MergeFn::UnionIntoParentTable`]. The 2-TABLE proof-congruence merge.
+    ///
+    /// It resolves the FD conflict of a single-output FD-keyed constructor view
+    /// `(children) -> eclass` whose per-row view proof (`eclass = f(children)`)
+    /// lives NOT in a second output column (the backend cannot host tuple output)
+    /// but in a separate single-output SIDE-TABLE `@<F>ViewProof :
+    /// (children..., eclass) -> proof`. On an FD conflict (same children, two
+    /// eclasses) it:
+    ///   1. reads each colliding row's view proof from `proof_side_table`, keyed
+    ///      `(children..., that_row_eclass)` — canon-at-creation guarantees a hit;
+    ///   2. composes the congruence edge proof `Trans(larger_pf, Sym(smaller_pf))`
+    ///      (same orientation as the rule-encoded `@congruence_rule`), where
+    ///      `larger = max(cur, new)`, `smaller = min(cur, new)`;
+    ///   3. writes the edge `[larger, smaller, edge_proof]` into the RELATIONAL
+    ///      proof-UF `@UF_S` (`parent_table`, `(S S) -> Proof :merge old`) — the
+    ///      same row the rule-encoded `union()` helper writes. The relational
+    ///      maintenance rules (singleparent / path_compress) then propagate it;
+    ///   4. returns the surviving (min) eclass.
+    ///
+    /// Fields:
+    /// - `parent_table`: the relational `@UF_S` proof-UF to write the edge into.
+    /// - `proof_side_table`: the `@<F>ViewProof` side-table to read view proofs from.
+    /// - `trans` / `sym`: the `Trans` / `Sym` proof constructors composing the edge.
+    ///
+    /// Only the FlowLog (and, later, Feldera) backends resolve this variant; the
+    /// native bridge has the A2 tuple proof view instead and treats it as
+    /// unsupported.
+    UnionIntoParentTableWithProof {
+        parent_table: FunctionId,
+        proof_side_table: FunctionId,
+        trans: FunctionId,
+        sym: FunctionId,
+    },
     /// `--native-merge` in PROOF mode: the proof-carrying counterpart of
     /// [`MergeFn::UnionIntoUf`]. Used by the `col0` (eclass) merge of a
     /// tuple-output FD-keyed constructor view `(children) -> (eclass, proof)`.
@@ -806,6 +841,26 @@ pub trait Backend: Send + Sync {
     /// `--native-merge` only value-fold merges run natively; constructor congruence
     /// keeps the rule encoding.
     fn supports_native_congruence_merge(&self) -> bool {
+        true
+    }
+
+    /// Whether this backend can host a TUPLE-output (multi-value) function table —
+    /// a function whose row has more than one output column, resolved by a
+    /// [`MergeFn::Columns`] of length > 1.
+    ///
+    /// Gates the PROOF-mode `--native-merge` view encoding. The reference bridge
+    /// returns `true` and uses the A2 TUPLE proof view `(children) -> (eclass,
+    /// proof)` (a `Columns([UnionIntoUfWithProof, EclassMinProof])` merge). The
+    /// single-output dataflow backends (FlowLog, Feldera) return `false`: they
+    /// cannot express a 2-output view, so the encoder emits the 2-TABLE form
+    /// instead — a single-output eclass view `(children) -> eclass` PLUS a
+    /// single-output proof SIDE-TABLE `(children, eclass) -> proof` — with the
+    /// proof-congruence done by [`MergeFn::UnionIntoParentTableWithProof`].
+    ///
+    /// DuckDB returns `supports_native_congruence_merge() == false`, so it never
+    /// reaches either proof-view form (congruence stays rule-encoded); its value
+    /// here is irrelevant and keeps the `true` default.
+    fn supports_tuple_output_views(&self) -> bool {
         true
     }
 

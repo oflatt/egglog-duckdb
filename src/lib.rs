@@ -1973,7 +1973,70 @@ impl EGraph {
                             .get(&decl.schema.output)
                             .and_then(|uf_name| self.functions.get(uf_name))
                             .map(|uf_func| uf_func.backend_id);
-                        if self.proof_state.proofs_enabled {
+                        if self.proof_state.proofs_enabled
+                            && !self.backend.supports_tuple_output_views()
+                        {
+                            // 2-TABLE PROOF-mode native-merge view (single-output
+                            // backends, e.g. FlowLog): the eclass view is
+                            // SINGLE-output `(children) -> eclass`; the per-row view
+                            // proof lives in a separate `@<F>ViewProof` SIDE-TABLE
+                            // `(children..., eclass) -> proof`. The merge
+                            // `UnionIntoParentTableWithProof` reads both colliding
+                            // rows' proofs from the side-table, composes the same
+                            // `Trans(larger_pf, Sym(smaller_pf))` edge proof the A2
+                            // tuple merge does, and writes it into the RELATIONAL
+                            // proof-UF `@UF_S` (`uf_parent`) — never the displaced
+                            // `@UF_Sf` (FlowLog has no proof-mode native-UF; the CLI
+                            // does not force `--native-uf` for this combination). The
+                            // relational singleparent / path_compress rules then
+                            // canonicalize the proof-UF, exactly as for the
+                            // rule-encoded `@congruence_rule`.
+                            let parent_table = self
+                                .proof_state
+                                .uf_parent
+                                .get(&decl.schema.output)
+                                .and_then(|uf_name| self.functions.get(uf_name))
+                                .map(|uf_func| uf_func.backend_id)
+                                .expect(
+                                    "2-table native-merge proof view requires the output \
+                                     sort's @UF_S parent table (relational proof path)",
+                                );
+                            // The side-table is declared just before this view in
+                            // `term_and_view`, so it is already in `self.functions`.
+                            // The side-table map is keyed by the ORIGINAL function
+                            // name (`f`), which the view carries as its
+                            // `:internal-term-constructor` (`term_constructor`).
+                            let orig_name = decl.term_constructor.clone().ok_or_else(|| {
+                                Error::BackendError(format!(
+                                    "2-table native-merge proof view `{}` has no \
+                                     term_constructor",
+                                    decl.name
+                                ))
+                            })?;
+                            let side_name = self
+                                .proof_state
+                                .proof_names
+                                .proof_side_table_name
+                                .get(&orig_name)
+                                .expect(
+                                    "2-table native-merge proof view requires its \
+                                     @<F>ViewProof side-table (declared before the view)",
+                                )
+                                .clone();
+                            let proof_side_table = self.functions[&side_name].backend_id;
+                            let trans = self.functions
+                                [&self.proof_state.proof_names.eq_trans_constructor]
+                                .backend_id;
+                            let sym = self.functions
+                                [&self.proof_state.proof_names.eq_sym_constructor]
+                                .backend_id;
+                            MergeFn::UnionIntoParentTableWithProof {
+                                parent_table,
+                                proof_side_table,
+                                trans,
+                                sym,
+                            }
+                        } else if self.proof_state.proofs_enabled {
                             // A2 PROOF-mode native-merge view: TUPLE output
                             // `(children) -> (eclass, proof)` (col0=eclass,
                             // col1=proof). The per-column merge does congruence

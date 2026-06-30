@@ -201,10 +201,13 @@ fn duck_merge_mode_scalar(
         MergeFn::OldCol(_) => MergeMode::Old,
         MergeFn::NewCol(_) => MergeMode::New,
         MergeFn::Const(_) | MergeFn::Function(_, _) => MergeMode::Old,
-        // Proof-mode native-merge is bridge-only; DuckDB has no proof-mode
-        // native-UF so these tuple-output proof merges (and the `KeyCol` the
-        // proof-mode term-build merge uses) never reach it.
-        MergeFn::UnionIntoUfWithProof { .. }
+        // Proof-mode native-merge is not wired on DuckDB (it keeps congruence
+        // rule-encoded under `--native-merge` — `supports_native_congruence_merge`
+        // is `false`), so the 2-table `UnionIntoParentTableWithProof`, the bridge's
+        // tuple-output proof merges, and the proof-mode term-build `KeyCol` never
+        // reach it.
+        MergeFn::UnionIntoParentTableWithProof { .. }
+        | MergeFn::UnionIntoUfWithProof { .. }
         | MergeFn::EclassMinProof { .. }
         | MergeFn::KeyCol(_) => {
             panic!("DuckDB backend does not support proof-mode native-merge merges")

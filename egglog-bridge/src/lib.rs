@@ -1529,6 +1529,16 @@ fn merge_fn_fill_deps(
             read_deps.insert(egraph.funcs[*trans].table);
             read_deps.insert(egraph.funcs[*sym].table);
         }
+        UnionIntoParentTableWithProof { .. } => {
+            // The 2-table proof-congruence merge is FlowLog/Feldera-only (it reads a
+            // proof side-table and writes the relational `@UF_S`); the native bridge
+            // never builds or resolves it (it uses the A2 tuple proof view). So it
+            // has no dependency footprint here.
+            panic!(
+                "MergeFn::UnionIntoParentTableWithProof is a single-output-backend \
+                 (FlowLog/Feldera) merge and is not resolved on the native bridge"
+            )
+        }
         EclassMinProof { .. } => {}
         Columns(cols) => {
             cols.iter()
@@ -1736,6 +1746,15 @@ fn merge_fn_resolve(merge: &MergeFn, function_name: &str, egraph: &mut EGraph) -
             eclass_col: *eclass_col,
             proof_col: *proof_col,
         },
+        // `--native-merge` PROOF mode on a single-output backend (FlowLog/Feldera):
+        // the 2-table proof-congruence merge is resolved by that backend's host
+        // interpreter, never by the native bridge.
+        MergeFn::UnionIntoParentTableWithProof { .. } => {
+            panic!(
+                "MergeFn::UnionIntoParentTableWithProof is a single-output-backend \
+                 (FlowLog/Feldera) merge and is not resolved on the native bridge"
+            )
+        }
         // `--native-merge` PROOF mode (`col1`): proof of the surviving min eclass.
         MergeFn::EclassMinProof {
             eclass_col,

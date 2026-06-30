@@ -49,6 +49,11 @@ pub(crate) struct EncodingNames {
     pub(crate) to_delete_name: HashMap<String, String>,
     pub(crate) subsumed_name: HashMap<String, String>,
     pub(crate) term_proof_name: HashMap<String, String>,
+    /// 2-TABLE proof-congruence (single-output backends, e.g. FlowLog): the proof
+    /// SIDE-TABLE `@<F>ViewProof : (children..., eclass) -> proof :merge old`
+    /// paired with the single-output eclass view `@<F>View : (children) -> eclass`.
+    /// Only populated when the backend cannot host the A2 tuple proof view.
+    pub(crate) proof_side_table_name: HashMap<String, String>,
 }
 
 /// Packages proof information for instrumenting actions.
@@ -88,6 +93,7 @@ impl EncodingNames {
             to_delete_name: HashMap::default(),
             subsumed_name: HashMap::default(),
             term_proof_name: HashMap::default(),
+            proof_side_table_name: HashMap::default(),
         }
     }
 }
@@ -592,6 +598,57 @@ impl ProofInstrumentor<'_> {
     /// destructure/construct forms.
     pub(crate) fn is_native_merge_proof_view(&self, view_name: &str) -> bool {
         self.proofs_enabled() && self.is_native_merge_view(view_name)
+    }
+
+    /// True when the backend can host a TUPLE-output (multi-value) function table.
+    /// The reference bridge / DuckDB return `true`; the single-output dataflow
+    /// backends (FlowLog / Feldera) return `false`, which selects the 2-TABLE
+    /// proof-view encoding instead of the A2 tuple proof view.
+    pub(crate) fn supports_tuple_output_views(&self) -> bool {
+        self.egraph.backend.supports_tuple_output_views()
+    }
+
+    /// True when `view_name` is a proof-mode native-merge view rendered as the A2
+    /// TUPLE proof view `(children) -> (eclass, Proof)` — i.e. proof mode AND the
+    /// backend can host tuple output. This is the original single-column-proof form.
+    pub(crate) fn is_native_merge_proof_view_tuple(&self, view_name: &str) -> bool {
+        self.is_native_merge_proof_view(view_name) && self.supports_tuple_output_views()
+    }
+
+    /// True when `view_name` is a proof-mode native-merge view rendered as the
+    /// 2-TABLE form: a SINGLE-output eclass view `(children) -> eclass` paired with
+    /// a single-output proof SIDE-TABLE `(children..., eclass) -> proof`. Selected
+    /// in proof mode on a single-output backend (FlowLog) that cannot host the A2
+    /// tuple proof view. The proof-congruence is done by
+    /// `MergeFn::UnionIntoParentTableWithProof`, reading the side-table.
+    pub(crate) fn is_native_merge_proof_view_2table(&self, view_name: &str) -> bool {
+        self.is_native_merge_proof_view(view_name) && !self.supports_tuple_output_views()
+    }
+
+    /// The proof SIDE-TABLE name for a function (2-table proof-congruence). Fresh
+    /// per function, paired with its `@<F>View` eclass view; deterministic.
+    pub(crate) fn proof_side_table_name(&mut self, name: &str) -> String {
+        if let Some(n) = self
+            .egraph
+            .proof_state
+            .proof_names
+            .proof_side_table_name
+            .get(name)
+        {
+            n.clone()
+        } else {
+            let fresh_name = self
+                .egraph
+                .parser
+                .symbol_gen
+                .fresh(&format!("{name}ViewProof"));
+            self.egraph
+                .proof_state
+                .proof_names
+                .proof_side_table_name
+                .insert(name.to_string(), fresh_name.clone());
+            fresh_name
+        }
     }
 
     /// True when native-engine-rebuild mode is active (`--nativerb`). Suppresses

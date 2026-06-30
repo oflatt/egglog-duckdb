@@ -1247,6 +1247,7 @@ impl EGraph {
             | MergeFn::UnionId
             | MergeFn::UnionIntoUf(_)
             | MergeFn::UnionIntoParentTable { .. }
+            | MergeFn::UnionIntoParentTableWithProof { .. }
             | MergeFn::UnionIntoUfWithProof { .. }
             | MergeFn::EclassMinProof { .. }
             // `KeyCol` is emitted only by the bridge-only proof-mode term-build
@@ -1353,10 +1354,12 @@ fn merge_mode_for_scalar(merge: &egglog_backend_trait::MergeFn) -> MergeMode {
         MergeFn::OldCol(_) => MergeMode::Old,
         MergeFn::NewCol(_) => MergeMode::New,
         MergeFn::Function(_, _) | MergeFn::Const(_) => MergeMode::Old,
-        // Proof-mode native-merge is bridge-only; Feldera has no proof-mode
-        // native-UF, so these tuple-output proof merges (and the `KeyCol` the
-        // proof-mode term-build merge uses) never reach it.
-        MergeFn::UnionIntoUfWithProof { .. }
+        // Proof-mode native-merge is not wired on Feldera (the 2-table
+        // `UnionIntoParentTableWithProof` and the bridge's tuple-output proof
+        // merges, plus the `KeyCol` the proof-mode term-build merge uses), so these
+        // never reach it.
+        MergeFn::UnionIntoParentTableWithProof { .. }
+        | MergeFn::UnionIntoUfWithProof { .. }
         | MergeFn::EclassMinProof { .. }
         | MergeFn::KeyCol(_) => {
             panic!("Feldera backend does not support proof-mode native-merge merges")
@@ -2021,6 +2024,16 @@ impl Backend for EGraph {
     }
 
     fn supports_containers(&self) -> bool {
+        false
+    }
+
+    /// Feldera carries exactly one output-column merge mode per relation — no
+    /// tuple-output (multi-value) function tables. So it cannot host the A2 tuple
+    /// proof view. (Feldera proof + `--native-merge` is not yet wired end-to-end —
+    /// it still forces `--native-uf` and rejects it on its own clean error path —
+    /// but the capability is declared honestly for when the 2-table form is
+    /// extended to Feldera.)
+    fn supports_tuple_output_views(&self) -> bool {
         false
     }
 

@@ -210,7 +210,22 @@ pub fn cli(mut egraph: EGraph) {
     // = true), instead of downgrading to the rule-encoded `@merge_rule`. Term-build
     // custom `:merge` (e-node minting on an eq-sort output) is NOT yet supported on
     // DuckDB and still rule-encodes (`supports_term_build_merge` = false).
-    if args.native_merge && (args.flowlog_backend || args.feldera_backend || args.duckdb_backend) {
+    //
+    // PROOF-MODE EXCEPTION (FlowLog): `--flowlog --proofs --native-merge` does NOT
+    // force `--native-uf`. Proof-mode native-UF needs a provenance-tracking
+    // `@UF_Sf` that FlowLog's `add_uf_function` rejects, AND FlowLog cannot host
+    // the bridge's tuple-output (A2) proof view. Instead FlowLog uses the
+    // RELATIONAL proof-UF (`@UF_S : (S S) -> Proof :merge old`, TableInsert-able and
+    // already maintained by the path_compress/singleparent rules that run on
+    // FlowLog) plus a single-output proof SIDE-TABLE — the 2-table proof-congruence
+    // encoding. So leave `native_uf` off for that combination. Feldera/DuckDB proof
+    // + native-merge are unchanged (they keep forcing native_uf and reject it on
+    // their own clean error path).
+    let flowlog_proof_native_merge = args.flowlog_backend && (args.proofs || args.proof_testing);
+    if args.native_merge
+        && (args.flowlog_backend || args.feldera_backend || args.duckdb_backend)
+        && !flowlog_proof_native_merge
+    {
         args.native_uf = true;
     }
 

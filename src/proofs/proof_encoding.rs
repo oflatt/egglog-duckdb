@@ -698,16 +698,17 @@ impl<'a> ProofInstrumentor<'a> {
                     :name \"{fresh_name}\")"
         );
 
-        // A2 LIMITATION: the native-merge PROOF view is a TUPLE-output function
+        // A2 LIMITATION: the TUPLE-output native-merge PROOF view
         // `(children) -> (eclass, proof)`. The backend `subsume` operation
         // (`rule.rs`) is written for single-output functions (it asserts
         // `entries.len() + 1 == schema.len()` and writes one ret_val), so a
         // children-keyed subsume of a 2-output view fails at rule-build time. No
         // proof workload exercises subsume, so we simply do NOT emit the subsume
         // rule for this view — `(subsume ...)` is inert under
-        // `--proofs --native-merge`. (Term-mode native-merge and the baseline
-        // proof view keep full subsume support.)
-        if self.is_native_merge_proof_view(&view_name) {
+        // `--proofs --native-merge`. (Term-mode native-merge, the 2-TABLE proof
+        // view, and the baseline proof view keep full subsume support — the 2-table
+        // eclass view is single-output, so subsume works there.)
+        if self.is_native_merge_proof_view_tuple(&view_name) {
             return delete_rule;
         }
 
@@ -1105,21 +1106,53 @@ impl<'a> ProofInstrumentor<'a> {
         if fdecl.internal_let {
             view_flags.push_str(" :internal-let");
         }
+        // 2-TABLE proof-congruence (single-output backends, e.g. FlowLog): a
+        // separate proof SIDE-TABLE `@<F>ViewProof : (children..., eclass) -> proof`
+        // declared ALONGSIDE the single-output eclass view. Declared BEFORE the
+        // view below so its backend `FunctionId` is resolved when the view's merge
+        // (`UnionIntoParentTableWithProof`, which names this side-table) is built in
+        // `declare_function`. `:merge old` keeps the first (canonical) proof per
+        // `(children, eclass)` key. Empty unless this view is the 2-table form.
+        let view_name_for_decl = self.view_name(name);
+        let two_table_proof =
+            native_merge_view && self.is_native_merge_proof_view_2table(&view_name_for_decl);
+        let side_table_decl = if two_table_proof {
+            let side = self.proof_side_table_name(name);
+            format!(
+                "(function {side} ({in_sorts} {out_type}) {proof_type} :merge old :internal-hidden)"
+            )
+        } else {
+            String::new()
+        };
+
         // Native-merge view declaration (the flag + `native_merge_views` insert
         // happened earlier so the view helpers above already used the FD forms).
         let view_decl = if native_merge_view {
             if self.egraph.proof_state.proofs_enabled {
-                // A2 PROOF-mode FD view: TUPLE output `(children) -> (eclass,
-                // Proof)`. The eclass column collapses congruence inline and the
-                // Proof column carries the view proof (`eclass = f(children)`).
-                // The `:merge (values old0 old1)` is a placeholder — lowering
-                // substitutes `MergeFn::Columns([UnionIntoUfWithProof,
-                // EclassMinProof])` by name (see `lib.rs`). It is a tuple-output
-                // `term_constructor` view (normally rejected by typechecking); the
-                // encoder-internal exception is keyed on `native_merge_views`.
-                format!(
-                    "(function {view_name} ({in_sorts}) ({out_type} {proof_type}) :merge (values old0 old1) :internal-term-constructor {name}{view_flags})"
-                )
+                if two_table_proof {
+                    // 2-TABLE PROOF FD view: SINGLE output `(children) -> eclass`
+                    // (same shape as the term FD view). The per-row view proof
+                    // lives in the `@<F>ViewProof` side-table, not a 2nd output
+                    // column. The `:merge old` is a placeholder — lowering
+                    // substitutes `MergeFn::UnionIntoParentTableWithProof` (which
+                    // reads the side-table, composes the congruence edge proof, and
+                    // writes the relational `@UF_S`) by name (see `lib.rs`).
+                    format!(
+                        "(function {view_name} ({in_sorts}) {out_type} :merge old :internal-term-constructor {name}{view_flags})"
+                    )
+                } else {
+                    // A2 PROOF-mode FD view: TUPLE output `(children) -> (eclass,
+                    // Proof)`. The eclass column collapses congruence inline and the
+                    // Proof column carries the view proof (`eclass = f(children)`).
+                    // The `:merge (values old0 old1)` is a placeholder — lowering
+                    // substitutes `MergeFn::Columns([UnionIntoUfWithProof,
+                    // EclassMinProof])` by name (see `lib.rs`). It is a tuple-output
+                    // `term_constructor` view (normally rejected by typechecking);
+                    // the encoder-internal exception is keyed on `native_merge_views`.
+                    format!(
+                        "(function {view_name} ({in_sorts}) ({out_type} {proof_type}) :merge (values old0 old1) :internal-term-constructor {name}{view_flags})"
+                    )
+                }
             } else {
                 // TERM-mode FD view: single output `(children) -> eclass`. The
                 // `:merge old` is a placeholder — lowering substitutes
@@ -1141,6 +1174,7 @@ impl<'a> ProofInstrumentor<'a> {
             (sort {fresh_sort})
             {to_ast_view_sort}
             (constructor {name} ({term_sorts}) {view_sort}{term_flags} :internal-hidden :unextractable)
+            {side_table_decl}
             {view_decl}
             (constructor {to_delete_name} ({in_sorts}) {fresh_sort} :internal-hidden)
             (constructor {subsumed_name} ({in_sorts}) {fresh_sort} :internal-hidden)
@@ -2129,6 +2163,27 @@ impl<'a> ProofInstrumentor<'a> {
     /// View is always a function (returning Proof or Unit).
     fn update_view(&mut self, fname: &str, args: &[String], proof: &str) -> String {
         let view_name = self.view_name(fname);
+        // 2-TABLE proof-congruence FD view (single-output backends): SINGLE-output
+        // eclass view `(children) -> eclass` PLUS the proof SIDE-TABLE
+        // `@<F>ViewProof : (children..., eclass) -> proof`. `args` is
+        // `children..., eclass`; emit BOTH writes — the eclass into the view and
+        // the per-row view proof into the side-table (CANON-AT-CREATION: this is
+        // the only place the side-table is populated, guaranteeing the merge's
+        // side-table read always hits). On an FD conflict the view's
+        // `UnionIntoParentTableWithProof` merge reads the side-table proofs,
+        // composes the congruence edge proof into the relational `@UF_S`, and keeps
+        // the min eclass.
+        if self.is_native_merge_proof_view_2table(&view_name) {
+            let (eclass, children) = args
+                .split_last()
+                .expect("native-merge view row has columns");
+            let side = self.proof_side_table_name(fname);
+            return format!(
+                "(set ({view_name} {children_s}) {eclass})
+                 (set ({side} {children_s} {eclass}) {proof})",
+                children_s = ListDisplay(children, " ")
+            );
+        }
         // Native-merge PROOF FD view (A2): TUPLE output `(children) -> (eclass,
         // proof)`. `args` is `children..., eclass`; emit
         // `(set (@FView children) (values eclass proof))`. On an FD conflict the
@@ -2170,7 +2225,7 @@ impl<'a> ProofInstrumentor<'a> {
     ///   `children..., eclass`.
     fn view_body_atom(&mut self, fname: &str, cols: &[String]) -> String {
         let view_name = self.view_name(fname);
-        if self.is_native_merge_proof_view(&view_name) {
+        if self.is_native_merge_proof_view_tuple(&view_name) {
             // TUPLE-output proof view: destructure `(= (values eclass _pf)
             // (@FView children))`, binding the eclass column. The proof column is
             // bound to a fresh throwaway var — callers of `view_body_atom`
@@ -2184,6 +2239,10 @@ impl<'a> ProofInstrumentor<'a> {
                 ListDisplay(children, " ")
             )
         } else if self.is_native_merge_view(&view_name) {
+            // 2-TABLE proof view AND term FD view: single-output
+            // `(= eclass (@FView children))`. The 2-table proof side-table is read
+            // separately where the proof is actually needed (`query_view_and_get_proof`);
+            // delete/subsume only need the eclass / row existence here.
             let (eclass, children) = cols
                 .split_last()
                 .expect("native-merge view row has columns");
@@ -2528,6 +2587,23 @@ impl<'a> ProofInstrumentor<'a> {
     fn query_view_and_get_proof(&mut self, fname: &str, args: &[String]) -> (String, String) {
         let view_name = self.view_name(fname);
         let pf_var = self.fresh_var();
+        // 2-TABLE proof view (single-output backends): bind the eclass from the
+        // SINGLE-output view `(= eclass (@FView children))` AND read the per-row
+        // view proof from the side-table `(= pf_var (@FViewProof children eclass))`.
+        // `args` is `children..., eclass` (the eclass is already named by the
+        // caller). The two atoms join on the shared eclass var.
+        if self.is_native_merge_proof_view_2table(&view_name) {
+            let (eclass, children) = args
+                .split_last()
+                .expect("native-merge view row has columns");
+            let side = self.proof_side_table_name(fname);
+            let children_s = ListDisplay(children, " ");
+            let query = format!(
+                "(= {eclass} ({view_name} {children_s}))
+                 (= {pf_var} ({side} {children_s} {eclass}))"
+            );
+            return (query, pf_var);
+        }
         // TUPLE-output proof view (A2): the eclass and the proof are BOTH outputs,
         // keyed on the children. `args` is `children..., eclass`; destructure
         // `(= (values eclass pf_var) (@FView children))`, binding the (already
