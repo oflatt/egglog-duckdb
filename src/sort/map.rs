@@ -217,6 +217,35 @@ impl ContainerSort for MapSort {
             let raw = termdag.app("map-insert".into(), args.to_vec());
             normalize_map_term(termdag, raw)
         };
+        let map_get_validator = |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
+            let [map, key] = args else { return None };
+            // Last-write-wins: take the last matching key.
+            collect_map_entries(termdag, *map)?
+                .into_iter()
+                .rev()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v)
+        };
+        let map_length_validator = |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
+            let [map] = args else { return None };
+            let len = collect_map_entries(termdag, *map)?.len() as i64;
+            Some(termdag.lit(Literal::Int(len)))
+        };
+        let map_contains_validator = |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
+            let [map, key] = args else { return None };
+            collect_map_entries(termdag, *map)?
+                .iter()
+                .any(|(k, _)| k == key)
+                .then(|| termdag.lit(Literal::Unit))
+        };
+        let map_not_contains_validator =
+            |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
+                let [map, key] = args else { return None };
+                let contains = collect_map_entries(termdag, *map)?
+                    .iter()
+                    .any(|(k, _)| k == key);
+                (!contains).then(|| termdag.lit(Literal::Unit))
+            };
 
         add_primitive_with_validator!(eg, "map-empty" = {self.clone(): MapSort} || -> @MapContainer (arc) { MapContainer {
             do_rebuild_keys: self.ctx.key.is_eq_sort() || self.ctx.key.is_eq_container_sort(),
@@ -237,13 +266,13 @@ impl ContainerSort for MapSort {
             Some(std::sync::Arc::new(map_of_validator)),
         );
 
-        add_primitive!(eg, "map-get"    = |    xs: @MapContainer (arc), x: # (self.key())                     | -?> # (self.value()) { xs.data.get(&x).copied() });
+        add_primitive_with_validator!(eg, "map-get"    = |    xs: @MapContainer (arc), x: # (self.key())                     | -?> # (self.value()) { xs.data.get(&x).copied() }, map_get_validator);
         add_primitive_with_validator!(eg, "map-insert" = |mut xs: @MapContainer (arc), x: # (self.key()), y: # (self.value())| -> @MapContainer (arc) {{ xs.data.insert(x, y); xs }}, map_insert_validator);
         add_primitive!(eg, "map-remove" = |mut xs: @MapContainer (arc), x: # (self.key())                     | -> @MapContainer (arc) {{ xs.data.remove(&x);   xs }});
 
-        add_primitive!(eg, "map-length"       = |xs: @MapContainer (arc)| -> i64 { xs.data.len() as i64 });
-        add_primitive!(eg, "map-contains"     = |xs: @MapContainer (arc), x: # (self.key())| -?> () { ( xs.data.contains_key(&x)).then_some(()) });
-        add_primitive!(eg, "map-not-contains" = |xs: @MapContainer (arc), x: # (self.key())| -?> () { (!xs.data.contains_key(&x)).then_some(()) });
+        add_primitive_with_validator!(eg, "map-length"       = |xs: @MapContainer (arc)| -> i64 { xs.data.len() as i64 }, map_length_validator);
+        add_primitive_with_validator!(eg, "map-contains"     = |xs: @MapContainer (arc), x: # (self.key())| -?> () { ( xs.data.contains_key(&x)).then_some(()) }, map_contains_validator);
+        add_primitive_with_validator!(eg, "map-not-contains" = |xs: @MapContainer (arc), x: # (self.key())| -?> () { (!xs.data.contains_key(&x)).then_some(()) }, map_not_contains_validator);
     }
 
     fn reconstruct_termdag(

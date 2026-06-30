@@ -17,6 +17,15 @@ fn normalize_multiset_term(termdag: &mut TermDag, mut children: Vec<TermId>) -> 
     termdag.app("multiset-of".into(), children)
 }
 
+/// The element terms of a multiset's canonical term form `(multiset-of e0 …)`
+/// (multiplicities kept as repeats); `None` for any other term.
+fn multiset_term_children(termdag: &TermDag, term: TermId) -> Option<Vec<TermId>> {
+    match termdag.get(term) {
+        Term::App(head, children) if head == "multiset-of" => Some(children.clone()),
+        _ => None,
+    }
+}
+
 impl ContainerValue for MultiSetContainer {
     fn rebuild_contents(&mut self, rebuilder: &dyn ValueRebuilder) -> bool {
         // If the contents are an eq-sort then we want to rebuild
@@ -142,6 +151,25 @@ impl ContainerSort for MultiSetSort {
         let multiset_of_validator = |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
             Some(normalize_multiset_term(termdag, args.to_vec()))
         };
+        let multiset_length_validator =
+            |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
+                let [ms] = args else { return None };
+                let len = multiset_term_children(termdag, *ms)?.len() as i64;
+                Some(termdag.lit(Literal::Int(len)))
+            };
+        let multiset_contains_validator =
+            |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
+                let [ms, value] = args else { return None };
+                multiset_term_children(termdag, *ms)?
+                    .contains(value)
+                    .then(|| termdag.lit(Literal::Unit))
+            };
+        let multiset_not_contains_validator =
+            |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
+                let [ms, value] = args else { return None };
+                let contains = multiset_term_children(termdag, *ms)?.contains(value);
+                (!contains).then(|| termdag.lit(Literal::Unit))
+            };
 
         add_primitive_with_validator!(eg, "multiset-of" = {self.clone(): MultiSetSort} [xs: # (self.element())] -> @MultiSetContainer (arc) { MultiSetContainer {
             do_rebuild: self.ctx.is_eq_container_sort(),
@@ -161,9 +189,9 @@ impl ContainerSort for MultiSetSort {
         add_primitive!(eg, "multiset-remove-swapped" = |x: # (self.element()), mut xs: @MultiSetContainer (arc)| -?> @MultiSetContainer (arc) { Some(MultiSetContainer { data: xs.data.remove(&x)?, ..xs }) });
         add_primitive!(eg, "multiset-subtract" = |mut xs: @MultiSetContainer (arc), other: @MultiSetContainer (arc)| -?> @MultiSetContainer (arc) { Some(MultiSetContainer { data: xs.data.subtract(&other.data)?, ..xs }) });
         add_primitive!(eg, "multiset-subtract-swapped" = |other: @MultiSetContainer (arc), mut xs: @MultiSetContainer (arc)| -?> @MultiSetContainer (arc) { Some(MultiSetContainer { data: xs.data.subtract(&other.data)?, ..xs }) });
-        add_primitive!(eg, "multiset-length"       = |xs: @MultiSetContainer (arc)| -> i64 { xs.data.len() as i64 });
-        add_primitive!(eg, "multiset-contains"     = |xs: @MultiSetContainer (arc), x: # (self.element())| -?> () { ( xs.data.contains(&x)).then_some(()) });
-        add_primitive!(eg, "multiset-not-contains" = |xs: @MultiSetContainer (arc), x: # (self.element())| -?> () { (!xs.data.contains(&x)).then_some(()) });
+        add_primitive_with_validator!(eg, "multiset-length"       = |xs: @MultiSetContainer (arc)| -> i64 { xs.data.len() as i64 }, multiset_length_validator);
+        add_primitive_with_validator!(eg, "multiset-contains"     = |xs: @MultiSetContainer (arc), x: # (self.element())| -?> () { ( xs.data.contains(&x)).then_some(()) }, multiset_contains_validator);
+        add_primitive_with_validator!(eg, "multiset-not-contains" = |xs: @MultiSetContainer (arc), x: # (self.element())| -?> () { (!xs.data.contains(&x)).then_some(()) }, multiset_not_contains_validator);
         add_primitive!(eg, "multiset-contains-swapped" = |x: # (self.element()), xs: @MultiSetContainer (arc)| -?> () { (xs.data.contains(&x)).then_some(()) });
         add_primitive!(eg, "multiset-not-contains-swapped" = |x: # (self.element()), xs: @MultiSetContainer (arc)| -?> () { (!xs.data.contains(&x)).then_some(()) });
         add_primitive!(eg, "multiset-intersection" = |xs: @MultiSetContainer (arc), ys: @MultiSetContainer (arc)| -> @MultiSetContainer (arc) { MultiSetContainer { data: xs.data.intersection(ys.data), ..xs } });
