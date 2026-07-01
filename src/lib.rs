@@ -495,9 +495,6 @@ impl EGraph {
     /// unconditionally: the DuckDB backend is term-encoding only.
     pub fn with_duckdb_backend(config: DuckBackendConfig) -> anyhow::Result<Self> {
         let mut db = egglog_bridge_duckdb::EGraph::new()?;
-        if config.native_uf {
-            db.enable_native_uf();
-        }
         if config.fast_rebuild {
             db.enable_fast_rebuild();
         }

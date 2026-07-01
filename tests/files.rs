@@ -330,32 +330,18 @@ impl Run {
             // where backend-side optimizations (inline-congruence,
             // native UF, hash-cons) skip cases that the proof
             // encoder relies on.
-            //
-            // Native UF and proof mode are not yet compatible: the
-            // proof encoder declares `uf_function_<sort>` as
-            // returning `(Pair sort proof)`, and rebuild rules read
-            // out the leader via `(pair-first p)`. Native UF
-            // replaces those reads with a UDF that returns just the
-            // leader as `i64`, which doesn't satisfy the encoder's
-            // pair type. Until native UF learns to return Pair
-            // values in proof mode, keep them apart in tests.
             let want_proofs = self.proofs || self.proof_testing;
-            // `native_uf` (term mode only — `generate_tests` never pairs it
-            // with proofs) drives PR #782's UF-backed encoding through the
-            // DuckDB backend: the config flag enables the SQL host-pass
-            // interception, and `with_native_uf()` below makes the encoder
-            // emit the matching `:impl displaced-union-find` program. Both are
-            // required (see lib.rs / cli.rs).
+            // DuckDB is migrated OFF native-UF onto the fast relational term-
+            // encoding: congruence is rule-encoded (`@congruence_rule*`) and the
+            // relational δuf fast-rebuild canonicalizes it (`fast_rebuild: true`,
+            // non-proof only — matching cli.rs's plain-`--duckdb` default). Proof
+            // mode keeps the full rebuild.
             let config = DuckBackendConfig {
                 proofs: want_proofs,
-                native_uf: self.native_uf,
-                fast_rebuild: false,
+                fast_rebuild: !want_proofs,
             };
             let mut egraph = EGraph::with_duckdb_backend(config)
                 .unwrap_or_else(|e| panic!("EGraph::with_duckdb_backend init failed: {e}"));
-            if self.native_uf {
-                egraph = egraph.with_native_uf();
-            }
             // proof_testing is a desugar-pass flag (read at
             // `desugar.rs:164` to rewrite `(check ...)` → `(prove
             // ...)`), and the desugar pass is shared by both
@@ -749,14 +735,10 @@ fn generate_tests(glob: &str) -> Vec<Trial> {
             });
         }
 
-        // duckdb + native UF: same supportability gate as plain duckdb.
-        if native_uf_enabled && duckdb_supported {
-            push_trial(Run {
-                duckdb: true,
-                native_uf: true,
-                ..run.clone()
-            });
-        }
+        // duckdb + native UF: REMOVED. DuckDB is migrated OFF native-UF onto the
+        // fast relational term-encoding (rule-encoded congruence + relational δuf
+        // fast-rebuild); the duckdb native-UF host-pass no longer exists. feldera
+        // and flowlog keep their native-UF treatments below (unchanged).
 
         // feldera + native UF: gated by the feldera env var as well.
         if native_uf_enabled && duckdb_supported && std::env::var("EGGLOG_TEST_FELDERA").is_ok() {

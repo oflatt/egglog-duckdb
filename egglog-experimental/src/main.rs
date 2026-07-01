@@ -52,9 +52,19 @@ fn main() {
     // rule-encoded + native-uf path — native-merge + native-uf conflict on these
     // backends, esp. proofs which need the relational proof-UF). An explicit
     // `--native-merge` still force-enables it.
-    let effective_native_merge =
-        (any_experimental && !argv.iter().any(|a| a == "--no-native-merge") && !explicit_native_uf)
-            || argv.iter().any(|a| a == "--native-merge");
+    //
+    // DUCKDB FAST-RELATIONAL (mirror cli.rs): plain `--duckdb` (non-proof, no
+    // explicit native-merge/native-uf) is migrated OFF native-UF onto the fast
+    // relational term-encoding — native-merge does NOT auto-on there (congruence
+    // stays rule-encoded + relational δuf fast-rebuild). An explicit
+    // `--native-merge --duckdb` / `--native-uf --duckdb` is REJECTED by
+    // `egglog::cli` (the old native path is gone on duckdb).
+    let duckdb_fast_relational_default = want_duckdb && !want_proofs_early;
+    let effective_native_merge = (any_experimental
+        && !argv.iter().any(|a| a == "--no-native-merge")
+        && !explicit_native_uf
+        && !duckdb_fast_relational_default)
+        || argv.iter().any(|a| a == "--native-merge");
     // Proof-mode native-merge on the dataflow/SQL backends (flowlog/feldera/DUCKDB)
     // uses the RELATIONAL proof-UF + a proof side-table (the 2-table encoding), NOT
     // the displaced native-UF (which their `add_uf_function` rejects in proof mode).
@@ -69,8 +79,12 @@ fn main() {
         explicit_native_uf || (!single_output_proof_native_merge && effective_native_merge);
     // `--fast-rebuild` engages the duckdb backend's delta-scoped rebuild; the
     // pre-built duckdb egraph must carry it so the flag survives cli.rs's
-    // short-circuit (mirror `want_native_uf`).
-    let want_fast_rebuild = argv.iter().any(|a| a == "--fast-rebuild");
+    // short-circuit (mirror `want_native_uf`). DUCKDB FAST-RELATIONAL: default it
+    // ON for the migrated plain-`--duckdb` path (non-proof, no native-uf/native-
+    // merge) so rule-encoded congruence is canonicalized by the relational δuf
+    // fast-rebuild — mirrors cli.rs's `args.fast_rebuild = true` fold.
+    let want_fast_rebuild = argv.iter().any(|a| a == "--fast-rebuild")
+        || (want_duckdb && !want_native_uf && !effective_native_merge && !want_proofs_early);
     // `--proof-testing` implies proofs — the desugar pass rewrites
     // `(check ...)` into `(prove-exists ...)` which needs the proof
     // encoding active. Without this, cli.rs's `args.proof_testing`
@@ -94,8 +108,12 @@ fn main() {
     // no-op). Mirrors cli's `--threads` default of 1 (0 = max).
     egglog::EGraph::set_num_threads(parse_num_threads(&argv));
     let egraph = if want_duckdb {
+        // DuckDB is migrated OFF native-UF onto the fast relational term-encoding:
+        // there is no `native_uf` config knob anymore. If `--native-uf` /
+        // `--duck-native-uf` / `--native-merge` were passed with `--duckdb`,
+        // `egglog::cli` (below) rejects them with a clear error; pre-build the
+        // fast-relational egraph regardless (cli exits before running it).
         egglog_experimental::new_experimental_egraph_duckdb(egglog::DuckBackendConfig {
-            native_uf: want_native_uf,
             fast_rebuild: want_fast_rebuild,
             proofs: want_proofs,
         })

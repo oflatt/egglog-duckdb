@@ -22,46 +22,6 @@ use duckdb::{Connection, ToSql};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-pub mod uf;
-use uf::UfTable;
-
-/// DuckDB scalar UDF that wraps `UfTable::find_ro`. Registered as
-/// `duck_uf_<sort>_find(x BIGINT) -> BIGINT` for each native-UF
-/// function. Uses the read-only walk (no path compression) so the
-/// UDF can run from inside a SELECT without taking a write lock
-/// on the table; we re-compress periodically off the hot path.
-struct UfFindScalar;
-
-impl VScalar for UfFindScalar {
-    type State = Arc<Mutex<UfTable>>;
-
-    unsafe fn invoke(
-        state: &Self::State,
-        input: &mut DataChunkHandle,
-        output: &mut dyn WritableVector,
-    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        unsafe {
-            let n = input.len();
-            let input_vec = input.flat_vector(0);
-            let inputs = input_vec.as_slice_with_len::<i64>(n);
-            let mut output_vec = output.flat_vector();
-            let outputs = output_vec.as_mut_slice::<i64>();
-            let uf = state.lock().unwrap();
-            for i in 0..n {
-                outputs[i] = uf.find_ro(inputs[i]);
-            }
-            Ok(())
-        }
-    }
-
-    fn signatures() -> Vec<ScalarFunctionSignature> {
-        vec![ScalarFunctionSignature::exact(
-            vec![LogicalTypeHandle::from(LogicalTypeId::Bigint)],
-            LogicalTypeHandle::from(LogicalTypeId::Bigint),
-        )]
-    }
-}
-
 /// State shared by all bigint/bigrat-related UDFs: a snapshot of the
 /// base-value pool whose interior intern tables are Arc-shared with
 /// the EGraph's pool, plus the resolved `BaseValueId`s for `Z` and
@@ -1377,57 +1337,11 @@ fn is_rebuilding_ruleset(ruleset: &str) -> bool {
         == "rebuilding"
 }
 
-/// Strip a rule name down to its family prefix: drop the leading `@`, a
-/// trailing `#<idx>` seminaive-instance suffix, then trailing digits. E.g.
-/// `@rebuild_rule12#5` -> `rebuild_rule`. The duck backend's trait surface
-/// never sees the egglog RULESET name (`new_rule` takes only a `desc`), so
-/// PR #782 maintenance/rebuild rules must be recognized by NAME instead.
-fn rule_family(rule_name: &str) -> &str {
-    rule_name
-        .trim_start_matches('@')
-        .split('#')
-        .next()
-        .unwrap_or(rule_name)
-        .trim_end_matches(|c: char| c.is_ascii_digit())
-}
-
-/// True for PR #782's `@rebuild_rule<N>` canonicalization rules (the
-/// `@rebuilding` ruleset). Recognized by NAME (the ruleset isn't available on
-/// the duck trait surface). Under `--native-uf` these are rewritten into the
-/// SQL host-pass form (`EGraph::rewrite_native_uf_rule`).
-fn is_rebuild_rule_name(rule_name: &str) -> bool {
-    rule_family(rule_name) == "rebuild_rule"
-}
-
-/// True for PR #782's `@uf_change_drain_rule<N>` drain rules (the
-/// `@uf_change_drain` ruleset). Recognized by NAME. Under `--native-uf` these
-/// are DROPPED at compile time: DuckDB never populates the `@UFChange_S`
-/// relation they drain (no leader-change callback), so they have nothing to do.
-fn is_uf_change_drain_rule_name(rule_name: &str) -> bool {
-    rule_family(rule_name) == "uf_change_drain_rule"
-}
-
-/// Sanitize a function name for use as a DuckDB UDF identifier.
-/// Same scheme as the temp-table naming: `@` → empty, `_` doubled,
-/// non-alnum → `_`.
-fn sanitize_for_udf(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if c.is_ascii_alphanumeric() || c == '_' {
-            out.push(c);
-        } else {
-            out.push('_');
-        }
-    }
-    out
-}
-
 mod backend_impl;
 pub mod base_values;
 mod compile;
 mod external_func;
 mod rule_builder;
-mod term_build_merge;
 
 /// Quote a SQL identifier with double quotes, escaping any embedded
 /// double quote. Necessary because egglog identifiers can contain
@@ -1905,11 +1819,6 @@ pub struct FunctionInfo {
     /// (so multiple distinct IDs per input set are allowed) and
     /// `allocate_and_insert` is the intended insertion path.
     pub eq_sort_ctor: bool,
-    /// True iff this function is backed by a native union-find
-    /// (`--duck-native-uf` flag on and merge is `(ordering-min …)`).
-    /// The rule compiler demotes body atoms against this function
-    /// to scalar UDF calls instead of joining the SQL table.
-    pub native_uf_udf: Option<String>,
     /// For an EqSort constructor under `--duck-native-uf`, the name
     /// of the raw UF (`pname`) table that union assertions land in.
     /// When set, the runner emits an *inline congruence* SQL at the
@@ -1938,24 +1847,16 @@ pub struct FunctionInfo {
     /// eclass). `None` for every other table. The tree carries `FunctionId`s
     /// resolved against `EGraph::backend_function_names`.
     pub merge_tree: Option<egglog_backend_trait::MergeFn>,
-    /// `Some(uf_table)` for a NATIVE-CONGRUENCE constructor view (`--native-merge`
-    /// with `supports_native_congruence_merge()` true): the `@<C>View` of an eq-sort
-    /// constructor, declared in the BASELINE all-columns Unit-relation shape
-    /// `(children..., eclass) -> Unit` (so its rows COEXIST — the relation's all-cols
-    /// PK only de-dupes identical rows). Set by [`Backend::register_native_merge_view`]
-    /// AFTER `declare` (the encoder dropped the view's `@congruence_rule*` and records
-    /// the view -> UF association). `uf_table` is the per-sort UF-backed function
-    /// (`@UF_Sf`) of the view's eclass column sort — the same table the dropped
-    /// `@congruence_rule*` wrote union edges into (via `(set (@UF_Sf larger) smaller)`),
-    /// and the table `sync_native_ufs` scans `(c0, c1, ts)` edges out of (its
-    /// `native_uf_pname` maps it to ITSELF; there is no separate `@UF_S` parent on
-    /// DuckDB).
-    ///
-    /// Its presence marks the view as native-congruence: at the iteration boundary
-    /// [`EGraph::emit_native_congruence`] reads each FD conflict (same children, two
-    /// eclasses) via a self-join and inserts the `(GREATEST, LEAST, ts)` union edge
-    /// into `uf_table` — exactly what the dropped rule did. `None` for every other
-    /// table.
+    /// TERM-MODE native-congruence marker — now INERT. It was set (via
+    /// [`Backend::register_native_merge_view`]) for a term-mode `--native-merge`
+    /// constructor view and consumed by the old `emit_native_congruence` host pass
+    /// that wrote FD-conflict union edges into `@UF_Sf`. That host pass and the
+    /// DuckDB native-UF machinery have been REMOVED (DuckDB now runs the fast
+    /// relational term-encoding with rule-encoded congruence), and term-mode
+    /// `--native-merge --duckdb` is rejected at the CLI — so nothing sets or reads
+    /// this on the live paths. Retained only to keep `register_native_merge_view`'s
+    /// signature; always `None` in practice. PROOF-mode congruence uses the
+    /// separate [`Self::native_congruence_proof`] field below.
     pub native_congruence_uf: Option<String>,
     /// `Some(cfg)` for a PROOF-mode NATIVE-CONGRUENCE constructor view (`--proofs
     /// --native-merge`): the `@<C>View` of an eq-sort constructor, declared in the
@@ -2035,10 +1936,6 @@ pub struct EGraph {
     /// Count of rule firings short-circuited by the watermark gate.
     /// Surfaced by `DUCK_PERF_DUMP`.
     rules_skipped: u64,
-    /// Whether `--duck-native-uf` is in effect for this `EGraph`.
-    /// Set once by `enable_native_uf` before any tables/rules are
-    /// registered; everything downstream branches on this.
-    native_uf_enabled: bool,
     /// Whether the program was term-encoded in proof-tracking mode.
     /// Set once by `enable_proofs` from the frontend's
     /// `with_duckdb_backend` when `DuckBackendConfig::proofs` is on.
@@ -2054,55 +1951,11 @@ pub struct EGraph {
     /// the proof checker rejects it. Term identity only matters for
     /// proofs, so non-proof runs keep the faster leader hash-cons.
     proofs_enabled: bool,
-    /// Per-sort native union-find tables, keyed by the egglog
-    /// function name they're standing in for (the `:merge
-    /// (ordering-min old new)` function emitted by term encoding).
-    /// The corresponding SQL table is still created — writes flow
-    /// through it so other rulesets that haven't been ported can
-    /// still read it via JOIN — but a DuckDB scalar UDF
-    /// (`duck_uf_<sanitized_name>_find`) is also registered that
-    /// lets queries look up the canonical root in O(α(n)) memory.
-    ///
-    /// `Arc<Mutex>` so the UDF (which DuckDB stores for the lifetime
-    /// of the connection) can lock state for find/union. We pin
-    /// DuckDB to a single thread (`SET threads = 1`) for determinism
-    /// so contention is nil — the Mutex is for shared ownership.
-    native_ufs: HashMap<String, Arc<Mutex<UfTable>>>,
-    /// For each native-UF function name, the corresponding raw UF
-    /// (pname) table name. Term encoding always emits the pair
-    /// `@UF_<sort>` (relation-style, holds raw union assertions)
-    /// and `@UF_<sort>f` (function-form, ordering-min merge); we
-    /// derive pname by stripping a trailing `f` at native-UF
-    /// registration time and store it explicitly so the sync
-    /// scanner doesn't have to re-derive on every iteration.
-    native_uf_pname: HashMap<String, String>,
-    /// Per native-UF function, the maximum `ts` we've already
-    /// pulled into the in-memory union-find. The sync scan reads
-    /// only rows newer than this on each iteration.
-    last_uf_sync_ts: HashMap<String, i64>,
-    /// Per eq-sort view, the `ts` through which inline-congruence
-    /// has already scanned. Inline-cong's "new" side restricts to
-    /// rows with `ts >= last_inline_cong_at AND ts < cur`, matching
-    /// the seminaive triangulation that `@congruence_rule` did in
-    /// the encoding. Without this, pairs that come from top-level
-    /// `insert_terms` (which never line up with any `cur`) get
-    /// silently skipped.
-    last_inline_cong_at: HashMap<String, i64>,
-    /// Per TERM-BUILD view (`merge_tree.is_some()`), the `ts` through which
-    /// `emit_term_build_merges` has already resolved FD conflicts. The conflict
-    /// self-join restricts its "new" side to rows with `ts >= last_termbuild_at`
-    /// so each conflict pair is processed once.
-    last_termbuild_at: HashMap<String, i64>,
-    /// Per NATIVE-CONGRUENCE view (`native_congruence_uf.is_some()`), the `ts`
-    /// through which `emit_native_congruence` has already resolved FD conflicts.
-    /// The conflict self-join restricts its window to rows with
+    /// Per PROOF-mode NATIVE-CONGRUENCE view (`native_congruence_proof.is_some()`),
+    /// the `ts` through which `emit_native_congruence_proof` has already resolved
+    /// FD conflicts. The conflict self-join restricts its window to rows with
     /// `ts >= last_native_cong_at` so each conflict pair is processed once.
     last_native_cong_at: HashMap<String, i64>,
-    /// Diagnostic counter: total rows pulled into native UFs across
-    /// all syncs. Surfaced via `DUCK_PERF_DUMP` (under the native-uf
-    /// flag) so we can see the work the SQL → memory bridge is
-    /// doing.
-    native_uf_unions_synced: u64,
     /// FunctionId -> registered table name. Populated by
     /// `Backend::add_table`; indexed by `FunctionId::rep()`. Trait
     /// callers receive numeric ids and we look up the underlying
@@ -2171,19 +2024,10 @@ pub struct EGraph {
     /// `DuckBackendConfig::fast_rebuild`), or via the legacy
     /// `DUCK_ADAPTIVE_REBUILD` / `DUCK_DELTA_REBUILD` env vars (back-compat).
     ///
-    /// This term-drop is ORTHOGONAL to whether the native UF is on:
-    /// - WITHOUT `--native-uf`: the RELATIONAL δuf fast-rebuild (compile.rs's
-    ///   `delta_rebuild_view_idx` decomposition — drop the VIEW-focus branch of
-    ///   the relational `view ⋈ @UF_Sf` rebuild rule).
-    /// - WITH `--native-uf` ([`native_uf_enabled`](Self::native_uf_enabled)):
-    ///   drop the rebuild host-pass's δview-focus seminaive branch (see
-    ///   `native_uf_drop_delta_view` in `add_rule`). The native-UF
-    ///   `__UF_CHANGED__` adaptive delta scan is a SEPARATE mechanism, engaged by
-    ///   `--native-uf` alone ([`adaptive_rebuild`](Self::adaptive_rebuild)); it
-    ///   accumulates the set of ids whose canonical changed (drained from the
-    ///   native UFs) and per rebuild iteration chooses between the
-    ///   `__UF_CHANGED__` semijoin and the full-scan gated variant regardless of
-    ///   `--fast-rebuild`.
+    /// This is the RELATIONAL δuf fast-rebuild (compile.rs's
+    /// `delta_rebuild_view_idx` decomposition — drop the VIEW-focus branch of the
+    /// relational `view ⋈ @UF_Sf` rebuild rule). DuckDB no longer has a native-UF
+    /// path, so this is the only fast-rebuild mechanism.
     fast_rebuild: bool,
     /// Switch-over fraction theta: when the accumulated changed-set
     /// size exceeds `theta * |UF id-space|`, run the full scan and
@@ -2197,38 +2041,7 @@ pub struct EGraph {
     /// last full-scan reset). Only maintained when `adaptive_rebuild`
     /// is on. Reset to empty after any full-scan gated variant runs.
     adaptive_changed_ids: std::collections::HashSet<i64>,
-    /// `--native-uf --duckdb` only: maps the PR #782 `@canon_S`
-    /// find-or-self primitive's [`ExternalFunctionId`] (returned by
-    /// [`Backend::add_uf_function`]) to the find UDF name
-    /// (`duck_uf_<sort>_find`) of its UF function. The frontend rebinds the
-    /// primitive name to this id via `rename_prim`/`set_external_func_name`;
-    /// when that happens we copy the mapping into `native_uf_canon_prim_udf`
-    /// keyed by the egglog primitive NAME (which is what shows up as
-    /// `Term::Prim(name, …)` in the compiled rule IR).
-    native_uf_canon_id_udf: HashMap<egglog_backend_trait::ExternalFunctionId, String>,
-    /// `--native-uf --duckdb` only: maps a PR #782 `@canon_S` find-or-self
-    /// primitive's egglog NAME to its find UDF name. The compile pre-pass
-    /// (`compile::rewrite_canon_prims`) rewrites every `Term::Prim(canon_name,
-    /// [x])` into a UDF-call prim so `prim_sql` emits `duck_uf_<sort>_find(x)`
-    /// (the SQL host-pass find), replacing the structural relational heuristic.
-    native_uf_canon_prim_udf: HashMap<String, String>,
-    /// `--native-uf --duckdb` only: maps a native-UF find UDF name
-    /// (`duck_uf_<sort>_find`) back to the `@UF_Sf` union table it reads. The
-    /// `@UF_Sf` table is where unions land (and whose watermark advances when a
-    /// union does), so the rebuild host-pass compiles a gated full-scan variant
-    /// keyed on it: when a union landed since the rule last ran, re-scan ALL
-    /// view rows and re-canonicalize the stale ones (the seminaive variant only
-    /// sees newly-inserted view rows; old rows go stale when a later union
-    /// displaces one of their ids).
-    native_uf_udf_to_table: HashMap<String, String>,
-    /// `--native-uf --duckdb` only: names of PR #782's `@UFChange_S` onchange
-    /// relations (one per eq-sort). DuckDB never runs the leader-change
-    /// callback that would populate them, so the rebuild rule's join against
-    /// them produces nothing; the compile pre-pass strips the onchange body
-    /// atom (and the filters it bound) so the rebuild drives off a view scan +
-    /// `@canon_S`-find guard (the SQL host-pass rebuild).
-    native_uf_onchange: std::collections::HashSet<String>,
-    /// Ids displaced by the most recent `sync_native_ufs` (the
+    /// Ids displaced by the most recent sync (the
     /// "recent delta"). The adaptive mode decision compares THIS
     /// against `theta * id_space`, not the full accumulated set:
     /// the accumulated set is what the delta scan must semijoin
@@ -2305,51 +2118,6 @@ pub(crate) struct DeltaVariant {
 /// any real table name so a stray substitution is obvious.
 pub(crate) const UF_CHANGED_PLACEHOLDER: &str = "__UF_CHANGED__";
 
-/// Synthetic `Term::Prim` op-name prefix the `--native-uf --duckdb` compile
-/// pre-pass ([`EGraph::rewrite_native_uf_rule`]) uses to mark a PR #782
-/// `@canon_S` find-or-self call rewritten to its find UDF. The rest of the
-/// op-name is the UDF name (`duck_uf_<sort>_find`); `compile::prim_sql` emits
-/// `<udf>(arg)`. A prefix that no real egglog primitive uses, so a stray match
-/// is impossible.
-pub(crate) const NATIVE_UF_FIND_PRIM_PREFIX: &str = "__duck_uf_find:";
-
-/// Apply `f` to every variable name referenced anywhere in `t` (recursing
-/// through `Prim`/`FuncCall` args). Used by the native-UF rebuild host-pass
-/// rewrite to find filters that dangle after the onchange atom is stripped.
-fn term_for_each_var(t: &Term, f: &mut impl FnMut(&str)) {
-    match t {
-        Term::Var(v) => f(v),
-        Term::Lit(_) => {}
-        Term::Prim(_, args) | Term::FuncCall { args, .. } => {
-            for a in args {
-                term_for_each_var(a, f);
-            }
-        }
-    }
-}
-
-/// Apply `f` to every native-UF find UDF name embedded in a rewritten
-/// `Term::Prim("__duck_uf_find:<udf>", …)` op (recursing through args). Used to
-/// compute the rebuild host-pass gate tables. See [`NATIVE_UF_FIND_PRIM_PREFIX`].
-fn term_for_each_find_udf(t: &Term, f: &mut impl FnMut(&str)) {
-    match t {
-        Term::Var(_) | Term::Lit(_) => {}
-        Term::Prim(op, args) => {
-            if let Some(udf) = op.strip_prefix(NATIVE_UF_FIND_PRIM_PREFIX) {
-                f(udf);
-            }
-            for a in args {
-                term_for_each_find_udf(a, f);
-            }
-        }
-        Term::FuncCall { args, .. } => {
-            for a in args {
-                term_for_each_find_udf(a, f);
-            }
-        }
-    }
-}
-
 /// One rule action paired with the table it writes to (so the
 /// watermark tracker can bump that table's high-water-mark after a
 /// successful row-affecting execute). `target` is `None` for no-op
@@ -2407,15 +2175,8 @@ impl EGraph {
             rule_to_ruleset: HashMap::new(),
             table_watermarks: HashMap::new(),
             rules_skipped: 0,
-            native_uf_enabled: false,
             proofs_enabled: false,
-            native_ufs: HashMap::new(),
-            native_uf_pname: HashMap::new(),
-            last_uf_sync_ts: HashMap::new(),
-            last_inline_cong_at: HashMap::new(),
-            last_termbuild_at: HashMap::new(),
             last_native_cong_at: HashMap::new(),
-            native_uf_unions_synced: 0,
             backend_function_names: Vec::new(),
             backend_report_level: egglog_backend_trait::ReportLevel::default(),
             backend_container_pool: backend_impl::DuckdbContainerPool,
@@ -2424,11 +2185,8 @@ impl EGraph {
             backend_external_funcs: external_func::DuckdbExternalFuncRegistry::default(),
             registered_builtin_udfs: std::collections::HashSet::new(),
             table_sizes: Arc::new(Mutex::new(HashMap::new())),
-            // Back-compat: either env var still turns the flag on. The flag is
-            // the real interface (set via `enable_fast_rebuild`); `native_uf_enabled`
-            // (set later) decides whether it routes to the adaptive native path
-            // or the relational δuf path. `DUCK_ADAPTIVE_REBUILD` was the
-            // native-path env, `DUCK_DELTA_REBUILD` the relational-path env.
+            // Back-compat: either env var still turns the relational δuf
+            // fast-rebuild on (the real interface is `enable_fast_rebuild`).
             fast_rebuild: std::env::var("DUCK_ADAPTIVE_REBUILD").is_ok()
                 || std::env::var("DUCK_DELTA_REBUILD").is_ok(),
             adaptive_theta: std::env::var("DUCK_ADAPTIVE_THETA")
@@ -2439,271 +2197,24 @@ impl EGraph {
             adaptive_debug: std::env::var("DUCK_ADAPTIVE_DEBUG").is_ok(),
             adaptive_changed_ids: std::collections::HashSet::new(),
             adaptive_recent_displaced: 0,
-            native_uf_canon_id_udf: HashMap::new(),
-            native_uf_canon_prim_udf: HashMap::new(),
-            native_uf_udf_to_table: HashMap::new(),
-            native_uf_onchange: std::collections::HashSet::new(),
         })
     }
 
     /// Turn on the native union-find path. Must be called before
-    /// any tables or rules are registered — `declare` checks this
-    /// flag when it sees a `:merge (ordering-min old new)` function
-    /// to decide whether to also spin up a `UfTable` + UDF.
-    pub fn enable_native_uf(&mut self) {
-        self.native_uf_enabled = true;
-    }
-
-    /// Turn on the `--fast-rebuild` delta-scoped rebuild. With `--native-uf`
-    /// this engages the adaptive native rebuild (see
-    /// [`adaptive_rebuild`](Self::adaptive_rebuild)); without it, the relational
-    /// δuf fast-rebuild. Order-independent w.r.t. [`enable_native_uf`](Self::enable_native_uf):
-    /// the routing is decided at run time from both flags.
+    /// Turn on the `--fast-rebuild` relational δuf fast-rebuild (compile-time,
+    /// see `delta_rebuild_view_idx`): the rebuild rule's `@rebuild_rule*` is
+    /// decomposed into the per-column delta form that drops the always-empty
+    /// `δview ⋈ uf_old` term. Bit-exact with the full rebuild.
     pub fn enable_fast_rebuild(&mut self) {
         self.fast_rebuild = true;
     }
 
-    /// True iff the ADAPTIVE native rebuild is engaged. This is the DEFAULT
-    /// under the native UF (`--native-uf`): native-UF provides the displaced-id
-    /// deltas, so the gated rebuild variant scopes to `view ⋈ δuf`. The adaptive
-    /// path accumulates the displaced-id set and chooses per-iteration between the
-    /// `__UF_CHANGED__` delta semijoin and a full scan (the full-scan fallback
-    /// preserves correctness when the changed set isn't small).
-    ///
-    /// `--fast-rebuild` is ORTHOGONAL to this gate. Under native-UF it DROPS the
-    /// rebuild rule's δview-focus seminaive branch (the new-view-rows probe,
-    /// empty under canon-at-creation; see `native_uf_drop_delta_view` in
-    /// `add_rule` / `compile::compile_rule`), so `--native-uf` (full rebuild,
-    /// keeps the δview probe) and `--native-uf --fast-rebuild` (drops it) are
-    /// distinct. Without the native UF, `--fast-rebuild` instead drives the
-    /// relational δuf path (compile-time, see `delta_rebuild_view_idx`).
+    /// DuckDB has been migrated off native-UF, so the ADAPTIVE native rebuild
+    /// (native-UF's `view ⋈ δuf` gated variant) is never engaged: always `false`.
+    /// The relational δuf fast-rebuild (`--fast-rebuild`) is a compile-time
+    /// decomposition (`delta_rebuild_view_idx`), independent of this gate.
     fn adaptive_rebuild(&self) -> bool {
-        self.native_uf_enabled
-    }
-
-    /// True iff `name` is a registered native union-find function (`@UF_Sf`,
-    /// registered via [`Backend::add_uf_function`] on the `--native-uf --duckdb`
-    /// path). Used by the rule builder to keep both columns of a union write
-    /// `(set (@UF_Sf lhs) rhs)` instead of stripping the trailing relation
-    /// "output" entry.
-    pub(crate) fn is_native_uf_function(&self, name: &str) -> bool {
-        self.native_ufs.contains_key(name)
-    }
-
-    /// `--native-uf --duckdb` compile pre-pass. Rewrites a PR #782 rule into
-    /// the SQL host-pass form before [`compile::compile_rule`]:
-    ///
-    /// 1. **Canon-prim -> find UDF.** Every `Term::Prim(@canon_S, [x])` (the
-    ///    find-or-self primitive bound to a UF function) becomes
-    ///    `Term::Prim("__duck_uf_find:<udf>", [x])`, which `compile::prim_sql`
-    ///    emits as `duck_uf_<sort>_find(x)` — the in-core UF answer. This is the
-    ///    EXPLICIT replacement for the relational structural demote heuristic.
-    ///
-    /// 2. **Rebuild host-pass.** A `@rebuild_rule` (in the `@rebuilding`
-    ///    ruleset) joins the always-empty `@UFChange_S` onchange relation
-    ///    against the view and filters `(= cj disp_)`. DuckDB never populates
-    ///    `@UFChange_S` (no leader-change callback), so the join yields nothing.
-    ///    We STRIP the onchange body atom and every Filter/Bind that references
-    ///    a variable the onchange atom (uniquely) bound, leaving a view scan +
-    ///    `(guard (or (bool-!= ci (@canon_S ci)) ...))` — i.e. re-canonicalize
-    ///    every stale view row via the find UDF, exactly the relational
-    ///    rebuild's host-pass.
-    fn rewrite_native_uf_rule(&self, mut rule: Rule) -> Rule {
-        // (2) Strip onchange atoms (rebuild host-pass) FIRST, so the canon
-        // rewrite in (1) doesn't touch the dropped filters. Recognized by NAME
-        // (`@rebuild_rule*`) — the duck trait surface drops the egglog ruleset.
-        if is_rebuild_rule_name(&rule.name) {
-            // Vars bound by an onchange (`@UFChange_S`) body atom.
-            let mut onchange_vars: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            // Vars bound by any *other* Func atom (the view).
-            let mut other_func_vars: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            for atom in &rule.body {
-                if let Atom::Func { name, args } = atom {
-                    let is_onchange = self.native_uf_onchange.contains(name);
-                    for t in args {
-                        if let Term::Var(v) = t {
-                            if is_onchange {
-                                onchange_vars.insert(v.clone());
-                            } else {
-                                other_func_vars.insert(v.clone());
-                            }
-                        }
-                    }
-                }
-            }
-            // A var is "onchange-only" if no surviving Func atom binds it.
-            let onchange_only: std::collections::HashSet<String> = onchange_vars
-                .into_iter()
-                .filter(|v| !other_func_vars.contains(v))
-                .collect();
-            let refs_onchange_only = |t: &Term| -> bool {
-                let mut found = false;
-                term_for_each_var(t, &mut |v| {
-                    if onchange_only.contains(v) {
-                        found = true;
-                    }
-                });
-                found
-            };
-            rule.body.retain(|atom| match atom {
-                // Drop the onchange relation atom itself.
-                Atom::Func { name, .. } => !self.native_uf_onchange.contains(name),
-                // Drop filters/binds that reference an onchange-only var
-                // (e.g. `(= cj disp_)`), which are now dangling.
-                Atom::Filter(t) => !refs_onchange_only(t),
-                Atom::Bind { var, expr } => {
-                    !onchange_only.contains(var) && !refs_onchange_only(expr)
-                }
-            });
-        }
-
-        // (1) Canon-prim -> find UDF, across all body atoms and actions.
-        if !self.native_uf_canon_prim_udf.is_empty() {
-            for atom in &mut rule.body {
-                match atom {
-                    Atom::Func { args, .. } => {
-                        for t in args.iter_mut() {
-                            self.rewrite_canon_in_term(t);
-                        }
-                    }
-                    Atom::Filter(t) => self.rewrite_canon_in_term(t),
-                    Atom::Bind { expr, .. } => self.rewrite_canon_in_term(expr),
-                }
-            }
-            for action in &mut rule.actions {
-                match action {
-                    Action::Insert { args, .. } | Action::LetCtor { args, .. } => {
-                        for t in args.iter_mut() {
-                            self.rewrite_canon_in_term(t);
-                        }
-                    }
-                    Action::Delete { key_args, .. } => {
-                        for t in key_args.iter_mut() {
-                            self.rewrite_canon_in_term(t);
-                        }
-                    }
-                    Action::LetExpr { expr, .. } => self.rewrite_canon_in_term(expr),
-                    Action::Panic { .. } => {}
-                }
-            }
-        }
-        rule
-    }
-
-    /// Rewrite `Term::Prim(@canon_S, [x])` -> `Term::Prim("__duck_uf_find:<udf>",
-    /// [x])` in place, recursing into nested prim/func-call args. See
-    /// [`Self::rewrite_native_uf_rule`].
-    fn rewrite_canon_in_term(&self, t: &mut Term) {
-        match t {
-            Term::Prim(op, args) => {
-                for a in args.iter_mut() {
-                    self.rewrite_canon_in_term(a);
-                }
-                if let Some(udf) = self.native_uf_canon_prim_udf.get(op) {
-                    *op = format!("{NATIVE_UF_FIND_PRIM_PREFIX}{udf}");
-                }
-            }
-            Term::FuncCall { args, .. } => {
-                for a in args.iter_mut() {
-                    self.rewrite_canon_in_term(a);
-                }
-            }
-            Term::Var(_) | Term::Lit(_) => {}
-        }
-    }
-
-    /// Distinct `@UF_Sf` union tables whose find UDF the (already canon-prim-
-    /// rewritten) rule references. Used to gate the rebuild host-pass full-scan
-    /// variant. See [`Self::rewrite_native_uf_rule`] / `compile::compile_rule`.
-    fn native_uf_rule_gate_tables(&self, rule: &Rule) -> Vec<String> {
-        let mut udfs: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut collect = |t: &Term| {
-            term_for_each_find_udf(t, &mut |udf| {
-                udfs.insert(udf.to_string());
-            });
-        };
-        for atom in &rule.body {
-            match atom {
-                Atom::Func { args, .. } => args.iter().for_each(&mut collect),
-                Atom::Filter(t) => collect(t),
-                Atom::Bind { expr, .. } => collect(expr),
-            }
-        }
-        for action in &rule.actions {
-            match action {
-                Action::Insert { args, .. } | Action::LetCtor { args, .. } => {
-                    args.iter().for_each(&mut collect)
-                }
-                Action::Delete { key_args, .. } => key_args.iter().for_each(&mut collect),
-                Action::LetExpr { expr, .. } => collect(expr),
-                Action::Panic { .. } => {}
-            }
-        }
-        let mut tables: Vec<String> = Vec::new();
-        for udf in udfs {
-            if let Some(t) = self.native_uf_udf_to_table.get(&udf)
-                && !tables.contains(t)
-            {
-                tables.push(t.clone());
-            }
-        }
-        tables
-    }
-
-    /// Register PR #782's UF-backed `:impl displaced-union-find` function
-    /// `name` (`@UF_Sf`) on the `--native-uf --duckdb` path, returning its find
-    /// UDF name (`duck_uf_<sort>_find`).
-    ///
-    /// Unlike the relational path (which spins the native UF up lazily in
-    /// `declare` when it sees a `:merge ordering-min` function paired with a
-    /// `@UF_S` parent table), the #782 path is driven by an *explicit*
-    /// [`Backend::add_uf_function`] call. There is no separate parent table:
-    /// `name` itself is both the union-write target and the sync-scan source.
-    /// We register it as an append-only 2-column relation `(S S)` so each
-    /// `(set (@UF_Sf lhs) rhs)` lands as a `(lhs, rhs, ts)` row (PK over both
-    /// columns, `ON CONFLICT DO NOTHING` — distinct union pairs survive; a
-    /// function's `lhs`-only PK would drop a second union of the same lhs).
-    /// `sync_native_ufs` scans new rows into the in-core [`UfTable`] and the
-    /// find UDF answers `@canon_S`/extraction finds.
-    pub(crate) fn register_native_uf_function(&mut self, name: &str) -> Result<String> {
-        if self.functions.contains_key(name) {
-            return Err(anyhow!("native UF {name}: already registered"));
-        }
-        // Append-only 2-column relation (both columns eq-sort ids -> BIGINT).
-        self.declare(
-            name,
-            FunctionInfo {
-                cols: vec![ColumnTy::I64, ColumnTy::I64],
-                inputs_len: 2,
-                merge: None,
-                eq_sort_ctor: false,
-                native_uf_udf: None,
-                eq_sort_pname: None,
-                identity_on_miss: false,
-                merge_tree: None,
-                native_congruence_uf: None,
-                native_congruence_proof: None,
-            },
-        )?;
-        let uf = Arc::new(Mutex::new(UfTable::new()));
-        let udf_name = format!("duck_uf_{}_find", sanitize_for_udf(name));
-        self.conn
-            .register_scalar_function_with_state::<UfFindScalar>(&udf_name, &uf)
-            .map_err(|e| anyhow!("failed to register UF UDF {udf_name}: {e}"))?;
-        self.native_ufs.insert(name.to_string(), uf);
-        self.native_uf_udf_to_table
-            .insert(udf_name.clone(), name.to_string());
-        // The scan source is the function itself (no separate `@UF_S` parent).
-        self.native_uf_pname
-            .insert(name.to_string(), name.to_string());
-        // Tag the function so the watermark-substitution in `add_rule` maps it
-        // to its own pname (a no-op) rather than leaving the gate stuck at 0.
-        if let Some(info) = self.functions.get_mut(name) {
-            info.native_uf_udf = Some(udf_name.clone());
-        }
-        Ok(udf_name)
+        false
     }
 
     /// Mark this `EGraph` as running a proof-tracking term encoding.
@@ -2755,13 +2266,6 @@ impl EGraph {
         name: String,
     ) {
         self.backend_external_funcs.set_name(id, name.clone());
-        // `--native-uf --duckdb`: the frontend rebinds the PR #782 `@canon_S`
-        // find-or-self primitive name to the canon-prim id returned by
-        // `add_uf_function`. Record `canon-name -> find UDF` so the compile
-        // pre-pass can rewrite `Term::Prim(canon-name, [x])` into a UDF call.
-        if let Some(udf) = self.native_uf_canon_id_udf.get(&id).cloned() {
-            self.native_uf_canon_prim_udf.insert(name.clone(), udf);
-        }
         self.register_builtin_prim_udf(&name);
     }
 
@@ -3231,94 +2735,6 @@ impl EGraph {
         Ok(())
     }
 
-    /// Currently registered native union-find tables, for read-only
-    /// inspection (testing, diagnostics). Mutating these directly
-    /// would skip the queue + drain protocol; callers that need to
-    /// add unions should go through the SQL path.
-    pub fn native_uf_table_count(&self) -> usize {
-        self.native_ufs.len()
-    }
-
-    /// Total rows of union assertions pulled into native UFs since
-    /// this `EGraph` was created. Surfaced by `DUCK_PERF_DUMP`.
-    pub fn native_uf_unions_synced(&self) -> u64 {
-        self.native_uf_unions_synced
-    }
-
-    /// Pull every union assertion newer than the last sync from
-    /// each native UF's corresponding pname (raw UF) table, apply
-    /// them via the queue + drain protocol, and advance the
-    /// per-UF watermark.
-    ///
-    /// The find UDF reads from each `UfTable` via `find_ro`; this
-    /// method is what keeps that read view consistent with whatever
-    /// rule actions have written into the SQL pname tables. The
-    /// runner calls it at the top of each iteration so any UDF
-    /// invocations within that iteration's rules see fresh state.
-    fn sync_native_ufs(&mut self) -> Result<usize> {
-        if self.native_ufs.is_empty() {
-            return Ok(0);
-        }
-        let mut total_displaced: usize = 0;
-        // Snapshot names to avoid double-borrowing self.
-        let names: Vec<String> = self.native_ufs.keys().cloned().collect();
-        for uf_name in names {
-            let pname = match self.native_uf_pname.get(&uf_name) {
-                Some(p) => p.clone(),
-                None => continue,
-            };
-            // Watermark check: if pname's max-ts watermark hasn't
-            // advanced past what we synced, there's nothing new.
-            let pname_wm = self.table_watermarks.get(&pname).copied().unwrap_or(0);
-            let last_synced = self.last_uf_sync_ts.get(&uf_name).copied().unwrap_or(-1);
-            if pname_wm <= last_synced {
-                continue;
-            }
-            let sql = format!(
-                "SELECT c0, c1, ts FROM {} WHERE ts > {}",
-                q(&pname),
-                last_synced,
-            );
-            let uf_arc = self.native_ufs[&uf_name].clone();
-            let mut stmt = self.conn.prepare(&sql)?;
-            let mut rows = stmt.query([])?;
-            let mut max_ts_seen = last_synced;
-            let mut count: u64 = 0;
-            let accumulate = self.adaptive_rebuild();
-            {
-                let mut uf = uf_arc.lock().unwrap();
-                while let Some(row) = rows.next()? {
-                    let a: i64 = row.get(0)?;
-                    let b: i64 = row.get(1)?;
-                    let ts: i64 = row.get(2)?;
-                    uf.enqueue_union(a, b);
-                    if ts > max_ts_seen {
-                        max_ts_seen = ts;
-                    }
-                    count += 1;
-                }
-                if count > 0 {
-                    uf.drain_pending();
-                    let drained = uf.drain_displaced();
-                    total_displaced += drained.len();
-                    // Adaptive path: keep the displaced ids around so
-                    // the next rebuild iteration can restrict its scan
-                    // to rows referencing one of them. Cleared only
-                    // after a full scan re-canonicalizes everything.
-                    if accumulate {
-                        self.adaptive_changed_ids.extend(drained);
-                    }
-                }
-            }
-            self.native_uf_unions_synced = self.native_uf_unions_synced.wrapping_add(count);
-            self.last_uf_sync_ts.insert(uf_name, max_ts_seen);
-        }
-        if self.adaptive_rebuild() {
-            self.adaptive_recent_displaced = total_displaced;
-        }
-        Ok(total_displaced)
-    }
-
     /// Adaptive denominator: the total number of rows in the eq-sort
     /// view tables the rebuild scans. This is the "relevant table
     /// size" — the cost of a full-scan rebuild iteration scales with
@@ -3752,7 +3168,6 @@ impl EGraph {
                 inputs_len: inputs.len(),
                 merge: None,
                 eq_sort_ctor: false,
-                native_uf_udf: None,
                 eq_sort_pname: pname_resolved,
                 identity_on_miss: false,
                 merge_tree: None,
@@ -3781,7 +3196,6 @@ impl EGraph {
                 inputs_len: inputs.len(),
                 merge: Some(merge),
                 eq_sort_ctor: false,
-                native_uf_udf: None,
                 eq_sort_pname: None,
                 identity_on_miss: false,
                 merge_tree: None,
@@ -3821,7 +3235,6 @@ impl EGraph {
                 // identical re-inserts.
                 merge: Some(MergeMode::Old),
                 eq_sort_ctor: false,
-                native_uf_udf: None,
                 eq_sort_pname: None,
                 identity_on_miss: false,
                 merge_tree: Some(tree),
@@ -3865,7 +3278,6 @@ impl EGraph {
                 inputs_len: inputs.len(),
                 merge: None,
                 eq_sort_ctor: true,
-                native_uf_udf: None,
                 eq_sort_pname: pname_resolved,
                 identity_on_miss: false,
                 merge_tree: None,
@@ -3937,38 +3349,6 @@ impl EGraph {
         // Insert-heavy analytical workloads on DuckDB don't want
         // OLTP-style auxiliary indexes — the columnar storage and
         // zone maps already cover the access patterns we use.
-        // Native-UF registration. We attach a UfTable + scalar UDF
-        // when the function has `:merge (ordering-min old new)` —
-        // term encoding emits exactly one such function per eq-sort
-        // (the function-form UF, `@_u_f___<sort>f`). The SQL table
-        // is still created above; writes go through it so the
-        // existing rulesets see them. The UDF is for fast reads.
-        let mut info = info;
-        if self.native_uf_enabled && info.merge == Some(MergeMode::Min) {
-            // pname (raw UF) is what term encoding writes raw union
-            // assertions into. It's declared *before* the function-
-            // form table and follows the `@UF_<sort>` / `@UF_<sort>f`
-            // naming convention: pname is the function name with a
-            // trailing `f` stripped. Resolve and check up front so
-            // we don't half-register if the convention is broken.
-            let pname = name.strip_suffix('f').ok_or_else(|| {
-                anyhow!("native UF {name}: name doesn't end in `f`; can't derive pname")
-            })?;
-            if !self.functions.contains_key(pname) {
-                return Err(anyhow!(
-                    "native UF {name}: expected pname `{pname}` to be declared first"
-                ));
-            }
-            let uf = Arc::new(Mutex::new(UfTable::new()));
-            let udf_name = format!("duck_uf_{}_find", sanitize_for_udf(name));
-            self.conn
-                .register_scalar_function_with_state::<UfFindScalar>(&udf_name, &uf)
-                .map_err(|e| anyhow!("failed to register UF UDF {udf_name}: {e}"))?;
-            self.native_ufs.insert(name.to_string(), uf);
-            self.native_uf_pname
-                .insert(name.to_string(), pname.to_string());
-            info.native_uf_udf = Some(udf_name);
-        }
         self.functions.insert(name.to_string(), info);
         Ok(())
     }
@@ -3988,120 +3368,22 @@ impl EGraph {
                 eprintln!("  action: {action:?}");
             }
         }
-        // Under `--duck-native-uf` the UF-maintenance rulesets are
-        // skipped at every iter (the native UF maintains the same
-        // invariants in-memory). Compile-time, some of their rules
-        // use primitives the bridge doesn't yet support (notably
-        // `pair` / `pair-first` / `pair-second` that proof-mode's
-        // UF function index emits). Skipping the compile for those
-        // rules outright avoids a hard error on programs that would
-        // never execute the rules anyway.
-        if self.native_uf_enabled && is_uf_maintenance_ruleset(&rule.ruleset) {
-            return Ok(());
-        }
-        // `--native-uf --duckdb`: DROP the `@uf_change_drain_rule*` rules — they
-        // delete from the always-empty `@UFChange_S` onchange relation (DuckDB
-        // runs no leader-change callback), so they have nothing to do. The duck
-        // trait surface never sees the egglog ruleset, so recognize by NAME.
-        if self.native_uf_enabled && is_uf_change_drain_rule_name(&rule.name) {
-            return Ok(());
-        }
-        // `--native-uf --duckdb` (PR #782 encoding): rewrite the rule into its
-        // SQL host-pass form — canon-prim calls become find-UDF calls, and the
-        // rebuild rule's always-empty `@UFChange_S` join is stripped to a view
-        // scan. No-op for the relational `--duck-native-uf` path (no canon
-        // prims / onchange relations registered).
-        let rule = if self.native_uf_enabled {
-            self.rewrite_native_uf_rule(rule)
-        } else {
-            rule
-        };
-        // Gate tables for the native-UF rebuild host-pass: the distinct `@UF_Sf`
-        // union tables whose find UDF the (rewritten) rule references. The
-        // rebuild rule needs a gated full-scan variant per such table so stale
-        // OLD view rows are re-canonicalized when a union lands (the seminaive
-        // variant only catches newly-inserted rows). Only for rebuild rules;
-        // empty otherwise (so non-rebuild rules and the relational path are
-        // unaffected).
-        let native_uf_gate_tables: Vec<String> =
-            if self.native_uf_enabled && is_rebuild_rule_name(&rule.name) {
-                self.native_uf_rule_gate_tables(&rule)
-            } else {
-                Vec::new()
-            };
-        // Relational δuf fast-rebuild engages only WITHOUT the native UF:
-        // `--fast-rebuild --native-uf` routes to the adaptive native path
-        // (`adaptive_rebuild()`), never this relational decomposition. (The
-        // legacy `DUCK_DELTA_REBUILD` env folds into `self.fast_rebuild`; gating
-        // on `!native_uf_enabled` here is also what prevents the broken
-        // `DUCK_DELTA_REBUILD` + native-uf combination.)
-        let delta_rebuild = self.fast_rebuild && !self.native_uf_enabled;
-        // `--native-uf --fast-rebuild`: drop the rebuild host-pass's δview-focus
-        // seminaive branch (process this iteration's NEW view rows through the
-        // find UDF — empty under canon-at-creation but it costs to probe). The
-        // gated `__UF_CHANGED__` `view ⋈ δuf` semijoin then does all the rebuild
-        // work, mirroring the relational `+fastrb` δview-drop. WITHOUT
-        // `--fast-rebuild` (plain `--native-uf` = +nuf), the δview branch is
-        // KEPT, so +nuf (full) and +nuf+fastrb (dropped) are distinct, matching
-        // plain vs +fastrb on the relational side. `compile_rule` further gates
-        // this on `native_uf_gate_tables` being non-empty (rebuild rules only),
-        // so user rules are unaffected.
-        let native_uf_drop_delta_view = self.native_uf_enabled && self.fast_rebuild;
-        let mut compiled = compile::compile_rule(
-            &rule,
-            &self.functions,
-            self.proofs_enabled,
-            &native_uf_gate_tables,
-            delta_rebuild,
-            native_uf_drop_delta_view,
-        )?;
+        // Relational δuf fast-rebuild (the migrated DuckDB default): decompose
+        // the `@rebuild_rule*` into the per-column delta form that drops the
+        // always-empty `δview ⋈ uf_old` term. Bit-exact with the full rebuild
+        // under canonicalize-at-creation.
+        let delta_rebuild = self.fast_rebuild;
+        let mut compiled =
+            compile::compile_rule(&rule, &self.functions, self.proofs_enabled, delta_rebuild)?;
         // Body tables = distinct Atom::Func names. The watermark gate
         // reads this set to decide whether the rule has anything new
         // to look at on a given iteration.
-        //
-        // Native-UF substitution: when a body atom references a
-        // function with a registered native UF (e.g.
-        // `@_u_f___mathf`), the corresponding SQL table is no
-        // longer written to — rule actions go through the union
-        // UDF or land in the raw pname table. So its watermark
-        // never advances, and gating on it would permanently
-        // block the rule after its first run. We substitute pname
-        // (the raw UF, where union assertions land) so the gate
-        // tracks the table that actually receives writes. Caused
-        // a silent miss before this fix: rebuild rules would skip
-        // because the @UF_*f watermark stayed at 0 even as new
-        // unions accumulated in the native UF.
         let mut bt: Vec<String> = Vec::new();
         for atom in &rule.body {
             if let Atom::Func { name, .. } = atom {
-                let effective = if let Some(info) = self.functions.get(name) {
-                    if info.native_uf_udf.is_some() {
-                        // Map @UF_<sort>f -> @UF_<sort> (pname).
-                        self.native_uf_pname
-                            .get(name)
-                            .cloned()
-                            .unwrap_or_else(|| name.clone())
-                    } else {
-                        name.clone()
-                    }
-                } else {
-                    name.clone()
-                };
-                if !bt.iter().any(|n| n == &effective) {
-                    bt.push(effective);
+                if !bt.iter().any(|n| n == name) {
+                    bt.push(name.clone());
                 }
-            }
-        }
-        // `--native-uf --duckdb` rebuild host-pass: the rewritten rebuild rule
-        // has no `@UF_Sf` body atom (the `@UFChange_S` join was stripped), so
-        // its body_tables would be just the view — and the rule-level watermark
-        // gate would SKIP the whole rule (incl. the gated full-scan variant)
-        // when only a union landed (which doesn't touch the view). Add the
-        // union tables to body_tables so a union advances the gate and the
-        // rebuild re-fires to re-canonicalize stale OLD view rows.
-        for gate in &native_uf_gate_tables {
-            if !bt.iter().any(|n| n == gate) {
-                bt.push(gate.clone());
             }
         }
         compiled.body_tables = bt;
@@ -4195,8 +3477,8 @@ impl EGraph {
     /// the frontend gives us specific `RuleId`s and we translate them
     /// to indices before calling here.
     pub fn run_iteration_for_indices(&mut self, indices: &[usize]) -> Result<usize> {
-        let synced_displaced = self.sync_native_ufs()?;
-        self.rules_affected = self.rules_affected.wrapping_add(synced_displaced as u64);
+        // DuckDB no longer syncs a native UF (migrated to relational fast-rebuild).
+        let synced_displaced = 0usize;
         // Only consult the adaptive decision (and risk resetting the
         // accumulated changed set) on iterations that actually run a
         // gated rebuild variant. Other iterations never full-scan, so
@@ -4212,14 +3494,10 @@ impl EGraph {
         let cur = self.next_ts;
         let mut total: usize = synced_displaced;
         let last_run_ats: HashMap<String, i64> = self.last_run_at.clone();
-        let skip_uf_maintenance = self.native_uf_enabled;
         for &idx in indices {
             let Some(rule) = self.rules.get(idx) else {
                 continue;
             };
-            if skip_uf_maintenance && is_uf_maintenance_ruleset(&rule.ruleset) {
-                continue;
-            }
             let last = *last_run_ats.get(&rule.name).unwrap_or(&0);
             total += run_rule_variants(
                 rule,
@@ -4237,35 +3515,13 @@ impl EGraph {
             )?;
             self.last_run_at.insert(rule.name.clone(), cur);
         }
-        // TERM-BUILD custom `:merge` (`--native-merge`): resolve FD conflicts on
-        // each touched term-build view by running the lowered tree as set-based
-        // SQL (the frontend dropped the `@merge_rule` for these functions). This
-        // is the frontend rule-driver path (the trait `run_rules` calls
-        // `run_iteration_for_indices`), so the term-build pass must run here —
-        // it is watermark-gated, so iterations that touched no term-build view
-        // are ~free.
-        if self.native_uf_enabled {
-            total += self.emit_term_build_merges(cur)?;
-            // Native CONSTRUCTOR-CONGRUENCE (`--native-merge` with
-            // `supports_native_congruence_merge()` true): resolve FD conflicts on
-            // each touched native-congruence view (`native_congruence_uf.is_some()`)
-            // by emitting `(larger, smaller)` union edges into the view's relational
-            // UF (`@UF_S`) and deleting the loser rows. This is the host pass that
-            // replaces the dropped `@congruence_rule*`. Run AFTER term-build so the
-            // constructor (`@<C>View`) rows a term-build merge minted this iteration
-            // also get their FD conflicts congruence-collapsed in the same pass. It
-            // is watermark-gated (iterations touching no native-congruence view are
-            // ~free); the resulting `@UF_S` edges are drained by `sync_native_ufs`
-            // and the views re-canonicalized by `@rebuild_rule*` next iteration.
-            total += self.emit_native_congruence(cur)?;
-        }
         // PROOF-mode native CONSTRUCTOR-CONGRUENCE (`--proofs --native-merge`):
         // resolve FD conflicts on each touched proof-native-congruence view
         // (`native_congruence_proof.is_some()`) by composing the congruence edge
         // proof `Trans(larger_pf, Sym(smaller_pf))` in SQL and writing the
-        // proof-carrying union edge into the relational proof-UF `@UF_S`. The proof
-        // path runs WITHOUT `--native-uf` (the CLI decouples it), so it is gated on
-        // the per-view config rather than `native_uf_enabled`. Watermark-gated, so
+        // proof-carrying union edge into the relational proof-UF `@UF_S`. It is
+        // gated on the per-view config (`native_congruence_proof.is_some()`).
+        // Watermark-gated, so
         // iterations touching no such view are ~free; the resulting `@UF_S` edges are
         // canonicalized by the relational singleparent / path_compress rules and the
         // views re-canonicalized by `@rebuild_rule*` next iteration.
@@ -4296,14 +3552,10 @@ impl EGraph {
         // are still unions to propagate — required when we skip
         // rulesets like @single_parent whose pname churn was the
         // only source of the signal before.
-        let synced_displaced = self.sync_native_ufs()?;
-        self.rules_affected = self.rules_affected.wrapping_add(synced_displaced as u64);
-        // Adaptive decision applies only when a gated rebuild variant
-        // will actually run this iteration (see `run_iteration_for_indices`).
-        let skip_uf_maintenance = self.native_uf_enabled;
+        // DuckDB no longer syncs a native UF (migrated to relational fast-rebuild).
+        let synced_displaced = 0usize;
         let runs = |rule: &CompiledRule| -> bool {
-            (allow_all || allowed.iter().any(|rs| rule.ruleset == *rs))
-                && !(skip_uf_maintenance && is_uf_maintenance_ruleset(&rule.ruleset))
+            allow_all || allowed.iter().any(|rs| rule.ruleset == *rs)
         };
         let has_gated = self
             .rules
@@ -4352,22 +3604,12 @@ impl EGraph {
     /// `None`). Returns total rows inserted across rules and
     /// variants.
     pub fn run_iteration_in(&mut self, ruleset: Option<&str>) -> Result<usize> {
-        let synced_displaced = self.sync_native_ufs()?;
-        self.rules_affected = self.rules_affected.wrapping_add(synced_displaced as u64);
-        let skip_uf_maintenance = self.native_uf_enabled;
-        // Predicate mirroring the in-loop skip conditions, so the
-        // adaptive decision/reset only engages on iterations that
-        // actually run a gated rebuild variant.
+        // DuckDB no longer syncs a native UF (migrated to relational fast-rebuild).
+        let synced_displaced = 0usize;
         let runs = |rule: &CompiledRule| -> bool {
             if let Some(rs) = ruleset
                 && rule.ruleset != rs
             {
-                return false;
-            }
-            if skip_uf_maintenance && is_uf_maintenance_ruleset(&rule.ruleset) {
-                return false;
-            }
-            if skip_uf_maintenance && is_congruence_rule_name(&rule.name) {
                 return false;
             }
             true
@@ -4406,323 +3648,10 @@ impl EGraph {
             )?;
             self.last_run_at.insert(rule.name.clone(), cur);
         }
-        // After rules fire, run the inline-congruence pass over
-        // every EqSort constructor table that received new rows
-        // this iteration. The encoding's `@congruence_rule*` rules
-        // are skipped above; this is where their work lands instead.
-        //
-        // Only fire on rulesets that can produce new view rows: the
-        // user's iter (`ruleset = None`) and `@rebuilding` (where
-        // the rebuild rule canonicalizes view rows). Other rulesets
-        // (cleanup, single_parent, parent, uf_function_index) only
-        // delete or push to pname, never insert into views, so the
-        // emit would scan empty `v1` sets repeatedly.
-        let should_emit_cong = self.native_uf_enabled
-            && (ruleset.is_none() || ruleset.is_some_and(is_rebuilding_ruleset));
-        // TERM-BUILD custom `:merge` (`--native-merge`): resolve FD conflicts on
-        // each touched term-build view by running the lowered tree as set-based
-        // SQL. Run BEFORE `emit_inline_congruence` so the constructor (`@<C>View`)
-        // rows the term-build mints get congruence-collapsed in the SAME
-        // iteration's inline-congruence pass (and across iterations via
-        // `sync_native_ufs`). Same ruleset gate as inline-congruence (only
-        // rulesets that can produce new view rows).
-        if should_emit_cong {
-            total += self.emit_term_build_merges(cur)?;
-        }
-        if should_emit_cong {
-            total += self.emit_inline_congruence(cur)?;
-        }
         if has_gated && gate_mode == GateMode::FullScan {
             self.adaptive_reset_changed();
         }
         let _ = synced_displaced;
-        Ok(total)
-    }
-
-    /// Native TERM-BUILD custom `:merge` resolution (`--native-merge`), INLINE as
-    /// set-based SQL. For each term-build view (`merge_tree.is_some()`) whose
-    /// watermark advanced since the last pass:
-    ///
-    ///   1. CONFLICT BATCH: self-join the all-cols-keyed view on its key columns
-    ///      to read every `(keys.., old_eclass, new_eclass)` FD conflict over the
-    ///      seminaive window (`old`/`new` are two different eclasses written for
-    ///      the same key). A deterministic orientation (`old = GREATEST eclass,
-    ///      new = LEAST`) makes the batch order reproducible.
-    ///   2. RUN the compiled tree (see [`term_build_merge`]): a sequence of bulk
-    ///      mint/view INSERTs that build the merge body's constructors set-based
-    ///      with hash-consing, then a write-back of the merged eclass.
-    ///   3. WRITE-BACK: delete the conflicting `(key, old)` / `(key, new)` rows
-    ///      and insert `(key, merged)` — restoring the view's FD before the next
-    ///      iteration reads it.
-    ///
-    /// Returns the number of conflict rows resolved (a saturation signal). The
-    /// minted `@<C>View` rows get congruence-collapsed by the following
-    /// `emit_inline_congruence` / cross-iteration `sync_native_ufs`.
-    fn emit_term_build_merges(&mut self, cur: i64) -> Result<usize> {
-        // Snapshot eligible (view, n_keys) pairs without holding a borrow.
-        let entries: Vec<(String, usize)> = self
-            .functions
-            .iter()
-            .filter_map(|(name, info)| {
-                info.merge_tree.as_ref()?;
-                // Skip if no writes since our last pass (watermark gate).
-                let wm = self.table_watermarks.get(name).copied().unwrap_or(0);
-                let last_at = self.last_termbuild_at.get(name).copied().unwrap_or(0);
-                if wm < last_at {
-                    return None;
-                }
-                // inputs_len = number of key (children) columns; the eclass is the
-                // single output at index inputs_len.
-                Some((name.clone(), info.inputs_len))
-            })
-            .collect();
-
-        let mut total: usize = 0;
-        for (view, n_keys) in entries {
-            let last_at = self.last_termbuild_at.get(&view).copied().unwrap_or(0);
-            let out_col = n_keys; // eclass column index.
-
-            // Compile the retained tree to (statements, merged_expr, guard).
-            let tree = self.functions[&view]
-                .merge_tree
-                .clone()
-                .expect("term-build view");
-            let (compiled, guard) = term_build_merge::compile_term_build(self, &tree, n_keys)?;
-
-            // (1) Build the conflict batch as a TEMP table. Self-join the view on
-            // its key columns. The rule-encoded `@merge_rule` fires with
-            // `(= (ordering-max old new) new)` — i.e. `old = min(old,new)`,
-            // `new = max(old,new)`. Match that orientation so the minted terms
-            // (e.g. `C1(old,new)`) are byte-identical: `old = LEAST eclass,
-            // new = GREATEST` (`v1.c{out} < v2.c{out}`). Each unordered pair
-            // appears once. The seminaive window: at least one side is new
-            // (`ts >= last_at`); no upper bound (term-build writes land at `cur`,
-            // mirroring inline-congruence's `wm`-gated side).
-            let key_join: Vec<String> = (0..n_keys).map(|i| format!("v1.c{i} = v2.c{i}")).collect();
-            let key_proj: Vec<String> = (0..n_keys).map(|i| format!("v1.c{i} AS c{i}")).collect();
-            let batch_sql = format!(
-                "CREATE OR REPLACE TEMP TABLE batch AS \
-                 SELECT {keyproj}, \
-                        v1.c{out_col} AS old, v2.c{out_col} AS new \
-                 FROM {v} v1 JOIN {v} v2 \
-                   ON {keyjoin} AND v1.c{out_col} < v2.c{out_col} \
-                 WHERE v1.ts >= ?1 OR v2.ts >= ?1",
-                keyproj = key_proj.join(", "),
-                v = q(&view),
-                keyjoin = key_join.join(" AND "),
-            );
-            // `exec_bound` string-substitutes `?1`->last_at, `?2`->cur (the
-            // project-wide convention; duckdb-rs numbered params aren't used).
-            exec_bound(&self.conn, &batch_sql, last_at, cur)?;
-            let n_conflicts: i64 = self
-                .conn
-                .query_row("SELECT COUNT(*) FROM batch", [], |r| r.get(0))?;
-            if n_conflicts == 0 {
-                self.last_termbuild_at.insert(view.clone(), cur);
-                continue;
-            }
-
-            // Apply the IfEq guard (filter out canon-equal pairs: those mint
-            // nothing and keep `old`). Rewrite `batch` to the kept rows.
-            if let Some(guard_pred) = &guard {
-                let filtered = format!(
-                    "CREATE OR REPLACE TEMP TABLE batch AS \
-                     SELECT * FROM batch b WHERE {guard_pred}"
-                );
-                exec_bound(&self.conn, &filtered, last_at, cur)?;
-            }
-
-            // (2) Run the compiled mint/view statements (each over `batch b`).
-            for stmt in &compiled.stmts {
-                let n = exec_bound(&self.conn, stmt, last_at, cur)?;
-                self.rules_affected = self.rules_affected.wrapping_add(n as u64);
-            }
-            // Bump the watermark of every table the merge minted into, so the
-            // seminaive skip-gate of downstream rules (the `@<C>View` rebuild /
-            // congruence rules and the user rewrites that read these views)
-            // re-fires on the freshly-minted rows. Without this, those rules'
-            // `run_rule_variants` gate sees a stale watermark and skips them, so
-            // the minted constructors never get congruence-collapsed or rewritten.
-            for t in &compiled.written_tables {
-                self.bump_watermark(t, cur);
-            }
-
-            // (3) Write-back: delete the conflicting view rows and insert
-            // `(keys.., merged)`. The merged eclass = `compiled.merged_expr`.
-            let key_cols: Vec<String> = (0..n_keys).map(|i| format!("c{i}")).collect();
-            let key_sel: Vec<String> = (0..n_keys).map(|i| format!("b.c{i}")).collect();
-            // Delete both conflicting outputs for each batch key.
-            let del_old = format!(
-                "DELETE FROM {v} WHERE ({kc}, c{out_col}) IN (SELECT {ks}, b.old FROM batch b)",
-                v = q(&view),
-                kc = key_cols.join(", "),
-                ks = key_sel.join(", "),
-            );
-            let del_new = format!(
-                "DELETE FROM {v} WHERE ({kc}, c{out_col}) IN (SELECT {ks}, b.new FROM batch b)",
-                v = q(&view),
-                kc = key_cols.join(", "),
-                ks = key_sel.join(", "),
-            );
-            let nd1 = exec_bound(&self.conn, &del_old, last_at, cur)?;
-            let nd2 = exec_bound(&self.conn, &del_new, last_at, cur)?;
-            // Insert the merged row.
-            let ins = format!(
-                "INSERT INTO {v} ({kc}, c{out_col}, ts) \
-                 SELECT {ks}, {merged}, ?2 FROM batch b \
-                 ON CONFLICT DO NOTHING",
-                v = q(&view),
-                kc = key_cols.join(", "),
-                ks = key_sel.join(", "),
-                merged = compiled.merged_expr,
-            );
-            let ni = exec_bound(&self.conn, &ins, last_at, cur)?;
-            self.rules_affected = self.rules_affected.wrapping_add((nd1 + nd2 + ni) as u64);
-            self.bump_watermark(&view, cur);
-            total += n_conflicts as usize;
-            self.last_termbuild_at.insert(view.clone(), cur);
-        }
-        Ok(total)
-    }
-
-    /// Native CONSTRUCTOR-CONGRUENCE resolution (`--native-merge` with
-    /// `supports_native_congruence_merge()` true), INLINE as set-based SQL. This is
-    /// the host pass that REPLACES the dropped `@congruence_rule*` self-join rule.
-    ///
-    /// The encoder declares each constructor's `@<C>View` in the BASELINE all-columns
-    /// Unit-relation shape `(children..., eclass) -> Unit` (NOT the FD `(children) ->
-    /// eclass` function shape the collapse-at-insert backends use — see
-    /// `native_merge_views_coexist` / `uses_fd_native_merge_view`), so two
-    /// `(set (@<C>View children eclass))` writes with the same children but different
-    /// eclasses COEXIST as distinct rows (the relation's all-cols PK only de-dupes
-    /// identical rows). The `@congruence_rule*` is dropped and the view -> UF
-    /// association is recorded on `FunctionInfo::native_congruence_uf` by
-    /// `register_native_merge_view`.
-    ///
-    /// For each native-congruence view (`native_congruence_uf.is_some()`) whose
-    /// watermark advanced since the last pass:
-    ///   1. SELF-JOIN the view on its children columns to read every `(children, e1,
-    ///      e2)` FD conflict (same children, two eclasses) over the seminaive window
-    ///      (`v1` is the delta `ts ∈ [last, cur)`, `v2` is any `ts < cur`) — the same
-    ///      delta semantics as the dropped `@congruence_rule*` / `emit_inline_congruence`.
-    ///   2. INSERT the union edge `(GREATEST(e1,e2), LEAST(e1,e2), cur)` into the
-    ///      view's per-sort UF-backed function (`native_congruence_uf`, i.e.
-    ///      `@UF_Sf`) — exactly the `(larger, smaller)` row the dropped
-    ///      `@congruence_rule*` wrote (via `(set (@UF_Sf larger) smaller)`) — with
-    ///      `ON CONFLICT DO NOTHING` to dedupe. `sync_native_ufs` then drains these
-    ///      edges into the in-core UF on the next iteration, and the existing
-    ///      `@rebuild_rule*` re-canonicalizes the views (its full-`(children, eclass)`
-    ///      delete retracts the stale non-leader row — no eager delete needed here,
-    ///      mirroring the rule encoding's lifecycle exactly so bounded `(run N)` is
-    ///      bit-exact).
-    ///
-    /// Returns the number of conflict rows resolved (a saturation signal, like
-    /// `emit_term_build_merges`). Reuses `emit_inline_congruence`'s self-join +
-    /// `GREATEST`/`LEAST` edge SQL and `emit_term_build_merges`'s TEMP-table batch +
-    /// watermark gate/bump structure.
-    fn emit_native_congruence(&mut self, cur: i64) -> Result<usize> {
-        // Snapshot eligible (view, uf_table, n_keys) triples without a borrow held.
-        let entries: Vec<(String, String, usize)> = self
-            .functions
-            .iter()
-            .filter_map(|(name, info)| {
-                let uf_table = info.native_congruence_uf.clone()?;
-                // The native-congruence view is the BASELINE all-columns Unit
-                // relation `@<C>View (children..., eclass)`: every column is a "key"
-                // column (`inputs_len == cols.len()`), the LAST being the eclass. So
-                // `n_keys` (the children count) is `inputs_len - 1` and the eclass
-                // sits at index `inputs_len - 1`. Need at least one child column to
-                // form an FD conflict.
-                if info.inputs_len < 2 {
-                    return None;
-                }
-                let n_keys = info.inputs_len - 1;
-                // Skip if no writes since our last pass (watermark gate).
-                let wm = self.table_watermarks.get(name).copied().unwrap_or(0);
-                let last_at = self.last_native_cong_at.get(name).copied().unwrap_or(0);
-                if wm < last_at {
-                    return None;
-                }
-                Some((name.clone(), uf_table, n_keys))
-            })
-            .collect();
-
-        let mut total: usize = 0;
-        for (view, uf_table, n_keys) in entries {
-            let last_at = self.last_native_cong_at.get(&view).copied().unwrap_or(0);
-            let out_col = n_keys; // eclass column index.
-
-            // (1) Build the conflict batch as a TEMP table. Self-join the all-cols-
-            // keyed view on its key (children) columns. Orientation `v1.c{out} <
-            // v2.c{out}` keeps the winner = min eclass (matching union-by-min) and
-            // names the loser = max eclass (`v2`); each unordered pair appears once.
-            // Seminaive window mirroring the dropped `@congruence_rule*` (and
-            // `emit_inline_congruence`): `v1` is the NEW-since-last-pass delta
-            // (`ts >= ?1 AND ts < ?2`) and `v2` covers everything earlier-or-equal
-            // (`ts < ?2`). The current iteration's freshly-inserted rows are the
-            // delta side `v1`; `v2 < cur` covers ALL prior rows. The pair is oriented
-            // by value (NOT by which side is `v1`): `loser = GREATEST(eclasses)`,
-            // `winner = LEAST` — so a conflict is caught whether the smaller- or the
-            // larger-eclass row is the new delta. `v1.c{out} <> v2.c{out}` filters
-            // equal-eclass self-joins. A pair where BOTH sides are new appears twice
-            // (v1/v2 swapped) but yields the same `(GREATEST, LEAST)` edge, deduped
-            // by the UF table's `ON CONFLICT DO NOTHING`. This matches the rule
-            // encoding's delta semantics exactly, so the same conflicts are found in
-            // the same iterations and the bounded-`(run N)` fixpoint is identical.
-            let key_join: Vec<String> = (0..n_keys).map(|i| format!("v1.c{i} = v2.c{i}")).collect();
-            let key_proj: Vec<String> = (0..n_keys).map(|i| format!("v1.c{i} AS c{i}")).collect();
-            let batch_sql = format!(
-                "CREATE OR REPLACE TEMP TABLE native_cong_batch AS \
-                 SELECT {keyproj}, \
-                        GREATEST(v1.c{out_col}, v2.c{out_col}) AS loser, \
-                        LEAST(v1.c{out_col}, v2.c{out_col}) AS winner \
-                 FROM {v} v1 JOIN {v} v2 \
-                   ON {keyjoin} AND v1.c{out_col} <> v2.c{out_col} \
-                 WHERE v1.ts >= ?1 AND v1.ts < ?2 AND v2.ts < ?2",
-                keyproj = key_proj.join(", "),
-                v = q(&view),
-                keyjoin = key_join.join(" AND "),
-            );
-            exec_bound(&self.conn, &batch_sql, last_at, cur)?;
-            let n_conflicts: i64 =
-                self.conn
-                    .query_row("SELECT COUNT(*) FROM native_cong_batch", [], |r| r.get(0))?;
-            if n_conflicts == 0 {
-                self.last_native_cong_at.insert(view.clone(), cur);
-                continue;
-            }
-
-            // (2) Insert the union edges into the per-sort UF-backed function
-            // (`@UF_Sf`): `(GREATEST=loser, LEAST=winner, cur)` — the `(larger,
-            // smaller)` row the dropped `@congruence_rule*` wrote (via
-            // `(set (@UF_Sf larger) smaller)`). `ON CONFLICT DO NOTHING` dedupes
-            // against its all-cols `(c0, c1)` PK; `sync_native_ufs` drains
-            // `(c0, c1, ts)` into the in-core UF.
-            let ins_edge = format!(
-                "INSERT INTO {u} (c0, c1, ts) \
-                 SELECT b.loser, b.winner, ?2 FROM native_cong_batch b \
-                 ON CONFLICT DO NOTHING",
-                u = q(&uf_table),
-            );
-            let ne = exec_bound(&self.conn, &ins_edge, last_at, cur)?;
-            if ne > 0 {
-                self.rules_affected = self.rules_affected.wrapping_add(ne as u64);
-                self.bump_watermark(&uf_table, cur);
-            }
-
-            // NOTE: we do NOT delete the loser view row here. This pass is a faithful
-            // replica of the dropped `@congruence_rule*`, which ONLY emits the union
-            // edge — it leaves both conflicting `(children, e1)`/`(children, e2)`
-            // rows in place and lets the `@rebuild_rule*` retract the stale
-            // (non-leader) row once the leader change propagates (the same lifecycle
-            // the native-UF rule encoding uses, where this view is all-cols keyed and
-            // the rebuild's now-DELETE-before-INSERT order — see
-            // `native_merge_views_coexist` — re-canonicalizes without self-wiping).
-            // Eagerly deleting the loser here desynchronizes from that lifecycle and
-            // under-merges within a bounded `(run N)`.
-            total += n_conflicts as usize;
-            self.last_native_cong_at.insert(view.clone(), cur);
-        }
         Ok(total)
     }
 
@@ -4928,101 +3857,6 @@ impl EGraph {
         exec_bound(&self.conn, &stmt, 0, cur)?;
         self.bump_watermark(table, cur);
         Ok(id_read)
-    }
-
-    /// For each EqSort constructor with a registered pname whose
-    /// table watermark advanced this iter, INSERT into the pname any
-    /// same-input/different-id pair as a `(max, min, cur)` union
-    /// assertion. Returns the total rows inserted across all tables.
-    ///
-    /// Semantics match the term encoding's `@congruence_rule<N>`
-    /// scanning new view rows against the current view, with
-    /// `ON CONFLICT DO NOTHING` to dedupe pairs that two
-    /// `v1`/`v2` orderings would otherwise emit twice.
-    fn emit_inline_congruence(&mut self, cur: i64) -> Result<usize> {
-        let mut total: usize = 0;
-        // Snapshot the eligible (view, pname, inputs_len) triples so
-        // we don't hold a borrow on `self.functions` during execute.
-        // A function is eligible iff it has a pname registered and
-        // can hold same-input/different-id rows (i.e. it has an ID
-        // column). For both `eq_sort_ctor` and view relations the ID
-        // is the last column.
-        let entries: Vec<(String, String, usize)> = self
-            .functions
-            .iter()
-            .filter_map(|(name, info)| {
-                let pname = info.eq_sort_pname.clone()?;
-                if info.cols.len() < 2 {
-                    return None;
-                }
-                // For eq_sort_ctor (term tables) `inputs_len` is the
-                // input arity; the ID is at index `inputs_len`. For
-                // view relations there is no separate output column —
-                // all `cols` are part of the row; the ID sits at the
-                // last position by convention (term encoding emits
-                // views shaped as `(inputs…, id)`).
-                let inputs_len = if info.eq_sort_ctor {
-                    info.inputs_len
-                } else {
-                    info.cols.len() - 1
-                };
-                if inputs_len == 0 {
-                    return None;
-                }
-                // Skip if no inserts since the last inline-cong scan.
-                // `wm` is the max-ever `ts` of any insert into this
-                // view; `last_at` is the upper end of the previous
-                // scan window. If `wm < last_at` the scan range is
-                // guaranteed empty. (Note: NOT `wm < cur` — the
-                // view's last write might be from a few iters ago and
-                // we'd still want to pick up pairs that involve it
-                // until they've been scanned.)
-                let wm = self.table_watermarks.get(name).copied().unwrap_or(0);
-                let last_at = self.last_inline_cong_at.get(name).copied().unwrap_or(0);
-                if wm < last_at {
-                    return None;
-                }
-                Some((name.clone(), pname, inputs_len))
-            })
-            .collect();
-        for (view, pname, inputs_len) in entries {
-            let id_col = inputs_len; // ID is at index `inputs_len`.
-            let join_preds: Vec<String> = (0..inputs_len)
-                .map(|i| format!("v1.c{i} = v2.c{i}"))
-                .collect();
-            // Seminaive triangulation: `v1` is the "new since last
-            // scan" side (`ts >= last_inline_cong_at`); `v2` covers
-            // everything earlier-or-equal (`ts < cur`, since the
-            // current iter's rows are accounted for via `v1`). The
-            // pair (v1=old, v2=new) is the same pair as (v1=new,
-            // v2=old) with the two halves swapped, so we don't need
-            // to emit a second branch — `ON CONFLICT DO NOTHING` on
-            // pname dedupes if v1 and v2 are both new.
-            let last_at = self.last_inline_cong_at.get(&view).copied().unwrap_or(0);
-            let sql = format!(
-                "INSERT INTO {} (c0, c1, ts) \
-                 SELECT GREATEST(v1.c{id_col}, v2.c{id_col}), \
-                        LEAST(v1.c{id_col}, v2.c{id_col}), \
-                        ?2 \
-                 FROM {} v1, {} v2 \
-                 WHERE v1.ts >= ?1 AND v1.ts < ?2 AND v2.ts < ?2 \
-                   AND v1.c{id_col} <> v2.c{id_col} \
-                   AND {} \
-                 ON CONFLICT DO NOTHING",
-                q(&pname),
-                q(&view),
-                q(&view),
-                join_preds.join(" AND "),
-            );
-            let n = exec_bound(&self.conn, &sql, last_at, cur)?;
-            if n > 0 {
-                self.rules_affected = self.rules_affected.wrapping_add(n as u64);
-                self.bump_watermark(&pname, cur);
-                total += n;
-            }
-            self.last_inline_cong_at.insert(view, cur);
-        }
-        Ok(total)
     }
 
     /// Run all rules (any ruleset) once. Convenience over

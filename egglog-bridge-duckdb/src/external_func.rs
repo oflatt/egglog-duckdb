@@ -67,30 +67,8 @@
 //!   inline-encodable types; intern-table lookup for the rest), but
 //!   needs to thread through the UDF entry point.
 
-use egglog_backend_trait::{ExecutionState, ExternalFunction, ExternalFunctionId, Value};
+use egglog_backend_trait::{ExternalFunction, ExternalFunctionId};
 use egglog_numeric_id::NumericId;
-
-/// Find-or-self canon-prim placeholder for the `--native-uf --duckdb` path.
-///
-/// PR #782's UF-backed function returns this id from
-/// [`crate::EGraph::add_uf_function`](crate::EGraph) as the `@canon_S`
-/// find-or-self primitive. On DuckDB the compile pre-pass
-/// (`compile::rewrite_canon_prims`) recognizes the primitive NAME the frontend
-/// rebinds to this id and rewrites `Term::Prim(name, [x])` into a `duck_uf_<sort>
-/// _find(x)` UDF call — so this registered `ExternalFunction` is never invoked
-/// through the SQL execution path (DuckDB evaluates primitives in SQL, not via
-/// `ExternalFunction::invoke`). It exists only so the id is a real, freeable
-/// [`ExternalFunctionId`]. Invoking it returns the argument unchanged
-/// (find-on-miss = self).
-#[derive(Clone)]
-pub(crate) struct CanonStub;
-
-impl ExternalFunction for CanonStub {
-    fn invoke(&self, _state: &mut ExecutionState, args: &[Value]) -> Option<Value> {
-        // Identity-on-miss: a find against an unrecorded id is the id itself.
-        args.first().copied()
-    }
-}
 
 /// Per-id storage slot. The `Vec<Slot>` index is the
 /// `ExternalFunctionId::rep()` value.

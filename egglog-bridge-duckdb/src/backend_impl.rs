@@ -885,14 +885,12 @@ impl Backend for EGraph {
     /// owns its eclass column. The frontend calls this (via `register_native_merge_views`)
     /// once per native-merge view before the first run.
     ///
-    /// On DuckDB the view keeps the BASELINE all-columns Unit-relation shape (rows
-    /// coexist; `native_merge_views_coexist()` is true) and the `@congruence_rule*`
-    /// has been dropped by the encoder. We record the UF function table on the view's
-    /// [`FunctionInfo::native_congruence_uf`]; [`EGraph::emit_native_congruence`] then
-    /// reads each FD conflict on the view via a self-join and writes the
-    /// `(larger, smaller)` union edge into that `@UF_Sf` — exactly what the dropped
-    /// rule did — and the existing `@rebuild_rule*` re-canonicalizes the views.
-    /// `sync_native_ufs` drains the `@UF_Sf` edges into the in-core UF.
+    /// NOTE: term-mode native-merge on DuckDB is now REJECTED at the CLI (its
+    /// congruence host-pass required the removed native-UF machinery), so this
+    /// registration is only exercised by the PROOF-mode native-merge path, which
+    /// resolves congruence via `emit_native_congruence_proof` /
+    /// [`FunctionInfo::native_congruence_proof`]. `native_congruence_uf` (the
+    /// term-mode association) is retained but inert on the fast-relational default.
     fn register_native_merge_view(&mut self, uf_func: FunctionId, view_func: FunctionId) {
         let uf_table = self.name_for_function_id(uf_func).to_string();
         let view_name = self.name_for_function_id(view_func).to_string();
@@ -941,59 +939,18 @@ impl Backend for EGraph {
         onchange: Option<FunctionId>,
         proof: Option<egglog_backend_trait::UfProofConfig>,
     ) -> anyhow::Result<(FunctionId, ExternalFunctionId)> {
-        // PR #782's UF-backed `:impl displaced-union-find` function is honoured
-        // only on the `--native-uf --duckdb` path. With the flag off, the
-        // relational UF encoding is used (no `add_uf_function` calls), so the
-        // bail is unreachable in practice. The DuckDB backend reuses its SQL
-        // host-pass rebuild (the `sync_native_ufs` scan + the find UDF + the
-        // rebuild-rule demote) but rewires recognition onto this explicit call.
-        if !self.native_uf_enabled {
-            anyhow::bail!(
-                "the DuckDB backend only supports `:impl displaced-union-find` functions \
-                 under `--native-uf` (it drives PR #782's UF-backed encoding through a \
-                 SQL host-pass rebuild)"
-            );
-        }
-        // Proof mode is TERM mode only for now (the provenance-tracking UF would
-        // need the `@UFChange_S` proof column composed in a leader-change
-        // callback, which the SQL host-pass rebuild does not run).
-        if proof.is_some() {
-            anyhow::bail!(
-                "the DuckDB backend does not yet support proof-mode native-UF functions \
-                 (`--native-uf` is TERM mode only on DuckDB)"
-            );
-        }
-
-        // Register `@UF_Sf` as an append-only 2-column relation `(S S)` (both
-        // columns PK -> distinct union pairs preserved, ON CONFLICT DO NOTHING),
-        // not a function: #782 writes a union as `(set (@UF_Sf lhs) rhs)`, and a
-        // function's input PK would dedupe on `lhs` and silently drop a second
-        // union of the same lhs to a different rhs. Each union assertion lands
-        // as a `(lhs, rhs, ts)` row; `sync_native_ufs` scans new rows into the
-        // in-core UF. Spin up the matching `UfTable` + find UDF.
-        let udf_name = self.register_native_uf_function(&name)?;
-
-        // Record the onchange relation name so the rebuild-rule host-pass
-        // rewrite can recognize and STRIP the (always-empty) `@UFChange_S` body
-        // atom: DuckDB never runs the leader-change callback, so the relational
-        // join `@UFChange_S ⋈ view` would produce nothing. Stripping it leaves a
-        // view scan + `@canon_S`-find guard — the SQL host-pass rebuild.
-        if let Some(oc) = onchange {
-            let oc_name = self.name_for_function_id(oc).to_string();
-            self.native_uf_onchange.insert(oc_name);
-        }
-
-        // The find-or-self canon-prim. A real, freeable `ExternalFunctionId`;
-        // the compile pre-pass (`compile::rewrite_canon_prims`) rewrites
-        // `Term::Prim(<canon-name>, [x])` into a UDF call (`<udf_name>(x)`) once
-        // the frontend rebinds the primitive name to this id (recorded in
-        // `set_external_func_name`). The registered stub is never invoked.
-        let canon = self.register_external_func(Box::new(external_func::CanonStub));
-        self.native_uf_canon_id_udf.insert(canon, udf_name);
-
-        let id = FunctionId::new(self.backend_function_names.len() as u32);
-        self.backend_function_names.push(name);
-        Ok((id, canon))
+        // DuckDB has been migrated OFF native-UF onto the fast RELATIONAL
+        // term-encoding, so PR #782's UF-backed `:impl displaced-union-find`
+        // function is no longer supported. Congruence is rule-encoded
+        // (`@congruence_rule*`) and canonicalized by the relational δuf
+        // fast-rebuild; the relational UF encoding never issues `add_uf_function`
+        // calls, so this path is unreachable in practice.
+        let _ = (name, onchange, proof);
+        anyhow::bail!(
+            "the DuckDB backend no longer supports `:impl displaced-union-find` \
+             (native-UF) functions; it was migrated onto the fast relational \
+             term-encoding (rule-encoded congruence + relational δuf fast-rebuild)"
+        )
     }
 
     fn table_size(&self, table: FunctionId) -> usize {
@@ -1222,33 +1179,10 @@ impl Backend for EGraph {
         }
     }
 
-    fn get_canon_repr(&self, val: Value, ty: ColumnTy) -> Value {
-        // For base values, canonicalization is the identity.
-        if matches!(ty, ColumnTy::Base(_)) {
-            return val;
-        }
-        // For eq-sort ids under `--duck-native-uf`, we have an
-        // in-memory union-find indexed by the sort's pname. The
-        // trait's `get_canon_repr` doesn't surface a sort handle —
-        // only `ColumnTy::Id`. As a pragmatic interim, we consult
-        // every registered native UF and take the first one that
-        // contains the id; if none does, return the id unchanged.
-        //
-        // Under the non-native-UF path, canonicalization happens
-        // implicitly through the SQL pname tables; the trait
-        // surface's `get_canon_repr` is not consulted at all by the
-        // existing pipeline. Until Commit 14 routes a caller through
-        // here, this method is correctness-irrelevant — a NOP-style
-        // identity returns the right answer in every situation that
-        // matters today.
-        let needle = val.rep() as i64;
-        for uf in self.native_ufs.values() {
-            // The UDF reads the UF read-only; we mirror that here.
-            let canon = uf.lock().unwrap().find_ro(needle);
-            if canon != needle {
-                return Value::new(canon as u32);
-            }
-        }
+    fn get_canon_repr(&self, val: Value, _ty: ColumnTy) -> Value {
+        // DuckDB canonicalizes implicitly through the SQL pname tables (the
+        // relational rebuild), so the trait surface's `get_canon_repr` is not
+        // consulted by the pipeline — an identity return is correct.
         val
     }
 
@@ -1488,24 +1422,19 @@ impl Backend for EGraph {
         true
     }
 
-    /// `--native-merge` CONSTRUCTOR-CONGRUENCE: DuckDB does congruence INLINE via a
-    /// set-based host pass instead of the rule-encoded `@congruence_rule*`. Returning
-    /// `true` makes the encoder DROP the `@congruence_rule*` self-join (proof_encoding
-    /// `handle_merge_or_congruence`) and record the view -> output-sort-UF association
-    /// (via `register_native_merge_view`). Combined with `native_merge_views_coexist()`
-    /// = `true`, the constructor's `@<C>View` keeps the BASELINE all-columns
-    /// Unit-relation shape `(children..., eclass) -> Unit` (NOT the FD `(children) ->
-    /// eclass` function shape the collapse-at-insert backends use), so its rows
-    /// COEXIST and the existing `@rebuild_rule*` retracts stale rows by the full
-    /// `(children, eclass)` key. At the iteration boundary
-    /// [`EGraph::emit_native_congruence`] self-joins the view, finds each FD conflict
-    /// (same children, two eclasses), and writes the `(larger, smaller)` union edge
-    /// into the eclass sort's `@UF_Sf` — exactly the row the dropped rule wrote;
-    /// `sync_native_ufs` drains it and `@rebuild_rule*` re-canonicalizes. This avoids
-    /// the historical wrong-results bug (the `UnionId`/`Min` FD merge collapsing
-    /// colliding eclasses at insert time WITHOUT emitting a union edge).
+    /// `--native-merge` CONSTRUCTOR-CONGRUENCE. Returning `true` makes the encoder
+    /// DROP the `@congruence_rule*` self-join (proof_encoding
+    /// `handle_merge_or_congruence`) and record the view -> output-sort-UF
+    /// association (via `register_native_merge_view`).
     ///
-    /// PROOF-mode native-merge IS now supported, via the 2-table proof-congruence
+    /// TERM MODE: DuckDB's term-mode native-merge (the old inline `emit_native_
+    /// congruence` host pass into `@UF_Sf`) has been REMOVED with the native-UF
+    /// migration — `--native-merge --duckdb` in non-proof mode is now rejected at
+    /// the CLI, and plain `--duckdb` keeps the rule-encoded `@congruence_rule*`
+    /// (this method's DROP effect only fires when the encoder's `native_merge()`
+    /// is set, which no longer happens for the non-proof duckdb default).
+    ///
+    /// PROOF-mode native-merge IS still supported, via the 2-table proof-congruence
     /// encoding rendered in the all-columns COEXIST shape: the constructor's
     /// `@<C>View` keeps the BASELINE all-columns shape `(children..., eclass) ->
     /// Proof` and a paired `@<F>ViewProof` SIDE-TABLE holds the per-row view proof.
@@ -1515,9 +1444,10 @@ impl Backend for EGraph {
     /// proof-carrying union edge `(larger, smaller, edge_proof)` into the relational
     /// proof-UF `@UF_S` — byte-for-byte the row the dropped `@congruence_rule*`
     /// wrote via `union(new, old, Trans(prf1, Sym(prf2)))`. So this returns `true`
-    /// in both term mode (proof-free congruence into `@UF_Sf`) and proof mode (the
-    /// proof-carrying congruence into `@UF_S`). `proofs_enabled` is set by
-    /// `enable_proofs` at construction, before the encoder queries this.
+    /// so PROOF-mode native-merge congruence keeps working (the proof-carrying
+    /// congruence into `@UF_S`); term mode no longer reaches the dropped-rule path.
+    /// `proofs_enabled` is set by `enable_proofs` at construction, before the
+    /// encoder queries this.
     fn supports_native_congruence_merge(&self) -> bool {
         true
     }

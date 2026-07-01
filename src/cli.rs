@@ -79,13 +79,11 @@ struct Args {
     /// are not yet supported; see `src/backend_duckdb.rs` for current scope.
     #[clap(long = "duckdb")]
     duckdb_backend: bool,
-    /// Use a native union-find data structure for the term-encoding
-    /// UF function (`@_u_f___<sort>f`) instead of a SQL table. The
-    /// table-backed UF requires three maintenance rulesets
-    /// (singleparent, path_compress, uf_function_index) that together
-    /// dominate runtime on saturating workloads; the native UF
-    /// replaces them with O(α(n)) memory ops behind a DuckDB UDF.
-    /// `--duckdb` only; off by default.
+    /// RETIRED. DuckDB has been migrated OFF native-UF onto the fast RELATIONAL
+    /// term-encoding, so this flag no longer has an implementation. It is kept
+    /// only so `--duck-native-uf --duckdb` produces a clear "no longer supported"
+    /// error (see the guard in `cli`) instead of an unknown-flag error. Use plain
+    /// `--duckdb`.
     #[clap(long = "duck-native-uf")]
     duck_native_uf: bool,
     /// Run the program on the experimental Feldera/DBSP backend.
@@ -105,14 +103,15 @@ struct Args {
     /// singleparent/path_compress/uf_function_index maintenance rulesets.
     /// Emits PR #782's `:impl displaced-union-find` UF-backed function plus an
     /// onchange relation driving the rebuild. Runs on the default native bridge
-    /// AND on `--flowlog` / `--feldera` / `--duckdb`: each honours the UF-backed
-    /// encoding but drives its own fast HOST-PASS rebuild instead of the
-    /// onchange-driven rebuild rules (Feldera additionally keeps the
-    /// `view ⋈ @UF_Sf` integral out of the DBSP circuit; DuckDB uses a find UDF
-    /// + demote pass). Term-encoding only on the dataflow/SQL backends. Supports
+    /// AND on `--flowlog` / `--feldera`: each honours the UF-backed encoding but
+    /// drives its own fast HOST-PASS rebuild instead of the onchange-driven
+    /// rebuild rules (Feldera additionally keeps the `view ⋈ @UF_Sf` integral out
+    /// of the DBSP circuit). Term-encoding only on the dataflow backends. Supports
     /// `--proofs` on the native bridge (provenance-tracking UF; leader-change
     /// callback composes the onchange proof) — but `--native-uf` with
-    /// `--flowlog`/`--feldera`/`--duckdb` is TERM mode only.
+    /// `--flowlog`/`--feldera` is TERM mode only.
+    /// NOTE: `--native-uf --duckdb` is REJECTED — DuckDB was migrated OFF native-UF
+    /// onto the fast relational term-encoding (use plain `--duckdb`).
     /// Off by default; the relational encoding is unchanged when off.
     #[clap(long = "native-uf")]
     native_uf: bool,
@@ -226,7 +225,24 @@ pub fn cli(mut egraph: EGraph) {
     // native-uf is NOT explicitly requested. (An explicit `--native-merge` still
     // force-enables it — e.g. the bridge A2 `--proofs --native-merge --native-uf`
     // path — since this only SETS, never clears, `args.native_merge`.)
-    if term_encoding_active && !args.no_native_merge && !args.native_uf {
+    //
+    // DUCKDB FAST-RELATIONAL (non-proof): `--duckdb` is migrated OFF native-UF
+    // onto the fast RELATIONAL term-encoding. Plain `--duckdb` (no explicit
+    // `--native-merge`/`--native-uf`, non-proof) must NOT auto-enable native-merge:
+    // congruence stays RULE-ENCODED (`@congruence_rule*`) and the relational
+    // δuf fast-rebuild does the canonicalization (see the `fast_rebuild` default
+    // below). Native-merge on non-proof duckdb would drop `@congruence_rule*` and
+    // require the (native-uf-gated) `emit_native_congruence` host pass, which has
+    // been removed — so leave it off. An explicit `--native-merge --duckdb` /
+    // `--native-uf --duckdb` is REJECTED with a clear error further below (the
+    // native path is gone on duckdb). feldera/flowlog and proof-mode duckdb are
+    // UNCHANGED: they keep auto-enabling native-merge.
+    let duckdb_fast_relational_default = args.duckdb_backend && !args.proofs && !args.proof_testing;
+    if term_encoding_active
+        && !args.no_native_merge
+        && !args.native_uf
+        && !duckdb_fast_relational_default
+    {
         args.native_merge = true;
     }
 
@@ -248,18 +264,25 @@ pub fn cli(mut egraph: EGraph) {
     //    FD-conflict via the UF-backed function).
     //
     // The FlowLog, Feldera, AND DuckDB backends require the UF-backed routing for
-    // congruence (their relational-UF native-merge path is not wired up), so
-    // `--native-merge` on those implies `--native-uf`. On the native bridge,
-    // `--native-merge` alone uses the relational UF; `--native-merge --native-uf`
-    // keeps the original UF-backed path intact.
+    // an EXPLICIT `--native-merge` (their relational-UF native-merge path is not
+    // wired up), so an explicit `--native-merge` on those implies `--native-uf`.
+    // On the native bridge, `--native-merge` alone uses the relational UF;
+    // `--native-merge --native-uf` keeps the original UF-backed path intact.
     //
-    // On DuckDB, `--native-merge` enables a VALUE-FOLD custom `:merge` (a pure
-    // fold of primitives over `old`/`new` that yields a plain value, e.g.
-    // `(from-string (to-string (* new old)))`) to run NATIVELY in-SQL via
-    // `ON CONFLICT DO UPDATE SET c{out} = <fold-expr>` (`supports_value_fold_merge`
-    // = true), instead of downgrading to the rule-encoded `@merge_rule`. Term-build
-    // custom `:merge` (e-node minting on an eq-sort output) is NOT yet supported on
-    // DuckDB and still rule-encodes (`supports_term_build_merge` = false).
+    // DUCKDB DEFAULT (non-proof, no explicit `--native-merge`/`--native-uf`):
+    // native-merge is NOT auto-enabled (see the flip carve-out above), so the fold
+    // below does NOT fire — `--duckdb` runs the fast RELATIONAL term-encoding with
+    // NO native-UF: congruence is RULE-ENCODED (`@congruence_rule*`) and the
+    // relational δuf fast-rebuild canonicalizes. Custom value-fold / term-build
+    // `:merge` on this default path also rule-encode (correct; the native in-SQL
+    // value-fold requires `--native-merge`, which is now opt-in on duckdb).
+    //
+    // EXPLICIT `--native-merge --duckdb` / `--native-uf --duckdb` are REJECTED
+    // (guard below): the old native path (congruence inline via
+    // `emit_native_congruence` and VALUE-FOLD custom `:merge` run natively in-SQL
+    // via `ON CONFLICT DO UPDATE SET c{out} = <fold-expr>`) required the removed
+    // DuckDB native-UF host-pass, so it is no longer available. `--native-merge`
+    // stays supported on the native bridge / flowlog / feldera.
     //
     // PROOF-MODE EXCEPTION (FlowLog / Feldera / DuckDB): `--flowlog --proofs
     // --native-merge`, `--feldera --proofs --native-merge`, and `--duckdb --proofs
@@ -277,11 +300,31 @@ pub fn cli(mut egraph: EGraph) {
     let single_output_proof_native_merge =
         (args.flowlog_backend || args.feldera_backend || args.duckdb_backend)
             && (args.proofs || args.proof_testing);
+    // Only flowlog/feldera force native-UF for native-merge now. DuckDB is
+    // migrated OFF native-UF entirely (no native-UF host-pass), so it is NOT in
+    // this fold — an explicit `--native-merge --duckdb` is rejected below rather
+    // than routed onto the (deleted) native-UF path.
     if args.native_merge
-        && (args.flowlog_backend || args.feldera_backend || args.duckdb_backend)
+        && (args.flowlog_backend || args.feldera_backend)
         && !single_output_proof_native_merge
     {
         args.native_uf = true;
+    }
+
+    // DUCKDB FAST-RELATIONAL: on the migrated default path (`--duckdb`, non-proof,
+    // no explicit native-merge/native-uf) engage the backend's relational δuf
+    // fast-rebuild so the RULE-ENCODED congruence is canonicalized by the fast
+    // per-column delta rebuild (`delta_rebuild = fast_rebuild && !native_uf` in
+    // egglog-bridge-duckdb). Bit-exact with the full rebuild under
+    // canonicalize-at-creation. Only when nothing else routed us onto native-uf /
+    // native-merge, and never in proof mode. feldera/flowlog are untouched.
+    if args.duckdb_backend
+        && !args.native_uf
+        && !args.native_merge
+        && !args.proofs
+        && !args.proof_testing
+    {
+        args.fast_rebuild = true;
     }
 
     // The experimental backends are mutually exclusive: each swaps in a
@@ -289,6 +332,35 @@ pub fn cli(mut egraph: EGraph) {
     if (args.duckdb_backend as u8) + (args.feldera_backend as u8) + (args.flowlog_backend as u8) > 1
     {
         log::error!("at most one of --duckdb, --feldera, --flowlog may be passed");
+        std::process::exit(1);
+    }
+
+    // DUCKDB is migrated OFF native-UF onto the fast RELATIONAL term-encoding.
+    // The DuckDB native-UF host-pass (and its `--native-merge` inline-congruence
+    // sibling, which required native-UF) have been removed. Reject the retired
+    // combinations with a clear pointer to the default rather than silently
+    // producing wrong results. (feldera/flowlog keep native-UF/native-merge.)
+    if args.duckdb_backend && (args.native_uf || args.duck_native_uf) {
+        log::error!(
+            "--native-uf / --duck-native-uf are no longer supported with --duckdb \
+             (DuckDB was migrated off native-UF onto the fast relational term-encoding). \
+             Use plain --duckdb (fast relational: rule-encoded congruence + relational \
+             δuf fast-rebuild)."
+        );
+        std::process::exit(1);
+    }
+    // NON-PROOF native-merge on duckdb required the removed native-UF host-pass
+    // (`emit_native_congruence`), so reject it. PROOF-MODE native-merge is a
+    // DIFFERENT path (`emit_native_congruence_proof`, the 2-table proof-congruence
+    // encoding — never native-UF-gated) and is still auto-enabled + supported, so
+    // it must NOT be rejected here.
+    if args.duckdb_backend && args.native_merge && !args.proofs && !args.proof_testing {
+        log::error!(
+            "--native-merge is no longer supported with --duckdb in non-proof mode \
+             (its inline congruence required the removed native-UF host-pass). Use \
+             plain --duckdb (fast relational: rule-encoded congruence + relational \
+             δuf fast-rebuild)."
+        );
         std::process::exit(1);
     }
 
@@ -518,15 +590,13 @@ pub fn cli(mut egraph: EGraph) {
                     }
                     continue;
                 }
-                // `--native-uf --duckdb`: enable the DuckDB backend's in-process
-                // UF host-pass (`enable_native_uf`, via the config flag) AND the
-                // matching PR #782 encoding (`with_native_uf` below) — both are
-                // needed (the encoding emits the UF-backed program; the backend
-                // interception runs it through the SQL host-pass rebuild). The
-                // legacy `--duck-native-uf` flag drives the same backend
-                // interception on the *relational* (non-#782) encoding.
+                // DuckDB is migrated OFF native-UF onto the fast RELATIONAL
+                // term-encoding: `fast_rebuild` engages the relational δuf
+                // fast-rebuild (defaulted ON for the plain-`--duckdb` path by the
+                // fold near the top of `cli`), and congruence is rule-encoded
+                // (`@congruence_rule*`). An explicit `--native-merge --duckdb`
+                // opt-in still routes through `with_native_merge` below.
                 let mut duck_eg = egglog::EGraph::with_duckdb_backend(egglog::DuckBackendConfig {
-                    native_uf: args.duck_native_uf || args.native_uf,
                     fast_rebuild: args.fast_rebuild,
                     proofs: false,
                 })
@@ -534,17 +604,6 @@ pub fn cli(mut egraph: EGraph) {
                     log::error!("failed to start DuckDB backend: {err}");
                     std::process::exit(1);
                 });
-                if args.native_uf {
-                    duck_eg = duck_eg.with_native_uf();
-                }
-                // `--native-merge --duckdb`: switch the freshly-built duckdb egraph's
-                // encoder to the FD-keyed view + native value-fold `:merge`. Must be
-                // set on `duck_eg` (the egraph that runs the program). The
-                // egglog-experimental binary instead pre-builds the duckdb egraph and
-                // reaches `with_native_merge` via the `has_duckdb_backend()` path above.
-                if args.native_merge {
-                    duck_eg = duck_eg.with_native_merge();
-                }
                 duck_eg.parser = std::mem::take(&mut egraph.parser);
                 duck_eg.fact_directory.clone_from(&args.fact_directory);
                 duck_eg.ensure_no_reserved_symbols(false);

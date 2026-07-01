@@ -117,54 +117,6 @@ fn action_target(a: &Action, functions: &HashMap<String, FunctionInfo>) -> Optio
     }
 }
 
-/// Mark each body atom as demotable iff it is a function-table
-/// lookup whose function has a registered native union-find UDF
-/// (`info.native_uf_udf == Some(_)`), the inputs are bound by an
-/// earlier body atom, and the output is a fresh `Var`. The compiler
-/// will emit a scalar UDF call binding the output var rather than
-/// adding a join atom.
-///
-/// Walks the body greedily in source order. A demoted atom only
-/// contributes its output binding, so later atoms that depend on
-/// it can still resolve.
-fn compute_native_uf_demote(body: &[Atom], functions: &HashMap<String, FunctionInfo>) -> Vec<bool> {
-    let mut demote = vec![false; body.len()];
-    let mut bound: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (i, atom) in body.iter().enumerate() {
-        match atom {
-            Atom::Func { name, args } => {
-                let info = match functions.get(name) {
-                    Some(i) => i,
-                    None => continue,
-                };
-                let inputs_bound = args[..info.inputs_len].iter().all(|t| match t {
-                    Term::Var(v) => bound.contains(v),
-                    _ => true,
-                });
-                let output_fresh = info.inputs_len + 1 == args.len()
-                    && matches!(&args[info.inputs_len], Term::Var(v) if !bound.contains(v));
-                if info.native_uf_udf.is_some() && inputs_bound && output_fresh {
-                    demote[i] = true;
-                    if let Term::Var(v) = &args[info.inputs_len] {
-                        bound.insert(v.clone());
-                    }
-                } else {
-                    for arg in args {
-                        if let Term::Var(v) = arg {
-                            bound.insert(v.clone());
-                        }
-                    }
-                }
-            }
-            Atom::Bind { var, .. } => {
-                bound.insert(var.clone());
-            }
-            Atom::Filter(_) => {}
-        }
-    }
-    demote
-}
-
 /// Lift inline `Term::FuncCall`s that target an EqSort constructor
 /// (or its term-encoded view) into explicit `LetCtor` actions, so
 /// the existing hash-cons machinery in the materialized path can
@@ -285,9 +237,7 @@ pub(crate) fn compile_rule(
     rule: &Rule,
     functions: &HashMap<String, FunctionInfo>,
     proofs_enabled: bool,
-    native_uf_gate_tables: &[String],
     delta_rebuild: bool,
-    native_uf_drop_delta_view: bool,
 ) -> Result<CompiledRule> {
     // Rewrite the rule before validation/compilation so any nested
     // eq-sort constructor calls in action positions become explicit
@@ -373,20 +323,11 @@ pub(crate) fn compile_rule(
         }
     }
 
-    // Native-UF demote plan: body atoms against `:merge ordering-min`
-    // functions get rewritten as scalar UDF calls
-    // (`duck_uf_<sort>_find(input)`) rather than join atoms. They
-    // don't contribute to the seminaive triangulation either —
-    // dropping them from `func_atom_indices` removes the variants
-    // that would have focused on them. Empty `Vec<bool>` (all
-    // false) when `--duck-native-uf` is off.
-    let demote = compute_native_uf_demote(&rule.body, functions);
-
     let func_atom_indices: Vec<usize> = rule
         .body
         .iter()
         .enumerate()
-        .filter_map(|(i, a)| (matches!(a, Atom::Func { .. }) && !demote[i]).then_some(i))
+        .filter_map(|(i, a)| matches!(a, Atom::Func { .. }).then_some(i))
         .collect();
 
     if rule.actions.is_empty() {
@@ -400,96 +341,15 @@ pub(crate) fn compile_rule(
     // exactly one "first new" atom), so no dedup is needed. Cuts
     // the per-iter statement count by ~K× without changing the
     // total join work.
-    //
-    // `--native-uf --fast-rebuild`: DROP this non-gated seminaive
-    // variant when it is the native-UF rebuild host-pass's δview-focus
-    // branch (process NEW view rows this iteration through the find
-    // UDF — `ts ∈ [?1,?2)`). It mirrors the relational `+fastrb`'s
-    // δview-drop (`delta_rebuild_view_idx`): Δ(view⋈uf) =
-    // [δview × uf_old ≡ ∅, DROP] + [view_all × δuf, KEEP]. The δuf
-    // term is the gated `__UF_CHANGED__` semijoin emitted below, which
-    // re-canonicalizes every stale row, so dropping the always-empty
-    // δview probe is bit-exact and saves the per-iteration scan. Only
-    // rebuild rules carry a non-empty `native_uf_gate_tables`, so this
-    // never touches user rules. Under `--native-uf` WITHOUT
-    // `--fast-rebuild` (the +nuf full-rebuild cell), the δview-focus
-    // branch is KEPT (it costs the probe, the point of the +nuf vs
-    // +nuf+fastrb distinction).
-    let drop_native_uf_view_focus = native_uf_drop_delta_view && !native_uf_gate_tables.is_empty();
     let mut variants: Vec<CompiledVariant> = Vec::new();
-    if !drop_native_uf_view_focus {
-        variants.push(compile_fused_variant(
-            rule,
-            &func_atom_indices,
-            functions,
-            &demote,
-            None,
-            proofs_enabled,
-            delta_rebuild,
-        )?);
-    }
-    // For each distinct table referenced by a demoted atom, emit
-    // one gated "UF-changed" recovery variant: scan the body with
-    // no `>= ?1` lower bound, look up canonical roots via UDF,
-    // canonicalize stale rows. The runner runs this only when the
-    // gated table's watermark has advanced since this rule last
-    // ran — saves work when nothing has unified.
-    let mut demote_tables: Vec<String> = Vec::new();
-    for (i, atom) in rule.body.iter().enumerate() {
-        if !demote[i] {
-            continue;
-        }
-        if let Atom::Func { name, .. } = atom
-            && !demote_tables.iter().any(|n| n == name)
-        {
-            demote_tables.push(name.clone());
-        }
-    }
-    for gated in &demote_tables {
-        // Native-UF gating: writes that affect the demoted atom's
-        // canonicalization land in the corresponding pname (raw UF)
-        // table, not the function-form table itself. Derive pname
-        // by the term-encoding naming convention so the runner can
-        // skip the gated variant when nothing new has unified this
-        // iteration.
-        let gate_pname = gated
-            .strip_suffix('f')
-            .unwrap_or(gated.as_str())
-            .to_string();
-        variants.push(compile_fused_variant(
-            rule,
-            &func_atom_indices,
-            functions,
-            &demote,
-            Some(&gate_pname),
-            proofs_enabled,
-            delta_rebuild,
-        )?);
-    }
-    // `--native-uf --duckdb` rebuild host-pass: the #782 rebuild rule was
-    // rewritten (in `EGraph::rewrite_native_uf_rule`) into a view scan +
-    // `@canon_S`-find guard, with no demotable `@UF_Sf` body atom, so the loop
-    // above emits no gated variant. The seminaive variant only sees view rows
-    // inserted this iteration; old rows go stale when a later union displaces
-    // one of their ids. Emit a gated full-scan variant per union table the
-    // rule reads (gated on that table's watermark — i.e. "a union landed since
-    // this rule last ran"), so stale old rows get re-canonicalized. This is the
-    // exact role the relational path's demote-table gated variant plays.
-    for gate in native_uf_gate_tables {
-        if demote_tables.iter().any(|n| n == gate) {
-            // Already gated via the demote path.
-            continue;
-        }
-        variants.push(compile_fused_variant(
-            rule,
-            &func_atom_indices,
-            functions,
-            &demote,
-            Some(gate),
-            proofs_enabled,
-            delta_rebuild,
-        )?);
-    }
+    variants.push(compile_fused_variant(
+        rule,
+        &func_atom_indices,
+        functions,
+        None,
+        proofs_enabled,
+        delta_rebuild,
+    )?);
     Ok(CompiledRule {
         name: rule.name.clone(),
         ruleset: rule.ruleset.clone(),
@@ -613,14 +473,17 @@ fn compile_fused_variant(
     rule: &Rule,
     func_atom_indices: &[usize],
     functions: &HashMap<String, FunctionInfo>,
-    demote: &[bool],
     gate_table: Option<&str>,
     proofs_enabled: bool,
     delta_rebuild: bool,
 ) -> Result<CompiledVariant> {
+    // DuckDB is migrated off native-UF, so no body atom is ever "demoted" to a
+    // find-UDF call — every Func atom is a real join atom. Keep the all-false
+    // `demote` plumbing the seminaive helpers expect.
+    let demote = vec![false; rule.body.len()];
+    let demote = demote.as_slice();
     // 1) Build the body's FROM/WHERE and a binding for body vars.
-    let (from, base_where_parts, mut binding) =
-        walk_body(&rule.body, &rule.name, functions, demote)?;
+    let (from, base_where_parts, mut binding) = walk_body(&rule.body, &rule.name)?;
     // No Func atoms → use a 1-row dummy as FROM source.
     let from = if from.is_empty() {
         "(SELECT 1) __empty__".to_string()
@@ -1051,11 +914,7 @@ pub(crate) fn compile_body_select(
             }
         }
     }
-    // `(check ...)` runs against the current state; no native-UF
-    // demote applies (we want the literal join, not a UDF lookup
-    // bypass) so all-false `demote`.
-    let no_demote = vec![false; atoms.len()];
-    let (from, where_parts, _binding) = walk_body(atoms, "<check>", functions, &no_demote)?;
+    let (from, where_parts, _binding) = walk_body(atoms, "<check>")?;
     let where_clause = format_where(&where_parts);
     if from.is_empty() {
         // No function atoms: a pure-primitive `(check (= 1 1))`-style
@@ -1085,40 +944,9 @@ fn try_walk_atom(
     from_parts: &mut Vec<String>,
     where_parts: &mut Vec<String>,
     rule_name: &str,
-    functions: &HashMap<String, FunctionInfo>,
-    demoted: bool,
 ) -> Result<bool> {
     match atom {
         Atom::Func { name, args } => {
-            if demoted {
-                // Native-UF demote: emit a scalar UDF call binding
-                // the output var instead of adding a join atom. The
-                // compute_native_uf_demote pre-pass already verified
-                // shape (inputs bound, single fresh output Var), but
-                // the worklist may not have processed the dependency
-                // yet on this pass — defer if any input var is still
-                // unbound.
-                let info = &functions[name];
-                if !args[..info.inputs_len].iter().all(|t| match t {
-                    Term::Var(v) => binding.contains_key(v),
-                    _ => true,
-                }) {
-                    return Ok(false);
-                }
-                let udf = info
-                    .native_uf_udf
-                    .as_ref()
-                    .expect("demoted atom must have native_uf_udf set");
-                let arg_sqls: Vec<String> = args[..info.inputs_len]
-                    .iter()
-                    .map(|t| term_sql(t, binding, rule_name))
-                    .collect::<Result<_>>()?;
-                let call = format!("{}({})", udf, arg_sqls.join(", "));
-                if let Term::Var(v) = &args[info.inputs_len] {
-                    binding.insert(v.clone(), call);
-                }
-                return Ok(true);
-            }
             let alias = format!("t{i}");
             from_parts.push(format!("{} {alias}", q(name)));
             for (col, term) in args.iter().enumerate() {
@@ -1242,8 +1070,6 @@ fn ts_predicates_for_focus(atoms: &[Atom], focus_idx: usize, demote: &[bool]) ->
 fn walk_body(
     atoms: &[Atom],
     rule_name: &str,
-    functions: &HashMap<String, FunctionInfo>,
-    demote: &[bool],
 ) -> Result<(String, Vec<String>, HashMap<String, String>)> {
     let mut binding: HashMap<String, String> = HashMap::new();
     let mut from_parts: Vec<String> = Vec::new();
@@ -1268,8 +1094,6 @@ fn walk_body(
                 &mut from_parts,
                 &mut where_parts,
                 rule_name,
-                functions,
-                demote.get(i).copied().unwrap_or(false),
             )?;
             if ok {
                 made_progress = true;
@@ -1868,20 +1692,6 @@ pub(crate) fn prim_sql(op: &str, args: &[String], rule_name: &str) -> Result<Str
         s if s.starts_with("bigint-") => {
             let udf = format!("__egglog_{}", s.replace('-', "_"));
             Ok(format!("{udf}({})", args.join(", ")))
-        }
-        // `--native-uf --duckdb`: a PR #782 `@canon_S` find-or-self call the
-        // compile pre-pass (`EGraph::rewrite_native_uf_rule`) rewrote to its
-        // find UDF. The op-name after the prefix is the UDF name
-        // (`duck_uf_<sort>_find`). Emit `<udf>(arg)` — the in-core UF answer.
-        s if s.starts_with(crate::NATIVE_UF_FIND_PRIM_PREFIX) => {
-            if args.len() != 1 {
-                return Err(anyhow!(
-                    "rule {rule_name}: native-UF find prim `{op}` expects 1 arg, got {}",
-                    args.len()
-                ));
-            }
-            let udf = &s[crate::NATIVE_UF_FIND_PRIM_PREFIX.len()..];
-            Ok(format!("{udf}({})", args[0]))
         }
         _ => Err(anyhow!("rule {rule_name}: unknown primitive `{op}`")),
     }
