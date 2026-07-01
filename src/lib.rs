@@ -597,23 +597,22 @@ impl EGraph {
         Self::with_flowlog_backend_config(FlowlogBackendConfig::default())
     }
 
-    /// [`EGraph::with_flowlog_backend`] with explicit knobs. The only knob is
-    /// [`FlowlogBackendConfig::native_uf`] (`--native-uf --flowlog`): the
-    /// FlowLog backend drives PR #782's UF-backed-table encoding through its
-    /// fast HOST-PASS rebuild (the in-process `UfTable` answers finds and
-    /// ingests unions; the onchange-driven `@rebuild_rule*` /
-    /// `@uf_change_drain_rule*` maintenance rules are intercepted/dropped). The
-    /// caller must ALSO enable the encoding via [`EGraph::with_native_uf`] so
-    /// the term encoder emits the `:impl displaced-union-find` program this
-    /// backend interception expects.
+    /// [`EGraph::with_flowlog_backend`] with explicit knobs. FlowLog has been
+    /// migrated OFF native-UF onto the fast RELATIONAL term-encoding (the LAST
+    /// backend, mirroring the DuckDB / Feldera migrations), so there is no
+    /// `native_uf` knob: `--flowlog` runs the relational encoding — RULE-ENCODED
+    /// congruence (`@congruence_rule*`) canonicalized by the `@rebuild_rule*`
+    /// rebuild rules, which lower as ORDINARY rules through FlowLog's general DD
+    /// rule engine (the sound `step_symmetric` path).
+    /// [`FlowlogBackendConfig::fast_rebuild`] is a NO-OP (the only flowlog
+    /// fast-rebuild variant was the unsound δUF path, now deleted), and
+    /// [`FlowlogBackendConfig::proofs`] runs the relational proof encoding.
     pub fn with_flowlog_backend_config(config: FlowlogBackendConfig) -> anyhow::Result<Self> {
         let mut db = egglog_bridge_flowlog::EGraph::new_interpret();
-        if config.native_uf {
-            db.enable_native_uf();
-        }
-        if config.fast_rebuild {
-            db.enable_fast_rebuild();
-        }
+        // `config.fast_rebuild` is a no-op on FlowLog: the relational general
+        // rebuild (every `@rebuild_rule*` lowered as an ordinary DD rule) is
+        // always used — there is no δUF-scoping fast-rebuild variant to engage.
+        let _ = config.fast_rebuild;
         if config.wcoj {
             db.enable_wcoj();
         }
@@ -640,22 +639,21 @@ impl EGraph {
     }
 }
 
-/// Knobs for [`EGraph::with_flowlog_backend_config`]. Mirrors
-/// [`DuckBackendConfig`] (FlowLog has no proof mode yet, so only `native_uf`).
+/// Knobs for [`EGraph::with_flowlog_backend_config`].
+///
+/// FlowLog has been migrated OFF native-UF onto the fast RELATIONAL term-encoding
+/// (the LAST backend, mirroring the DuckDB / Feldera migrations): there is no
+/// `native_uf` knob — congruence is rule-encoded (`@congruence_rule*`) and the
+/// `@rebuild_rule*` rebuild rules lower as ORDINARY rules through the general DD
+/// rule engine (the sound `step_symmetric` path).
 #[derive(Clone, Default, Debug)]
 pub struct FlowlogBackendConfig {
-    /// `--native-uf --flowlog`: drive PR #782's UF-backed encoding through the
-    /// FlowLog backend's in-process `UfTable` + host-pass rebuild (finds and
-    /// union ingestion in-core; the onchange-driven maintenance rules
-    /// intercepted/dropped). Must be paired with [`EGraph::with_native_uf`] (the
-    /// encoding). Experimental; off by default.
-    pub native_uf: bool,
-    /// `--fast-rebuild`: engage the FlowLog backend's RELATIONAL δuf fast-rebuild
-    /// (`enable_fast_rebuild`), dropping the always-empty `δview ⋈ uf_old` rebuild
-    /// term. Only meaningful WITHOUT [`native_uf`](Self::native_uf): under
-    /// native-UF the host-side `view ⋈ δuf` delta rebuild is already the default,
-    /// so this flag is a no-op there. (Also reachable via the
-    /// `FLOWLOG_DELTA_REBUILD` env var.) Experimental; off by default.
+    /// `--fast-rebuild`: NO-OP on FlowLog. The only flowlog fast-rebuild variant
+    /// was the δUF-scoping relational fast-rebuild (and the unsound δUF host-pass),
+    /// both removed together with native-UF — every `@rebuild_rule*` now lowers as
+    /// an ordinary DD rule (no two-substep split, no `transient` scoping). The
+    /// field is retained so the CLI can keep setting it uniformly with
+    /// duckdb/feldera, but it has no effect on the flowlog backend.
     pub fast_rebuild: bool,
     /// `--wcoj`: route the reverse-distributivity triangle rule
     /// `(rewrite (Add (Mul a b) (Mul a c)) (Mul a (Add b c)))` through the

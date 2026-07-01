@@ -246,11 +246,24 @@ pub fn cli(mut egraph: EGraph) {
     let duckdb_fast_relational_default = args.duckdb_backend && !args.proofs && !args.proof_testing;
     let feldera_fast_relational_default =
         args.feldera_backend && !args.proofs && !args.proof_testing;
+    // FLOWLOG FAST-RELATIONAL (non-proof): `--flowlog` is now the LAST backend
+    // migrated OFF native-UF onto the fast RELATIONAL term-encoding. Plain
+    // `--flowlog` (no explicit `--native-merge`/`--native-uf`, non-proof) must NOT
+    // auto-enable native-merge: congruence stays RULE-ENCODED (`@congruence_rule*`)
+    // and the `@rebuild_rule*` rebuild rules lower as ORDINARY rules through
+    // FlowLog's general DD rule engine (the sound `step_symmetric` path). Native-UF
+    // on flowlog is deleted, so an explicit `--native-uf --flowlog` / non-proof
+    // `--native-merge --flowlog` is REJECTED below (like duckdb/feldera). Proof-mode
+    // flowlog is UNCHANGED: it keeps auto-enabling native-merge (the relational
+    // proof-UF congruence).
+    let flowlog_fast_relational_default =
+        args.flowlog_backend && !args.proofs && !args.proof_testing;
     if term_encoding_active
         && !args.no_native_merge
         && !args.native_uf
         && !duckdb_fast_relational_default
         && !feldera_fast_relational_default
+        && !flowlog_fast_relational_default
     {
         args.native_merge = true;
     }
@@ -293,29 +306,15 @@ pub fn cli(mut egraph: EGraph) {
     // DuckDB native-UF host-pass, so it is no longer available. `--native-merge`
     // stays supported on the native bridge / flowlog / feldera.
     //
-    // PROOF-MODE EXCEPTION (FlowLog / Feldera / DuckDB): `--flowlog --proofs
-    // --native-merge`, `--feldera --proofs --native-merge`, and `--duckdb --proofs
-    // --native-merge` do NOT force `--native-uf`. Proof-mode native-UF needs a
-    // provenance-tracking `@UF_Sf` that all three backends' `add_uf_function`
-    // rejects, AND none can host the bridge's tuple-output (A2) proof view. Instead
-    // they use the RELATIONAL proof-UF (`@UF_S : (S S) -> Proof :merge old`,
-    // TableInsert-able and already maintained by the path_compress/singleparent
-    // rules that run on all of them) plus a single-output proof SIDE-TABLE — the
-    // 2-table proof-congruence encoding. DuckDB resolves the FD conflict in a
-    // between-statement host pass (`emit_native_congruence_proof`): self-join the
-    // coexisting view, read both proofs from the side-table, MINT `Trans(larger_pf,
-    // Sym(smaller_pf))` in SQL, write the edge into `@UF_S`. So leave `native_uf`
-    // off for these combinations.
-    let single_output_proof_native_merge =
-        (args.flowlog_backend || args.feldera_backend || args.duckdb_backend)
-            && (args.proofs || args.proof_testing);
-    // Only flowlog forces native-UF for native-merge now. DuckDB AND Feldera are
-    // migrated OFF native-UF entirely (no native-UF host-pass), so they are NOT in
-    // this fold — an explicit `--native-merge --duckdb` / `--native-merge --feldera`
-    // is rejected below rather than routed onto the (deleted) native-UF path.
-    if args.native_merge && args.flowlog_backend && !single_output_proof_native_merge {
-        args.native_uf = true;
-    }
+    // NO backend forces `--native-uf` anymore: FlowLog was the LAST one, and it is
+    // now migrated OFF native-UF onto the fast relational term-encoding (like DuckDB
+    // and Feldera before it). Non-proof `--native-merge --flowlog` and
+    // `--native-uf --flowlog` are REJECTED below. Proof-mode native-merge on all
+    // three experimental backends (`--flowlog --proofs --native-merge`, etc.) never
+    // used native-UF: it uses the RELATIONAL proof-UF (`@UF_S : (S S) -> Proof
+    // :merge old`, TableInsert-able and maintained by the path_compress/singleparent
+    // rules) plus a single-output proof SIDE-TABLE — the 2-table proof-congruence
+    // encoding — so it is left as auto-enabled native-merge with `native_uf` off.
 
     // DUCKDB FAST-RELATIONAL: on the migrated default path (`--duckdb`, non-proof,
     // no explicit native-merge/native-uf) engage the backend's relational δuf
@@ -390,7 +389,7 @@ pub fn cli(mut egraph: EGraph) {
     // non-proof host-pass is now deleted). PROOF-MODE `--feldera --proofs
     // --native-merge` is a DIFFERENT path (the relational proof-UF + proof
     // side-table, never native-UF-gated) and stays supported, so `--native-merge`
-    // is rejected only in non-proof mode below. (flowlog keeps native-UF/native-merge.)
+    // is rejected only in non-proof mode below. (flowlog now also rejects these — see below.)
     if args.feldera_backend && args.native_uf {
         log::error!(
             "--native-uf is no longer supported with --feldera \
@@ -410,39 +409,66 @@ pub fn cli(mut egraph: EGraph) {
         std::process::exit(1);
     }
 
+    // FLOWLOG is the LAST backend migrated OFF native-UF onto the fast RELATIONAL
+    // term-encoding (mirror of the DuckDB / Feldera migrations above). The FlowLog
+    // native-UF machinery — the in-core `UfTable`, the synthetic `@DispΔ`
+    // displaced-ids relation, the DD-engine `view ⋈ @DispΔ` rebuild, the unsound
+    // δuf-scoping host-pass rebuild, the `@canon_S` canon-prim, and the
+    // `union → in-core UF` routing — has been DELETED. Non-proof `--flowlog` now
+    // runs the relational encoding: RULE-ENCODED congruence (`@congruence_rule*`)
+    // canonicalized by the `@rebuild_rule*` rebuild rules, which lower as ORDINARY
+    // rules through FlowLog's general DD rule engine (the sound `step_symmetric`
+    // path). Reject the retired combinations with a clear pointer to the default.
+    // `--native-uf --flowlog` is rejected UNCONDITIONALLY (FlowLog never had
+    // proof-mode native-UF — `add_uf_function` always bailed on proofs — and the
+    // non-proof host-pass is now deleted). PROOF-MODE `--flowlog --proofs
+    // --native-merge` is a DIFFERENT path (the relational proof-UF + proof
+    // side-table, never native-UF-gated) and stays supported, so `--native-merge`
+    // is rejected only in non-proof mode.
+    if args.flowlog_backend && args.native_uf {
+        log::error!(
+            "--native-uf is no longer supported with --flowlog \
+             (FlowLog was migrated off native-UF onto the fast relational term-encoding). \
+             Use plain --flowlog (fast relational: rule-encoded congruence + the \
+             rebuild rules lowered through the general DD rule engine)."
+        );
+        std::process::exit(1);
+    }
+    if args.flowlog_backend && args.native_merge && !args.proofs && !args.proof_testing {
+        log::error!(
+            "--native-merge is no longer supported with --flowlog in non-proof mode \
+             (its inline congruence required the removed native-UF host-pass). Use \
+             plain --flowlog (fast relational: rule-encoded congruence + the rebuild \
+             rules lowered through the general DD rule engine)."
+        );
+        std::process::exit(1);
+    }
+
     // The BRIDGE `--native-uf` path (engine displaced-union-find,
     // `:impl displaced-union-find`) is retired: it is strictly worse than the
     // relational native-merge default (~22s vs ~10.6s on math-micro) and
     // blowup-prone. Reject it on the native bridge (no experimental backend
-    // selected) and point at the default. `--native-uf` is now supported only with
-    // `--flowlog` (its fast host-pass rebuild depends on it); `--duckdb` and
-    // `--feldera` have been migrated off native-UF and reject it above. The flowlog
-    // native-merge forcing above only sets `args.native_uf` when `--flowlog` is
-    // present, so this guard never fires for it.
+    // selected) and point at the default. ALL experimental backends
+    // (`--duckdb` / `--feldera` / `--flowlog`) have now been migrated off native-UF
+    // and reject `--native-uf` above, so `--native-uf` is no longer accepted
+    // anywhere — this guard covers the remaining (native-bridge) case.
     if args.native_uf && !any_experimental_backend {
         log::error!(
             "--native-uf on the native bridge is no longer supported (the engine \
              displaced-union-find path was retired as strictly slower and blowup-prone). \
              Use the relational native-merge default (drop --native-uf; term encoding \
-             turns on native `:merge` automatically), or combine --native-uf with the \
-             --flowlog backend."
+             turns on native `:merge` automatically). --native-uf is no longer \
+             supported on any backend."
         );
         std::process::exit(1);
     }
 
-    // The native-UF encoding mode (PR #782's `:impl displaced-union-find`
-    // UF-backed function) runs on the native bridge AND all three experimental
-    // backends (`--flowlog`/`--feldera`/`--duckdb`): each honours the UF-backed
-    // encoding but drives its own fast HOST-PASS rebuild instead of the
-    // onchange-driven rebuild rules. All backends support `--native-uf`.
-    // Native-UF on the dataflow/SQL backends is TERM mode only (proofs are a
-    // later step; `--proofs` is supported only on the native bridge).
-    // native-UF + proofs validates on the native bridge, feldera, AND flowlog:
-    // proofs are tracked at the ENCODING level (proof_encoding.rs), independent of
-    // whether the host drives a native-UF host-pass rebuild (verified via
-    // --proof-testing). Only the DuckDB backend can't yet build proof-mode
-    // native-UF functions; it rejects those precisely on its own (clean error, and
-    // only for the files that actually need them), so no blanket CLI guard here.
+    // `--native-uf` is now rejected on every backend (see the per-backend guards
+    // above and the native-bridge guard here), so `args.native_uf` is always false
+    // past this point. The shared `--native-uf` encoding apparatus is retired in a
+    // separate final cleanup pass. Proof-mode native-merge on the experimental
+    // backends uses the RELATIONAL proof-UF (tracked at the encoding level in
+    // proof_encoding.rs), independent of native-UF.
 
     // `--wcoj` is a FlowLog-only knob (the worst-case-optimal triangle delta
     // query lives in the FlowLog DD backend). Reject it on any other path so a
@@ -735,15 +761,17 @@ pub fn cli(mut egraph: EGraph) {
                         proofs: args.proofs || args.proof_testing,
                     })
                 } else {
-                    // `--native-uf --flowlog`: enable the FlowLog backend's
-                    // in-process UF host-pass (`enable_native_uf`) here, and the
-                    // matching #782 encoding (`with_native_uf`) below — both are
-                    // needed (the encoding emits the program; the backend
-                    // interception runs it through the host-pass rebuild).
-                    // `--wcoj` routes the triangle rule through the WCOJ delta
-                    // query (FlowLog only; ignored on other backends).
+                    // FlowLog is migrated OFF native-UF onto the fast RELATIONAL
+                    // term-encoding: there is no `native_uf` config knob anymore.
+                    // `--native-uf --flowlog` / non-proof `--native-merge --flowlog`
+                    // are rejected by the guards above, so this path only ever builds
+                    // the relational egraph. Congruence is RULE-ENCODED and the
+                    // rebuild rules lower through the general DD rule engine.
+                    // `fast_rebuild` is a NO-OP on flowlog (its only fast-rebuild
+                    // variant was the unsound δUF path, now deleted); the knob is
+                    // retained for CLI symmetry. `--wcoj` routes the triangle rule
+                    // through the WCOJ delta query (FlowLog only).
                     egglog::EGraph::with_flowlog_backend_config(egglog::FlowlogBackendConfig {
-                        native_uf: args.native_uf,
                         fast_rebuild: args.fast_rebuild,
                         wcoj: args.wcoj,
                         proofs: args.proofs || args.proof_testing,
@@ -753,18 +781,13 @@ pub fn cli(mut egraph: EGraph) {
                     log::error!("failed to start experimental backend: {err}");
                     std::process::exit(1);
                 });
-                // `--native-uf` is flowlog-only now (feldera/duckdb rejected it
-                // above): enable the #782 encoding on the flowlog backend egraph.
-                if args.native_uf && args.flowlog_backend {
-                    backend_eg = backend_eg.with_native_uf();
-                }
                 // `--native-merge`: switch the rebuilt backend egraph's encoder to
                 // the FD-keyed view + inline UnionId merge. Must be set on
                 // `backend_eg` (the egraph that actually runs the program), not the
-                // pre-rebuild `egraph`. On flowlog this is the native-UF-backed
-                // merge; on feldera it is reachable ONLY in proof mode (the
-                // relational proof-UF congruence — non-proof `--native-merge
-                // --feldera` is rejected above).
+                // pre-rebuild `egraph`. On flowlog/feldera this is reachable ONLY in
+                // proof mode (the relational proof-UF congruence — non-proof
+                // `--native-merge --flowlog` / `--native-merge --feldera` is rejected
+                // above).
                 if args.native_merge && (args.flowlog_backend || args.feldera_backend) {
                     backend_eg = backend_eg.with_native_merge();
                 }

@@ -67,16 +67,14 @@ pub fn new_experimental_egraph_duckdb(config: egglog::DuckBackendConfig) -> anyh
 /// engine and registers the experimental surface (sorts, primitives such as
 /// `get-size!`, commands) on it up front, so they survive into the run. (The
 /// CLI's `--flowlog` branch short-circuits its own rebuild when handed an
-/// already-flowlog-backed egraph — see `cli.rs`.) `with_native_uf` is applied
-/// to match the encoding when `config.native_uf` is set, mirroring `cli.rs`.
+/// already-flowlog-backed egraph — see `cli.rs`.) FlowLog has been migrated OFF
+/// native-UF onto the fast relational term-encoding (the LAST backend), so (like
+/// feldera/duckdb) there is no `with_native_uf` step — `FlowlogBackendConfig` has
+/// no `native_uf` knob.
 pub fn new_experimental_egraph_flowlog(
     config: egglog::FlowlogBackendConfig,
 ) -> anyhow::Result<EGraph> {
-    let native_uf = config.native_uf;
     let mut egraph = EGraph::with_flowlog_backend_config(config)?;
-    if native_uf {
-        egraph = egraph.with_native_uf();
-    }
     extend_with_experimental(&mut egraph);
     Ok(egraph)
 }

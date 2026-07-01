@@ -57,7 +57,6 @@ mod external_func;
 pub mod interpret;
 mod rule_builder;
 pub mod subprocess;
-mod uf;
 
 use base_values::base_values_as_pool_mut;
 use compile::{pack_row, row_col, unpack_row, BodyOp, HeadOp, MergeMode, Row, RuleIr, Slot};
@@ -213,101 +212,6 @@ pub struct EGraph {
     /// Per-ruleset, per-function last-fed row snapshot `Rc`, for computing the
     /// signed delta fed into the FUSED join's shared inputs (the fused `fed`).
     pub(crate) dd_fused_fed: HashMap<Vec<usize>, HashMap<FunctionId, std::rc::Rc<HashSet<Row>>>>,
-    /// `--native-uf --flowlog`: drive PR #782's UF-backed-table encoding through
-    /// FlowLog's fast HOST-PASS rebuild (instead of the onchange-driven rebuild
-    /// rules that would run on the DD dataflow and regress the ~2.1× win).
-    ///
-    /// The #782 term encoder emits a UF-backed `:impl displaced-union-find`
-    /// function `@UF_Sf (S) S` per eq-sort (via [`Backend::add_uf_function`])
-    /// plus a `@UFChange_S` onchange relation and `@rebuild_rule*` /
-    /// `@uf_change_drain_rule*` maintenance rules. When this is on we honour the
-    /// `add_uf_function` request (a real `UfTable` + find-or-self canon-prim),
-    /// route union writes `(set (@UF_Sf lhs) rhs)` into the in-core UF, suppress
-    /// the maintenance rules by name, and re-canonicalize view rows host-side.
-    /// Must be enabled (via [`EGraph::enable_native_uf`]) before any UF function
-    /// is registered. Pure backend interception — the encoder is unchanged.
-    pub(crate) native_uf_enabled: bool,
-    /// Per-eq-sort native union-find, keyed by the [`FunctionId`] of the
-    /// `@UF_Sf` UF-backed function (the [`Backend::add_uf_function`] handle).
-    /// Reads (`find_ro`) and union ingestion both go through this. Single-
-    /// threaded host, so a plain `UfTable` (no `Arc<Mutex>`) suffices.
-    pub(crate) native_ufs: HashMap<FunctionId, uf::UfTable>,
-    /// Maps the `@canon_S` find-or-self primitive's [`ExternalFunctionId`]
-    /// (returned by [`Backend::add_uf_function`] and bound by the frontend to
-    /// the canon-prim name) to its UF function id. A `BodyOp::Prim` / `HeadOp::
-    /// Call` on this id is answered host-side from the matching [`native_ufs`]
-    /// entry (`find_ro`) instead of through the `Database` external func.
-    pub(crate) native_uf_canon_prim: HashMap<ExternalFunctionId, FunctionId>,
-    /// Every id ever ingested into a native UF (per `@UF_Sf` function), so the
-    /// iteration-boundary drain can bound its displaced-set bookkeeping without
-    /// exposing the `UfTable`'s internal node map.
-    pub(crate) native_uf_members: HashMap<FunctionId, HashSet<u32>>,
-    /// The `--fast-rebuild` axis. Two distinct roles depending on `--native-uf`:
-    ///   * RELATIONAL (without `--native-uf`): drive the fused DD worker's δUF
-    ///     rebuild that drops the always-empty `δview ⋈ uf_old` term. OR'd with
-    ///     the `FLOWLOG_DELTA_REBUILD` env var at build time.
-    ///   * NATIVE-UF: select the CUSTOM rebuild (the off-engine host-pass
-    ///     reverse-index δuf scan, `interpret::native_uf_rebuild_envs`) instead of
-    ///     the PURE-ENGINE rebuild (the DD-engine `view ⋈ @DispΔ` join). The host
-    ///     UfTable is shared by both — only the REBUILD differs.
-    ///
-    /// Off by default.
-    pub(crate) fast_rebuild: bool,
-    /// Native-UF delta rebuild: the set of ids whose canonical changed during the
-    /// PREVIOUS iteration's `drain_pending` (per `@UF_Sf` function). Stashed by
-    /// `native_uf_drain_all` instead of discarded, then fed into the synthetic
-    /// `@DispΔ` displaced-ids relation at the start of the NEXT `run_iteration`
-    /// (before the read snapshot) so the DD-engine rebuild's `view ⋈ δdisplaced`
-    /// join sees the prior round's displaced ids (the rebuild runs BEFORE the
-    /// drain). See [`native_uf_disp_rel`] / `interpret::sync_displaced_relations`.
-    pub(crate) native_uf_displaced_prev: HashMap<FunctionId, Vec<i64>>,
-    /// Native-UF rebuild: set in `run_iteration`/`native_uf_rebuild_envs` when
-    /// this call's `@rebuilding` ruleset consumed [`native_uf_displaced_prev`]
-    /// (the PURE-ENGINE `view ⋈ δdisplaced` DD join consumed the fed `@DispΔ`
-    /// rows, or the CUSTOM host-pass scoped scan read the displaced sets). The
-    /// iteration-boundary drain reads it to RESET `native_uf_displaced_prev`
-    /// exactly once per rebuild round, so the next round carries only ids
-    /// displaced AFTER this rebuild (one UF backs many views, all fused into the
-    /// one rebuild `run_iteration`). Cleared each drain.
-    pub(crate) native_uf_rebuild_ran: bool,
-    /// CUSTOM rebuild (`--native-uf --fast-rebuild`): reverse index per VIEW
-    /// function — eq-sort id value → the view rows that hold it in an eq-sort
-    /// column. Maintained incrementally as view rows enter/leave the mirror (see
-    /// `index_insert_row` / `index_remove_row`). Built lazily on the first
-    /// rebuild scan for a view func (a one-time full scan that also seeds this
-    /// index); thereafter the scoped scan looks up only the displaced ids' rows
-    /// here. Absence of an entry means "not yet built" → fall back to a full scan
-    /// that builds it. Maintained ONLY on the custom path (empty on PURE-ENGINE).
-    pub(crate) native_uf_rev_index: HashMap<FunctionId, HashMap<u32, HashSet<Row>>>,
-    /// CUSTOM rebuild (`--native-uf --fast-rebuild`): the eq-sort columns of a
-    /// VIEW function, as `(column index, UF func)` pairs (the `col_uf` mapping
-    /// `native_uf_rebuild_envs` derives from a `@rebuild_rule`). Cached on the
-    /// first rebuild scan so the index-maintenance hooks know which columns of a
-    /// view row to index. Populated ONLY on the custom path.
-    pub(crate) native_uf_view_cols: HashMap<FunctionId, Vec<(usize, FunctionId)>>,
-    /// PURE-ENGINE rebuild (`--native-uf`, no `--fast-rebuild`): per `@UF_Sf`
-    /// function, the [`FunctionId`] of a synthetic arity-1 "displaced ids"
-    /// relation `@DispΔ`. The PURE-ENGINE rebuild feeds it each iteration and
-    /// joins the view against it on the DD dataflow (`rebuild_rule_dd_ir`,
-    /// `sync_displaced_relations`); the CUSTOM path leaves it empty.
-    /// It is the native analog of the relational `@UF_Sf` flat-index relation
-    /// the plain-`--flowlog` rebuild joins the view against: instead of routing
-    /// the rebuild to a host pass, we feed this relation's mirror — at the start
-    /// of each `run_iteration`, before the read snapshot — with the previous
-    /// round's displaced ids ([`native_uf_displaced_prev`]), and rewrite each
-    /// `@rebuild_rule` to join the view against it (the empty `@UFChange_S`
-    /// onchange atom is stripped, exactly the DuckDB host-pass rewrite, but the
-    /// surviving `view ⋈ δdisplaced` join then runs on the DD dataflow,
-    /// seminaive on the fed δ). The `@canon_S` guard / head finds stay native
-    /// (host-side prim tail), so the JOIN moves onto DD while the O(1) find
-    /// stays in-core — no full re-scan, no eqsat blowup. Registered in
-    /// [`Backend::add_uf_function`].
-    pub(crate) native_uf_disp_rel: HashMap<FunctionId, FunctionId>,
-    /// Cache of the DD-rewritten `@rebuild_rule` IR, keyed by rule index: the
-    /// onchange atom stripped and a `@DispΔ(eqsort_col)` atom appended, so the
-    /// rule lowers to `view ⋈ δdisplaced` on the fused DD worker. Built lazily
-    /// the first time a rebuild rule is routed (the source IR never changes).
-    pub(crate) native_uf_rebuild_dd_ir: HashMap<usize, RuleIr>,
     /// `--wcoj`: route the reverse-distributivity triangle rule through the
     /// worst-case-optimal delta-query join (dogsdogsdogs prefix-extension +
     /// AltNeu 3-stream decomposition in [`dd_native`]) instead of the left-deep
@@ -315,13 +219,6 @@ pub struct EGraph {
     /// non-triangle rules are unaffected. Off by default — when off the FlowLog
     /// join path is byte-identical to the pre-WCOJ behavior.
     pub(crate) wcoj_enabled: bool,
-    /// `--native-merge`: maps an FD-keyed CONSTRUCTOR view's [`FunctionId`] to the
-    /// [`FunctionId`] of the union-find (`@UF_Sf`) that owns its eclass (OUTPUT)
-    /// column. Populated by [`Backend::register_native_merge_view`]. When a view
-    /// in this map has an FD conflict (`resolve_merge` finds two eclasses for one
-    /// children key), the loser is `enqueue_union`-ed with the winner into this UF
-    /// — congruence done INLINE at insert time instead of by a self-join rule.
-    pub(crate) native_merge_uf: HashMap<FunctionId, FunctionId>,
     /// `--native-merge` PROOF mode (2-table): maps an FD-keyed CONSTRUCTOR view's
     /// [`FunctionId`] to the proof-congruence config (the relational proof-UF
     /// `@UF_S`, the `@<F>ViewProof` side-table, and the `Trans`/`Sym` proof
@@ -334,8 +231,8 @@ pub struct EGraph {
     pub(crate) native_merge_proof: HashMap<FunctionId, NativeMergeProof>,
     /// `--native-merge` TERM-BUILD: per-`run_iteration` scratch — the `@<C>View`
     /// rows a term-build merge (`eval_term_build_merge`) just minted, by view
-    /// function id and children key. The views carry their OWN congruence merge
-    /// (`native_merge_uf`), so after a term-build resolve writes their rows
+    /// function id and children key. The views carry their OWN congruence merge, so
+    /// after a term-build resolve writes their rows
     /// `run_iteration` drains this set through `resolve_merge` (a fixpoint sub-loop)
     /// to reconcile any FD conflict the new view rows introduced — exactly the
     /// congruence the bridge's `TableInsert`-respects-target-merge does. Drained
@@ -420,43 +317,10 @@ impl EGraph {
             dd_native_fed: HashMap::new(),
             dd_fused: HashMap::new(),
             dd_fused_fed: HashMap::new(),
-            native_uf_enabled: false,
-            native_ufs: HashMap::new(),
-            native_uf_canon_prim: HashMap::new(),
-            native_uf_members: HashMap::new(),
-            fast_rebuild: false,
-            native_uf_displaced_prev: HashMap::new(),
-            native_uf_rebuild_ran: false,
-            native_uf_rev_index: HashMap::new(),
-            native_uf_view_cols: HashMap::new(),
-            native_uf_disp_rel: HashMap::new(),
-            native_uf_rebuild_dd_ir: HashMap::new(),
             wcoj_enabled: false,
-            native_merge_uf: HashMap::new(),
             native_merge_proof: HashMap::new(),
             term_build_view_keys: HashMap::new(),
         }
-    }
-
-    /// Turn on the native union-find path (`--native-uf --flowlog`). Must be
-    /// called before any UF function is registered: [`Backend::add_uf_function`]
-    /// checks this flag to decide whether to honour the PR #782 UF-backed-table
-    /// request (a real in-core [`uf::UfTable`] + find-or-self canon-prim) or to
-    /// bail (the default). Mirrors the DuckDB backend's `enable_native_uf`.
-    pub fn enable_native_uf(&mut self) {
-        self.native_uf_enabled = true;
-    }
-
-    /// Turn on `--fast-rebuild`. Two roles depending on `--native-uf`:
-    ///   * RELATIONAL (no native UF): the fused DD worker's substep split that
-    ///     drops the always-empty `δview ⋈ uf_old` rebuild term (sound under
-    ///     canonicalize-at-creation). Equivalent to the `FLOWLOG_DELTA_REBUILD`
-    ///     env var.
-    ///   * NATIVE-UF: select the CUSTOM rebuild (the off-engine host-pass
-    ///     reverse-index δuf scan) over the PURE-ENGINE rebuild (the DD-engine
-    ///     `view ⋈ @DispΔ` join). The host UfTable is shared by both.
-    pub fn enable_fast_rebuild(&mut self) {
-        self.fast_rebuild = true;
     }
 
     /// Turn on `--wcoj`: route the reverse-distributivity triangle rule through
@@ -466,66 +330,6 @@ impl EGraph {
     /// unaffected. Off by default.
     pub fn enable_wcoj(&mut self) {
         self.wcoj_enabled = true;
-    }
-
-    /// Read-only native-UF find for the `@UF_Sf` function `uf_func`. Returns the
-    /// class leader of `x` (or `x` itself if `x` has never been unioned /
-    /// `uf_func` is not a native UF). Single hash lookup (eager-flatten UF).
-    pub(crate) fn native_uf_find(&self, uf_func: FunctionId, x: u32) -> u32 {
-        match self.native_ufs.get(&uf_func) {
-            Some(uf) => uf.find_ro(x as i64) as u32,
-            None => x,
-        }
-    }
-
-    /// Apply all queued unions to every native UF (called once per `run_rules`
-    /// after head writes land). After this, every UF is flat: `find_ro` is O(1)
-    /// and consistent with the union assertions ingested this iteration.
-    /// Returns the total number of ids whose canonical changed (the "real
-    /// change" signal the outer saturate loop needs, since the relational UF's
-    /// `@UF_S` / flat-index churn is no longer produced).
-    pub(crate) fn native_uf_drain_all(&mut self) -> usize {
-        for uf in self.native_ufs.values_mut() {
-            uf.drain_pending();
-        }
-        let mut displaced = 0;
-        if self.native_uf_enabled {
-            // The native-UF DD rebuild is the δdisplaced-driven path, so stash
-            // this round's displaced ids for the next round's `@DispΔ` feed.
-            // If the `@rebuilding` ruleset ran earlier in THIS `run_iteration`
-            // (so the `view ⋈ δdisplaced` DD join consumed the displaced sets),
-            // RESET them now — every view sharing each UF has had its chance, so
-            // the next round should see only ids displaced AFTER this rebuild
-            // (the per-round reset that bounds the `@DispΔ` relation). The rebuild
-            // itself enqueues no unions, so this clear precedes appending this
-            // call's (typically empty) displaced ids.
-            if self.native_uf_rebuild_ran {
-                self.native_uf_displaced_prev.clear();
-                self.native_uf_rebuild_ran = false;
-            }
-            // STASH this round's displaced ids per UF func for the `@DispΔ` feed.
-            // We APPEND (not overwrite): a `run_iteration` that enqueues no unions
-            // still reaches this drain, and the rebuild ruleset runs in a SEPARATE
-            // `run_iteration` than the union-enqueuing user rules — so the
-            // displaced ids must accumulate across the intervening (possibly
-            // empty) drains until a rebuild consumes them.
-            for (&func, uf) in self.native_ufs.iter_mut() {
-                let d = uf.drain_displaced();
-                displaced += d.len();
-                if !d.is_empty() {
-                    self.native_uf_displaced_prev
-                        .entry(func)
-                        .or_default()
-                        .extend(d);
-                }
-            }
-        } else {
-            for uf in self.native_ufs.values_mut() {
-                displaced += uf.displaced_len();
-                let _ = uf.drain_displaced();
-            }
-        }
-        displaced
     }
 
     pub(crate) fn info(&self, f: FunctionId) -> &RelationInfo {
@@ -542,68 +346,7 @@ impl EGraph {
 
     /// Insert a single row into the Rust mirror.
     fn mirror_insert(&mut self, f: FunctionId, row: Row) {
-        // CUSTOM rebuild only: keep the reverse index in sync (no-op unless `f`'s
-        // index is built). `index_insert_row` itself gates on `native_uf_enabled`
-        // + a built index, so it is cheap when off; the explicit `fast_rebuild`
-        // guard keeps the PURE-ENGINE path from ever building an index.
-        if self.native_uf_enabled && self.fast_rebuild {
-            self.index_insert_row(f, &row);
-        }
         std::rc::Rc::make_mut(self.mirror.entry(f).or_default()).insert(row);
-    }
-
-    /// CUSTOM rebuild (`--native-uf --fast-rebuild`) reverse-index maintenance:
-    /// record that `row` (now in the mirror of view func `f`) holds each of its
-    /// eq-sort column values, so a later scoped rebuild can find it by a displaced
-    /// id. No-op unless native-UF is on AND `f`'s eq-sort columns have been
-    /// learned (i.e. the index for `f` was already built by the first full-scan
-    /// rebuild). Indexing is keyed only on the eq-sort columns
-    /// (`native_uf_view_cols`), so non-UF columns never bloat the index.
-    pub(crate) fn index_insert_row(&mut self, f: FunctionId, row: &[u32]) {
-        if !self.native_uf_enabled {
-            return;
-        }
-        let Some(cols) = self.native_uf_view_cols.get(&f) else {
-            return;
-        };
-        // Skip if the index for `f` is not yet built (first rebuild does the
-        // full scan + seed). `native_uf_view_cols` is set together with the
-        // index, so this is belt-and-suspenders.
-        let Some(idx) = self.native_uf_rev_index.get_mut(&f) else {
-            return;
-        };
-        for &(ci, _uf) in cols {
-            if let Some(&v) = row.get(ci) {
-                idx.entry(v)
-                    .or_default()
-                    .insert(row.to_vec().into_boxed_slice());
-            }
-        }
-    }
-
-    /// CUSTOM rebuild reverse-index maintenance: drop `row` from view func `f`'s
-    /// reverse index (it just left the mirror). Mirror of
-    /// [`index_insert_row`](Self::index_insert_row).
-    pub(crate) fn index_remove_row(&mut self, f: FunctionId, row: &[u32]) {
-        if !self.native_uf_enabled {
-            return;
-        }
-        let Some(cols) = self.native_uf_view_cols.get(&f) else {
-            return;
-        };
-        let Some(idx) = self.native_uf_rev_index.get_mut(&f) else {
-            return;
-        };
-        for &(ci, _uf) in cols {
-            if let Some(&v) = row.get(ci) {
-                if let Some(rows) = idx.get_mut(&v) {
-                    rows.remove(row);
-                    if rows.is_empty() {
-                        idx.remove(&v);
-                    }
-                }
-            }
-        }
     }
 
     /// Inherent accessor for the embedded [`BaseValues`] registry (the frontend
@@ -730,16 +473,14 @@ impl EGraph {
                 by_key.entry(&row[..inputs_len]).or_default().push(row);
             }
         }
-        // `--native-merge`: if this function is an FD-keyed constructor view, an
-        // FD conflict (same children, two eclasses) means those eclasses are
-        // CONGRUENT and must be unioned. The merge keeps the min output (the UF
-        // leader, matching union-by-min) AND injects a union of every losing
-        // eclass with the winner into the view's union-find — congruence INLINE at
-        // insert time. Collect the (a, b) pairs to enqueue after the borrow ends.
-        let native_merge_uf = self.native_merge_uf.get(&f).copied();
-        let mut union_pairs: Vec<(u32, u32)> = Vec::new();
-        // Resolve each touched key; collect the rows to remove and the winner to
-        // insert. Only keys with >1 candidate row can change.
+        // FlowLog runs the fast RELATIONAL term-encoding: congruence is RULE-ENCODED
+        // (`@congruence_rule*`) and canonicalized by the `@rebuild_rule*` rules on the
+        // DD engine. So an ordinary function's FD conflict resolves by the plain
+        // merge mode (Min/Old/New) — there is no in-core-UF congruence injection
+        // (non-proof `--native-merge --flowlog` is rejected; proof-mode native-merge
+        // routes through `native_merge_proof` above). Resolve each touched key;
+        // collect the rows to remove and the winner to insert. Only keys with >1
+        // candidate row can change.
         let mut new_rows: Vec<Row> = Vec::new();
         let mut drop_rows: HashSet<Row> = HashSet::new();
         for (_key, mut cands) in by_key {
@@ -767,58 +508,17 @@ impl EGraph {
                     drop_rows.insert((**row).clone());
                 }
             }
-            // Native-merge: union each candidate eclass with the chosen winner.
-            // `enqueue_union` is idempotent for already-equal ids and picks the min
-            // leader itself, so passing every candidate (incl. the winner) is safe;
-            // the dedup against `chosen` keeps the staged list small.
-            if native_merge_uf.is_some() {
-                for row in &cands {
-                    let out = row_col(row, inputs_len);
-                    if out != chosen {
-                        union_pairs.push((chosen, out));
-                    }
-                }
-            }
             new_rows.push(winner);
         }
-        if drop_rows.is_empty() && union_pairs.is_empty() {
+        if drop_rows.is_empty() {
             return false;
         }
-        {
-            let set = std::rc::Rc::make_mut(self.mirror.get_mut(&f).unwrap());
-            for r in &drop_rows {
-                set.remove(r);
-            }
-            for r in &new_rows {
-                set.insert(r.clone());
-            }
+        let set = std::rc::Rc::make_mut(self.mirror.get_mut(&f).unwrap());
+        for r in &drop_rows {
+            set.remove(r);
         }
-        // CUSTOM rebuild only: reflect the FD collapse in the reverse index (the
-        // mutation block above borrowed `self.mirror` exclusively, so update the
-        // index after it drops). No-op on PURE-ENGINE / when native-UF is off.
-        if self.native_uf_enabled && self.fast_rebuild {
-            for r in &drop_rows {
-                self.index_remove_row(f, r);
-            }
-            for r in &new_rows {
-                self.index_insert_row(f, r);
-            }
-        }
-        // `--native-merge`: inject the congruence unions into the view's UF. The
-        // ids are drained + applied at the iteration boundary (`native_uf_drain_all`,
-        // like every other union); the displaced-id signal then drives the rebuild
-        // that re-canonicalizes any other rows holding the loser eclass. Returning
-        // `true` here keeps the outer saturate loop iterating until the unions and
-        // their rebuild fallout reach a fixpoint.
-        if let Some(uf_func) = native_merge_uf {
-            if let Some(uf) = self.native_ufs.get_mut(&uf_func) {
-                let mem = self.native_uf_members.entry(uf_func).or_default();
-                for (a, b) in &union_pairs {
-                    uf.enqueue_union(*a as i64, *b as i64);
-                    mem.insert(*a);
-                    mem.insert(*b);
-                }
-            }
+        for r in &new_rows {
+            set.insert(r.clone());
         }
         true
     }
@@ -1106,15 +806,6 @@ impl EGraph {
                 changed |= set.insert(r.clone());
             }
         }
-        // Keep the reverse index in sync on the CUSTOM rebuild path.
-        if self.native_uf_enabled && self.fast_rebuild {
-            for r in &drop_rows {
-                self.index_remove_row(f, r);
-            }
-            for r in &new_rows {
-                self.index_insert_row(f, r);
-            }
-        }
         // Any e-node minted / view row written this resolve is a real change — keep
         // the saturate loop iterating until congruence + rebuild reach a fixpoint.
         if !self.term_build_view_keys.is_empty() {
@@ -1163,17 +854,11 @@ impl EGraph {
                     .iter()
                     .map(|a| self.eval_term_build_node(a, cur, new, inputs_len, lookup_index))
                     .collect();
-                // A `Function` over a native-UF function is the find-or-self canon
-                // lookup (`@UF_Sf` / identity-on-miss); answer it from the in-core
-                // UF (pure read — no mint, no write). Any other `Function` is a
-                // constructor-style lookup that mints on miss (`lookup_or_create`).
-                if self.native_ufs.contains_key(func) {
-                    debug_assert_eq!(argv.len(), 1, "canon Function lookup must be single-arg");
-                    self.native_uf_find(*func, argv[0])
-                } else {
-                    let key: Vec<Value> = argv.into_iter().map(Value::new).collect();
-                    interpret::lookup_or_create(self, *func, &key, lookup_index).rep()
-                }
+                // A `Function` is a constructor-style lookup that mints on miss
+                // (`lookup_or_create`). FlowLog is on the relational encoding (no
+                // native-UF functions), so there is no in-core-UF find route here.
+                let key: Vec<Value> = argv.into_iter().map(Value::new).collect();
+                interpret::lookup_or_create(self, *func, &key, lookup_index).rep()
             }
             MergeFn::Construct(table, key_args, value_args) => {
                 // Mint a constructor e-node (hash-consed; existing key -> its id,
@@ -1201,36 +886,18 @@ impl EGraph {
                     .iter()
                     .map(|a| self.eval_term_build_node(a, cur, new, inputs_len, lookup_index))
                     .collect();
-                // THE NATIVE-UF/`@UF_S` WRINKLE: a `TableInsert` whose target is a
-                // native-UF function is a UNION edge (`(set (@UF_Sf lhs) rhs)`), not
-                // a raw mirror write — route it into the in-core UF (a self-edge
-                // `lhs == rhs` is a harmless no-op). Under `--native-uf` the
-                // frontend elides the relational `@UF_S` self-union side-effect
-                // entirely (no parent table), so this branch is inert on the tests
-                // that ship today; it is kept for correctness if the lowering ever
-                // emits a UF-targeted insert. Otherwise this is a `@<C>View` row:
-                // mirror-insert it and record its key so `run_iteration` reconciles
-                // the view's own congruence merge.
-                if self.native_ufs.contains_key(table) {
-                    if row.len() >= 2 && row[0] != row[1] {
-                        let (a, b) = (row[0], row[1]);
-                        if let Some(uf) = self.native_ufs.get_mut(table) {
-                            uf.enqueue_union(a as i64, b as i64);
-                        }
-                        let mem = self.native_uf_members.entry(*table).or_default();
-                        mem.insert(a);
-                        mem.insert(b);
-                    }
-                } else {
-                    let view_arity = self.info(*table).arity;
-                    let view_inputs = view_arity.saturating_sub(1);
-                    let key: Vec<u32> = row.iter().take(view_inputs).copied().collect();
-                    self.mirror_insert(*table, row.into_boxed_slice());
-                    self.term_build_view_keys
-                        .entry(*table)
-                        .or_default()
-                        .insert(key);
-                }
+                // A `TableInsert` writes a `@<C>View` row: mirror-insert it and record
+                // its key so `run_iteration` reconciles the view's own congruence
+                // merge. (FlowLog is on the relational encoding — no native-UF
+                // functions — so there is no UF-targeted union-edge branch here.)
+                let view_arity = self.info(*table).arity;
+                let view_inputs = view_arity.saturating_sub(1);
+                let key: Vec<u32> = row.iter().take(view_inputs).copied().collect();
+                self.mirror_insert(*table, row.into_boxed_slice());
+                self.term_build_view_keys
+                    .entry(*table)
+                    .or_default()
+                    .insert(key);
                 // The bridge returns the OLD value of the resolving column; the
                 // enclosing `Seq` discards it.
                 cur[inputs_len]
@@ -1516,11 +1183,6 @@ impl Backend for EGraph {
         });
         let has_output = arity > 0 && !output_is_unit;
         // `--native-merge`: the UF a view's FD-conflict congruence union targets is named
-        // UNIFORMLY by the `UnionIntoUf(uf_func)` merge variant (the same single source of truth
-        // the native bridge reads). Capture it at `add_table` so every backend reads the target UF
-        // from the same place; `register_native_merge_view` is then only a consistency assertion.
-        // The view is declared after its eq-sort, so the UF's `FunctionId` already resolves here.
-        let native_merge_target = native_merge_target_uf(&config.merge);
         // `--native-merge` PROOF mode (2-table): a single-output eclass view whose
         // merge is `UnionIntoParentTableWithProof` carries the proof-congruence
         // config (relational `@UF_S`, the `@<F>ViewProof` side-table, Trans/Sym).
@@ -1559,9 +1221,16 @@ impl Backend for EGraph {
             merge_tree,
         });
         self.mirror.insert(id, std::rc::Rc::new(HashSet::new()));
-        if let Some(uf_func) = native_merge_target {
-            self.native_merge_uf.insert(id, uf_func);
-        }
+        // A `UnionIntoUf` merge (the native-UF native-merge encoding) is no longer
+        // supported on FlowLog (migrated off native-UF; the CLI rejects non-proof
+        // `--native-merge`/`--native-uf`), so it must never reach here. Panic loudly
+        // if it does rather than silently drop the congruence routing.
+        assert!(
+            native_merge_target_uf(&config.merge).is_none(),
+            "FlowLog was migrated off native-UF: a `UnionIntoUf` (native-UF native-merge) \
+             view reached add_table (`{}`); non-proof --native-merge/--native-uf are rejected",
+            self.info(id).name
+        );
         if let Some(proof) = native_merge_proof {
             self.native_merge_proof.insert(id, proof);
         }
@@ -1572,100 +1241,28 @@ impl Backend for EGraph {
         &mut self,
         name: String,
         _onchange: Option<FunctionId>,
-        proof: Option<egglog_backend_trait::UfProofConfig>,
+        _proof: Option<egglog_backend_trait::UfProofConfig>,
     ) -> Result<(FunctionId, ExternalFunctionId)> {
-        // Only the `--native-uf --flowlog` path supports PR #782's UF-backed
-        // function. With the flag off the relational UF encoding is used (no
-        // `add_uf_function` calls), so a bail here is unreachable in practice.
-        if !self.native_uf_enabled {
-            anyhow::bail!(
-                "the FlowLog backend only supports `:impl displaced-union-find` \
-                 functions under `--native-uf` (it drives PR #782's UF-backed \
-                 encoding through either a DD-engine `view ⋈ δdisplaced` rebuild \
-                 or, under `--fast-rebuild`, a custom host-pass rebuild)"
-            );
-        }
-        // Proof mode is a later step (TERM mode only for now): a provenance-
-        // tracking UF would need the `@UFChange_S` proof column composed in a
-        // leader-change callback, which neither native-UF rebuild runs.
-        if proof.is_some() {
-            anyhow::bail!(
-                "the FlowLog backend does not yet support proof-mode native-UF \
-                 functions (`--native-uf` is TERM mode only on FlowLog)"
-            );
-        }
-
-        // Register the UF function as a real relation: schema `(S) S` (arity 2,
-        // output column, `Min` merge — the union-find leader). The mirror is
-        // never populated by writes (union `set`s are intercepted into the
-        // in-core UF), but the relation must exist so its FunctionId resolves in
-        // `info` / `lookup_id` (the extractor's `find_canonical` reads it).
-        let id = FunctionId::new(self.relations.len() as u32);
-        self.relations.push(RelationInfo {
-            name,
-            arity: 2,
-            has_output: true,
-            merge: MergeMode::Min,
-            identity_on_miss: false,
-            merge_tree: None,
-        });
-        self.mirror.insert(id, std::rc::Rc::new(HashSet::new()));
-        self.native_ufs.insert(id, uf::UfTable::new());
-        self.native_uf_members.insert(id, HashSet::new());
-
-        // Synthetic arity-1 "displaced ids" relation `@DispΔ` for the PURE-ENGINE
-        // rebuild (the native analog of the relational `@UF_Sf` flat index the
-        // plain-`--flowlog` rebuild joins against). On the PURE-ENGINE path it is
-        // fed each iteration — before the read snapshot — with the previous
-        // round's displaced ids, and the rewritten `@rebuild_rule` joins the
-        // view's eq-sort column against it on the fused DD worker
-        // (`view ⋈ δdisplaced`). On the CUSTOM (`--fast-rebuild`) path it stays
-        // empty. Registered unconditionally (harmless when unused): plain relation
-        // (whole-row key), never read back through the trait.
-        let disp_id = FunctionId::new(self.relations.len() as u32);
-        self.relations.push(RelationInfo {
-            name: format!("@Disp\u{0394}_{}", id.rep()),
-            arity: 1,
-            has_output: false,
-            merge: MergeMode::Relation,
-            identity_on_miss: false,
-            merge_tree: None,
-        });
-        self.mirror
-            .insert(disp_id, std::rc::Rc::new(HashSet::new()));
-        self.native_uf_disp_rel.insert(id, disp_id);
-
-        // The find-or-self canon-prim. A real, freeable `ExternalFunctionId`,
-        // but the interpreter intercepts calls to it (see `native_uf_canon_prim`)
-        // and answers `find_ro` from the in-core UF — the registered stub is
-        // never actually invoked through the `Database`.
-        let canon = self.register_external_func(Box::new(external_func::CanonStub));
-        self.native_uf_canon_prim.insert(canon, id);
-        Ok((id, canon))
+        // FlowLog has been migrated OFF native-UF onto the fast relational
+        // term-encoding (the LAST backend). The `:impl displaced-union-find`
+        // UF-backed function (the in-core `UfTable` host-pass) no longer exists
+        // here — the relational encoding uses `add_table` for `@UF_Sf`
+        // (identity-on-miss, `Min` merge) and no `add_uf_function` calls. The CLI
+        // rejects `--native-uf --flowlog` and non-proof `--native-merge --flowlog`,
+        // so this is unreachable in practice; bail loudly if the encoder ever emits
+        // a UF-backed function.
+        let _ = name;
+        anyhow::bail!(
+            "the FlowLog backend was migrated off native-UF; `:impl displaced-union-find` \
+             functions are not supported (use the relational term-encoding)"
+        )
     }
 
-    fn register_native_merge_view(&mut self, uf_func: FunctionId, view_func: FunctionId) {
-        // `--native-merge`: the view's eclass (OUTPUT) column belongs to `uf_func`. The view->UF
-        // association is now captured UNIFORMLY at `add_table` from the view's `UnionIntoUf` merge
-        // (the same single source of truth the native bridge reads), so this is a consistency
-        // assertion that the frontend's schedule-time registration agrees with the merge that was
-        // baked in at declare time — not the routing source. `resolve_merge` reads
-        // `native_merge_uf` to inject the union into this UF on an FD conflict.
-        debug_assert!(
-            self.native_ufs.contains_key(&uf_func),
-            "register_native_merge_view: uf_func is not a native union-find"
-        );
-        if let Some(existing) = self.native_merge_uf.get(&view_func) {
-            assert_eq!(
-                *existing, uf_func,
-                "register_native_merge_view: view {view_func:?} merge targets UF {existing:?} \
-                 but is being registered against UF {uf_func:?}"
-            );
-        } else {
-            // Defensive: a view registered without an `UnionIntoUf` merge (should not happen under
-            // the encoder's native-merge lowering) still gets its association recorded.
-            self.native_merge_uf.insert(view_func, uf_func);
-        }
+    fn register_native_merge_view(&mut self, _uf_func: FunctionId, _view_func: FunctionId) {
+        // `--native-merge` non-proof (the `UnionIntoUf` in-core-UF congruence) is no
+        // longer supported on FlowLog (it required native-UF, now deleted); the CLI
+        // rejects it. Proof-mode native-merge routes through `native_merge_proof`
+        // (captured at `add_table`), not through this hook. Nothing to register.
     }
 
     fn table_size(&self, table: FunctionId) -> usize {
@@ -1709,17 +1306,6 @@ impl Backend for EGraph {
     // -- direct access ------------------------------------------------------
 
     fn lookup_id(&self, func: FunctionId, key: &[Value]) -> Option<Value> {
-        // Native-UF find route: the `@UF_Sf` function's rows are not
-        // materialized (unions live in the in-core UF), so a mirror scan would
-        // always miss. Answer from the UF instead: `find_ro(x)` is the class
-        // leader, or `x` itself when unrecorded. This is the extractor's
-        // `find_canonical` path (`backend.lookup_id`).
-        if let Some(uf) = self.native_ufs.get(&func) {
-            if key.len() == 1 {
-                return Some(Value::new(uf.find_ro(key[0].rep() as i64) as u32));
-            }
-            return None;
-        }
         let info = self.info(func);
         if !info.has_output {
             return None;
@@ -1785,15 +1371,6 @@ impl Backend for EGraph {
     fn clear_table(&mut self, func: FunctionId) {
         if let Some(set) = self.mirror.get_mut(&func) {
             std::rc::Rc::make_mut(set).clear();
-        }
-        // CUSTOM rebuild only: drop the func's reverse index too (the index for
-        // an emptied func has no live rows). Clearing to an empty map keeps it
-        // "built" so the incremental hooks stay active; the next inserts
-        // repopulate it. No-op on PURE-ENGINE.
-        if self.native_uf_enabled && self.fast_rebuild {
-            if let Some(idx) = self.native_uf_rev_index.get_mut(&func) {
-                idx.clear();
-            }
         }
         // The DD `fed` snapshots (`dd_native_fed` / `dd_fused_fed`) are diffed
         // against the live mirror each iteration, so clearing the mirror is

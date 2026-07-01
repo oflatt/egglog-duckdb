@@ -86,27 +86,6 @@ impl ExternalFuncRegistry {
     }
 }
 
-/// Find-or-self canon-prim placeholder for the native-UF path
-/// (`--native-uf --flowlog`).
-///
-/// PR #782's UF-backed function returns this id from `add_uf_function` as the
-/// `@canon_S` find-or-self primitive. On the FlowLog backend the interpreter
-/// recognizes the id (see `EGraph::native_uf_canon_prim`) and answers the call
-/// host-side from the in-core `UfTable` — so this registered `ExternalFunction`
-/// is never actually invoked through the `Database`. It exists only so the id
-/// is a real, freeable [`ExternalFunctionId`]. Invoking it (which would mean the
-/// interception was missed) returns the argument unchanged (find-on-miss = self).
-#[derive(Clone)]
-pub struct CanonStub;
-
-impl ExternalFunction for CanonStub {
-    fn invoke(&self, _state: &mut ExecutionState, args: &[Value]) -> Option<Value> {
-        // Identity-on-miss: a find against an unrecorded id is the id itself.
-        // (The native-UF interceptor normally answers this before we get here.)
-        args.first().copied()
-    }
-}
-
 /// A real, invokable panic sentinel registered into the Database by
 /// `Backend::new_panic`. Invoking it panics with the recorded message.
 #[derive(Clone)]

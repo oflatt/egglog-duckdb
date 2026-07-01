@@ -53,20 +53,23 @@ fn main() {
     // backends, esp. proofs which need the relational proof-UF). An explicit
     // `--native-merge` still force-enables it.
     //
-    // DUCKDB + FELDERA FAST-RELATIONAL (mirror cli.rs): plain `--duckdb` /
-    // `--feldera` (non-proof, no explicit native-merge/native-uf) is migrated OFF
-    // native-UF onto the fast relational term-encoding — native-merge does NOT
-    // auto-on there (congruence stays rule-encoded + relational δuf fast-rebuild).
-    // An explicit `--native-merge --duckdb` / `--native-uf --duckdb` (and the same
-    // with `--feldera`, non-proof) is REJECTED by `egglog::cli` (the old native
-    // path is gone on both).
+    // DUCKDB + FELDERA + FLOWLOG FAST-RELATIONAL (mirror cli.rs): plain `--duckdb`
+    // / `--feldera` / `--flowlog` (non-proof, no explicit native-merge/native-uf)
+    // is migrated OFF native-UF onto the fast relational term-encoding — native-
+    // merge does NOT auto-on there (congruence stays rule-encoded; duckdb/feldera
+    // use the relational δuf fast-rebuild, flowlog lowers the rebuild rules through
+    // its general DD rule engine). An explicit `--native-merge` / `--native-uf`
+    // with any of these (non-proof) is REJECTED by `egglog::cli` (the old native
+    // path is gone on all three).
     let duckdb_fast_relational_default = want_duckdb && !want_proofs_early;
     let feldera_fast_relational_default = want_feldera && !want_proofs_early;
+    let flowlog_fast_relational_default = want_flowlog && !want_proofs_early;
     let effective_native_merge = (any_experimental
         && !argv.iter().any(|a| a == "--no-native-merge")
         && !explicit_native_uf
         && !duckdb_fast_relational_default
-        && !feldera_fast_relational_default)
+        && !feldera_fast_relational_default
+        && !flowlog_fast_relational_default)
         || argv.iter().any(|a| a == "--native-merge");
     // Proof-mode native-merge on the dataflow/SQL backends (flowlog/feldera/DUCKDB)
     // uses the RELATIONAL proof-UF + a proof side-table (the 2-table encoding), NOT
@@ -125,8 +128,13 @@ fn main() {
         })
         .expect("failed to start DuckDB-backed experimental egraph")
     } else if want_flowlog {
+        // FlowLog is migrated OFF native-UF onto the fast relational term-encoding
+        // (the LAST backend): there is no `native_uf` config knob anymore. If
+        // `--native-uf` / non-proof `--native-merge` were passed with `--flowlog`,
+        // `egglog::cli` (below) rejects them with a clear error; pre-build the
+        // fast-relational egraph regardless (cli exits before running it).
+        // `fast_rebuild` is a no-op on flowlog (retained for CLI symmetry).
         egglog_experimental::new_experimental_egraph_flowlog(egglog::FlowlogBackendConfig {
-            native_uf: want_native_uf,
             fast_rebuild: want_fast_rebuild,
             wcoj: want_wcoj,
             proofs: want_proofs,

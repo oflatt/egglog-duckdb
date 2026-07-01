@@ -271,12 +271,13 @@ impl Run {
         // snapshot — including per-function tuple counts via the
         // appended `(print-size)`.
         if self.flowlog {
-            // `native_uf`: as for feldera, the config flag enables the FlowLog
-            // backend's in-process UF host-pass and `with_native_uf()` makes
-            // the encoder emit the matching `:impl displaced-union-find`
-            // program. Both required. Term mode only.
+            // FlowLog is migrated OFF native-UF onto the fast relational term-
+            // encoding (the LAST backend): congruence is rule-encoded
+            // (`@congruence_rule*`) and the `@rebuild_rule*` rebuild rules lower as
+            // ordinary rules through the general DD rule engine (the sound
+            // `step_symmetric` path). `fast_rebuild` is a no-op on flowlog.
+            // Term mode only here.
             let mut egraph = EGraph::with_flowlog_backend_config(FlowlogBackendConfig {
-                native_uf: self.native_uf,
                 fast_rebuild: false,
                 // `--wcoj`: route the triangle rule through the worst-case-
                 // optimal delta query. Bit-exact with the binary join, so it is
@@ -285,9 +286,6 @@ impl Run {
                 proofs: false,
             })
             .unwrap_or_else(|e| panic!("EGraph::with_flowlog_backend init failed: {e}"));
-            if self.native_uf {
-                egraph = egraph.with_native_uf();
-            }
             egraph.ensure_no_reserved_symbols(false);
             return match egraph.parse_and_run_program(filename, &program) {
                 Ok(msgs) => {
@@ -733,22 +731,17 @@ fn generate_tests(glob: &str) -> Vec<Trial> {
 
         // duckdb + native UF: REMOVED. DuckDB is migrated OFF native-UF onto the
         // fast relational term-encoding (rule-encoded congruence + relational δuf
-        // fast-rebuild); the duckdb native-UF host-pass no longer exists. feldera
-        // and flowlog keep their native-UF treatments below (unchanged).
+        // fast-rebuild); the duckdb native-UF host-pass no longer exists.
 
         // feldera + native UF: REMOVED. Feldera is migrated OFF native-UF onto the
         // fast relational term-encoding (rule-encoded congruence + relational δuf
-        // fast-rebuild); the feldera native-UF host-pass no longer exists. flowlog
-        // keeps its native-UF treatment below (unchanged).
+        // fast-rebuild); the feldera native-UF host-pass no longer exists.
 
-        // flowlog + native UF: gated by the flowlog env var as well.
-        if native_uf_enabled && duckdb_supported && std::env::var("EGGLOG_TEST_FLOWLOG").is_ok() {
-            push_trial(Run {
-                flowlog: true,
-                native_uf: true,
-                ..run.clone()
-            });
-        }
+        // flowlog + native UF: REMOVED. FlowLog is the LAST backend migrated OFF
+        // native-UF onto the fast relational term-encoding (rule-encoded congruence
+        // + the rebuild rules lowered through the general DD rule engine); the
+        // flowlog native-UF host-pass no longer exists. The plain `flowlog`
+        // treatment above already exercises the migrated relational path.
 
         // duckdb + proofs: run files through the proof-tracking
         // encoder on the DuckDB backend. The encoder threads proof
