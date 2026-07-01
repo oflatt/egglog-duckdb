@@ -70,33 +70,6 @@ fn add_ns(c: &AtomicU64, d: std::time::Duration) {
     c.fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
 }
 
-/// δuf-driven rebuild (gated `FELDERA_DELTA_REBUILD`; needs canonicalize-at-
-/// creation so the `@UF_Sf` flat-index funcs are tagged transient). The rebuild
-/// join `view ⋈ uf` has incremental derivative `δview⋈uf + view⋈δuf`. Because
-/// new view rows are born canonical (the eclass fix), the `δview⋈uf` term is
-/// empty, so it is DROPPED. Two sub-steps per `step`:
-///   A: feed δview (non-transient) deltas, KEEP only the non-rebuild rules'
-///      output (congruence), DISCARD the rebuild rules' `δview⋈uf` output;
-///   B: feed δuf (transient) deltas, KEEP the rebuild rules' `view⋈δuf` output.
-/// The uf arrangement (DBSP integral) is FULLY maintained across both
-/// transactions — it is NEVER zeroed (the bug in flowlog's old `step_transient`).
-/// This ports `dd_native.rs::step_delta_rebuild` to DBSP's transaction model:
-/// each sub-step is a separate `transaction()` tick feeding a delta subset.
-pub(crate) fn delta_rebuild_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FELDERA_DELTA_REBUILD").is_some())
-}
-
-/// Trace flag for the δuf-driven rebuild (gated `FELDERA_DELTA_REBUILD_TRACE`):
-/// per-step view/uf delta sizes and the kept/dropped rebuild output counts, the
-/// DBSP analog of flowlog's `[dd_transient]` trace.
-fn delta_rebuild_trace() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FELDERA_DELTA_REBUILD_TRACE").is_some())
-}
-
 /// Hard upper bound on distinct body variables / atom columns the DBSP join
 /// supports (the WIDEST fixed-arity `DBData` row bucket).
 ///
@@ -2073,12 +2046,6 @@ struct FusedRuleW<R: Row> {
     output: OutputHandle<OrdZSet<R>>,
     /// Number of canonical body variables (binding-row width in use).
     n_vars: usize,
-    /// δuf-driven rebuild (Phase-2): true iff this rule's body reads a TRANSIENT
-    /// relation (an identity-on-miss `@UF_Sf` flat-index func) — i.e. it is a
-    /// rebuild rule whose `view ⋈ uf` join is driven from δuf in sub-step B. A
-    /// congruence rule (reading only view tables) is `false` and is captured in
-    /// sub-step A. Unused unless `FELDERA_DELTA_REBUILD` is set.
-    reads_transient: bool,
 }
 
 /// A fused, delta-fed body join for a WHOLE ruleset, MONOMORPHIZED to a fixed
@@ -2090,17 +2057,6 @@ pub struct FusedJoinImpl<R: Row> {
     inputs: HashMap<FunctionId, ZSetHandle<R>>,
     /// The fused rules, in build order. Each carries its own output handle.
     rules: Vec<FusedRuleW<R>>,
-    /// δuf-driven rebuild (gated `FELDERA_DELTA_REBUILD`): the TRANSIENT input
-    /// relations (identity-on-miss `@UF_Sf` flat-index funcs) read by this
-    /// ruleset's rebuild rules. When this is non-empty AND the flag is set,
-    /// [`FusedJoinImpl::step`] runs the two-substep δuf-driven path; otherwise it
-    /// runs the original symmetric single-transaction path. Restricted to funcs
-    /// this circuit actually has an input for.
-    transient_funcs: HashSet<FunctionId>,
-    /// `--fast-rebuild` (relational): when set, the δuf-driven rebuild two-substep
-    /// split is engaged (drop the empty `δview⋈uf_old` term). Set from the
-    /// backend config flag OR the `FELDERA_DELTA_REBUILD` env var at build time.
-    delta_rebuild: bool,
 }
 
 /// A fused body join for a whole ruleset, width-dispatched: the row carried
@@ -2117,15 +2073,10 @@ pub enum FusedJoin {
 impl FusedJoin {
     /// Build ONE circuit for the whole ruleset, dispatching to the smallest
     /// width bucket that fits. `plans` pairs each rule's index with its
-    /// [`JoinPlan`]; `engine` is the shared primitive engine. `transient_funcs`
-    /// are the identity-on-miss `@UF_Sf` flat-index funcs (for the δuf-driven
-    /// rebuild path); pass an empty set to keep the symmetric behavior.
-    pub fn build(
-        plans: &[(usize, JoinPlan)],
-        engine: &PrimEngine,
-        transient_funcs: &HashSet<FunctionId>,
-        delta_rebuild: bool,
-    ) -> Result<FusedJoin> {
+    /// [`JoinPlan`]; `engine` is the shared primitive engine. Every rule
+    /// (congruence, user, and `@rebuild_rule*` canonicalization) runs through the
+    /// same general fused join.
+    pub fn build(plans: &[(usize, JoinPlan)], engine: &PrimEngine) -> Result<FusedJoin> {
         let needed = plans
             .iter()
             .map(|(_, p)| p.var_order.len())
@@ -2140,24 +2091,9 @@ impl FusedJoin {
             needed
         };
         Ok(match pick_width(needed) {
-            8 => FusedJoin::W8(FusedJoinImpl::build(
-                plans,
-                engine,
-                transient_funcs,
-                delta_rebuild,
-            )?),
-            16 => FusedJoin::W16(FusedJoinImpl::build(
-                plans,
-                engine,
-                transient_funcs,
-                delta_rebuild,
-            )?),
-            _ => FusedJoin::W32(FusedJoinImpl::build(
-                plans,
-                engine,
-                transient_funcs,
-                delta_rebuild,
-            )?),
+            8 => FusedJoin::W8(FusedJoinImpl::build(plans, engine)?),
+            16 => FusedJoin::W16(FusedJoinImpl::build(plans, engine)?),
+            _ => FusedJoin::W32(FusedJoinImpl::build(plans, engine)?),
         })
     }
 
@@ -2197,14 +2133,7 @@ impl<R: Row> FusedJoinImpl<R> {
     /// Build ONE circuit for the whole ruleset. `plans` pairs each rule's index
     /// with its [`JoinPlan`]; `engine` is the shared primitive engine captured
     /// into call-prim closures (only used by rules with genuine value prims).
-    /// `transient_funcs` are the identity-on-miss `@UF_Sf` flat-index funcs (for
-    /// the δuf-driven rebuild path).
-    fn build(
-        plans: &[(usize, JoinPlan)],
-        engine: &PrimEngine,
-        transient_funcs: &HashSet<FunctionId>,
-        delta_rebuild: bool,
-    ) -> Result<FusedJoinImpl<R>> {
+    fn build(plans: &[(usize, JoinPlan)], engine: &PrimEngine) -> Result<FusedJoinImpl<R>> {
         // Snapshot the per-rule plan data the circuit closure needs (owned, so
         // the `move` closure is `'static`).
         struct RulePlan {
@@ -2253,14 +2182,6 @@ impl<R: Row> FusedJoinImpl<R> {
                 }
             }
         }
-
-        // δuf-driven rebuild: which rules read a transient (`@UF_Sf`) func in
-        // their body. Computed in build order (the same order `rule_outs` /
-        // `rules` are assembled), before `rule_plans` is moved into the closure.
-        let reads_transient: Vec<bool> = rule_plans
-            .iter()
-            .map(|rp| rp.atom_funcs.iter().any(|f| transient_funcs.contains(f)))
-            .collect();
 
         let engine = engine.clone();
 
@@ -2349,31 +2270,18 @@ impl<R: Row> FusedJoinImpl<R> {
         let inputs: HashMap<FunctionId, ZSetHandle<R>> = input_vec.into_iter().collect();
         let rules: Vec<FusedRuleW<R>> = rule_outs
             .into_iter()
-            .zip(reads_transient)
-            .map(
-                |((idx, var_order, n_vars, output), reads_transient)| FusedRuleW {
-                    idx,
-                    var_order,
-                    output,
-                    n_vars,
-                    reads_transient,
-                },
-            )
-            .collect();
-
-        // Keep only transient funcs this circuit actually has an input for.
-        let transient_funcs: HashSet<FunctionId> = transient_funcs
-            .iter()
-            .copied()
-            .filter(|f| inputs.contains_key(f))
+            .map(|(idx, var_order, n_vars, output)| FusedRuleW {
+                idx,
+                var_order,
+                output,
+                n_vars,
+            })
             .collect();
 
         Ok(FusedJoinImpl {
             handle,
             inputs,
             rules,
-            transient_funcs,
-            delta_rebuild,
         })
     }
 
@@ -2392,24 +2300,6 @@ impl<R: Row> FusedJoinImpl<R> {
     /// same order as [`FusedJoinImpl::rule_indices`]; each inner `Vec` is that
     /// rule's `(binding_row, weight)` pairs (positive = new, negative = retracted).
     fn step(
-        &mut self,
-        deltas: &HashMap<FunctionId, Vec<(Vec<u32>, ZWeight)>>,
-    ) -> Result<Vec<Vec<(Vec<u32>, ZWeight)>>> {
-        // δuf-driven rebuild: when this ruleset reads a transient (`@UF_Sf`) func
-        // and the relational fast-rebuild is enabled (config `--fast-rebuild` OR
-        // the `FELDERA_DELTA_REBUILD` env var, captured at build time into
-        // `self.delta_rebuild`), run the two-substep split that drops the (empty,
-        // by the eclass fix) `δview⋈uf_old` rebuild derivative. Otherwise the
-        // original symmetric single-transaction path (no behavior change).
-        if !self.transient_funcs.is_empty() && self.delta_rebuild {
-            return self.step_delta_rebuild(deltas);
-        }
-        self.step_symmetric(deltas)
-    }
-
-    /// The original symmetric incremental join: feed ALL deltas, ONE transaction,
-    /// capture every rule. Behavior-identical to the pre-Phase-2 `step`.
-    fn step_symmetric(
         &mut self,
         deltas: &HashMap<FunctionId, Vec<(Vec<u32>, ZWeight)>>,
     ) -> Result<Vec<Vec<(Vec<u32>, ZWeight)>>> {
@@ -2435,101 +2325,6 @@ impl<R: Row> FusedJoinImpl<R> {
         // ONE transaction for the WHOLE ruleset; keep every rule's output.
         let mut accs: Vec<HashMap<Vec<u32>, ZWeight>> = vec![HashMap::new(); self.rules.len()];
         self.run_transaction(&mut accs, |_| true, prof)?;
-        Ok(accs
-            .into_iter()
-            .map(|acc| acc.into_iter().filter(|(_, w)| *w != 0).collect())
-            .collect())
-    }
-
-    /// δuf-driven rebuild (gated `FELDERA_DELTA_REBUILD`). Two persistent
-    /// sub-steps, each a separate DBSP transaction tick over the SAME (never
-    /// zeroed) integrals — the DBSP analog of flowlog's two `drive_to`+`drain_into`
-    /// calls:
-    ///   A: feed δview (non-transient) deltas, run one transaction, KEEP only the
-    ///      non-rebuild rules' output (congruence) and DISCARD the rebuild rules'
-    ///      `δview⋈uf` output — the term the eclass fix makes empty;
-    ///   B: feed δuf (transient) deltas, run a second transaction, KEEP the
-    ///      rebuild rules' `view⋈δuf` output.
-    /// Both transactions advance the same circuit, so the uf/view integrals are
-    /// fully maintained across them (the soundness-critical invariant).
-    fn step_delta_rebuild(
-        &mut self,
-        deltas: &HashMap<FunctionId, Vec<(Vec<u32>, ZWeight)>>,
-    ) -> Result<Vec<Vec<(Vec<u32>, ZWeight)>>> {
-        let prof = std::env::var("FELDERA_PROFILE").is_ok();
-        let trace = delta_rebuild_trace();
-        let mut accs: Vec<HashMap<Vec<u32>, ZWeight>> = vec![HashMap::new(); self.rules.len()];
-
-        // Sub-step A: feed δview (non-transient). Keep congruence; DROP the
-        // rebuild rules' δview⋈uf output.
-        let t_feed_a = std::time::Instant::now();
-        let mut view_pushed = false;
-        let mut view_rows = 0usize;
-        for (func, rows) in deltas {
-            if self.transient_funcs.contains(func) {
-                continue;
-            }
-            if let Some(input) = self.inputs.get(func) {
-                for (row, w) in rows {
-                    input.push(pack_row(row), *w);
-                    view_pushed = true;
-                    view_rows += 1;
-                }
-            }
-        }
-        if prof && view_pushed {
-            add_ns(&PROF_FEED_NS, t_feed_a.elapsed());
-            PROF_STEP_CALLS.fetch_add(1, Ordering::Relaxed);
-        }
-        let a_dropped = if view_pushed {
-            self.run_transaction(&mut accs, |rule| !rule.reads_transient, prof)?
-        } else {
-            0
-        };
-
-        // Sub-step B: feed δuf (transient). Keep the rebuild rules' view⋈δuf
-        // output; the non-rebuild rules emit nothing new off δuf (they don't read
-        // a transient func), so capturing only `reads_transient` is exact.
-        let t_feed_b = std::time::Instant::now();
-        let mut uf_pushed = false;
-        let mut uf_rows = 0usize;
-        for (func, rows) in deltas {
-            if !self.transient_funcs.contains(func) {
-                continue;
-            }
-            if let Some(input) = self.inputs.get(func) {
-                for (row, w) in rows {
-                    input.push(pack_row(row), *w);
-                    uf_pushed = true;
-                    uf_rows += 1;
-                }
-            }
-        }
-        if prof && uf_pushed {
-            add_ns(&PROF_FEED_NS, t_feed_b.elapsed());
-            PROF_STEP_CALLS.fetch_add(1, Ordering::Relaxed);
-        }
-        let b_kept = if uf_pushed {
-            self.run_transaction(&mut accs, |rule| rule.reads_transient, prof)?
-        } else {
-            0
-        };
-
-        if trace {
-            let n_rebuild = self.rules.iter().filter(|r| r.reads_transient).count();
-            #[allow(clippy::disallowed_macros)]
-            {
-                eprintln!(
-                    "[feldera_delta_rebuild] n_rules={} n_rebuild={n_rebuild} \
-                     transient_funcs={} view_delta_rows={view_rows} \
-                     uf_delta_rows={uf_rows} rebuild_out_A(δview⋈uf,dropped)={a_dropped} \
-                     rebuild_out_B(view⋈δuf,kept)={b_kept}",
-                    self.rules.len(),
-                    self.transient_funcs.len()
-                );
-            }
-        }
-
         Ok(accs
             .into_iter()
             .map(|acc| acc.into_iter().filter(|(_, w)| *w != 0).collect())
@@ -2614,6 +2409,7 @@ mod persistent_tests {
             ],
             guards: vec![],
             steps: vec![],
+            projection: None,
         }
     }
 

@@ -53,17 +53,20 @@ fn main() {
     // backends, esp. proofs which need the relational proof-UF). An explicit
     // `--native-merge` still force-enables it.
     //
-    // DUCKDB FAST-RELATIONAL (mirror cli.rs): plain `--duckdb` (non-proof, no
-    // explicit native-merge/native-uf) is migrated OFF native-UF onto the fast
-    // relational term-encoding — native-merge does NOT auto-on there (congruence
-    // stays rule-encoded + relational δuf fast-rebuild). An explicit
-    // `--native-merge --duckdb` / `--native-uf --duckdb` is REJECTED by
-    // `egglog::cli` (the old native path is gone on duckdb).
+    // DUCKDB + FELDERA FAST-RELATIONAL (mirror cli.rs): plain `--duckdb` /
+    // `--feldera` (non-proof, no explicit native-merge/native-uf) is migrated OFF
+    // native-UF onto the fast relational term-encoding — native-merge does NOT
+    // auto-on there (congruence stays rule-encoded + relational δuf fast-rebuild).
+    // An explicit `--native-merge --duckdb` / `--native-uf --duckdb` (and the same
+    // with `--feldera`, non-proof) is REJECTED by `egglog::cli` (the old native
+    // path is gone on both).
     let duckdb_fast_relational_default = want_duckdb && !want_proofs_early;
+    let feldera_fast_relational_default = want_feldera && !want_proofs_early;
     let effective_native_merge = (any_experimental
         && !argv.iter().any(|a| a == "--no-native-merge")
         && !explicit_native_uf
-        && !duckdb_fast_relational_default)
+        && !duckdb_fast_relational_default
+        && !feldera_fast_relational_default)
         || argv.iter().any(|a| a == "--native-merge");
     // Proof-mode native-merge on the dataflow/SQL backends (flowlog/feldera/DUCKDB)
     // uses the RELATIONAL proof-UF + a proof side-table (the 2-table encoding), NOT
@@ -77,14 +80,17 @@ fn main() {
     // REQUIRES native-UF (and the proof carve-out keeps it OFF for proof mode).
     let want_native_uf =
         explicit_native_uf || (!single_output_proof_native_merge && effective_native_merge);
-    // `--fast-rebuild` engages the duckdb backend's delta-scoped rebuild; the
-    // pre-built duckdb egraph must carry it so the flag survives cli.rs's
-    // short-circuit (mirror `want_native_uf`). DUCKDB FAST-RELATIONAL: default it
-    // ON for the migrated plain-`--duckdb` path (non-proof, no native-uf/native-
-    // merge) so rule-encoded congruence is canonicalized by the relational δuf
-    // fast-rebuild — mirrors cli.rs's `args.fast_rebuild = true` fold.
+    // `--fast-rebuild` engages the backend's delta-scoped rebuild; the pre-built
+    // backend egraph must carry it so the flag survives cli.rs's short-circuit
+    // (mirror `want_native_uf`). DUCKDB + FELDERA FAST-RELATIONAL: default it ON for
+    // the migrated plain-`--duckdb` / `--feldera` path (non-proof, no
+    // native-uf/native-merge) so rule-encoded congruence is canonicalized by the
+    // relational δuf fast-rebuild — mirrors cli.rs's `args.fast_rebuild = true` fold.
     let want_fast_rebuild = argv.iter().any(|a| a == "--fast-rebuild")
-        || (want_duckdb && !want_native_uf && !effective_native_merge && !want_proofs_early);
+        || ((want_duckdb || want_feldera)
+            && !want_native_uf
+            && !effective_native_merge
+            && !want_proofs_early);
     // `--proof-testing` implies proofs — the desugar pass rewrites
     // `(check ...)` into `(prove-exists ...)` which needs the proof
     // encoding active. Without this, cli.rs's `args.proof_testing`
@@ -127,8 +133,12 @@ fn main() {
         })
         .expect("failed to start FlowLog-backed experimental egraph")
     } else if want_feldera {
+        // Feldera is migrated OFF native-UF onto the fast relational term-encoding:
+        // there is no `native_uf` config knob anymore. If `--native-uf` /
+        // non-proof `--native-merge` were passed with `--feldera`, `egglog::cli`
+        // (below) rejects them with a clear error; pre-build the fast-relational
+        // egraph regardless (cli exits before running it).
         egglog_experimental::new_experimental_egraph_feldera(egglog::FelderaBackendConfig {
-            native_uf: want_native_uf,
             fast_rebuild: want_fast_rebuild,
             proofs: want_proofs,
         })

@@ -542,24 +542,21 @@ impl EGraph {
         Self::with_feldera_backend_config(FelderaBackendConfig::default())
     }
 
-    /// [`EGraph::with_feldera_backend`] with explicit knobs. The only knob is
-    /// [`FelderaBackendConfig::native_uf`] (`--native-uf --feldera`): the Feldera
-    /// backend drives PR #782's UF-backed-table encoding through its fast
-    /// HOST-PASS rebuild (the in-process `UfTable` answers finds and ingests
-    /// unions; the onchange-driven `@rebuild_rule*` / `@uf_change_drain_rule*`
-    /// maintenance rules are intercepted/dropped, keeping the `view ⋈ @UF_Sf`
-    /// integral OUT of the DBSP circuit — the ~24% / transaction-count win). The
-    /// caller must ALSO enable the encoding via [`EGraph::with_native_uf`] so the
-    /// term encoder emits the `:impl displaced-union-find` program this backend
-    /// interception expects.
+    /// [`EGraph::with_feldera_backend`] with explicit knobs. Feldera has been
+    /// migrated OFF native-UF onto the fast RELATIONAL term-encoding, so there is
+    /// no `native_uf` knob: `--feldera` runs the relational encoding — RULE-ENCODED
+    /// congruence (`@congruence_rule*`) canonicalized by the `@rebuild_rule*`
+    /// rebuild rules, which lower as ORDINARY rules through Feldera's general DBSP
+    /// rule engine (`view ⋈ @UF_Sf` incremental joins over the real materialized
+    /// `@UF_Sf` flat index). [`FelderaBackendConfig::fast_rebuild`] is a NO-OP
+    /// (the δuf-scoping rebuild optimization was removed with native-UF), and
+    /// [`FelderaBackendConfig::proofs`] runs the relational proof encoding.
     pub fn with_feldera_backend_config(config: FelderaBackendConfig) -> anyhow::Result<Self> {
-        let mut db = egglog_bridge_feldera::EGraph::new();
-        if config.native_uf {
-            db.enable_native_uf();
-        }
-        if config.fast_rebuild {
-            db.enable_fast_rebuild();
-        }
+        let db = egglog_bridge_feldera::EGraph::new();
+        // `config.fast_rebuild` is now a no-op on Feldera: the relational general
+        // rebuild (every `@rebuild_rule*` lowered as an ordinary DBSP rule) is
+        // always used — there is no δuf-scoping fast-rebuild variant to engage.
+        let _ = config.fast_rebuild;
         let backend: Box<dyn egglog_backend_trait::Backend> = Box::new(db);
         let mut eg = Self::with_backend(backend);
 
@@ -679,23 +676,19 @@ pub struct FlowlogBackendConfig {
     pub proofs: bool,
 }
 
-/// Knobs for [`EGraph::with_feldera_backend_config`]. Mirrors
-/// [`FlowlogBackendConfig`] (Feldera has no proof mode yet, so only `native_uf`).
+/// Knobs for [`EGraph::with_feldera_backend_config`].
+///
+/// Feldera has been migrated OFF native-UF onto the fast RELATIONAL term-encoding
+/// (mirror of the DuckDB migration): there is no `native_uf` knob — congruence is
+/// rule-encoded (`@congruence_rule*`) and the `@rebuild_rule*` rebuild rules lower
+/// as ORDINARY rules through the general DBSP rule engine (`view ⋈ @UF_Sf`).
 #[derive(Clone, Default, Debug)]
 pub struct FelderaBackendConfig {
-    /// `--native-uf --feldera`: drive PR #782's UF-backed encoding through the
-    /// Feldera backend's in-process `UfTable` + host-pass rebuild (finds and
-    /// union ingestion in-core; the onchange-driven maintenance rules
-    /// intercepted/dropped), keeping the `view ⋈ @UF_Sf` integral OUT of the
-    /// DBSP circuit. Must be paired with [`EGraph::with_native_uf`] (the
-    /// encoding). Experimental; off by default.
-    pub native_uf: bool,
-    /// `--fast-rebuild`: engage the Feldera backend's RELATIONAL δuf fast-rebuild
-    /// (`enable_fast_rebuild`), dropping the always-empty `δview ⋈ uf_old` rebuild
-    /// term. Only meaningful WITHOUT [`native_uf`](Self::native_uf): under
-    /// native-UF the host-side `view ⋈ δuf` delta rebuild is already the default,
-    /// so this flag is a no-op there. (Also reachable via the
-    /// `FELDERA_DELTA_REBUILD` env var.) Experimental; off by default.
+    /// `--fast-rebuild`: NO-OP on Feldera. The δuf-scoping relational fast-rebuild
+    /// optimization was removed together with native-UF — every `@rebuild_rule*`
+    /// now lowers as an ordinary DBSP rule (no two-substep split, no `transient`
+    /// scoping). The field is retained so the CLI can keep setting it uniformly
+    /// with duckdb, but it has no effect on the feldera backend.
     pub fast_rebuild: bool,
     /// `--proofs` / `--proof-testing`: build the egraph with proof-tracking term
     /// encoding active from construction. Mirrors [`DuckBackendConfig::proofs`]:

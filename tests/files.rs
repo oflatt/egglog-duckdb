@@ -35,14 +35,15 @@ struct Run {
     /// eq-sort union-find is lowered to the `:impl displaced-union-find`
     /// UF-backed function rather than the relational union-find. This
     /// dimension is orthogonal to the backend dimension: when set, the
-    /// reference/native-bridge run enables `EGraph::with_native_uf()`, and
-    /// each backend treatment (duckdb/feldera/flowlog) additionally enables
-    /// its own in-process UF host-pass via the backend config's `native_uf`
-    /// flag. Native UF must be bit-exact with the reference, so every
-    /// native-uf treatment is diffed against the SAME shared snapshot. Term
-    /// mode only: never combined with `proofs`/`proof_testing`. Gated behind
-    /// `EGGLOG_TEST_NATIVE_UF=1` (plus the per-backend `EGGLOG_TEST_FLOWLOG` /
-    /// `EGGLOG_TEST_FELDERA` gates) so it never perturbs the default run.
+    /// reference/native-bridge run enables `EGraph::with_native_uf()`, and the
+    /// flowlog treatment additionally enables its own in-process UF host-pass via
+    /// the backend config's `native_uf` flag. (duckdb and feldera have been
+    /// migrated off native-UF onto the fast relational term-encoding, so they no
+    /// longer pair with this dimension.) Native UF must be bit-exact with the
+    /// reference, so every native-uf treatment is diffed against the SAME shared
+    /// snapshot. Term mode only: never combined with `proofs`/`proof_testing`.
+    /// Gated behind `EGGLOG_TEST_NATIVE_UF=1` (plus the per-backend
+    /// `EGGLOG_TEST_FLOWLOG` gate) so it never perturbs the default run.
     native_uf: bool,
     /// Run the FlowLog treatment with `--wcoj` enabled: the reverse-
     /// distributivity triangle rule is routed through the worst-case-optimal
@@ -231,21 +232,16 @@ impl Run {
         // counts via the appended `(print-size)`. This is Milestone 3's
         // end-to-end check.
         if self.feldera {
-            // `native_uf` drives PR #782's UF-backed encoding through the
-            // Feldera backend's in-process host-pass: the config flag enables
-            // the backend interception, and `with_native_uf()` makes the term
-            // encoder emit the `:impl displaced-union-find` program the
-            // interception expects. Both are required (see lib.rs). Term mode
-            // only — never combined with proofs here.
+            // Feldera is migrated OFF native-UF onto the fast relational term-
+            // encoding: congruence is rule-encoded (`@congruence_rule*`) and the
+            // relational δuf fast-rebuild's `view ⋈ @UF_Sf` join canonicalizes it
+            // (`fast_rebuild: true` — matching cli.rs's plain-`--feldera` default).
+            // Term mode only here.
             let mut egraph = EGraph::with_feldera_backend_config(FelderaBackendConfig {
-                native_uf: self.native_uf,
-                fast_rebuild: false,
+                fast_rebuild: true,
                 proofs: false,
             })
             .unwrap_or_else(|e| panic!("EGraph::with_feldera_backend init failed: {e}"));
-            if self.native_uf {
-                egraph = egraph.with_native_uf();
-            }
             egraph.ensure_no_reserved_symbols(false);
             return match egraph.parse_and_run_program(filename, &program) {
                 Ok(msgs) => {
@@ -714,15 +710,15 @@ fn generate_tests(glob: &str) -> Vec<Trial> {
         }
 
         // native-UF treatments (PR #782 `--native-uf`, TERM mode only): run
-        // the UF-backed-table encoding on each backend and confirm it is
-        // bit-exact with the reference via the SAME shared snapshot. Native UF
+        // the UF-backed-table encoding on the native bridge / flowlog and confirm
+        // it is bit-exact with the reference via the SAME shared snapshot. Native UF
         // is a correctness-preserving optimization, so any divergence here is
         // a real bug. All of these are gated behind `EGGLOG_TEST_NATIVE_UF=1`
-        // (the per-backend ones additionally behind their existing
-        // `EGGLOG_TEST_FELDERA` / `EGGLOG_TEST_FLOWLOG` gates) so they never
-        // perturb the default `cargo test` run. Never combined with
-        // proofs/proof_testing (native UF + proofs is not yet wired — see the
-        // duckdb branch in `test_program`).
+        // (the per-backend one additionally behind the existing
+        // `EGGLOG_TEST_FLOWLOG` gate) so they never perturb the default `cargo test`
+        // run. duckdb and feldera have been migrated off native-UF (their
+        // per-backend native-UF trials are removed). Never combined with
+        // proofs/proof_testing (native UF + proofs is not yet wired).
         let native_uf_enabled = std::env::var("EGGLOG_TEST_NATIVE_UF").is_ok();
 
         // native bridge + native UF: same support gate as the `term_encoding`
@@ -740,14 +736,10 @@ fn generate_tests(glob: &str) -> Vec<Trial> {
         // fast-rebuild); the duckdb native-UF host-pass no longer exists. feldera
         // and flowlog keep their native-UF treatments below (unchanged).
 
-        // feldera + native UF: gated by the feldera env var as well.
-        if native_uf_enabled && duckdb_supported && std::env::var("EGGLOG_TEST_FELDERA").is_ok() {
-            push_trial(Run {
-                feldera: true,
-                native_uf: true,
-                ..run.clone()
-            });
-        }
+        // feldera + native UF: REMOVED. Feldera is migrated OFF native-UF onto the
+        // fast relational term-encoding (rule-encoded congruence + relational δuf
+        // fast-rebuild); the feldera native-UF host-pass no longer exists. flowlog
+        // keeps its native-UF treatment below (unchanged).
 
         // flowlog + native UF: gated by the flowlog env var as well.
         if native_uf_enabled && duckdb_supported && std::env::var("EGGLOG_TEST_FLOWLOG").is_ok() {

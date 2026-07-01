@@ -82,15 +82,13 @@ pub fn new_experimental_egraph_flowlog(
 }
 
 /// Build an experimental egraph backed by Feldera. See
-/// [`new_experimental_egraph_flowlog`].
+/// [`new_experimental_egraph_flowlog`]. Feldera has been migrated OFF native-UF
+/// onto the fast relational term-encoding, so (unlike flowlog) there is no
+/// `with_native_uf` step — `FelderaBackendConfig` has no `native_uf` knob.
 pub fn new_experimental_egraph_feldera(
     config: egglog::FelderaBackendConfig,
 ) -> anyhow::Result<EGraph> {
-    let native_uf = config.native_uf;
     let mut egraph = EGraph::with_feldera_backend_config(config)?;
-    if native_uf {
-        egraph = egraph.with_native_uf();
-    }
     extend_with_experimental(&mut egraph);
     Ok(egraph)
 }
