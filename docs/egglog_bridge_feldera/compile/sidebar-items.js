@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_ARITY"],"enum":["BodyOp","HeadOp","MergeMode","Slot"],"fn":["pack_row","row_col","slot_lookup","unpack_row"],"struct":["BodyAtom","RuleIr"],"type":["Row"]};

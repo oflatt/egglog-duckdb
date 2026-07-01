@@ -1,0 +1,708 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `egglog-bridge-flowlog/src/interpret.rs`."><title>interpret.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-e56847b5.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="egglog_bridge_flowlog" data-themes="" data-resource-suffix="" data-rustdoc-version="1.91.0 (f8297e351 2025-10-28)" data-channel="1.91.0" data-search-js="search-e256b49e.js" data-stringdex-js="stringdex-c3e638e9.js" data-settings-js="settings-c38705f0.js" ><script src="../../static.files/storage-e2aeef58.js"></script><script defer src="../../static.files/src-script-813739b1.js"></script><script defer src="../../src-files.js"></script><script defer src="../../static.files/main-6dc2a7f3.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-263c88ec.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content"><div class="main-heading"><h1><div class="sub-heading">egglog_bridge_flowlog/</div>interpret.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-3"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="doccomment">//! Host-side iteration driver for the FlowLog backend.
+<a href=#2 id=2 data-nosnippet>2</a>//!
+<a href=#3 id=3 data-nosnippet>3</a>//! One `run_rules` call = **one bounded egglog iteration**. The body join runs
+<a href=#4 id=4 data-nosnippet>4</a>//! on the in-process, build-once, epoch-driven raw differential-dataflow
+<a href=#5 id=5 data-nosnippet>5</a>//! dataflow (`crate::dd_native`); this module owns the orchestration around it:
+<a href=#6 id=6 data-nosnippet>6</a>//!
+<a href=#7 id=7 data-nosnippet>7</a>//! 1. snapshot the relation mirror (the read view for this iteration — all rules
+<a href=#8 id=8 data-nosnippet>8</a>//!    match against the same pre-iteration state, egglog's semi-naive "match the
+<a href=#9 id=9 data-nosnippet>9</a>//!    old database, then apply" model for a single hop);
+<a href=#10 id=10 data-nosnippet>10</a>//! 2. for each rule, drive its persistent DD join with the per-relation signed
+<a href=#11 id=11 data-nosnippet>11</a>//!    delta vs. what that join was last fed, then re-run any body primitives
+<a href=#12 id=12 data-nosnippet>12</a>//!    (`!=` guards, value-computing prims) host-side over the produced bindings;
+<a href=#13 id=13 data-nosnippet>13</a>//! 3. for every surviving binding, execute the head ops in order — `set` /
+<a href=#14 id=14 data-nosnippet>14</a>//!    `remove` / `subsume` writes, RHS `lookup` (eq-sort constructor: create on
+<a href=#15 id=15 data-nosnippet>15</a>//!    miss), RHS primitive `call`, `union`, `panic`;
+<a href=#16 id=16 data-nosnippet>16</a>//! 4. apply all collected writes/removes to the mirror and resolve
+<a href=#17 id=17 data-nosnippet>17</a>//!    functional-dependency conflicts per each touched function's merge mode.
+<a href=#18 id=18 data-nosnippet>18</a>//!
+<a href=#19 id=19 data-nosnippet>19</a>//! ## The engine split (mirrors Feldera Stage C)
+<a href=#20 id=20 data-nosnippet>20</a>//!
+<a href=#21 id=21 data-nosnippet>21</a>//! The relational table-atom join is the ONLY thing on the engine, and it is the
+<a href=#22 id=22 data-nosnippet>22</a>//! ONLY join path — there is no host nested-loop fallback. Any rule the DD plan
+<a href=#23 id=23 data-nosnippet>23</a>//! cannot lower (a binding row exceeding the fixed width cap [`dd_native::W`], or
+<a href=#24 id=24 data-nosnippet>24</a>//! any shape `plan_join` rejects) `panic!`s with a specific reason. The primitive
+<a href=#25 id=25 data-nosnippet>25</a>//! tail + head actions are applied HOST-side here, exactly mirroring Feldera's
+<a href=#26 id=26 data-nosnippet>26</a>//! "table join on the engine, prim tail host-side" split.
+<a href=#27 id=27 data-nosnippet>27</a>//!
+<a href=#28 id=28 data-nosnippet>28</a>//! Primitives are invoked through `Database::with_execution_state`, so they see
+<a href=#29 id=29 data-nosnippet>29</a>//! the same interned base `Value`s the frontend created — giving the FlowLog
+<a href=#30 id=30 data-nosnippet>30</a>//! backend bit-for-bit value parity with the reference backend (no `eval_prim`
+<a href=#31 id=31 data-nosnippet>31</a>//! trait change — flowlog keeps its zero-trait-change posture).
+<a href=#32 id=32 data-nosnippet>32</a>
+<a href=#33 id=33 data-nosnippet>33</a></span><span class="kw">use </span>anyhow::{anyhow, <span class="prelude-ty">Result</span>};
+<a href=#34 id=34 data-nosnippet>34</a><span class="kw">use </span>egglog_backend_trait::{FunctionId, Value};
+<a href=#35 id=35 data-nosnippet>35</a><span class="kw">use </span>egglog_numeric_id::NumericId;
+<a href=#36 id=36 data-nosnippet>36</a><span class="kw">use </span>hashbrown::{HashMap, HashSet};
+<a href=#37 id=37 data-nosnippet>37</a>
+<a href=#38 id=38 data-nosnippet>38</a><span class="kw">use </span><span class="kw">crate</span>::compile::{row_col, slot_lookup, BodyOp, HeadOp, Row, RuleIr, Slot};
+<a href=#39 id=39 data-nosnippet>39</a><span class="kw">use </span><span class="kw">crate</span>::EGraph;
+<a href=#40 id=40 data-nosnippet>40</a>
+<a href=#41 id=41 data-nosnippet>41</a><span class="doccomment">/// Binding environment: variable id → bound `u32` value.
+<a href=#42 id=42 data-nosnippet>42</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">type </span>Env = HashMap&lt;u32, u32&gt;;
+<a href=#43 id=43 data-nosnippet>43</a>
+<a href=#44 id=44 data-nosnippet>44</a><span class="doccomment">/// A pending write to apply after all matches are computed.
+<a href=#45 id=45 data-nosnippet>45</a></span><span class="kw">enum </span>Write {
+<a href=#46 id=46 data-nosnippet>46</a>    <span class="doccomment">/// Insert/overwrite a full row.
+<a href=#47 id=47 data-nosnippet>47</a>    </span>Set(FunctionId, Row),
+<a href=#48 id=48 data-nosnippet>48</a>    <span class="doccomment">/// Retract by key (the slots address inputs for a function, whole row for a
+<a href=#49 id=49 data-nosnippet>49</a>    /// relation).
+<a href=#50 id=50 data-nosnippet>50</a>    </span>Remove(FunctionId, Vec&lt;u32&gt;),
+<a href=#51 id=51 data-nosnippet>51</a>}
+<a href=#52 id=52 data-nosnippet>52</a>
+<a href=#53 id=53 data-nosnippet>53</a><span class="doccomment">/// One bounded egglog iteration with the body join running on the in-process,
+<a href=#54 id=54 data-nosnippet>54</a>/// build-once, epoch-driven raw differential-dataflow dataflow
+<a href=#55 id=55 data-nosnippet>55</a>/// (`crate::dd_native`). This is the FlowLog analog of the Feldera backend's
+<a href=#56 id=56 data-nosnippet>56</a>/// `interpret::run_iteration` + `persistent_bindings`.
+<a href=#57 id=57 data-nosnippet>57</a>///
+<a href=#58 id=58 data-nosnippet>58</a>/// Per rule: compute the signed `+/-` delta of each body relation vs the rows
+<a href=#59 id=59 data-nosnippet>59</a>/// last fed to that rule's persistent DD join, `step` the join (which feeds ONLY
+<a href=#60 id=60 data-nosnippet>60</a>/// the delta into never-cleared InputSessions — genuinely incremental), turn the
+<a href=#61 id=61 data-nosnippet>61</a>/// positive binding deltas into envs, re-run body prims host-side (value prims /
+<a href=#62 id=62 data-nosnippet>62</a>/// guards the engine keeps off-circuit), then apply head actions. Writes +
+<a href=#63 id=63 data-nosnippet>63</a>/// FD-merge are applied so results are bit-exact.
+<a href=#64 id=64 data-nosnippet>64</a></span><span class="kw">pub fn </span>run_iteration(eg: <span class="kw-2">&amp;mut </span>EGraph, rule_idxs: <span class="kw-2">&amp;</span>[usize]) -&gt; <span class="prelude-ty">Result</span>&lt;bool&gt; {
+<a href=#65 id=65 data-nosnippet>65</a>    <span class="comment">// FlowLog runs the fast RELATIONAL term-encoding: EVERY rule — including the
+<a href=#66 id=66 data-nosnippet>66</a>    // `@rebuild_rule*` canonicalization rules — lowers as an ordinary rule and
+<a href=#67 id=67 data-nosnippet>67</a>    // joins on the fused DD worker (the sound `step_symmetric` path: `view ⋈ @UF_Sf`
+<a href=#68 id=68 data-nosnippet>68</a>    // + full-recanon action). No native-UF host-pass, no synthetic `@DispΔ`
+<a href=#69 id=69 data-nosnippet>69</a>    // relation, no rebuild-rule recognizer, no δUF-scoping special-casing.
+<a href=#70 id=70 data-nosnippet>70</a>
+<a href=#71 id=71 data-nosnippet>71</a>    // Snapshot the read view: rules match against the pre-iteration mirror.
+<a href=#72 id=72 data-nosnippet>72</a>    //
+<a href=#73 id=73 data-nosnippet>73</a>    // The snapshot shares each function's row set by `Rc` rather than
+<a href=#74 id=74 data-nosnippet>74</a>    // deep-cloning every row: this is O(#functions), not O(state). Mutations to
+<a href=#75 id=75 data-nosnippet>75</a>    // the mirror this call (head writes, hash-cons in `lookup_or_create`, merge
+<a href=#76 id=76 data-nosnippet>76</a>    // resolution) go through `Rc::make_mut`, which copy-on-writes only the
+<a href=#77 id=77 data-nosnippet>77</a>    // functions actually changed while this snapshot is alive — so `read` keeps
+<a href=#78 id=78 data-nosnippet>78</a>    // the start-of-call contents and rules all match the pre-iteration state.
+<a href=#79 id=79 data-nosnippet>79</a>    </span><span class="kw">let </span>read: HashMap&lt;FunctionId, std::rc::Rc&lt;HashSet&lt;Row&gt;&gt;&gt; = eg
+<a href=#80 id=80 data-nosnippet>80</a>        .mirror
+<a href=#81 id=81 data-nosnippet>81</a>        .iter()
+<a href=#82 id=82 data-nosnippet>82</a>        .map(|(f, set)| (<span class="kw-2">*</span>f, std::rc::Rc::clone(set)))
+<a href=#83 id=83 data-nosnippet>83</a>        .collect();
+<a href=#84 id=84 data-nosnippet>84</a>
+<a href=#85 id=85 data-nosnippet>85</a>    <span class="comment">// Snapshot the fresh-id counter: any hash-cons (`lookup_or_create`) this
+<a href=#86 id=86 data-nosnippet>86</a>    // call advances it, the O(1) signal that a new term row was created.
+<a href=#87 id=87 data-nosnippet>87</a>    </span><span class="kw">let </span>next_id_at_start = eg.next_id;
+<a href=#88 id=88 data-nosnippet>88</a>
+<a href=#89 id=89 data-nosnippet>89</a>    <span class="kw">let </span><span class="kw-2">mut </span>writes: Vec&lt;Write&gt; = Vec::new();
+<a href=#90 id=90 data-nosnippet>90</a>    <span class="kw">let </span><span class="kw-2">mut </span>touched: HashSet&lt;FunctionId&gt; = HashSet::new();
+<a href=#91 id=91 data-nosnippet>91</a>    <span class="comment">// Iteration-scoped `key -&gt; output` index for `lookup_or_create` (eq-sort
+<a href=#92 id=92 data-nosnippet>92</a>    // constructor hash-cons). Built lazily per function so repeated lookups in
+<a href=#93 id=93 data-nosnippet>93</a>    // one iteration are O(1) instead of rescanning the growing mirror each time.
+<a href=#94 id=94 data-nosnippet>94</a>    </span><span class="kw">let </span><span class="kw-2">mut </span>lookup_index: HashMap&lt;FunctionId, HashMap&lt;Box&lt;[u32]&gt;, u32&gt;&gt; = HashMap::new();
+<a href=#95 id=95 data-nosnippet>95</a>
+<a href=#96 id=96 data-nosnippet>96</a>    <span class="comment">// Collect each rule's index + IR up front (clone to avoid borrow conflicts
+<a href=#97 id=97 data-nosnippet>97</a>    // while we also mutate the mirror via lookups). EVERY rule — including the
+<a href=#98 id=98 data-nosnippet>98</a>    // `@rebuild_rule*` canonicalization rules — takes the ordinary atom-rule path
+<a href=#99 id=99 data-nosnippet>99</a>    // (no recognizer, no rewrite, no drop): they are relational rules
+<a href=#100 id=100 data-nosnippet>100</a>    // (`view ⋈ @UF_Sf` body + full-recanon head) and join on the fused DD worker
+<a href=#101 id=101 data-nosnippet>101</a>    // like any other rule.
+<a href=#102 id=102 data-nosnippet>102</a>    </span><span class="kw">let </span>rules: Vec&lt;(usize, RuleIr)&gt; = rule_idxs
+<a href=#103 id=103 data-nosnippet>103</a>        .iter()
+<a href=#104 id=104 data-nosnippet>104</a>        .filter_map(|<span class="kw-2">&amp;</span>i| eg.rules.get(i).and_then(|r| r.clone()).map(|r| (i, r)))
+<a href=#105 id=105 data-nosnippet>105</a>        .collect();
+<a href=#106 id=106 data-nosnippet>106</a>
+<a href=#107 id=107 data-nosnippet>107</a>    <span class="comment">// Compute every rule's binding envs FIRST (so the whole atom-bearing ruleset
+<a href=#108 id=108 data-nosnippet>108</a>    // runs on ONE fused DD worker in a single epoch — `fused_bindings`), THEN
+<a href=#109 id=109 data-nosnippet>109</a>    // apply head actions in the original rule firing order. Atom-less rules
+<a href=#110 id=110 data-nosnippet>110</a>    // (`(rule () …)`) have no input relation to drive the DD dataflow, so they
+<a href=#111 id=111 data-nosnippet>111</a>    // stay host-side (fire once); they are computed inline below.
+<a href=#112 id=112 data-nosnippet>112</a>    </span><span class="kw">let </span>envs_by_rule = fused_bindings(eg, <span class="kw-2">&amp;</span>read, <span class="kw-2">&amp;</span>rules)<span class="question-mark">?</span>;
+<a href=#113 id=113 data-nosnippet>113</a>
+<a href=#114 id=114 data-nosnippet>114</a>    <span class="kw">for </span>((idx, rule), envs) <span class="kw">in </span>rules.iter().zip(envs_by_rule.into_iter()) {
+<a href=#115 id=115 data-nosnippet>115</a>        <span class="kw">let _ </span>= idx;
+<a href=#116 id=116 data-nosnippet>116</a>        <span class="kw">for </span><span class="kw-2">mut </span>env <span class="kw">in </span>envs {
+<a href=#117 id=117 data-nosnippet>117</a>            apply_head(
+<a href=#118 id=118 data-nosnippet>118</a>                eg,
+<a href=#119 id=119 data-nosnippet>119</a>                <span class="kw-2">&amp;</span>rule.head,
+<a href=#120 id=120 data-nosnippet>120</a>                <span class="kw-2">&amp;mut </span>env,
+<a href=#121 id=121 data-nosnippet>121</a>                <span class="kw-2">&amp;mut </span>writes,
+<a href=#122 id=122 data-nosnippet>122</a>                <span class="kw-2">&amp;mut </span>touched,
+<a href=#123 id=123 data-nosnippet>123</a>                <span class="kw-2">&amp;mut </span>lookup_index,
+<a href=#124 id=124 data-nosnippet>124</a>            )<span class="question-mark">?</span>;
+<a href=#125 id=125 data-nosnippet>125</a>        }
+<a href=#126 id=126 data-nosnippet>126</a>    }
+<a href=#127 id=127 data-nosnippet>127</a>
+<a href=#128 id=128 data-nosnippet>128</a>    <span class="comment">// Apply collected writes to the mirror.
+<a href=#129 id=129 data-nosnippet>129</a>    //
+<a href=#130 id=130 data-nosnippet>130</a>    // Removes are BATCHED per function: applying each `Write::Remove` with its
+<a href=#131 id=131 data-nosnippet>131</a>    // own `set.retain` scan is O(|removes| · |state|) — quadratic. We collect all
+<a href=#132 id=132 data-nosnippet>132</a>    // retraction keys per function into a hash set, then do a SINGLE `retain`
+<a href=#133 id=133 data-nosnippet>133</a>    // pass per touched function: O(|state|) total. Removes are applied FIRST
+<a href=#134 id=134 data-nosnippet>134</a>    // (batched), then Sets — preserving the term encoder's `(@uf)` "delete old
+<a href=#135 id=135 data-nosnippet>135</a>    // leader, set new leader" delete-then-set ordering.
+<a href=#136 id=136 data-nosnippet>136</a>    //
+<a href=#137 id=137 data-nosnippet>137</a>    // `changed` is computed INCREMENTALLY as writes land (O(delta)), not via a
+<a href=#138 id=138 data-nosnippet>138</a>    // full before/after content compare. A hash-cons in `lookup_or_create`
+<a href=#139 id=139 data-nosnippet>139</a>    // always allocates a fresh id, so any term created this call advances
+<a href=#140 id=140 data-nosnippet>140</a>    // `next_id` — that alone is a real mirror change.
+<a href=#141 id=141 data-nosnippet>141</a>    </span><span class="kw">let </span><span class="kw-2">mut </span>changed = eg.next_id != next_id_at_start;
+<a href=#142 id=142 data-nosnippet>142</a>    <span class="kw">let </span><span class="kw-2">mut </span>removes_by_func: HashMap&lt;FunctionId, (usize, HashSet&lt;Box&lt;[u32]&gt;&gt;)&gt; = HashMap::new();
+<a href=#143 id=143 data-nosnippet>143</a>    <span class="kw">let </span><span class="kw-2">mut </span>sets: Vec&lt;(FunctionId, Row)&gt; = Vec::new();
+<a href=#144 id=144 data-nosnippet>144</a>    <span class="kw">for </span>w <span class="kw">in </span>writes {
+<a href=#145 id=145 data-nosnippet>145</a>        <span class="kw">match </span>w {
+<a href=#146 id=146 data-nosnippet>146</a>            Write::Set(f, row) =&gt; sets.push((f, row)),
+<a href=#147 id=147 data-nosnippet>147</a>            Write::Remove(f, key) =&gt; {
+<a href=#148 id=148 data-nosnippet>148</a>                <span class="kw">let </span>entry = removes_by_func
+<a href=#149 id=149 data-nosnippet>149</a>                    .entry(f)
+<a href=#150 id=150 data-nosnippet>150</a>                    .or_insert_with(|| (key.len(), HashSet::new()));
+<a href=#151 id=151 data-nosnippet>151</a>                entry.<span class="number">1</span>.insert(key.into_boxed_slice());
+<a href=#152 id=152 data-nosnippet>152</a>            }
+<a href=#153 id=153 data-nosnippet>153</a>        }
+<a href=#154 id=154 data-nosnippet>154</a>    }
+<a href=#155 id=155 data-nosnippet>155</a>    <span class="kw">for </span>(f, (keylen, keys)) <span class="kw">in </span>removes_by_func {
+<a href=#156 id=156 data-nosnippet>156</a>        <span class="kw">if let </span><span class="prelude-val">Some</span>(set) = eg.mirror.get_mut(<span class="kw-2">&amp;</span>f) {
+<a href=#157 id=157 data-nosnippet>157</a>            <span class="kw">let </span>before_len = set.len();
+<a href=#158 id=158 data-nosnippet>158</a>            std::rc::Rc::make_mut(set).retain(|row| {
+<a href=#159 id=159 data-nosnippet>159</a>                <span class="kw">let </span>k: Box&lt;[u32]&gt; = (<span class="number">0</span>..keylen).map(|i| row_col(row, i)).collect();
+<a href=#160 id=160 data-nosnippet>160</a>                !keys.contains(<span class="kw-2">&amp;</span>k)
+<a href=#161 id=161 data-nosnippet>161</a>            });
+<a href=#162 id=162 data-nosnippet>162</a>            changed |= set.len() != before_len;
+<a href=#163 id=163 data-nosnippet>163</a>        }
+<a href=#164 id=164 data-nosnippet>164</a>    }
+<a href=#165 id=165 data-nosnippet>165</a>    <span class="kw">let </span><span class="kw-2">mut </span>touched_keys: HashMap&lt;FunctionId, HashSet&lt;Vec&lt;u32&gt;&gt;&gt; = HashMap::new();
+<a href=#166 id=166 data-nosnippet>166</a>    <span class="kw">for </span>(f, row) <span class="kw">in </span>sets {
+<a href=#167 id=167 data-nosnippet>167</a>        <span class="kw">let </span>inputs_len = eg.info(f).arity.saturating_sub(<span class="number">1</span>);
+<a href=#168 id=168 data-nosnippet>168</a>        <span class="kw">let </span>key: Vec&lt;u32&gt; = (<span class="number">0</span>..inputs_len).map(|i| row_col(<span class="kw-2">&amp;</span>row, i)).collect();
+<a href=#169 id=169 data-nosnippet>169</a>        <span class="kw">let </span>inserted = std::rc::Rc::make_mut(eg.mirror.entry(f).or_default()).insert(row.clone());
+<a href=#170 id=170 data-nosnippet>170</a>        changed |= inserted;
+<a href=#171 id=171 data-nosnippet>171</a>        touched_keys.entry(f).or_default().insert(key);
+<a href=#172 id=172 data-nosnippet>172</a>    }
+<a href=#173 id=173 data-nosnippet>173</a>
+<a href=#174 id=174 data-nosnippet>174</a>    <span class="comment">// `--native-merge` TERM-BUILD scratch: cleared before the resolves so the
+<a href=#175 id=175 data-nosnippet>175</a>    // view rows a term-build merge mints this iteration are recorded fresh.
+<a href=#176 id=176 data-nosnippet>176</a>    </span>eg.term_build_view_keys.clear();
+<a href=#177 id=177 data-nosnippet>177</a>
+<a href=#178 id=178 data-nosnippet>178</a>    <span class="comment">// Resolve FD conflicts on every function a head action wrote to (a `set`
+<a href=#179 id=179 data-nosnippet>179</a>    // can introduce two rows sharing a key that must merge per the merge mode).
+<a href=#180 id=180 data-nosnippet>180</a>    </span><span class="kw">let </span>empty_keys: HashSet&lt;Vec&lt;u32&gt;&gt; = HashSet::new();
+<a href=#181 id=181 data-nosnippet>181</a>    <span class="kw">for </span><span class="kw-2">&amp;</span>f <span class="kw">in </span><span class="kw-2">&amp;</span>touched {
+<a href=#182 id=182 data-nosnippet>182</a>        <span class="kw">let </span>keys = touched_keys.get(<span class="kw-2">&amp;</span>f).unwrap_or(<span class="kw-2">&amp;</span>empty_keys);
+<a href=#183 id=183 data-nosnippet>183</a>        changed |= eg.resolve_merge(f, keys);
+<a href=#184 id=184 data-nosnippet>184</a>    }
+<a href=#185 id=185 data-nosnippet>185</a>
+<a href=#186 id=186 data-nosnippet>186</a>    <span class="comment">// `--native-merge` TERM-BUILD: a term-build merge minted `@&lt;C&gt;View` rows
+<a href=#187 id=187 data-nosnippet>187</a>    // (recorded in `term_build_view_keys`). Those views carry their OWN congruence
+<a href=#188 id=188 data-nosnippet>188</a>    // merge, so reconcile their FD conflicts now — exactly the
+<a href=#189 id=189 data-nosnippet>189</a>    // "TableInsert respects the target table's merge" semantics of the bridge.
+<a href=#190 id=190 data-nosnippet>190</a>    // Drain to a fixpoint: resolving one view can enqueue unions but writes no new
+<a href=#191 id=191 data-nosnippet>191</a>    // view rows, so this terminates in one pass in practice; the loop is defensive.
+<a href=#192 id=192 data-nosnippet>192</a>    </span><span class="kw">while </span>!eg.term_build_view_keys.is_empty() {
+<a href=#193 id=193 data-nosnippet>193</a>        <span class="kw">let </span>pending: Vec&lt;(FunctionId, HashSet&lt;Vec&lt;u32&gt;&gt;)&gt; =
+<a href=#194 id=194 data-nosnippet>194</a>            eg.term_build_view_keys.drain().collect();
+<a href=#195 id=195 data-nosnippet>195</a>        <span class="kw">for </span>(view, keys) <span class="kw">in </span>pending {
+<a href=#196 id=196 data-nosnippet>196</a>            changed |= eg.resolve_merge(view, <span class="kw-2">&amp;</span>keys);
+<a href=#197 id=197 data-nosnippet>197</a>        }
+<a href=#198 id=198 data-nosnippet>198</a>    }
+<a href=#199 id=199 data-nosnippet>199</a>
+<a href=#200 id=200 data-nosnippet>200</a>    <span class="prelude-val">Ok</span>(changed)
+<a href=#201 id=201 data-nosnippet>201</a>}
+<a href=#202 id=202 data-nosnippet>202</a>
+<a href=#203 id=203 data-nosnippet>203</a><span class="doccomment">/// Derive a stable ruleset LABEL for a `run_rules` call from the rules it runs,
+<a href=#204 id=204 data-nosnippet>204</a>/// for `FLOWLOG_DD_RULESET_PROF`. The backend trait does not carry the ruleset
+<a href=#205 id=205 data-nosnippet>205</a>/// name down to `run_rules`, but the term encoder gives each maintenance rule a
+<a href=#206 id=206 data-nosnippet>206</a>/// `fresh()`-suffixed name with a stable PREFIX that identifies its ruleset
+<a href=#207 id=207 data-nosnippet>207</a>/// (`uf_update*` / `singleparent*` / `uf_function_index*` / `congruence_rule*` /
+<a href=#208 id=208 data-nosnippet>208</a>/// `rebuild_rule*` / `merge_rule*` / `merge_cleanup*` / `delete_rule*`); user
+<a href=#209 id=209 data-nosnippet>209</a>/// rewrite rules are named by their full s-expression text. We map each rule
+<a href=#210 id=210 data-nosnippet>210</a>/// name to its category, then label the call by the categories present (all
+<a href=#211 id=211 data-nosnippet>211</a>/// rules in one `run_rules` call belong to one egglog ruleset).
+<a href=#212 id=212 data-nosnippet>212</a>/// Map a single rule NAME to its bucket label. Maintenance rules emitted by the
+<a href=#213 id=213 data-nosnippet>213</a>/// term encoder (proof_encoding.rs) carry a stable, `fresh()`-suffixed name;
+<a href=#214 id=214 data-nosnippet>214</a>/// most are `@`-prefixed (`@uf_update`, `@congruence_rule`, …) but
+<a href=#215 id=215 data-nosnippet>215</a>/// `singleparent@uf_update` is not. Match the identifying substring so the
+<a href=#216 id=216 data-nosnippet>216</a>/// leading `@` and trailing digits don't matter. Order: most specific first
+<a href=#217 id=217 data-nosnippet>217</a>/// (`singleparent` and the `_subsume` variant before their bare forms;
+<a href=#218 id=218 data-nosnippet>218</a>/// `uf_function_index` before `uf_update`).
+<a href=#219 id=219 data-nosnippet>219</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>rule_category(name: <span class="kw-2">&amp;</span>str) -&gt; <span class="kw-2">&amp;</span><span class="lifetime">'static </span>str {
+<a href=#220 id=220 data-nosnippet>220</a>    <span class="kw">const </span>MAINT: <span class="kw-2">&amp;</span>[(<span class="kw-2">&amp;</span>str, <span class="kw-2">&amp;</span>str)] = <span class="kw-2">&amp;</span>[
+<a href=#221 id=221 data-nosnippet>221</a>        (<span class="string">"singleparent"</span>, <span class="string">"single_parent"</span>),
+<a href=#222 id=222 data-nosnippet>222</a>        (<span class="string">"uf_function_index"</span>, <span class="string">"uf_function_index"</span>),
+<a href=#223 id=223 data-nosnippet>223</a>        <span class="comment">// PR #782 native-UF drain (the `@uf_change_drain` ruleset). Must be
+<a href=#224 id=224 data-nosnippet>224</a>        // matched BEFORE `uf_update` (substring overlap is none, but keep the
+<a href=#225 id=225 data-nosnippet>225</a>        // most-specific UF rules grouped). Dropped under `--native-uf`.
+<a href=#226 id=226 data-nosnippet>226</a>        </span>(<span class="string">"uf_change_drain"</span>, <span class="string">"uf_change_drain"</span>),
+<a href=#227 id=227 data-nosnippet>227</a>        (<span class="string">"uf_update"</span>, <span class="string">"path_compress/uf_update"</span>),
+<a href=#228 id=228 data-nosnippet>228</a>        (<span class="string">"delete_rule_subsume"</span>, <span class="string">"delete_subsume"</span>),
+<a href=#229 id=229 data-nosnippet>229</a>        (<span class="string">"delete_rule"</span>, <span class="string">"delete_subsume"</span>),
+<a href=#230 id=230 data-nosnippet>230</a>        <span class="comment">// `@congruence_rule` and `@rebuild_rule` are both in the term encoder's
+<a href=#231 id=231 data-nosnippet>231</a>        // `rebuilding` ruleset and run in ONE fused `run_rules` call; split them
+<a href=#232 id=232 data-nosnippet>232</a>        // into distinct buckets so the native-UF-addressable cost
+<a href=#233 id=233 data-nosnippet>233</a>        // (canonicalization, which joins function rows against `@uf`) can be
+<a href=#234 id=234 data-nosnippet>234</a>        // separated from congruence detection (which stays relational under a
+<a href=#235 id=235 data-nosnippet>235</a>        // native UF).
+<a href=#236 id=236 data-nosnippet>236</a>        </span>(<span class="string">"congruence_rule"</span>, <span class="string">"congruence"</span>),
+<a href=#237 id=237 data-nosnippet>237</a>        (<span class="string">"rebuild_rule"</span>, <span class="string">"canonicalize"</span>),
+<a href=#238 id=238 data-nosnippet>238</a>        (<span class="string">"merge_cleanup"</span>, <span class="string">"rebuilding_cleanup"</span>),
+<a href=#239 id=239 data-nosnippet>239</a>        (<span class="string">"merge_rule"</span>, <span class="string">"merge_rule"</span>),
+<a href=#240 id=240 data-nosnippet>240</a>    ];
+<a href=#241 id=241 data-nosnippet>241</a>    <span class="kw">for </span>(needle, label) <span class="kw">in </span>MAINT {
+<a href=#242 id=242 data-nosnippet>242</a>        <span class="kw">if </span>name.contains(needle) {
+<a href=#243 id=243 data-nosnippet>243</a>            <span class="kw">return </span>label;
+<a href=#244 id=244 data-nosnippet>244</a>        }
+<a href=#245 id=245 data-nosnippet>245</a>    }
+<a href=#246 id=246 data-nosnippet>246</a>    <span class="kw">if </span>name.starts_with(<span class="string">"eval_actions"</span>) {
+<a href=#247 id=247 data-nosnippet>247</a>        <span class="kw">return </span><span class="string">"eval_actions"</span>;
+<a href=#248 id=248 data-nosnippet>248</a>    }
+<a href=#249 id=249 data-nosnippet>249</a>    <span class="string">"&lt;user&gt;"
+<a href=#250 id=250 data-nosnippet>250</a></span>}
+<a href=#251 id=251 data-nosnippet>251</a>
+<a href=#252 id=252 data-nosnippet>252</a><span class="doccomment">/// Compute every rule's binding envs in ONE fused pass: the whole atom-bearing
+<a href=#253 id=253 data-nosnippet>253</a>/// ruleset's body joins run on a SINGLE shared timely worker
+<a href=#254 id=254 data-nosnippet>254</a>/// ([`dd_native::FusedDdJoin`]) clocked once this iteration, then each rule's
+<a href=#255 id=255 data-nosnippet>255</a>/// host-side prim tail is re-run over its own bindings. Atom-less rules
+<a href=#256 id=256 data-nosnippet>256</a>/// (`(rule () …)`) have no input relation to drive the DD dataflow, so they are
+<a href=#257 id=257 data-nosnippet>257</a>/// fired once host-side. Returns a `Vec&lt;Vec&lt;Env&gt;&gt;` parallel to `rules` (same
+<a href=#258 id=258 data-nosnippet>258</a>/// order), ready for `apply_head`.
+<a href=#259 id=259 data-nosnippet>259</a></span><span class="kw">fn </span>fused_bindings(
+<a href=#260 id=260 data-nosnippet>260</a>    eg: <span class="kw-2">&amp;mut </span>EGraph,
+<a href=#261 id=261 data-nosnippet>261</a>    read: <span class="kw-2">&amp;</span>HashMap&lt;FunctionId, std::rc::Rc&lt;HashSet&lt;Row&gt;&gt;&gt;,
+<a href=#262 id=262 data-nosnippet>262</a>    rules: <span class="kw-2">&amp;</span>[(usize, RuleIr)],
+<a href=#263 id=263 data-nosnippet>263</a>) -&gt; <span class="prelude-ty">Result</span>&lt;Vec&lt;Vec&lt;Env&gt;&gt;&gt; {
+<a href=#264 id=264 data-nosnippet>264</a>    <span class="kw">use </span><span class="kw">crate</span>::dd_native;
+<a href=#265 id=265 data-nosnippet>265</a>
+<a href=#266 id=266 data-nosnippet>266</a>    <span class="kw">let </span>prof = dd_native::prof_enabled();
+<a href=#267 id=267 data-nosnippet>267</a>    <span class="kw">let </span>rs_prof = dd_native::ruleset_prof_enabled();
+<a href=#268 id=268 data-nosnippet>268</a>    <span class="comment">// Per-ruleset attribution: the wall clock for the WHOLE atom-bearing path
+<a href=#269 id=269 data-nosnippet>269</a>    // this call, plus the per-bucket nanos we accumulate below. The call's time
+<a href=#270 id=270 data-nosnippet>270</a>    // is later apportioned across the rule CATEGORIES present (so `@rebuild_rule`
+<a href=#271 id=271 data-nosnippet>271</a>    // and `@congruence_rule`, fused into one timely step, land in distinct
+<a href=#272 id=272 data-nosnippet>272</a>    // `canonicalize`/`congruence` buckets).
+<a href=#273 id=273 data-nosnippet>273</a>    </span><span class="kw">let </span>rs_t_total = std::time::Instant::now();
+<a href=#274 id=274 data-nosnippet>274</a>    <span class="kw">let </span><span class="kw-2">mut </span>rs_delta_ns: u64 = <span class="number">0</span>;
+<a href=#275 id=275 data-nosnippet>275</a>    <span class="kw">let </span><span class="kw-2">mut </span>rs_prim_ns: u64 = <span class="number">0</span>;
+<a href=#276 id=276 data-nosnippet>276</a>    <span class="kw">let </span><span class="kw-2">mut </span>rs_feed_ns: u64 = <span class="number">0</span>;
+<a href=#277 id=277 data-nosnippet>277</a>    <span class="kw">let </span><span class="kw-2">mut </span>rs_step_ns: u64 = <span class="number">0</span>;
+<a href=#278 id=278 data-nosnippet>278</a>    <span class="kw">let </span><span class="kw-2">mut </span>rs_delta_rows: u64 = <span class="number">0</span>;
+<a href=#279 id=279 data-nosnippet>279</a>    <span class="kw">let </span><span class="kw-2">mut </span>out: Vec&lt;Vec&lt;Env&gt;&gt; = <span class="macro">vec!</span>[Vec::new(); rules.len()];
+<a href=#280 id=280 data-nosnippet>280</a>
+<a href=#281 id=281 data-nosnippet>281</a>    <span class="comment">// Partition: atom-bearing rules drive the fused DD worker; atom-less rules
+<a href=#282 id=282 data-nosnippet>282</a>    // fire once host-side. Record each atom-bearing rule's POSITION in `rules` so
+<a href=#283 id=283 data-nosnippet>283</a>    // we can scatter the fused output back into `out` in the caller's order.
+<a href=#284 id=284 data-nosnippet>284</a>    </span><span class="kw">let </span><span class="kw-2">mut </span>atom_positions: Vec&lt;usize&gt; = Vec::new();
+<a href=#285 id=285 data-nosnippet>285</a>    <span class="kw">let </span><span class="kw-2">mut </span>atom_rule_idxs: Vec&lt;usize&gt; = Vec::new();
+<a href=#286 id=286 data-nosnippet>286</a>    <span class="kw">for </span>(pos, (idx, rule)) <span class="kw">in </span>rules.iter().enumerate() {
+<a href=#287 id=287 data-nosnippet>287</a>        <span class="kw">let _ </span>= idx;
+<a href=#288 id=288 data-nosnippet>288</a>        <span class="kw">let </span>has_atoms = rule.body.iter().any(|op| <span class="macro">matches!</span>(op, BodyOp::Atom(<span class="kw">_</span>)));
+<a href=#289 id=289 data-nosnippet>289</a>        <span class="kw">if </span>has_atoms {
+<a href=#290 id=290 data-nosnippet>290</a>            atom_positions.push(pos);
+<a href=#291 id=291 data-nosnippet>291</a>            atom_rule_idxs.push(<span class="kw-2">*</span>idx);
+<a href=#292 id=292 data-nosnippet>292</a>        } <span class="kw">else </span>{
+<a href=#293 id=293 data-nosnippet>293</a>            <span class="comment">// Atom-less rule: fire once (presence in `seen` = already fired).
+<a href=#294 id=294 data-nosnippet>294</a>            </span><span class="kw">if </span>eg.seen.contains_key(idx) {
+<a href=#295 id=295 data-nosnippet>295</a>                <span class="kw">continue</span>;
+<a href=#296 id=296 data-nosnippet>296</a>            }
+<a href=#297 id=297 data-nosnippet>297</a>            eg.seen.insert(<span class="kw-2">*</span>idx, ());
+<a href=#298 id=298 data-nosnippet>298</a>            <span class="kw">let </span><span class="kw-2">mut </span>envs: Vec&lt;Env&gt; = <span class="macro">vec!</span>[Env::new()];
+<a href=#299 id=299 data-nosnippet>299</a>            <span class="kw">for </span>op <span class="kw">in </span><span class="kw-2">&amp;</span>rule.body {
+<a href=#300 id=300 data-nosnippet>300</a>                envs = step_prim(eg, op, envs)<span class="question-mark">?</span>;
+<a href=#301 id=301 data-nosnippet>301</a>                <span class="kw">if </span>envs.is_empty() {
+<a href=#302 id=302 data-nosnippet>302</a>                    <span class="kw">break</span>;
+<a href=#303 id=303 data-nosnippet>303</a>                }
+<a href=#304 id=304 data-nosnippet>304</a>            }
+<a href=#305 id=305 data-nosnippet>305</a>            out[pos] = envs;
+<a href=#306 id=306 data-nosnippet>306</a>        }
+<a href=#307 id=307 data-nosnippet>307</a>    }
+<a href=#308 id=308 data-nosnippet>308</a>
+<a href=#309 id=309 data-nosnippet>309</a>    <span class="kw">if </span>atom_positions.is_empty() {
+<a href=#310 id=310 data-nosnippet>310</a>        <span class="kw">return </span><span class="prelude-val">Ok</span>(out);
+<a href=#311 id=311 data-nosnippet>311</a>    }
+<a href=#312 id=312 data-nosnippet>312</a>
+<a href=#313 id=313 data-nosnippet>313</a>    <span class="comment">// The fused join is keyed by the SORTED atom-bearing rule-index list (the
+<a href=#314 id=314 data-nosnippet>314</a>    // ruleset identity), exactly like feldera's `FusedJoin`. Build it ONCE
+<a href=#315 id=315 data-nosnippet>315</a>    // (lazily) per distinct ruleset, planning each rule. Any shape `plan_join`
+<a href=#316 id=316 data-nosnippet>316</a>    // rejects PANICS (no host fallback; the DD dataflow is the only join path).
+<a href=#317 id=317 data-nosnippet>317</a>    </span><span class="kw">let </span><span class="kw-2">mut </span>key: Vec&lt;usize&gt; = atom_rule_idxs.clone();
+<a href=#318 id=318 data-nosnippet>318</a>    key.sort_unstable();
+<a href=#319 id=319 data-nosnippet>319</a>
+<a href=#320 id=320 data-nosnippet>320</a>    <span class="kw">if </span>!eg.dd_fused.contains_key(<span class="kw-2">&amp;</span>key) {
+<a href=#321 id=321 data-nosnippet>321</a>        <span class="comment">// Plan in the SAME order as `atom_positions` so the fused build order
+<a href=#322 id=322 data-nosnippet>322</a>        // matches our scatter order (the fused join preserves plan order).
+<a href=#323 id=323 data-nosnippet>323</a>        </span><span class="kw">let </span><span class="kw-2">mut </span>plans: Vec&lt;(usize, dd_native::JoinPlan)&gt; = Vec::with_capacity(atom_positions.len());
+<a href=#324 id=324 data-nosnippet>324</a>        <span class="kw">for </span>(<span class="kw-2">&amp;</span>pos, <span class="kw-2">&amp;</span>idx) <span class="kw">in </span>atom_positions.iter().zip(atom_rule_idxs.iter()) {
+<a href=#325 id=325 data-nosnippet>325</a>            <span class="kw">let </span>rule = <span class="kw-2">&amp;</span>rules[pos].<span class="number">1</span>;
+<a href=#326 id=326 data-nosnippet>326</a>            <span class="kw">let </span>plan = <span class="kw">match </span>dd_native::plan_join(rule) {
+<a href=#327 id=327 data-nosnippet>327</a>                <span class="prelude-val">Ok</span>(p) =&gt; p,
+<a href=#328 id=328 data-nosnippet>328</a>                <span class="prelude-val">Err</span>(reason) =&gt; <span class="macro">panic!</span>(
+<a href=#329 id=329 data-nosnippet>329</a>                    <span class="string">"FlowLog DD join cannot lower rule {:?}: {reason} \
+<a href=#330 id=330 data-nosnippet>330</a>                     (no host fallback; the DD dataflow is the only join path)"</span>,
+<a href=#331 id=331 data-nosnippet>331</a>                    rule.name
+<a href=#332 id=332 data-nosnippet>332</a>                ),
+<a href=#333 id=333 data-nosnippet>333</a>            };
+<a href=#334 id=334 data-nosnippet>334</a>            plans.push((idx, plan));
+<a href=#335 id=335 data-nosnippet>335</a>        }
+<a href=#336 id=336 data-nosnippet>336</a>        <span class="comment">// `--wcoj`: enable the worst-case-optimal triangle delta query. The
+<a href=#337 id=337 data-nosnippet>337</a>        // build detects the triangle shape per rule; non-triangle rules in the
+<a href=#338 id=338 data-nosnippet>338</a>        // ruleset keep the binary `.join` chain (hybrid). Off ⇒ byte-identical
+<a href=#339 id=339 data-nosnippet>339</a>        // to the pre-WCOJ build. EVERY rule — including the `@rebuild_rule*`
+<a href=#340 id=340 data-nosnippet>340</a>        // canonicalization rules — runs through the same general fused join (the
+<a href=#341 id=341 data-nosnippet>341</a>        // sound `step_symmetric` path); there is no δUF-scoping fast-rebuild
+<a href=#342 id=342 data-nosnippet>342</a>        // variant anymore.
+<a href=#343 id=343 data-nosnippet>343</a>        </span><span class="kw">let </span>wcoj = eg.wcoj_enabled;
+<a href=#344 id=344 data-nosnippet>344</a>        <span class="kw">let </span>fused = dd_native::FusedDdJoin::build(<span class="kw-2">&amp;</span>plans, wcoj, <span class="bool-val">false</span>)<span class="question-mark">?</span>;
+<a href=#345 id=345 data-nosnippet>345</a>        eg.dd_fused.insert(key.clone(), fused);
+<a href=#346 id=346 data-nosnippet>346</a>    }
+<a href=#347 id=347 data-nosnippet>347</a>
+<a href=#348 id=348 data-nosnippet>348</a>    <span class="comment">// The fused join's internal rule order (its build order = `atom_positions`
+<a href=#349 id=349 data-nosnippet>349</a>    // order). Map each fused output slot back to the caller `rules` position and
+<a href=#350 id=350 data-nosnippet>350</a>    // capture each rule's canonical var order.
+<a href=#351 id=351 data-nosnippet>351</a>    </span><span class="kw">let </span>(fused_rule_idxs, fused_body_funcs): (Vec&lt;usize&gt;, Vec&lt;Vec&lt;FunctionId&gt;&gt;) = {
+<a href=#352 id=352 data-nosnippet>352</a>        <span class="kw">let </span>fused = eg.dd_fused.get(<span class="kw-2">&amp;</span>key).expect(<span class="string">"fused join present"</span>);
+<a href=#353 id=353 data-nosnippet>353</a>        (
+<a href=#354 id=354 data-nosnippet>354</a>            fused.rule_indices(),
+<a href=#355 id=355 data-nosnippet>355</a>            (<span class="number">0</span>..fused.rule_indices().len())
+<a href=#356 id=356 data-nosnippet>356</a>                .map(|p| fused.rule_body_funcs(p).to_vec())
+<a href=#357 id=357 data-nosnippet>357</a>                .collect(),
+<a href=#358 id=358 data-nosnippet>358</a>        )
+<a href=#359 id=359 data-nosnippet>359</a>    };
+<a href=#360 id=360 data-nosnippet>360</a>    <span class="comment">// The fused build order equals `atom_rule_idxs` (we built it that way), so
+<a href=#361 id=361 data-nosnippet>361</a>    // map fused position -&gt; caller `rules` position via `atom_positions`.
+<a href=#362 id=362 data-nosnippet>362</a>    </span><span class="macro">debug_assert_eq!</span>(fused_rule_idxs, atom_rule_idxs, <span class="string">"fused build order"</span>);
+<a href=#363 id=363 data-nosnippet>363</a>
+<a href=#364 id=364 data-nosnippet>364</a>    <span class="comment">// Each atom-bearing rule's canonical var order (for env reconstruction).
+<a href=#365 id=365 data-nosnippet>365</a>    </span><span class="kw">let </span>var_orders: Vec&lt;Vec&lt;u32&gt;&gt; = atom_positions
+<a href=#366 id=366 data-nosnippet>366</a>        .iter()
+<a href=#367 id=367 data-nosnippet>367</a>        .map(|<span class="kw-2">&amp;</span>pos| {
+<a href=#368 id=368 data-nosnippet>368</a>            <span class="kw">let </span>rule = <span class="kw-2">&amp;</span>rules[pos].<span class="number">1</span>;
+<a href=#369 id=369 data-nosnippet>369</a>            dd_native::plan_join(rule)
+<a href=#370 id=370 data-nosnippet>370</a>                .expect(<span class="string">"plan re-derivable"</span>)
+<a href=#371 id=371 data-nosnippet>371</a>                .var_order()
+<a href=#372 id=372 data-nosnippet>372</a>        })
+<a href=#373 id=373 data-nosnippet>373</a>        .collect();
+<a href=#374 id=374 data-nosnippet>374</a>
+<a href=#375 id=375 data-nosnippet>375</a>    <span class="comment">// Distinct relations across the whole ruleset → ONE combined signed delta map
+<a href=#376 id=376 data-nosnippet>376</a>    // fed into the fused worker's SHARED inputs. The `fed` snapshot is per-ruleset
+<a href=#377 id=377 data-nosnippet>377</a>    // (the fused join's identity), diffed against the live mirror like the per-rule
+<a href=#378 id=378 data-nosnippet>378</a>    // `dd_native_fed`.
+<a href=#379 id=379 data-nosnippet>379</a>    </span><span class="kw">let </span>t_delta = std::time::Instant::now();
+<a href=#380 id=380 data-nosnippet>380</a>    <span class="kw">let </span>empty_set: std::rc::Rc&lt;HashSet&lt;Row&gt;&gt; = std::rc::Rc::new(HashSet::new());
+<a href=#381 id=381 data-nosnippet>381</a>    <span class="kw">let </span><span class="kw-2">mut </span>all_funcs: Vec&lt;FunctionId&gt; = Vec::new();
+<a href=#382 id=382 data-nosnippet>382</a>    <span class="kw">for </span>bf <span class="kw">in </span><span class="kw-2">&amp;</span>fused_body_funcs {
+<a href=#383 id=383 data-nosnippet>383</a>        <span class="kw">for </span><span class="kw-2">&amp;</span>f <span class="kw">in </span>bf {
+<a href=#384 id=384 data-nosnippet>384</a>            <span class="kw">if </span>!all_funcs.contains(<span class="kw-2">&amp;</span>f) {
+<a href=#385 id=385 data-nosnippet>385</a>                all_funcs.push(f);
+<a href=#386 id=386 data-nosnippet>386</a>            }
+<a href=#387 id=387 data-nosnippet>387</a>        }
+<a href=#388 id=388 data-nosnippet>388</a>    }
+<a href=#389 id=389 data-nosnippet>389</a>    <span class="kw">let </span><span class="kw-2">mut </span>delta: HashMap&lt;FunctionId, Vec&lt;(Vec&lt;u32&gt;, isize)&gt;&gt; = HashMap::new();
+<a href=#390 id=390 data-nosnippet>390</a>    {
+<a href=#391 id=391 data-nosnippet>391</a>        <span class="kw">let </span>fed = eg.dd_fused_fed.entry(key.clone()).or_default();
+<a href=#392 id=392 data-nosnippet>392</a>        <span class="kw">for </span><span class="kw-2">&amp;</span>f <span class="kw">in </span><span class="kw-2">&amp;</span>all_funcs {
+<a href=#393 id=393 data-nosnippet>393</a>            <span class="kw">let </span>cur = read.get(<span class="kw-2">&amp;</span>f).cloned().unwrap_or_else(|| empty_set.clone());
+<a href=#394 id=394 data-nosnippet>394</a>            <span class="kw">let </span>prev = fed.entry(f).or_insert_with(|| empty_set.clone());
+<a href=#395 id=395 data-nosnippet>395</a>            <span class="kw">if </span>std::rc::Rc::ptr_eq(<span class="kw-2">&amp;</span>cur, prev) {
+<a href=#396 id=396 data-nosnippet>396</a>                <span class="kw-2">*</span>prev = cur;
+<a href=#397 id=397 data-nosnippet>397</a>                <span class="kw">continue</span>;
+<a href=#398 id=398 data-nosnippet>398</a>            }
+<a href=#399 id=399 data-nosnippet>399</a>            <span class="kw">let </span><span class="kw-2">mut </span>rows: Vec&lt;(Vec&lt;u32&gt;, isize)&gt; = Vec::new();
+<a href=#400 id=400 data-nosnippet>400</a>            <span class="kw">for </span>r <span class="kw">in </span>cur.iter() {
+<a href=#401 id=401 data-nosnippet>401</a>                <span class="kw">if </span>!prev.contains(r) {
+<a href=#402 id=402 data-nosnippet>402</a>                    rows.push((r.to_vec(), <span class="number">1</span>));
+<a href=#403 id=403 data-nosnippet>403</a>                }
+<a href=#404 id=404 data-nosnippet>404</a>            }
+<a href=#405 id=405 data-nosnippet>405</a>            <span class="kw">for </span>r <span class="kw">in </span>prev.iter() {
+<a href=#406 id=406 data-nosnippet>406</a>                <span class="kw">if </span>!cur.contains(r) {
+<a href=#407 id=407 data-nosnippet>407</a>                    rows.push((r.to_vec(), -<span class="number">1</span>));
+<a href=#408 id=408 data-nosnippet>408</a>                }
+<a href=#409 id=409 data-nosnippet>409</a>            }
+<a href=#410 id=410 data-nosnippet>410</a>            <span class="kw">if </span>!rows.is_empty() {
+<a href=#411 id=411 data-nosnippet>411</a>                rs_delta_rows += rows.len() <span class="kw">as </span>u64;
+<a href=#412 id=412 data-nosnippet>412</a>                delta.insert(f, rows);
+<a href=#413 id=413 data-nosnippet>413</a>            }
+<a href=#414 id=414 data-nosnippet>414</a>            <span class="kw-2">*</span>prev = cur;
+<a href=#415 id=415 data-nosnippet>415</a>        }
+<a href=#416 id=416 data-nosnippet>416</a>    }
+<a href=#417 id=417 data-nosnippet>417</a>    <span class="kw">let </span>delta_elapsed = t_delta.elapsed().as_nanos() <span class="kw">as </span>u64;
+<a href=#418 id=418 data-nosnippet>418</a>    <span class="kw">if </span>prof {
+<a href=#419 id=419 data-nosnippet>419</a>        dd_native::PROF_DELTA_NS.fetch_add(delta_elapsed, std::sync::atomic::Ordering::Relaxed);
+<a href=#420 id=420 data-nosnippet>420</a>    }
+<a href=#421 id=421 data-nosnippet>421</a>    rs_delta_ns += delta_elapsed;
+<a href=#422 id=422 data-nosnippet>422</a>
+<a href=#423 id=423 data-nosnippet>423</a>    <span class="comment">// ONE step of the shared worker for the WHOLE ruleset. `step` updates the
+<a href=#424 id=424 data-nosnippet>424</a>    // global PROF_FEED_NS / PROF_STEP_NS counters when profiling is on (which it
+<a href=#425 id=425 data-nosnippet>425</a>    // is whenever either env var is set), so snapshot them before/after to split
+<a href=#426 id=426 data-nosnippet>426</a>    // this ruleset's feed vs worker_step time.
+<a href=#427 id=427 data-nosnippet>427</a>    </span><span class="kw">use </span>std::sync::atomic::Ordering <span class="kw">as </span>ProfOrd;
+<a href=#428 id=428 data-nosnippet>428</a>    <span class="kw">let </span>feed_before = dd_native::PROF_FEED_NS.load(ProfOrd::Relaxed);
+<a href=#429 id=429 data-nosnippet>429</a>    <span class="kw">let </span>step_before = dd_native::PROF_STEP_NS.load(ProfOrd::Relaxed);
+<a href=#430 id=430 data-nosnippet>430</a>    eg.dd_rule_runs += atom_positions.len() <span class="kw">as </span>u64;
+<a href=#431 id=431 data-nosnippet>431</a>    <span class="kw">let </span>per_rule_bindings = {
+<a href=#432 id=432 data-nosnippet>432</a>        <span class="kw">let </span>fused = eg.dd_fused.get_mut(<span class="kw-2">&amp;</span>key).expect(<span class="string">"fused join present"</span>);
+<a href=#433 id=433 data-nosnippet>433</a>        fused.step(<span class="kw-2">&amp;</span>delta)<span class="question-mark">?
+<a href=#434 id=434 data-nosnippet>434</a>    </span>};
+<a href=#435 id=435 data-nosnippet>435</a>    <span class="kw">if </span>rs_prof {
+<a href=#436 id=436 data-nosnippet>436</a>        rs_feed_ns += dd_native::PROF_FEED_NS
+<a href=#437 id=437 data-nosnippet>437</a>            .load(ProfOrd::Relaxed)
+<a href=#438 id=438 data-nosnippet>438</a>            .wrapping_sub(feed_before);
+<a href=#439 id=439 data-nosnippet>439</a>        rs_step_ns += dd_native::PROF_STEP_NS
+<a href=#440 id=440 data-nosnippet>440</a>            .load(ProfOrd::Relaxed)
+<a href=#441 id=441 data-nosnippet>441</a>            .wrapping_sub(step_before);
+<a href=#442 id=442 data-nosnippet>442</a>    }
+<a href=#443 id=443 data-nosnippet>443</a>
+<a href=#444 id=444 data-nosnippet>444</a>    <span class="comment">// Per-rule positive-binding count = the fused join's workload proxy for each
+<a href=#445 id=445 data-nosnippet>445</a>    // rule (used below to apportion the single fused worker_step across the rule
+<a href=#446 id=446 data-nosnippet>446</a>    // CATEGORIES present in this call). Length is parallel to `atom_positions`.
+<a href=#447 id=447 data-nosnippet>447</a>    </span><span class="kw">let </span><span class="kw-2">mut </span>rs_pos_bindings: Vec&lt;u64&gt; = <span class="macro">vec!</span>[<span class="number">0</span>; atom_positions.len()];
+<a href=#448 id=448 data-nosnippet>448</a>
+<a href=#449 id=449 data-nosnippet>449</a>    <span class="comment">// Turn each rule's positive binding deltas into envs; re-run its body prims
+<a href=#450 id=450 data-nosnippet>450</a>    // host-side. Negative weights are integral bookkeeping (a body row retracted)
+<a href=#451 id=451 data-nosnippet>451</a>    // — egglog heads are monotone-fire, so we do NOT re-fire on disappearance.
+<a href=#452 id=452 data-nosnippet>452</a>    </span><span class="kw">let </span>t_prim = std::time::Instant::now();
+<a href=#453 id=453 data-nosnippet>453</a>    <span class="kw">for </span>(fpos, bindings) <span class="kw">in </span>per_rule_bindings.into_iter().enumerate() {
+<a href=#454 id=454 data-nosnippet>454</a>        <span class="kw">let </span>caller_pos = atom_positions[fpos];
+<a href=#455 id=455 data-nosnippet>455</a>        <span class="kw">let </span>rule = <span class="kw-2">&amp;</span>rules[caller_pos].<span class="number">1</span>;
+<a href=#456 id=456 data-nosnippet>456</a>        <span class="kw">let </span>var_order = <span class="kw-2">&amp;</span>var_orders[fpos];
+<a href=#457 id=457 data-nosnippet>457</a>        <span class="kw">let </span><span class="kw-2">mut </span>envs: Vec&lt;Env&gt; = Vec::new();
+<a href=#458 id=458 data-nosnippet>458</a>        <span class="kw">for </span>(bind, w) <span class="kw">in </span><span class="kw-2">&amp;</span>bindings {
+<a href=#459 id=459 data-nosnippet>459</a>            <span class="kw">if </span><span class="kw-2">*</span>w &lt;= <span class="number">0 </span>{
+<a href=#460 id=460 data-nosnippet>460</a>                <span class="kw">continue</span>;
+<a href=#461 id=461 data-nosnippet>461</a>            }
+<a href=#462 id=462 data-nosnippet>462</a>            rs_pos_bindings[fpos] += <span class="number">1</span>;
+<a href=#463 id=463 data-nosnippet>463</a>            <span class="kw">let </span><span class="kw-2">mut </span>env: Env = Env::new();
+<a href=#464 id=464 data-nosnippet>464</a>            <span class="kw">for </span>(i, <span class="kw-2">&amp;</span>v) <span class="kw">in </span>var_order.iter().enumerate() {
+<a href=#465 id=465 data-nosnippet>465</a>                env.insert(v, bind[i]);
+<a href=#466 id=466 data-nosnippet>466</a>            }
+<a href=#467 id=467 data-nosnippet>467</a>            <span class="kw">let </span><span class="kw-2">mut </span>es: Vec&lt;Env&gt; = <span class="macro">vec!</span>[env];
+<a href=#468 id=468 data-nosnippet>468</a>            <span class="kw">for </span>op <span class="kw">in </span><span class="kw-2">&amp;</span>rule.body {
+<a href=#469 id=469 data-nosnippet>469</a>                <span class="kw">if let </span>BodyOp::Prim { .. } = op {
+<a href=#470 id=470 data-nosnippet>470</a>                    es = step_prim(eg, op, es)<span class="question-mark">?</span>;
+<a href=#471 id=471 data-nosnippet>471</a>                }
+<a href=#472 id=472 data-nosnippet>472</a>            }
+<a href=#473 id=473 data-nosnippet>473</a>            envs.extend(es);
+<a href=#474 id=474 data-nosnippet>474</a>        }
+<a href=#475 id=475 data-nosnippet>475</a>        out[caller_pos] = envs;
+<a href=#476 id=476 data-nosnippet>476</a>    }
+<a href=#477 id=477 data-nosnippet>477</a>
+<a href=#478 id=478 data-nosnippet>478</a>    <span class="kw">let </span>prim_elapsed = t_prim.elapsed().as_nanos() <span class="kw">as </span>u64;
+<a href=#479 id=479 data-nosnippet>479</a>    <span class="kw">if </span>prof {
+<a href=#480 id=480 data-nosnippet>480</a>        dd_native::PROF_PRIM_NS.fetch_add(prim_elapsed, std::sync::atomic::Ordering::Relaxed);
+<a href=#481 id=481 data-nosnippet>481</a>    }
+<a href=#482 id=482 data-nosnippet>482</a>    rs_prim_ns += prim_elapsed;
+<a href=#483 id=483 data-nosnippet>483</a>
+<a href=#484 id=484 data-nosnippet>484</a>    <span class="kw">if </span>rs_prof {
+<a href=#485 id=485 data-nosnippet>485</a>        <span class="kw">let </span>rs_total_ns = rs_t_total.elapsed().as_nanos() <span class="kw">as </span>u64;
+<a href=#486 id=486 data-nosnippet>486</a>        <span class="comment">// Several rule CATEGORIES (e.g. `canonicalize` = `@rebuild_rule` and
+<a href=#487 id=487 data-nosnippet>487</a>        // `congruence` = `@congruence_rule`) run in ONE fused timely step, so
+<a href=#488 id=488 data-nosnippet>488</a>        // there is no per-category wall clock. Apportion this call's measured
+<a href=#489 id=489 data-nosnippet>489</a>        // buckets across the categories present, weighted by each category's
+<a href=#490 id=490 data-nosnippet>490</a>        // share of POSITIVE output bindings (the join workload it produced). If
+<a href=#491 id=491 data-nosnippet>491</a>        // no rule produced output this call, fall back to an even split by rule
+<a href=#492 id=492 data-nosnippet>492</a>        // count so the call's wall time is still attributed.
+<a href=#493 id=493 data-nosnippet>493</a>        </span><span class="kw">let </span><span class="kw-2">mut </span>cat_w: HashMap&lt;<span class="kw-2">&amp;</span><span class="lifetime">'static </span>str, u64&gt; = HashMap::new();
+<a href=#494 id=494 data-nosnippet>494</a>        <span class="kw">let </span><span class="kw-2">mut </span>cat_n: HashMap&lt;<span class="kw-2">&amp;</span><span class="lifetime">'static </span>str, u64&gt; = HashMap::new();
+<a href=#495 id=495 data-nosnippet>495</a>        <span class="comment">// Cross-check: nanos of (apportioned) worker_step attributable to rules
+<a href=#496 id=496 data-nosnippet>496</a>        // whose BODY reads a `@uf` table (`UF_*` relation) — the native-UF-
+<a href=#497 id=497 data-nosnippet>497</a>        // addressable fraction proxy.
+<a href=#498 id=498 data-nosnippet>498</a>        </span><span class="kw">let </span><span class="kw-2">mut </span>uf_body_w: u64 = <span class="number">0</span>;
+<a href=#499 id=499 data-nosnippet>499</a>        <span class="kw">for </span>(fpos, <span class="kw-2">&amp;</span>pos) <span class="kw">in </span>atom_positions.iter().enumerate() {
+<a href=#500 id=500 data-nosnippet>500</a>            <span class="kw">let </span>rule = <span class="kw-2">&amp;</span>rules[pos].<span class="number">1</span>;
+<a href=#501 id=501 data-nosnippet>501</a>            <span class="kw">let </span>cat = rule_category(<span class="kw-2">&amp;</span>rule.name);
+<a href=#502 id=502 data-nosnippet>502</a>            <span class="kw">let </span>w = rs_pos_bindings[fpos];
+<a href=#503 id=503 data-nosnippet>503</a>            <span class="kw-2">*</span>cat_w.entry(cat).or_default() += w;
+<a href=#504 id=504 data-nosnippet>504</a>            <span class="kw-2">*</span>cat_n.entry(cat).or_default() += <span class="number">1</span>;
+<a href=#505 id=505 data-nosnippet>505</a>            <span class="kw">let </span>reads_uf = rule.body.iter().any(
+<a href=#506 id=506 data-nosnippet>506</a>                |op| <span class="macro">matches!</span>(op, BodyOp::Atom(a) <span class="kw">if </span>eg.relation_name(a.func).contains(<span class="string">"UF_"</span>)),
+<a href=#507 id=507 data-nosnippet>507</a>            );
+<a href=#508 id=508 data-nosnippet>508</a>            <span class="kw">if </span>reads_uf {
+<a href=#509 id=509 data-nosnippet>509</a>                uf_body_w += w;
+<a href=#510 id=510 data-nosnippet>510</a>            }
+<a href=#511 id=511 data-nosnippet>511</a>        }
+<a href=#512 id=512 data-nosnippet>512</a>        <span class="kw">let </span>total_w: u64 = cat_w.values().sum();
+<a href=#513 id=513 data-nosnippet>513</a>        <span class="kw">let </span>total_n: u64 = cat_n.values().sum();
+<a href=#514 id=514 data-nosnippet>514</a>        <span class="comment">// Worker_step nanos apportioned to UF-body-reading rules.
+<a href=#515 id=515 data-nosnippet>515</a>        </span><span class="kw">let </span>uf_step_ns = <span class="kw">if </span>total_w &gt; <span class="number">0 </span>{
+<a href=#516 id=516 data-nosnippet>516</a>            (rs_step_ns <span class="kw">as </span>u128 * uf_body_w <span class="kw">as </span>u128 / total_w <span class="kw">as </span>u128) <span class="kw">as </span>u64
+<a href=#517 id=517 data-nosnippet>517</a>        } <span class="kw">else </span>{
+<a href=#518 id=518 data-nosnippet>518</a>            <span class="number">0
+<a href=#519 id=519 data-nosnippet>519</a>        </span>};
+<a href=#520 id=520 data-nosnippet>520</a>        dd_native::ruleset_uf_body_record(uf_step_ns, rs_step_ns);
+<a href=#521 id=521 data-nosnippet>521</a>        <span class="kw">for </span>(cat, <span class="kw-2">&amp;</span>w) <span class="kw">in </span><span class="kw-2">&amp;</span>cat_w {
+<a href=#522 id=522 data-nosnippet>522</a>            <span class="kw">let </span>n = cat_n[cat];
+<a href=#523 id=523 data-nosnippet>523</a>            <span class="comment">// share by binding workload, else by rule count.
+<a href=#524 id=524 data-nosnippet>524</a>            </span><span class="kw">let </span>(num, den): (u128, u128) = <span class="kw">if </span>total_w &gt; <span class="number">0 </span>{
+<a href=#525 id=525 data-nosnippet>525</a>                (w <span class="kw">as </span>u128, total_w <span class="kw">as </span>u128)
+<a href=#526 id=526 data-nosnippet>526</a>            } <span class="kw">else </span>{
+<a href=#527 id=527 data-nosnippet>527</a>                (n <span class="kw">as </span>u128, total_n.max(<span class="number">1</span>) <span class="kw">as </span>u128)
+<a href=#528 id=528 data-nosnippet>528</a>            };
+<a href=#529 id=529 data-nosnippet>529</a>            <span class="kw">let </span>part = |v: u64| (v <span class="kw">as </span>u128 * num / den) <span class="kw">as </span>u64;
+<a href=#530 id=530 data-nosnippet>530</a>            dd_native::ruleset_prof_record(
+<a href=#531 id=531 data-nosnippet>531</a>                cat,
+<a href=#532 id=532 data-nosnippet>532</a>                part(rs_total_ns),
+<a href=#533 id=533 data-nosnippet>533</a>                part(rs_step_ns),
+<a href=#534 id=534 data-nosnippet>534</a>                part(rs_feed_ns),
+<a href=#535 id=535 data-nosnippet>535</a>                part(rs_prim_ns),
+<a href=#536 id=536 data-nosnippet>536</a>                part(rs_delta_ns),
+<a href=#537 id=537 data-nosnippet>537</a>                part(rs_delta_rows),
+<a href=#538 id=538 data-nosnippet>538</a>            );
+<a href=#539 id=539 data-nosnippet>539</a>        }
+<a href=#540 id=540 data-nosnippet>540</a>    }
+<a href=#541 id=541 data-nosnippet>541</a>
+<a href=#542 id=542 data-nosnippet>542</a>    <span class="prelude-val">Ok</span>(out)
+<a href=#543 id=543 data-nosnippet>543</a>}
+<a href=#544 id=544 data-nosnippet>544</a>
+<a href=#545 id=545 data-nosnippet>545</a><span class="doccomment">/// Evaluate a primitive body op over each binding env, returning the new list of
+<a href=#546 id=546 data-nosnippet>546</a>/// envs. A value-computing prim binds (or checks) its return var; a guard prim
+<a href=#547 id=547 data-nosnippet>547</a>/// (`!=`) that fails prunes the env. Table atoms are NOT handled here — they run
+<a href=#548 id=548 data-nosnippet>548</a>/// on the DD dataflow; this is only the host-side primitive tail.
+<a href=#549 id=549 data-nosnippet>549</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>step_prim(eg: <span class="kw-2">&amp;mut </span>EGraph, op: <span class="kw-2">&amp;</span>BodyOp, envs: Vec&lt;Env&gt;) -&gt; <span class="prelude-ty">Result</span>&lt;Vec&lt;Env&gt;&gt; {
+<a href=#550 id=550 data-nosnippet>550</a>    <span class="kw">let </span>BodyOp::Prim { id, args, ret } = op <span class="kw">else </span>{
+<a href=#551 id=551 data-nosnippet>551</a>        <span class="macro">unreachable!</span>(<span class="string">"step_prim called on a non-primitive body op"</span>);
+<a href=#552 id=552 data-nosnippet>552</a>    };
+<a href=#553 id=553 data-nosnippet>553</a>    <span class="kw">let </span><span class="kw-2">mut </span>out = Vec::new();
+<a href=#554 id=554 data-nosnippet>554</a>    <span class="kw">for </span>env <span class="kw">in </span>envs {
+<a href=#555 id=555 data-nosnippet>555</a>        <span class="kw">let </span>resolved: <span class="prelude-ty">Option</span>&lt;Vec&lt;Value&gt;&gt; = args
+<a href=#556 id=556 data-nosnippet>556</a>            .iter()
+<a href=#557 id=557 data-nosnippet>557</a>            .map(|s| slot_lookup(s, <span class="kw-2">&amp;</span>|v| env.get(<span class="kw-2">&amp;</span>v).copied()).map(Value::new))
+<a href=#558 id=558 data-nosnippet>558</a>            .collect();
+<a href=#559 id=559 data-nosnippet>559</a>        <span class="kw">let </span><span class="prelude-val">Some</span>(argv) = resolved <span class="kw">else </span>{ <span class="kw">continue </span>};
+<a href=#560 id=560 data-nosnippet>560</a>        <span class="kw">let </span>result = eg.eval_prim_internal(<span class="kw-2">*</span>id, <span class="kw-2">&amp;</span>argv);
+<a href=#561 id=561 data-nosnippet>561</a>        <span class="kw">let </span><span class="prelude-val">Some</span>(result) = result <span class="kw">else </span>{
+<a href=#562 id=562 data-nosnippet>562</a>            <span class="comment">// Primitive failed (e.g. `!=` of equal args) — prune.
+<a href=#563 id=563 data-nosnippet>563</a>            </span><span class="kw">continue</span>;
+<a href=#564 id=564 data-nosnippet>564</a>        };
+<a href=#565 id=565 data-nosnippet>565</a>        <span class="kw">match </span>ret {
+<a href=#566 id=566 data-nosnippet>566</a>            Slot::Var(v) =&gt; {
+<a href=#567 id=567 data-nosnippet>567</a>                <span class="kw">let </span><span class="kw-2">mut </span>next = env.clone();
+<a href=#568 id=568 data-nosnippet>568</a>                <span class="kw">match </span>next.get(v) {
+<a href=#569 id=569 data-nosnippet>569</a>                    <span class="prelude-val">Some</span>(<span class="kw-2">&amp;</span>existing) <span class="kw">if </span>existing != result.rep() =&gt; <span class="kw">continue</span>,
+<a href=#570 id=570 data-nosnippet>570</a>                    <span class="kw">_ </span>=&gt; {
+<a href=#571 id=571 data-nosnippet>571</a>                        next.insert(<span class="kw-2">*</span>v, result.rep());
+<a href=#572 id=572 data-nosnippet>572</a>                    }
+<a href=#573 id=573 data-nosnippet>573</a>                }
+<a href=#574 id=574 data-nosnippet>574</a>                out.push(next);
+<a href=#575 id=575 data-nosnippet>575</a>            }
+<a href=#576 id=576 data-nosnippet>576</a>            Slot::Const(c) =&gt; {
+<a href=#577 id=577 data-nosnippet>577</a>                <span class="kw">if </span><span class="kw-2">*</span>c == result.rep() {
+<a href=#578 id=578 data-nosnippet>578</a>                    out.push(env);
+<a href=#579 id=579 data-nosnippet>579</a>                }
+<a href=#580 id=580 data-nosnippet>580</a>            }
+<a href=#581 id=581 data-nosnippet>581</a>        }
+<a href=#582 id=582 data-nosnippet>582</a>    }
+<a href=#583 id=583 data-nosnippet>583</a>    <span class="prelude-val">Ok</span>(out)
+<a href=#584 id=584 data-nosnippet>584</a>}
+<a href=#585 id=585 data-nosnippet>585</a>
+<a href=#586 id=586 data-nosnippet>586</a><span class="doccomment">/// Execute the head ops for one binding, accumulating writes.
+<a href=#587 id=587 data-nosnippet>587</a></span><span class="kw">fn </span>apply_head(
+<a href=#588 id=588 data-nosnippet>588</a>    eg: <span class="kw-2">&amp;mut </span>EGraph,
+<a href=#589 id=589 data-nosnippet>589</a>    head: <span class="kw-2">&amp;</span>[HeadOp],
+<a href=#590 id=590 data-nosnippet>590</a>    env: <span class="kw-2">&amp;mut </span>Env,
+<a href=#591 id=591 data-nosnippet>591</a>    writes: <span class="kw-2">&amp;mut </span>Vec&lt;Write&gt;,
+<a href=#592 id=592 data-nosnippet>592</a>    touched: <span class="kw-2">&amp;mut </span>HashSet&lt;FunctionId&gt;,
+<a href=#593 id=593 data-nosnippet>593</a>    lookup_index: <span class="kw-2">&amp;mut </span>HashMap&lt;FunctionId, HashMap&lt;Box&lt;[u32]&gt;, u32&gt;&gt;,
+<a href=#594 id=594 data-nosnippet>594</a>) -&gt; <span class="prelude-ty">Result</span>&lt;()&gt; {
+<a href=#595 id=595 data-nosnippet>595</a>    <span class="kw">for </span>op <span class="kw">in </span>head {
+<a href=#596 id=596 data-nosnippet>596</a>        <span class="kw">match </span>op {
+<a href=#597 id=597 data-nosnippet>597</a>            HeadOp::Set { func, slots } =&gt; {
+<a href=#598 id=598 data-nosnippet>598</a>                <span class="kw">let </span>row = build_row(slots, env)<span class="question-mark">?</span>;
+<a href=#599 id=599 data-nosnippet>599</a>                touched.insert(<span class="kw-2">*</span>func);
+<a href=#600 id=600 data-nosnippet>600</a>                writes.push(Write::Set(<span class="kw-2">*</span>func, row));
+<a href=#601 id=601 data-nosnippet>601</a>            }
+<a href=#602 id=602 data-nosnippet>602</a>            HeadOp::Remove { func, slots } =&gt; {
+<a href=#603 id=603 data-nosnippet>603</a>                <span class="kw">let </span>key: Vec&lt;u32&gt; = slots
+<a href=#604 id=604 data-nosnippet>604</a>                    .iter()
+<a href=#605 id=605 data-nosnippet>605</a>                    .map(|s| resolve(s, env))
+<a href=#606 id=606 data-nosnippet>606</a>                    .collect::&lt;<span class="prelude-ty">Result</span>&lt;<span class="kw">_</span>&gt;&gt;()<span class="question-mark">?</span>;
+<a href=#607 id=607 data-nosnippet>607</a>                touched.insert(<span class="kw-2">*</span>func);
+<a href=#608 id=608 data-nosnippet>608</a>                writes.push(Write::Remove(<span class="kw-2">*</span>func, key));
+<a href=#609 id=609 data-nosnippet>609</a>            }
+<a href=#610 id=610 data-nosnippet>610</a>            HeadOp::Subsume { func, .. } =&gt; {
+<a href=#611 id=611 data-nosnippet>611</a>                <span class="comment">// Subsumption is not tracked; treat as a no-op (the row stays
+<a href=#612 id=612 data-nosnippet>612</a>                // present). `supports_subsumption()` is false, so the frontend
+<a href=#613 id=613 data-nosnippet>613</a>                // never relies on subsumed-row filtering on this backend.
+<a href=#614 id=614 data-nosnippet>614</a>                </span>touched.insert(<span class="kw-2">*</span>func);
+<a href=#615 id=615 data-nosnippet>615</a>            }
+<a href=#616 id=616 data-nosnippet>616</a>            HeadOp::Lookup { func, args, ret } =&gt; {
+<a href=#617 id=617 data-nosnippet>617</a>                <span class="kw">let </span>key: Vec&lt;Value&gt; = args
+<a href=#618 id=618 data-nosnippet>618</a>                    .iter()
+<a href=#619 id=619 data-nosnippet>619</a>                    .map(|s| resolve(s, env).map(Value::new))
+<a href=#620 id=620 data-nosnippet>620</a>                    .collect::&lt;<span class="prelude-ty">Result</span>&lt;<span class="kw">_</span>&gt;&gt;()<span class="question-mark">?</span>;
+<a href=#621 id=621 data-nosnippet>621</a>                <span class="kw">let </span>val = lookup_or_create(eg, <span class="kw-2">*</span>func, <span class="kw-2">&amp;</span>key, lookup_index);
+<a href=#622 id=622 data-nosnippet>622</a>                env.insert(<span class="kw-2">*</span>ret, val.rep());
+<a href=#623 id=623 data-nosnippet>623</a>            }
+<a href=#624 id=624 data-nosnippet>624</a>            HeadOp::Call { id, args, ret } =&gt; {
+<a href=#625 id=625 data-nosnippet>625</a>                <span class="kw">let </span>argv: Vec&lt;Value&gt; = args
+<a href=#626 id=626 data-nosnippet>626</a>                    .iter()
+<a href=#627 id=627 data-nosnippet>627</a>                    .map(|s| resolve(s, env).map(Value::new))
+<a href=#628 id=628 data-nosnippet>628</a>                    .collect::&lt;<span class="prelude-ty">Result</span>&lt;<span class="kw">_</span>&gt;&gt;()<span class="question-mark">?</span>;
+<a href=#629 id=629 data-nosnippet>629</a>                <span class="kw">let </span>result = eg.eval_prim_internal(<span class="kw-2">*</span>id, <span class="kw-2">&amp;</span>argv);
+<a href=#630 id=630 data-nosnippet>630</a>                <span class="kw">if let </span><span class="prelude-val">Some</span>(v) = result {
+<a href=#631 id=631 data-nosnippet>631</a>                    env.insert(<span class="kw-2">*</span>ret, v.rep());
+<a href=#632 id=632 data-nosnippet>632</a>                }
+<a href=#633 id=633 data-nosnippet>633</a>                <span class="comment">// A `None` result (primitive failure) in an action is a no-op;
+<a href=#634 id=634 data-nosnippet>634</a>                // real failures surface as panics through `PanicFunc`.
+<a href=#635 id=635 data-nosnippet>635</a>            </span>}
+<a href=#636 id=636 data-nosnippet>636</a>            HeadOp::Union { .. } =&gt; {
+<a href=#637 id=637 data-nosnippet>637</a>                <span class="comment">// Term-encoding mode emits unions as `(set (@uf …))` writes, not
+<a href=#638 id=638 data-nosnippet>638</a>                // trait `union` calls (mirrors the DuckDB/Feldera backends). A
+<a href=#639 id=639 data-nosnippet>639</a>                // direct `union` therefore never reaches a tractable program.
+<a href=#640 id=640 data-nosnippet>640</a>            </span>}
+<a href=#641 id=641 data-nosnippet>641</a>            HeadOp::Panic(msg) =&gt; {
+<a href=#642 id=642 data-nosnippet>642</a>                <span class="kw">return </span><span class="prelude-val">Err</span>(<span class="macro">anyhow!</span>(<span class="string">"{msg}"</span>));
+<a href=#643 id=643 data-nosnippet>643</a>            }
+<a href=#644 id=644 data-nosnippet>644</a>        }
+<a href=#645 id=645 data-nosnippet>645</a>    }
+<a href=#646 id=646 data-nosnippet>646</a>    <span class="prelude-val">Ok</span>(())
+<a href=#647 id=647 data-nosnippet>647</a>}
+<a href=#648 id=648 data-nosnippet>648</a>
+<a href=#649 id=649 data-nosnippet>649</a><span class="doccomment">/// Build a full row from head-action slots under `env`.
+<a href=#650 id=650 data-nosnippet>650</a></span><span class="kw">fn </span>build_row(slots: <span class="kw-2">&amp;</span>[Slot], env: <span class="kw-2">&amp;</span>Env) -&gt; <span class="prelude-ty">Result</span>&lt;Row&gt; {
+<a href=#651 id=651 data-nosnippet>651</a>    <span class="kw">let </span>vals: Vec&lt;u32&gt; = slots
+<a href=#652 id=652 data-nosnippet>652</a>        .iter()
+<a href=#653 id=653 data-nosnippet>653</a>        .map(|s| resolve(s, env))
+<a href=#654 id=654 data-nosnippet>654</a>        .collect::&lt;<span class="prelude-ty">Result</span>&lt;<span class="kw">_</span>&gt;&gt;()<span class="question-mark">?</span>;
+<a href=#655 id=655 data-nosnippet>655</a>    <span class="prelude-val">Ok</span>(vals.into_boxed_slice())
+<a href=#656 id=656 data-nosnippet>656</a>}
+<a href=#657 id=657 data-nosnippet>657</a>
+<a href=#658 id=658 data-nosnippet>658</a><span class="doccomment">/// Resolve a slot to a concrete value, erroring if it is an unbound variable.
+<a href=#659 id=659 data-nosnippet>659</a></span><span class="kw">fn </span>resolve(s: <span class="kw-2">&amp;</span>Slot, env: <span class="kw-2">&amp;</span>Env) -&gt; <span class="prelude-ty">Result</span>&lt;u32&gt; {
+<a href=#660 id=660 data-nosnippet>660</a>    slot_lookup(s, <span class="kw-2">&amp;</span>|v| env.get(<span class="kw-2">&amp;</span>v).copied())
+<a href=#661 id=661 data-nosnippet>661</a>        .ok_or_else(|| <span class="macro">anyhow!</span>(<span class="string">"unbound variable {s:?} in rule head"</span>))
+<a href=#662 id=662 data-nosnippet>662</a>}
+<a href=#663 id=663 data-nosnippet>663</a>
+<a href=#664 id=664 data-nosnippet>664</a><span class="doccomment">/// Look up the output of `func` for input `key`. If absent, create the row with
+<a href=#665 id=665 data-nosnippet>665</a>/// a fresh id (eq-sort constructor semantics — mirrors `add_term`). The created
+<a href=#666 id=666 data-nosnippet>666</a>/// row is written directly into the mirror so subsequent lookups in the same
+<a href=#667 id=667 data-nosnippet>667</a>/// iteration see it (hash-cons).
+<a href=#668 id=668 data-nosnippet>668</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>lookup_or_create(
+<a href=#669 id=669 data-nosnippet>669</a>    eg: <span class="kw-2">&amp;mut </span>EGraph,
+<a href=#670 id=670 data-nosnippet>670</a>    func: FunctionId,
+<a href=#671 id=671 data-nosnippet>671</a>    key: <span class="kw-2">&amp;</span>[Value],
+<a href=#672 id=672 data-nosnippet>672</a>    index: <span class="kw-2">&amp;mut </span>HashMap&lt;FunctionId, HashMap&lt;Box&lt;[u32]&gt;, u32&gt;&gt;,
+<a href=#673 id=673 data-nosnippet>673</a>) -&gt; Value {
+<a href=#674 id=674 data-nosnippet>674</a>    <span class="kw">let </span>info = eg.info(func);
+<a href=#675 id=675 data-nosnippet>675</a>    <span class="kw">let </span>inputs_len = info.arity.saturating_sub(<span class="number">1</span>);
+<a href=#676 id=676 data-nosnippet>676</a>    <span class="kw">let </span>identity_on_miss = info.identity_on_miss;
+<a href=#677 id=677 data-nosnippet>677</a>    <span class="comment">// Lazily build the key-&gt;output index for this function from the mirror so
+<a href=#678 id=678 data-nosnippet>678</a>    // repeated lookups within one iteration are O(1) instead of O(state) scans.
+<a href=#679 id=679 data-nosnippet>679</a>    </span><span class="kw">let </span>idx = index.entry(func).or_insert_with(|| {
+<a href=#680 id=680 data-nosnippet>680</a>        <span class="kw">let </span><span class="kw-2">mut </span>m: HashMap&lt;Box&lt;[u32]&gt;, u32&gt; = HashMap::new();
+<a href=#681 id=681 data-nosnippet>681</a>        <span class="kw">if let </span><span class="prelude-val">Some</span>(set) = eg.mirror.get(<span class="kw-2">&amp;</span>func) {
+<a href=#682 id=682 data-nosnippet>682</a>            <span class="kw">for </span>row <span class="kw">in </span>set.iter() {
+<a href=#683 id=683 data-nosnippet>683</a>                <span class="kw">let </span>k: Box&lt;[u32]&gt; = (<span class="number">0</span>..inputs_len).map(|i| row_col(row, i)).collect();
+<a href=#684 id=684 data-nosnippet>684</a>                m.insert(k, row_col(row, inputs_len));
+<a href=#685 id=685 data-nosnippet>685</a>            }
+<a href=#686 id=686 data-nosnippet>686</a>        }
+<a href=#687 id=687 data-nosnippet>687</a>        m
+<a href=#688 id=688 data-nosnippet>688</a>    });
+<a href=#689 id=689 data-nosnippet>689</a>    <span class="kw">let </span>k: Box&lt;[u32]&gt; = key.iter().map(|v| v.rep()).collect();
+<a href=#690 id=690 data-nosnippet>690</a>    <span class="kw">if let </span><span class="prelude-val">Some</span>(<span class="kw-2">&amp;</span>out) = idx.get(<span class="kw-2">&amp;</span>k) {
+<a href=#691 id=691 data-nosnippet>691</a>        <span class="kw">return </span>Value::new(out);
+<a href=#692 id=692 data-nosnippet>692</a>    }
+<a href=#693 id=693 data-nosnippet>693</a>    <span class="comment">// Identity-on-miss ("lookup-or-self"): a missing key resolves to the key
+<a href=#694 id=694 data-nosnippet>694</a>    // itself and inserts no row. Used by the canonicalize-at-creation encoding
+<a href=#695 id=695 data-nosnippet>695</a>    // for the flat UF-index `@UF_Sf`, where this is exactly `find_UFold(x)=x`
+<a href=#696 id=696 data-nosnippet>696</a>    // for an id with no recorded leader.
+<a href=#697 id=697 data-nosnippet>697</a>    </span><span class="kw">if </span>identity_on_miss {
+<a href=#698 id=698 data-nosnippet>698</a>        <span class="macro">debug_assert_eq!</span>(key.len(), <span class="number">1</span>, <span class="string">"identity-on-miss expects a single key column"</span>);
+<a href=#699 id=699 data-nosnippet>699</a>        <span class="kw">return </span>key[<span class="number">0</span>];
+<a href=#700 id=700 data-nosnippet>700</a>    }
+<a href=#701 id=701 data-nosnippet>701</a>    <span class="kw">let </span>id = eg.fresh_id_internal();
+<a href=#702 id=702 data-nosnippet>702</a>    idx.insert(k, id);
+<a href=#703 id=703 data-nosnippet>703</a>    <span class="kw">let </span><span class="kw-2">mut </span>full: Vec&lt;u32&gt; = key.iter().map(|v| v.rep()).collect();
+<a href=#704 id=704 data-nosnippet>704</a>    full.push(id);
+<a href=#705 id=705 data-nosnippet>705</a>    <span class="kw">let </span>row: Row = full.into_boxed_slice();
+<a href=#706 id=706 data-nosnippet>706</a>    std::rc::Rc::make_mut(eg.mirror.entry(func).or_default()).insert(row);
+<a href=#707 id=707 data-nosnippet>707</a>    Value::new(id)
+<a href=#708 id=708 data-nosnippet>708</a>}</code></pre></div></section></main></body></html>

@@ -1,0 +1,157 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Operations on an in-progress rule."><title>RuleBuilderOps in egglog_backend_trait - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-e56847b5.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="egglog_backend_trait" data-themes="" data-resource-suffix="" data-rustdoc-version="1.91.0 (f8297e351 2025-10-28)" data-channel="1.91.0" data-search-js="search-e256b49e.js" data-stringdex-js="stringdex-c3e638e9.js" data-settings-js="settings-c38705f0.js" ><script src="../static.files/storage-e2aeef58.js"></script><script defer src="sidebar-items.js"></script><script defer src="../static.files/main-6dc2a7f3.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-263c88ec.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc trait"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">RuleBuilderOps</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../egglog_backend_trait/index.html">egglog_<wbr>backend_<wbr>trait</a><span class="version">2.0.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Rule<wbr>Builder<wbr>Ops</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#variable-creation" title="Variable creation">Variable creation</a></li><li><a href="#unsupported-on-duckdb" title="Unsupported on DuckDB">Unsupported on DuckDB</a></li></ul><h3><a href="#required-methods">Required Methods</a></h3><ul class="block"><li><a href="#tymethod.build" title="build">build</a></li><li><a href="#tymethod.call_external_func" title="call_external_func">call_external_func</a></li><li><a href="#tymethod.lookup" title="lookup">lookup</a></li><li><a href="#tymethod.new_var" title="new_var">new_var</a></li><li><a href="#tymethod.new_var_named" title="new_var_named">new_var_named</a></li><li><a href="#tymethod.panic" title="panic">panic</a></li><li><a href="#tymethod.query_prim" title="query_prim">query_prim</a></li><li><a href="#tymethod.query_table" title="query_table">query_table</a></li><li><a href="#tymethod.remove" title="remove">remove</a></li><li><a href="#tymethod.set" title="set">set</a></li><li><a href="#tymethod.subsume" title="subsume">subsume</a></li><li><a href="#tymethod.union" title="union">union</a></li></ul><h3><a href="#provided-methods">Provided Methods</a></h3><ul class="block"><li><a href="#method.build_check" title="build_check">build_check</a></li><li><a href="#method.new_panic" title="new_panic">new_panic</a></li><li><a href="#method.rename_prim" title="rename_prim">rename_prim</a></li><li><a href="#method.set_focus_exclude_table" title="set_focus_exclude_table">set_focus_exclude_table</a></li><li><a href="#method.set_no_decomp" title="set_no_decomp">set_no_decomp</a></li></ul><h3><a href="#implementors">Implementors</a></h3></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="index.html">In crate egglog_<wbr>backend_<wbr>trait</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="index.html">egglog_backend_trait</a></div><h1>Trait <span class="trait">Rule<wbr>Builder<wbr>Ops</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/egglog_backend_trait/lib.rs.html#1063-1211">Source</a> </span></div><pre class="rust item-decl"><code>pub trait RuleBuilderOps {
+<details class="toggle type-contents-toggle"><summary class="hideme"><span>Show 17 methods</span></summary>    // Required methods
+    fn <a href="#tymethod.new_var" class="fn">new_var</a>(&amp;mut self, ty: <a class="enum" href="enum.ColumnTy.html" title="enum egglog_backend_trait::ColumnTy">ColumnTy</a>) -&gt; <a class="enum" href="enum.QueryEntry.html" title="enum egglog_backend_trait::QueryEntry">QueryEntry</a>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.new_var_named" class="fn">new_var_named</a>(&amp;mut self, ty: <a class="enum" href="enum.ColumnTy.html" title="enum egglog_backend_trait::ColumnTy">ColumnTy</a>, name: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.91.0/std/primitive.str.html">str</a>) -&gt; <a class="enum" href="enum.QueryEntry.html" title="enum egglog_backend_trait::QueryEntry">QueryEntry</a>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.query_table" class="fn">query_table</a>(
+        &amp;mut self,
+        func: <a class="struct" href="struct.FunctionId.html" title="struct egglog_backend_trait::FunctionId">FunctionId</a>,
+        entries: &amp;[<a class="enum" href="enum.QueryEntry.html" title="enum egglog_backend_trait::QueryEntry">QueryEntry</a>],
+        is_subsumed: <a class="enum" href="https://doc.rust-lang.org/1.91.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.91.0/std/primitive.bool.html">bool</a>&gt;,
+    ) -&gt; <a class="type" href="https://docs.rs/anyhow/1.0.100/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.91.0/std/primitive.unit.html">()</a>&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.query_prim" class="fn">query_prim</a>(
+        &amp;mut self,
+        func: <a class="struct" href="struct.ExternalFunctionId.html" title="struct egglog_backend_trait::ExternalFunctionId">ExternalFunctionId</a>,
+        entries: &amp;[<a class="enum" href="enum.QueryEntry.html" title="enum egglog_backend_trait::QueryEntry">QueryEntry</a>],
+        ret_ty: <a class="enum" href="enum.ColumnTy.html" title="enum egglog_backend_trait::ColumnTy">ColumnTy</a>,
+    ) -&gt; <a class="type" href="https://docs.rs/anyhow/1.0.100/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.91.0/std/primitive.unit.html">()</a>&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.call_external_func" class="fn">call_external_func</a>(
+        &amp;mut self,
+        func: <a class="struct" href="struct.ExternalFunctionId.html" title="struct egglog_backend_trait::ExternalFunctionId">ExternalFunctionId</a>,
+        args: &amp;[<a class="enum" href="enum.QueryEntry.html" title="enum egglog_backend_trait::QueryEntry">QueryEntry</a>],
+        ret_ty: <a class="enum" href="enum.ColumnTy.html" title="enum egglog_backend_trait::ColumnTy">ColumnTy</a>,
+        panic_msg: <a class="type" href="type.PanicMsg.html" title="type egglog_backend_trait::PanicMsg">PanicMsg</a>,
+    ) -&gt; <a class="enum" href="enum.QueryEntry.html" title="enum egglog_backend_trait::QueryEntry">QueryEntry</a>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.lookup" class="fn">lookup</a>(
+        &amp;mut self,
+        func: <a class="struct" href="struct.FunctionId.html" title="struct egglog_backend_trait::FunctionId">FunctionId</a>,
+        entries: &amp;[<a class="enum" href="enum.QueryEntry.html" title="enum egglog_backend_trait::QueryEntry">QueryEntry</a>],
+        panic_msg: <a class="type" href="type.PanicMsg.html" title="type egglog_backend_trait::PanicMsg">PanicMsg</a>,
+    ) -&gt; <a class="enum" href="enum.QueryEntry.html" title="enum egglog_backend_trait::QueryEntry">QueryEntry</a>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.subsume" class="fn">subsume</a>(
+        &amp;mut self,
+        func: <a class="struct" href="struct.FunctionId.html" title="struct egglog_backend_trait::FunctionId">FunctionId</a>,
+        entries: &amp;[<a class="enum" href="enum.QueryEntry.html" title="enum egglog_backend_trait::QueryEntry">QueryEntry</a>],
+    ) -&gt; <a class="type" href="https://docs.rs/anyhow/1.0.100/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.91.0/std/primitive.unit.html">()</a>&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.set" class="fn">set</a>(&amp;mut self, func: <a class="struct" href="struct.FunctionId.html" title="struct egglog_backend_trait::FunctionId">FunctionId</a>, entries: &amp;[<a class="enum" href="enum.QueryEntry.html" title="enum egglog_backend_trait::QueryEntry">QueryEntry</a>]);
+<span class="item-spacer"></span>    fn <a href="#tymethod.remove" class="fn">remove</a>(&amp;mut self, func: <a class="struct" href="struct.FunctionId.html" title="struct egglog_backend_trait::FunctionId">FunctionId</a>, entries: &amp;[<a class="enum" href="enum.QueryEntry.html" title="enum egglog_backend_trait::QueryEntry">QueryEntry</a>]);
+<span class="item-spacer"></span>    fn <a href="#tymethod.union" class="fn">union</a>(&amp;mut self, l: <a class="enum" href="enum.QueryEntry.html" title="enum egglog_backend_trait::QueryEntry">QueryEntry</a>, r: <a class="enum" href="enum.QueryEntry.html" title="enum egglog_backend_trait::QueryEntry">QueryEntry</a>);
+<span class="item-spacer"></span>    fn <a href="#tymethod.panic" class="fn">panic</a>(&amp;mut self, message: <a class="struct" href="https://doc.rust-lang.org/1.91.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>);
+<span class="item-spacer"></span>    fn <a href="#tymethod.build" class="fn">build</a>(self: <a class="struct" href="https://doc.rust-lang.org/1.91.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;Self&gt;) -&gt; <a class="type" href="https://docs.rs/anyhow/1.0.100/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="struct" href="struct.RuleId.html" title="struct egglog_backend_trait::RuleId">RuleId</a>&gt;;
+
+    // Provided methods
+    fn <a href="#method.new_panic" class="fn">new_panic</a>(&amp;mut self, _message: <a class="struct" href="https://doc.rust-lang.org/1.91.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>) -&gt; <a class="struct" href="struct.ExternalFunctionId.html" title="struct egglog_backend_trait::ExternalFunctionId">ExternalFunctionId</a> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.set_no_decomp" class="fn">set_no_decomp</a>(&amp;mut self, _no_decomp: <a class="primitive" href="https://doc.rust-lang.org/1.91.0/std/primitive.bool.html">bool</a>) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.set_focus_exclude_table" class="fn">set_focus_exclude_table</a>(&amp;mut self, _func: <a class="struct" href="struct.FunctionId.html" title="struct egglog_backend_trait::FunctionId">FunctionId</a>) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.build_check" class="fn">build_check</a>(self: <a class="struct" href="https://doc.rust-lang.org/1.91.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;Self&gt;) -&gt; <a class="type" href="https://docs.rs/anyhow/1.0.100/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.91.0/std/primitive.bool.html">bool</a>&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.rename_prim" class="fn">rename_prim</a>(&amp;mut self, _id: <a class="struct" href="struct.ExternalFunctionId.html" title="struct egglog_backend_trait::ExternalFunctionId">ExternalFunctionId</a>, _name: <a class="struct" href="https://doc.rust-lang.org/1.91.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>) { ... }
+</details>}</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Operations on an in-progress rule.</p>
+<p>This trait mirrors the public methods on
+<code>egglog_bridge::RuleBuilder</code>. The bridge’s impl is a trivial newtype
+passthrough; the DuckDB impl accumulates calls into its internal
+<code>duck::Rule</code> data IR and submits to <code>compile_rule</code> on
+<a href="trait.RuleBuilderOps.html#tymethod.build" title="method egglog_backend_trait::RuleBuilderOps::build"><code>RuleBuilderOps::build</code></a>.</p>
+<h3 id="variable-creation"><a class="doc-anchor" href="#variable-creation">§</a>Variable creation</h3>
+<p><code>new_var</code> and <code>new_var_named</code> allocate new variables. The returned
+<code>QueryEntry</code> can be passed back to body atoms / actions. Each <code>QueryEntry</code>
+carries its <a href="enum.ColumnTy.html" title="enum egglog_backend_trait::ColumnTy"><code>ColumnTy</code></a> for runtime arity / type checking.</p>
+<h3 id="unsupported-on-duckdb"><a class="doc-anchor" href="#unsupported-on-duckdb">§</a>Unsupported on DuckDB</h3>
+<ul>
+<li><a href="trait.RuleBuilderOps.html#tymethod.subsume" title="method egglog_backend_trait::RuleBuilderOps::subsume"><code>RuleBuilderOps::subsume</code></a>: error.</li>
+<li>Complex <code>MergeFn::Function</code> / <code>MergeFn::Primitive</code> referenced via
+<code>query_prim</code>: error at <code>build()</code> time when the rule references such a
+merge.</li>
+</ul>
+</div></details><h2 id="required-methods" class="section-header">Required Methods<a href="#required-methods" class="anchor">§</a></h2><div class="methods"><details class="toggle method-toggle" open><summary><section id="tymethod.new_var" class="method"><a class="src rightside" href="../src/egglog_backend_trait/lib.rs.html#1067">Source</a><h4 class="code-header">fn <a href="#tymethod.new_var" class="fn">new_var</a>(&amp;mut self, ty: <a class="enum" href="enum.ColumnTy.html" title="enum egglog_backend_trait::ColumnTy">ColumnTy</a>) -&gt; <a class="enum" href="enum.QueryEntry.html" title="enum egglog_backend_trait::QueryEntry">QueryEntry</a></h4></section></summary><div class="docblock"><p>Bind a new variable of the given type.</p>
+<p>Wraps <code>RuleBuilder::new_var</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.new_var_named" class="method"><a class="src rightside" href="../src/egglog_backend_trait/lib.rs.html#1073">Source</a><h4 class="code-header">fn <a href="#tymethod.new_var_named" class="fn">new_var_named</a>(&amp;mut self, ty: <a class="enum" href="enum.ColumnTy.html" title="enum egglog_backend_trait::ColumnTy">ColumnTy</a>, name: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.91.0/std/primitive.str.html">str</a>) -&gt; <a class="enum" href="enum.QueryEntry.html" title="enum egglog_backend_trait::QueryEntry">QueryEntry</a></h4></section></summary><div class="docblock"><p>Bind a new variable of the given type with a display name (eases
+debugging).</p>
+<p>Wraps <code>RuleBuilder::new_var_named</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.query_table" class="method"><a class="src rightside" href="../src/egglog_backend_trait/lib.rs.html#1080-1085">Source</a><h4 class="code-header">fn <a href="#tymethod.query_table" class="fn">query_table</a>(
+    &amp;mut self,
+    func: <a class="struct" href="struct.FunctionId.html" title="struct egglog_backend_trait::FunctionId">FunctionId</a>,
+    entries: &amp;[<a class="enum" href="enum.QueryEntry.html" title="enum egglog_backend_trait::QueryEntry">QueryEntry</a>],
+    is_subsumed: <a class="enum" href="https://doc.rust-lang.org/1.91.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.91.0/std/primitive.bool.html">bool</a>&gt;,
+) -&gt; <a class="type" href="https://docs.rs/anyhow/1.0.100/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.91.0/std/primitive.unit.html">()</a>&gt;</h4></section></summary><div class="docblock"><p>Add a table body atom. The final entry is the function’s return
+value. When <code>is_subsumed</code> is <code>Some</code>, the atom is constrained to rows
+with that subsumption bit.</p>
+<p>Wraps <code>RuleBuilder::query_table</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.query_prim" class="method"><a class="src rightside" href="../src/egglog_backend_trait/lib.rs.html#1090-1095">Source</a><h4 class="code-header">fn <a href="#tymethod.query_prim" class="fn">query_prim</a>(
+    &amp;mut self,
+    func: <a class="struct" href="struct.ExternalFunctionId.html" title="struct egglog_backend_trait::ExternalFunctionId">ExternalFunctionId</a>,
+    entries: &amp;[<a class="enum" href="enum.QueryEntry.html" title="enum egglog_backend_trait::QueryEntry">QueryEntry</a>],
+    ret_ty: <a class="enum" href="enum.ColumnTy.html" title="enum egglog_backend_trait::ColumnTy">ColumnTy</a>,
+) -&gt; <a class="type" href="https://docs.rs/anyhow/1.0.100/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.91.0/std/primitive.unit.html">()</a>&gt;</h4></section></summary><div class="docblock"><p>Add a primitive body atom. The final entry is the return value.</p>
+<p>Wraps <code>RuleBuilder::query_prim</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.call_external_func" class="method"><a class="src rightside" href="../src/egglog_backend_trait/lib.rs.html#1102-1108">Source</a><h4 class="code-header">fn <a href="#tymethod.call_external_func" class="fn">call_external_func</a>(
+    &amp;mut self,
+    func: <a class="struct" href="struct.ExternalFunctionId.html" title="struct egglog_backend_trait::ExternalFunctionId">ExternalFunctionId</a>,
+    args: &amp;[<a class="enum" href="enum.QueryEntry.html" title="enum egglog_backend_trait::QueryEntry">QueryEntry</a>],
+    ret_ty: <a class="enum" href="enum.ColumnTy.html" title="enum egglog_backend_trait::ColumnTy">ColumnTy</a>,
+    panic_msg: <a class="type" href="type.PanicMsg.html" title="type egglog_backend_trait::PanicMsg">PanicMsg</a>,
+) -&gt; <a class="enum" href="enum.QueryEntry.html" title="enum egglog_backend_trait::QueryEntry">QueryEntry</a></h4></section></summary><div class="docblock"><p>Call an external function in the RHS, panicking with <code>panic_msg</code> on
+failure. Returns the result variable.</p>
+<p>Wraps <code>RuleBuilder::call_external_func</code>. <code>panic_msg</code> is a <a href="type.PanicMsg.html" title="type egglog_backend_trait::PanicMsg"><code>PanicMsg</code></a>
+closure, evaluated only if the call actually fails.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.lookup" class="method"><a class="src rightside" href="../src/egglog_backend_trait/lib.rs.html#1115-1120">Source</a><h4 class="code-header">fn <a href="#tymethod.lookup" class="fn">lookup</a>(
+    &amp;mut self,
+    func: <a class="struct" href="struct.FunctionId.html" title="struct egglog_backend_trait::FunctionId">FunctionId</a>,
+    entries: &amp;[<a class="enum" href="enum.QueryEntry.html" title="enum egglog_backend_trait::QueryEntry">QueryEntry</a>],
+    panic_msg: <a class="type" href="type.PanicMsg.html" title="type egglog_backend_trait::PanicMsg">PanicMsg</a>,
+) -&gt; <a class="enum" href="enum.QueryEntry.html" title="enum egglog_backend_trait::QueryEntry">QueryEntry</a></h4></section></summary><div class="docblock"><p>RHS: look up the value of <code>func(entries)</code>, with the function’s
+configured default behavior on miss.</p>
+<p>Wraps <code>RuleBuilder::lookup</code>. <code>panic_msg</code> is a <a href="type.PanicMsg.html" title="type egglog_backend_trait::PanicMsg"><code>PanicMsg</code></a> closure
+(evaluated only on miss when the function is <code>DefaultVal::Fail</code>).</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.subsume" class="method"><a class="src rightside" href="../src/egglog_backend_trait/lib.rs.html#1128">Source</a><h4 class="code-header">fn <a href="#tymethod.subsume" class="fn">subsume</a>(&amp;mut self, func: <a class="struct" href="struct.FunctionId.html" title="struct egglog_backend_trait::FunctionId">FunctionId</a>, entries: &amp;[<a class="enum" href="enum.QueryEntry.html" title="enum egglog_backend_trait::QueryEntry">QueryEntry</a>]) -&gt; <a class="type" href="https://docs.rs/anyhow/1.0.100/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.91.0/std/primitive.unit.html">()</a>&gt;</h4></section></summary><div class="docblock"><p>RHS: subsume the row keyed by <code>entries</code> in <code>func</code>.</p>
+<p>Wraps <code>RuleBuilder::subsume</code>.</p>
+<p><strong>DuckDB</strong>: errors at this call site. Programs that need subsume
+must use the reference backend in v1.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.set" class="method"><a class="src rightside" href="../src/egglog_backend_trait/lib.rs.html#1133">Source</a><h4 class="code-header">fn <a href="#tymethod.set" class="fn">set</a>(&amp;mut self, func: <a class="struct" href="struct.FunctionId.html" title="struct egglog_backend_trait::FunctionId">FunctionId</a>, entries: &amp;[<a class="enum" href="enum.QueryEntry.html" title="enum egglog_backend_trait::QueryEntry">QueryEntry</a>])</h4></section></summary><div class="docblock"><p>RHS: set <code>func(entries[..n-1])</code> to <code>entries[n-1]</code>.</p>
+<p>Wraps <code>RuleBuilder::set</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.remove" class="method"><a class="src rightside" href="../src/egglog_backend_trait/lib.rs.html#1138">Source</a><h4 class="code-header">fn <a href="#tymethod.remove" class="fn">remove</a>(&amp;mut self, func: <a class="struct" href="struct.FunctionId.html" title="struct egglog_backend_trait::FunctionId">FunctionId</a>, entries: &amp;[<a class="enum" href="enum.QueryEntry.html" title="enum egglog_backend_trait::QueryEntry">QueryEntry</a>])</h4></section></summary><div class="docblock"><p>RHS: remove the row keyed by <code>entries</code> from <code>func</code>.</p>
+<p>Wraps <code>RuleBuilder::remove</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.union" class="method"><a class="src rightside" href="../src/egglog_backend_trait/lib.rs.html#1143">Source</a><h4 class="code-header">fn <a href="#tymethod.union" class="fn">union</a>(&amp;mut self, l: <a class="enum" href="enum.QueryEntry.html" title="enum egglog_backend_trait::QueryEntry">QueryEntry</a>, r: <a class="enum" href="enum.QueryEntry.html" title="enum egglog_backend_trait::QueryEntry">QueryEntry</a>)</h4></section></summary><div class="docblock"><p>RHS: merge two values in the union-find.</p>
+<p>Wraps <code>RuleBuilder::union</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.panic" class="method"><a class="src rightside" href="../src/egglog_backend_trait/lib.rs.html#1148">Source</a><h4 class="code-header">fn <a href="#tymethod.panic" class="fn">panic</a>(&amp;mut self, message: <a class="struct" href="https://doc.rust-lang.org/1.91.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>)</h4></section></summary><div class="docblock"><p>RHS: panic with the given message.</p>
+<p>Wraps <code>RuleBuilder::panic</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.build" class="method"><a class="src rightside" href="../src/egglog_backend_trait/lib.rs.html#1187">Source</a><h4 class="code-header">fn <a href="#tymethod.build" class="fn">build</a>(self: <a class="struct" href="https://doc.rust-lang.org/1.91.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;Self&gt;) -&gt; <a class="type" href="https://docs.rs/anyhow/1.0.100/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="struct" href="struct.RuleId.html" title="struct egglog_backend_trait::RuleId">RuleId</a>&gt;</h4></section></summary><div class="docblock"><p>Finalize the rule. Returns the registered <a href="struct.RuleId.html" title="struct egglog_backend_trait::RuleId"><code>RuleId</code></a>.</p>
+<p>Wraps <code>RuleBuilder::build</code>. The DuckDB impl hands the accumulated
+<code>duck::Rule</code> IR off to <code>compile_rule</code> and inserts it into the
+backend’s rule registry. If any accumulated call referenced a
+feature the backend does not support (e.g. subsume on DuckDB), this
+is where the error surfaces.</p>
+</div></details></div><h2 id="provided-methods" class="section-header">Provided Methods<a href="#provided-methods" class="anchor">§</a></h2><div class="methods"><details class="toggle method-toggle" open><summary><section id="method.new_panic" class="method"><a class="src rightside" href="../src/egglog_backend_trait/lib.rs.html#1156-1158">Source</a><h4 class="code-header">fn <a href="#method.new_panic" class="fn">new_panic</a>(&amp;mut self, _message: <a class="struct" href="https://doc.rust-lang.org/1.91.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>) -&gt; <a class="struct" href="struct.ExternalFunctionId.html" title="struct egglog_backend_trait::ExternalFunctionId">ExternalFunctionId</a></h4></section></summary><div class="docblock"><p>Register a deferred-panic external function on the underlying egraph
+and return its id. Used (e.g. by <code>unstable-fn</code>) to bake a panic id
+into a wrapped function’s call site.</p>
+<p>Wraps <code>RuleBuilder::new_panic</code>. Default panics for backends that do
+not support it; the bridge forwards to its <code>RuleBuilder</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.set_no_decomp" class="method"><a class="src rightside" href="../src/egglog_backend_trait/lib.rs.html#1164">Source</a><h4 class="code-header">fn <a href="#method.set_no_decomp" class="fn">set_no_decomp</a>(&amp;mut self, _no_decomp: <a class="primitive" href="https://doc.rust-lang.org/1.91.0/std/primitive.bool.html">bool</a>)</h4></section></summary><div class="docblock"><p>Skip tree-decomposition during query planning for this rule
+(the <code>:no-decomp</code> option / <code>--no-decomp</code>). Default no-op for
+backends that don’t decompose (e.g. duckdb); the bridge
+forwards it to its <code>RuleBuilder</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.set_focus_exclude_table" class="method"><a class="src rightside" href="../src/egglog_backend_trait/lib.rs.html#1178">Source</a><h4 class="code-header">fn <a href="#method.set_focus_exclude_table" class="fn">set_focus_exclude_table</a>(&amp;mut self, _func: <a class="struct" href="struct.FunctionId.html" title="struct egglog_backend_trait::FunctionId">FunctionId</a>)</h4></section></summary><div class="docblock"><p>Exclude the given function’s table from being a seminaive delta focus
+for this rule: the rule never fires on <em>new</em> rows of this table joined
+against <em>old</em> rows of the others. Used by the term-encoding
+fast-rebuild (<code>--fast-rebuild</code> on the native bridge) to drop the
+always-empty <code>δview ⋈ uf_old</code> variant of the <code>view ⋈ @UF_Sf</code> rebuild
+rule (excludes the view table), keeping only <code>view ⋈ δuf</code>. Bit-exact
+with the full rebuild under canonicalize-at-creation.</p>
+<p>Default no-op: the dataflow/SQL backends implement their own
+fast-rebuild (<code>enable_fast_rebuild()</code>) and never receive these encoding
+rebuild rules in fast-rebuild mode; only the bridge forwards this to its
+<code>RuleBuilder</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.build_check" class="method"><a class="src rightside" href="../src/egglog_backend_trait/lib.rs.html#1196-1200">Source</a><h4 class="code-header">fn <a href="#method.build_check" class="fn">build_check</a>(self: <a class="struct" href="https://doc.rust-lang.org/1.91.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;Self&gt;) -&gt; <a class="type" href="https://docs.rs/anyhow/1.0.100/anyhow/type.Result.html" title="type anyhow::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.91.0/std/primitive.bool.html">bool</a>&gt;</h4></section></summary><div class="docblock"><p>Consume the builder and check whether its accumulated body
+matches at least one assignment in the current database.
+Actions accumulated in the builder are ignored. The bridge
+backend’s default implementation panics; the DuckDB backend
+overrides this to compile the body to SQL and run it.
+Used by <code>(check …)</code> on the DuckDB path; the bridge keeps its
+existing external-func side-channel approach in <code>check_facts</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.rename_prim" class="method"><a class="src rightside" href="../src/egglog_backend_trait/lib.rs.html#1210">Source</a><h4 class="code-header">fn <a href="#method.rename_prim" class="fn">rename_prim</a>(&amp;mut self, _id: <a class="struct" href="struct.ExternalFunctionId.html" title="struct egglog_backend_trait::ExternalFunctionId">ExternalFunctionId</a>, _name: <a class="struct" href="https://doc.rust-lang.org/1.91.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>)</h4></section></summary><div class="docblock"><p>Rename an already-registered primitive on the backend so that
+the per-id name reflects the call-site’s concrete type. Used
+to disambiguate built-in primitives whose egglog name is
+overloaded across sorts (e.g. <code>^</code> is XOR for i64 and POWER for
+f64; <code>+</code> for String is concat). The bridge backend doesn’t
+need this (it dispatches via the typed <code>ExternalFunction</code>
+directly), so the default is a no-op. The duck rule-builder
+routes the call through the egraph it already holds mutably.</p>
+</div></details></div><h2 id="implementors" class="section-header">Implementors<a href="#implementors" class="anchor">§</a></h2><div id="implementors-list"></div><script src="../trait.impl/egglog_backend_trait/trait.RuleBuilderOps.js" async></script></section></div></main></body></html>

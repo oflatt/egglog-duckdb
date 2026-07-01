@@ -1,0 +1,219 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `egglog-bridge-flowlog/src/codegen.rs`."><title>codegen.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-e56847b5.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="egglog_bridge_flowlog" data-themes="" data-resource-suffix="" data-rustdoc-version="1.91.0 (f8297e351 2025-10-28)" data-channel="1.91.0" data-search-js="search-e256b49e.js" data-stringdex-js="stringdex-c3e638e9.js" data-settings-js="settings-c38705f0.js" ><script src="../../static.files/storage-e2aeef58.js"></script><script defer src="../../static.files/src-script-813739b1.js"></script><script defer src="../../src-files.js"></script><script defer src="../../static.files/main-6dc2a7f3.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-263c88ec.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content"><div class="main-heading"><h1><div class="sub-heading">egglog_bridge_flowlog/</div>codegen.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-3"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="doccomment">//! Runtime translation of an egglog rule (the trait-level `RuleBuilderOps` IR)
+<a href=#2 id=2 data-nosnippet>2</a>//! into a FlowLog `.dl` program plus a thin **driver** crate, for the M2
+<a href=#3 id=3 data-nosnippet>3</a>//! shell-out architecture.
+<a href=#4 id=4 data-nosnippet>4</a>//!
+<a href=#5 id=5 data-nosnippet>5</a>//! ## What is generated, at runtime
+<a href=#6 id=6 data-nosnippet>6</a>//!
+<a href=#7 id=7 data-nosnippet>7</a>//! M1 compiled a *build-time-fixed* `transitive_step.dl` and recognized the
+<a href=#8 id=8 data-nosnippet>8</a>//! rule shape structurally. M2 instead takes the rule the frontend builds **at
+<a href=#9 id=9 data-nosnippet>9</a>//! runtime** (`StepShape`, recognized from the live `RuleIr`) and emits:
+<a href=#10 id=10 data-nosnippet>10</a>//!
+<a href=#11 id=11 data-nosnippet>11</a>//! 1. a `.dl` for it (a non-recursive single-join step — one `commit()` = one
+<a href=#12 id=12 data-nosnippet>12</a>//!    bounded hop, exactly the M1 per-iteration model, but the relation names,
+<a href=#13 id=13 data-nosnippet>13</a>//!    join columns, and head come from the runtime rule, not a fixed file);
+<a href=#14 id=14 data-nosnippet>14</a>//! 2. a driver `main.rs` that `include!`s the flowlog-build-generated engine and
+<a href=#15 id=15 data-nosnippet>15</a>//!    speaks a line-based **stdin/stdout command protocol** (see `protocol`);
+<a href=#16 id=16 data-nosnippet>16</a>//! 3. a `Cargo.toml` + `build.rs` so the temp crate compiles standalone.
+<a href=#17 id=17 data-nosnippet>17</a>//!
+<a href=#18 id=18 data-nosnippet>18</a>//! The caller (`subprocess.rs`) hashes the `.dl`, builds the crate **once** per
+<a href=#19 id=19 data-nosnippet>19</a>//! rule-set (`cargo build`, ~tens of seconds cold), caches the binary by hash,
+<a href=#20 id=20 data-nosnippet>20</a>//! then spawns it and drives it over the pipe for the whole program — so the
+<a href=#21 id=21 data-nosnippet>21</a>//! flowlog incremental engine stays warm and incrementality is preserved.
+<a href=#22 id=22 data-nosnippet>22</a>//!
+<a href=#23 id=23 data-nosnippet>23</a>//! ## The non-recursive single-join shape
+<a href=#24 id=24 data-nosnippet>24</a>//!
+<a href=#25 id=25 data-nosnippet>25</a>//! The recognized step is `head(x, z) :- path(x, y), edge(y, z)`. We emit two
+<a href=#26 id=26 data-nosnippet>26</a>//! command-staged input relations (`path`, `edge`) and one output `hop`:
+<a href=#27 id=27 data-nosnippet>27</a>//!
+<a href=#28 id=28 data-nosnippet>28</a>//! ```text
+<a href=#29 id=29 data-nosnippet>29</a>//! .decl edge(src: int32, dst: int32)
+<a href=#30 id=30 data-nosnippet>30</a>//! .input edge(IO="command", delimiter=",")
+<a href=#31 id=31 data-nosnippet>31</a>//! .decl path(src: int32, dst: int32)
+<a href=#32 id=32 data-nosnippet>32</a>//! .input path(IO="command", delimiter=",")
+<a href=#33 id=33 data-nosnippet>33</a>//! .decl hop(src: int32, dst: int32)
+<a href=#34 id=34 data-nosnippet>34</a>//! hop(x, z) :- path(x, y), edge(y, z).
+<a href=#35 id=35 data-nosnippet>35</a>//! .output hop
+<a href=#36 id=36 data-nosnippet>36</a>//! ```
+<a href=#37 id=37 data-nosnippet>37</a>//!
+<a href=#38 id=38 data-nosnippet>38</a>//! The host (`lib.rs::run_one_hop_shellout`) folds each commit's `hop` deltas
+<a href=#39 id=39 data-nosnippet>39</a>//! into the Rust-side mirror and re-stages the new `path` rows next round, the
+<a href=#40 id=40 data-nosnippet>40</a>//! same bounded host-feedback loop M1 used — only now driving a *subprocess*
+<a href=#41 id=41 data-nosnippet>41</a>//! over a pipe instead of an in-process engine.
+<a href=#42 id=42 data-nosnippet>42</a>
+<a href=#43 id=43 data-nosnippet>43</a>/// The fixed relation names the generated `.dl` and driver use. The runtime
+<a href=#44 id=44 data-nosnippet>44</a>/// rule's actual `FunctionId`s are mapped onto these three roles by the host
+<a href=#45 id=45 data-nosnippet>45</a>/// (`StepShape`); the `.dl` itself only needs stable lowercase idents so the
+<a href=#46 id=46 data-nosnippet>46</a>/// generated engine's API (`insert_path` / `insert_edge` / `IncrementalResults.
+<a href=#47 id=47 data-nosnippet>47</a>/// hop`) and the driver's protocol dispatch are predictable.
+<a href=#48 id=48 data-nosnippet>48</a></span><span class="kw">pub const </span>REL_EDGE: <span class="kw-2">&amp;</span>str = <span class="string">"edge"</span>;
+<a href=#49 id=49 data-nosnippet>49</a><span class="kw">pub const </span>REL_PATH: <span class="kw-2">&amp;</span>str = <span class="string">"path"</span>;
+<a href=#50 id=50 data-nosnippet>50</a><span class="kw">pub const </span>REL_HOP: <span class="kw-2">&amp;</span>str = <span class="string">"hop"</span>;
+<a href=#51 id=51 data-nosnippet>51</a>
+<a href=#52 id=52 data-nosnippet>52</a><span class="doccomment">/// Emit the runtime `.dl` for a recognized transitive-closure step.
+<a href=#53 id=53 data-nosnippet>53</a>///
+<a href=#54 id=54 data-nosnippet>54</a>/// The shape is fixed (non-recursive single join), but this is produced *at
+<a href=#55 id=55 data-nosnippet>55</a>/// rule-install time from the runtime rule IR* — it is not a checked-in file.
+<a href=#56 id=56 data-nosnippet>56</a>/// Future shapes (different arities / multiple joins) extend here.
+<a href=#57 id=57 data-nosnippet>57</a></span><span class="kw">pub fn </span>emit_dl() -&gt; String {
+<a href=#58 id=58 data-nosnippet>58</a>    <span class="kw">let </span><span class="kw-2">mut </span>s = String::new();
+<a href=#59 id=59 data-nosnippet>59</a>    s.push_str(<span class="string">"// AUTO-GENERATED at runtime by egglog-bridge-flowlog (M2 shell-out).\n"</span>);
+<a href=#60 id=60 data-nosnippet>60</a>    s.push_str(<span class="string">"// One non-recursive join = one bounded egglog hop per commit().\n\n"</span>);
+<a href=#61 id=61 data-nosnippet>61</a>    s.push_str(<span class="kw-2">&amp;</span><span class="macro">format!</span>(<span class="string">".decl {REL_EDGE}(src: int32, dst: int32)\n"</span>));
+<a href=#62 id=62 data-nosnippet>62</a>    s.push_str(<span class="kw-2">&amp;</span><span class="macro">format!</span>(
+<a href=#63 id=63 data-nosnippet>63</a>        <span class="string">".input {REL_EDGE}(IO=\"command\", delimiter=\",\")\n\n"
+<a href=#64 id=64 data-nosnippet>64</a>    </span>));
+<a href=#65 id=65 data-nosnippet>65</a>    s.push_str(<span class="kw-2">&amp;</span><span class="macro">format!</span>(<span class="string">".decl {REL_PATH}(src: int32, dst: int32)\n"</span>));
+<a href=#66 id=66 data-nosnippet>66</a>    s.push_str(<span class="kw-2">&amp;</span><span class="macro">format!</span>(
+<a href=#67 id=67 data-nosnippet>67</a>        <span class="string">".input {REL_PATH}(IO=\"command\", delimiter=\",\")\n\n"
+<a href=#68 id=68 data-nosnippet>68</a>    </span>));
+<a href=#69 id=69 data-nosnippet>69</a>    s.push_str(<span class="kw-2">&amp;</span><span class="macro">format!</span>(<span class="string">".decl {REL_HOP}(src: int32, dst: int32)\n"</span>));
+<a href=#70 id=70 data-nosnippet>70</a>    s.push_str(<span class="kw-2">&amp;</span><span class="macro">format!</span>(
+<a href=#71 id=71 data-nosnippet>71</a>        <span class="string">"{REL_HOP}(x, z) :- {REL_PATH}(x, y), {REL_EDGE}(y, z).\n"
+<a href=#72 id=72 data-nosnippet>72</a>    </span>));
+<a href=#73 id=73 data-nosnippet>73</a>    s.push_str(<span class="kw-2">&amp;</span><span class="macro">format!</span>(<span class="string">".output {REL_HOP}\n"</span>));
+<a href=#74 id=74 data-nosnippet>74</a>    s
+<a href=#75 id=75 data-nosnippet>75</a>}
+<a href=#76 id=76 data-nosnippet>76</a>
+<a href=#77 id=77 data-nosnippet>77</a><span class="doccomment">/// The driver crate's `Cargo.toml`, parameterized by the absolute path to the
+<a href=#78 id=78 data-nosnippet>78</a>/// local flowlog-rs clone (so the temp crate finds `flowlog-runtime` /
+<a href=#79 id=79 data-nosnippet>79</a>/// `flowlog-build`). The crate is intentionally NOT a workspace member
+<a href=#80 id=80 data-nosnippet>80</a>/// (`[workspace]` empty table) so it builds standalone in its temp dir.
+<a href=#81 id=81 data-nosnippet>81</a></span><span class="kw">pub fn </span>emit_cargo_toml(crate_name: <span class="kw-2">&amp;</span>str, flowlog_root: <span class="kw-2">&amp;</span>str) -&gt; String {
+<a href=#82 id=82 data-nosnippet>82</a>    <span class="macro">format!</span>(
+<a href=#83 id=83 data-nosnippet>83</a>        <span class="string">r#"[package]
+<a href=#84 id=84 data-nosnippet>84</a>name = "{crate_name}"
+<a href=#85 id=85 data-nosnippet>85</a>version = "0.0.0"
+<a href=#86 id=86 data-nosnippet>86</a>edition = "2021"
+<a href=#87 id=87 data-nosnippet>87</a>publish = false
+<a href=#88 id=88 data-nosnippet>88</a>
+<a href=#89 id=89 data-nosnippet>89</a># Standalone: do NOT inherit the egglog workspace.
+<a href=#90 id=90 data-nosnippet>90</a>[workspace]
+<a href=#91 id=91 data-nosnippet>91</a>
+<a href=#92 id=92 data-nosnippet>92</a>[[bin]]
+<a href=#93 id=93 data-nosnippet>93</a>name = "{crate_name}"
+<a href=#94 id=94 data-nosnippet>94</a>path = "src/main.rs"
+<a href=#95 id=95 data-nosnippet>95</a>
+<a href=#96 id=96 data-nosnippet>96</a>[dependencies]
+<a href=#97 id=97 data-nosnippet>97</a>flowlog-runtime = {{ path = "{flowlog_root}/crates/flowlog-runtime" }}
+<a href=#98 id=98 data-nosnippet>98</a>
+<a href=#99 id=99 data-nosnippet>99</a>[build-dependencies]
+<a href=#100 id=100 data-nosnippet>100</a>flowlog-build = {{ path = "{flowlog_root}/crates/flowlog-build" }}
+<a href=#101 id=101 data-nosnippet>101</a>"#
+<a href=#102 id=102 data-nosnippet>102</a>    </span>)
+<a href=#103 id=103 data-nosnippet>103</a>}
+<a href=#104 id=104 data-nosnippet>104</a>
+<a href=#105 id=105 data-nosnippet>105</a><span class="doccomment">/// The driver crate's `build.rs`: compile the runtime-emitted `program.dl` into
+<a href=#106 id=106 data-nosnippet>106</a>/// `$OUT_DIR/program.rs` in incremental mode. Identical in spirit to the M1
+<a href=#107 id=107 data-nosnippet>107</a>/// build.rs, but the `.dl` it compiles was written at runtime.
+<a href=#108 id=108 data-nosnippet>108</a></span><span class="kw">pub fn </span>emit_build_rs() -&gt; String {
+<a href=#109 id=109 data-nosnippet>109</a>    <span class="string">r#"//! AUTO-GENERATED driver build.rs (M2 shell-out).
+<a href=#110 id=110 data-nosnippet>110</a>use flowlog_build::{Builder, ExecutionMode};
+<a href=#111 id=111 data-nosnippet>111</a>
+<a href=#112 id=112 data-nosnippet>112</a>fn main() {
+<a href=#113 id=113 data-nosnippet>113</a>    println!("cargo:rerun-if-changed=program.dl");
+<a href=#114 id=114 data-nosnippet>114</a>    Builder::default()
+<a href=#115 id=115 data-nosnippet>115</a>        .string_intern(false)
+<a href=#116 id=116 data-nosnippet>116</a>        .mode(ExecutionMode::DatalogInc)
+<a href=#117 id=117 data-nosnippet>117</a>        .compile(&amp;["program.dl"], &amp;[] as &amp;[&amp;str])
+<a href=#118 id=118 data-nosnippet>118</a>        .expect("flowlog-build failed to compile program.dl");
+<a href=#119 id=119 data-nosnippet>119</a>}
+<a href=#120 id=120 data-nosnippet>120</a>"#
+<a href=#121 id=121 data-nosnippet>121</a>    </span>.to_string()
+<a href=#122 id=122 data-nosnippet>122</a>}
+<a href=#123 id=123 data-nosnippet>123</a>
+<a href=#124 id=124 data-nosnippet>124</a><span class="doccomment">/// The driver `main.rs`: include the generated engine, then run the line-based
+<a href=#125 id=125 data-nosnippet>125</a>/// stdin/stdout command protocol. The host side that speaks this wire format is
+<a href=#126 id=126 data-nosnippet>126</a>/// [`crate::subprocess::DriverHandle`].
+<a href=#127 id=127 data-nosnippet>127</a>///
+<a href=#128 id=128 data-nosnippet>128</a>/// Protocol (one command per line on stdin; responses on stdout):
+<a href=#129 id=129 data-nosnippet>129</a>///   - `insert &lt;rel&gt; &lt;c0&gt; &lt;c1&gt;`  -&gt; stage an insert delta (no response)
+<a href=#130 id=130 data-nosnippet>130</a>///   - `remove &lt;rel&gt; &lt;c0&gt; &lt;c1&gt;`  -&gt; stage a remove delta (no response)
+<a href=#131 id=131 data-nosnippet>131</a>///   - `commit`  -&gt; step ONE epoch; emit `delta hop &lt;x&gt; &lt;z&gt; &lt;diff&gt;` for every
+<a href=#132 id=132 data-nosnippet>132</a>///     output delta, then a final `ok` line
+<a href=#133 id=133 data-nosnippet>133</a>///   - `read &lt;rel&gt;`              -&gt; (reserved; emits `ok`)
+<a href=#134 id=134 data-nosnippet>134</a>///   - `quit`                    -&gt; exit 0
+<a href=#135 id=135 data-nosnippet>135</a>///
+<a href=#136 id=136 data-nosnippet>136</a>/// The driver flushes stdout after every command so the host never deadlocks.
+<a href=#137 id=137 data-nosnippet>137</a></span><span class="kw">pub fn </span>emit_main_rs() -&gt; String {
+<a href=#138 id=138 data-nosnippet>138</a>    <span class="string">r#"//! AUTO-GENERATED driver (M2 shell-out): embeds a flowlog-rs
+<a href=#139 id=139 data-nosnippet>139</a>//! `DatalogIncrementalEngine` for the runtime-emitted `program.dl` and drives
+<a href=#140 id=140 data-nosnippet>140</a>//! it over a line-based stdin/stdout command protocol. One `commit` command =
+<a href=#141 id=141 data-nosnippet>141</a>//! one engine `commit()` = one bounded egglog hop.
+<a href=#142 id=142 data-nosnippet>142</a>
+<a href=#143 id=143 data-nosnippet>143</a>#[allow(clippy::all)]
+<a href=#144 id=144 data-nosnippet>144</a>#[allow(dead_code)]
+<a href=#145 id=145 data-nosnippet>145</a>#[allow(unused)]
+<a href=#146 id=146 data-nosnippet>146</a>mod gen {
+<a href=#147 id=147 data-nosnippet>147</a>    include!(concat!(env!("OUT_DIR"), "/program.rs"));
+<a href=#148 id=148 data-nosnippet>148</a>}
+<a href=#149 id=149 data-nosnippet>149</a>
+<a href=#150 id=150 data-nosnippet>150</a>use gen::DatalogIncrementalEngine;
+<a href=#151 id=151 data-nosnippet>151</a>use std::io::{BufRead, Write};
+<a href=#152 id=152 data-nosnippet>152</a>
+<a href=#153 id=153 data-nosnippet>153</a>fn main() {
+<a href=#154 id=154 data-nosnippet>154</a>    let mut engine = DatalogIncrementalEngine::new(1);
+<a href=#155 id=155 data-nosnippet>155</a>
+<a href=#156 id=156 data-nosnippet>156</a>    let stdin = std::io::stdin();
+<a href=#157 id=157 data-nosnippet>157</a>    let stdout = std::io::stdout();
+<a href=#158 id=158 data-nosnippet>158</a>    let mut out = stdout.lock();
+<a href=#159 id=159 data-nosnippet>159</a>
+<a href=#160 id=160 data-nosnippet>160</a>    for line in stdin.lock().lines() {
+<a href=#161 id=161 data-nosnippet>161</a>        let line = match line {
+<a href=#162 id=162 data-nosnippet>162</a>            Ok(l) =&gt; l,
+<a href=#163 id=163 data-nosnippet>163</a>            Err(_) =&gt; break,
+<a href=#164 id=164 data-nosnippet>164</a>        };
+<a href=#165 id=165 data-nosnippet>165</a>        let line = line.trim();
+<a href=#166 id=166 data-nosnippet>166</a>        if line.is_empty() {
+<a href=#167 id=167 data-nosnippet>167</a>            continue;
+<a href=#168 id=168 data-nosnippet>168</a>        }
+<a href=#169 id=169 data-nosnippet>169</a>        let mut it = line.split_whitespace();
+<a href=#170 id=170 data-nosnippet>170</a>        let cmd = it.next().unwrap_or("");
+<a href=#171 id=171 data-nosnippet>171</a>        match cmd {
+<a href=#172 id=172 data-nosnippet>172</a>            "insert" | "remove" =&gt; {
+<a href=#173 id=173 data-nosnippet>173</a>                let rel = it.next().unwrap_or("");
+<a href=#174 id=174 data-nosnippet>174</a>                let cols: Vec&lt;i32&gt; = it.filter_map(|t| t.parse::&lt;i32&gt;().ok()).collect();
+<a href=#175 id=175 data-nosnippet>175</a>                if cols.len() != 2 {
+<a href=#176 id=176 data-nosnippet>176</a>                    let _ = writeln!(out, "err expected 2 columns, got {}", cols.len());
+<a href=#177 id=177 data-nosnippet>177</a>                    let _ = out.flush();
+<a href=#178 id=178 data-nosnippet>178</a>                    continue;
+<a href=#179 id=179 data-nosnippet>179</a>                }
+<a href=#180 id=180 data-nosnippet>180</a>                let tup = (cols[0], cols[1]);
+<a href=#181 id=181 data-nosnippet>181</a>                let items = vec![tup];
+<a href=#182 id=182 data-nosnippet>182</a>                match (cmd, rel) {
+<a href=#183 id=183 data-nosnippet>183</a>                    ("insert", "edge") =&gt; engine.insert_edge(items),
+<a href=#184 id=184 data-nosnippet>184</a>                    ("insert", "path") =&gt; engine.insert_path(items),
+<a href=#185 id=185 data-nosnippet>185</a>                    ("remove", "edge") =&gt; engine.remove_edge(items),
+<a href=#186 id=186 data-nosnippet>186</a>                    ("remove", "path") =&gt; engine.remove_path(items),
+<a href=#187 id=187 data-nosnippet>187</a>                    _ =&gt; {
+<a href=#188 id=188 data-nosnippet>188</a>                        let _ = writeln!(out, "err unknown rel {rel}");
+<a href=#189 id=189 data-nosnippet>189</a>                        let _ = out.flush();
+<a href=#190 id=190 data-nosnippet>190</a>                    }
+<a href=#191 id=191 data-nosnippet>191</a>                }
+<a href=#192 id=192 data-nosnippet>192</a>            }
+<a href=#193 id=193 data-nosnippet>193</a>            "commit" =&gt; {
+<a href=#194 id=194 data-nosnippet>194</a>                let results = engine.commit();
+<a href=#195 id=195 data-nosnippet>195</a>                for (t, d) in results.hop.into_iter() {
+<a href=#196 id=196 data-nosnippet>196</a>                    let t: (i32, i32) = t;
+<a href=#197 id=197 data-nosnippet>197</a>                    let _ = writeln!(out, "delta hop {} {} {}", t.0, t.1, d);
+<a href=#198 id=198 data-nosnippet>198</a>                }
+<a href=#199 id=199 data-nosnippet>199</a>                let _ = writeln!(out, "ok");
+<a href=#200 id=200 data-nosnippet>200</a>                let _ = out.flush();
+<a href=#201 id=201 data-nosnippet>201</a>            }
+<a href=#202 id=202 data-nosnippet>202</a>            "read" =&gt; {
+<a href=#203 id=203 data-nosnippet>203</a>                // Reserved: the host keeps its own mirror; nothing to stream.
+<a href=#204 id=204 data-nosnippet>204</a>                let _ = writeln!(out, "ok");
+<a href=#205 id=205 data-nosnippet>205</a>                let _ = out.flush();
+<a href=#206 id=206 data-nosnippet>206</a>            }
+<a href=#207 id=207 data-nosnippet>207</a>            "quit" =&gt; {
+<a href=#208 id=208 data-nosnippet>208</a>                break;
+<a href=#209 id=209 data-nosnippet>209</a>            }
+<a href=#210 id=210 data-nosnippet>210</a>            other =&gt; {
+<a href=#211 id=211 data-nosnippet>211</a>                let _ = writeln!(out, "err unknown command {other}");
+<a href=#212 id=212 data-nosnippet>212</a>                let _ = out.flush();
+<a href=#213 id=213 data-nosnippet>213</a>            }
+<a href=#214 id=214 data-nosnippet>214</a>        }
+<a href=#215 id=215 data-nosnippet>215</a>    }
+<a href=#216 id=216 data-nosnippet>216</a>}
+<a href=#217 id=217 data-nosnippet>217</a>"#
+<a href=#218 id=218 data-nosnippet>218</a>    </span>.to_string()
+<a href=#219 id=219 data-nosnippet>219</a>}</code></pre></div></section></main></body></html>

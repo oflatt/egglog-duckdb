@@ -1,0 +1,65 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="DBSP-backed body join for the Feldera backend (#23 Stage C complete)."><title>egglog_bridge_feldera::dbsp_join - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-e56847b5.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="egglog_bridge_feldera" data-themes="" data-resource-suffix="" data-rustdoc-version="1.91.0 (f8297e351 2025-10-28)" data-channel="1.91.0" data-search-js="search-e256b49e.js" data-stringdex-js="stringdex-c3e638e9.js" data-settings-js="settings-c38705f0.js" ><script src="../../static.files/storage-e2aeef58.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-6dc2a7f3.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-263c88ec.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module dbsp_join</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../egglog_bridge_feldera/index.html">egglog_<wbr>bridge_<wbr>feldera</a><span class="version">2.0.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module dbsp_<wbr>join</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#what-runs-on-dbsp" title="What runs on DBSP">What runs on DBSP</a></li><li><a href="#pure-body-prims-run-on-circuit" title="Pure body prims run ON-CIRCUIT">Pure body prims run ON-CIRCUIT</a></li><li><a href="#eligibility--the-row-width-cap" title="Eligibility / the row-width cap">Eligibility / the row-width cap</a></li></ul><h3><a href="#structs">Module Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#enums" title="Enums">Enums</a></li><li><a href="#constants" title="Constants">Constants</a></li><li><a href="#traits" title="Traits">Traits</a></li><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate egglog_<wbr>bridge_<wbr>feldera</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">egglog_bridge_feldera</a></div><h1>Module <span>dbsp_<wbr>join</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/egglog_bridge_feldera/dbsp_join.rs.html#1-2462">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>DBSP-backed body join for the Feldera backend (#23 Stage C complete).</p>
+<p>This module runs a rule’s <strong>relational body join on DBSP’s dataflow engine</strong>
+— the paper’s core technical contribution. The persistent per-rule circuit
+(<a href="struct.PersistentJoin.html" title="struct egglog_bridge_feldera::dbsp_join::PersistentJoin"><code>PersistentJoin</code></a>) is the ONLY join path: there is no host nested-loop
+fallback. A genuinely-ineligible rule PANICS (see <a href="fn.plan_join.html" title="fn egglog_bridge_feldera::dbsp_join::plan_join"><code>plan_join</code></a>).</p>
+<h3 id="what-runs-on-dbsp"><a class="doc-anchor" href="#what-runs-on-dbsp">§</a>What runs on DBSP</h3>
+<p><a href="struct.PersistentJoin.html" title="struct egglog_bridge_feldera::dbsp_join::PersistentJoin"><code>PersistentJoin</code></a> builds a <strong>non-recursive</strong> DBSP circuit ONCE per rule that
+computes the join of the body’s table atoms (multi-atom, left-deep), with
+<code>!=</code> guards applied as DBSP <code>filter</code> operators <em>inside</em> the dataflow. It is
+fed only the per-relation signed DELTA each iteration; the incremental join +
+integral do the seminaive bookkeeping and retraction natively. The circuit’s
+output is a z-set of <strong>binding rows</strong> (a fixed-width <a href="trait.Row.html" title="trait egglog_bridge_feldera::dbsp_join::Row"><code>Row</code></a> bucket — 8, 16 or
+32 columns, chosen per ruleset) holding the rule’s body variables in a fixed
+canonical order.</p>
+<h3 id="pure-body-prims-run-on-circuit"><a class="doc-anchor" href="#pure-body-prims-run-on-circuit">§</a>Pure body prims run ON-CIRCUIT</h3>
+<p>Value-computing body prims are evaluated on-circuit through the shared
+<a href="../struct.PrimEngine.html" title="struct egglog_bridge_feldera::PrimEngine"><code>crate::PrimEngine</code></a> (an <code>Arc&lt;Mutex&lt;Database&gt;&gt;</code> captured into the circuit
+closures), so the whole body join — guards AND value prims — runs on DBSP.
+Recognized rep-comparison prims are inlined without a lock; everything else
+is evaluated by re-running the REAL prim under the engine lock (the call-prim
+path). Only head application (<code>set</code>/<code>delete</code>/<code>lookup</code>/<code>union</code> + FD-merge)
+stays host-side (<code>interpret::run_iteration</code> / <code>apply_head</code>).</p>
+<h3 id="eligibility--the-row-width-cap"><a class="doc-anchor" href="#eligibility--the-row-width-cap">§</a>Eligibility / the row-width cap</h3>
+<p>DBSP rows must be fixed-arity <code>DBData</code> (rkyv-archivable); we use a fixed-width
+<a href="trait.Row.html" title="trait egglog_bridge_feldera::dbsp_join::Row"><code>Row</code></a> bucket per ruleset (the smallest of 8/16/32 columns that fits — see
+[<code>pick_width</code>]). A rule is eligible (does not panic) iff:</p>
+<ul>
+<li>it has at least one table atom (atom-less rules are fired once by the
+caller, not planned here);</li>
+<li>every table atom has arity &lt;= <a href="constant.JOIN_WIDTH.html" title="constant egglog_bridge_feldera::dbsp_join::JOIN_WIDTH"><code>JOIN_WIDTH</code></a> (the widest bucket, 32);</li>
+<li>the rule’s body uses &lt;= <a href="constant.JOIN_WIDTH.html" title="constant egglog_bridge_feldera::dbsp_join::JOIN_WIDTH"><code>JOIN_WIDTH</code></a> distinct variables (binding row);</li>
+<li>every body primitive is PURE. A recognized rep-comparison prim (<code>!=</code>,
+<code>bool-!=</code>, <code>or</code>, <code>guard</code>, <code>ordering-min/max</code>) is inlined when its operand
+columns support the relevant rep-arithmetic (ORDERING prims require <code>Id</code>
+columns; EQUALITY prims also accept the injectively-interned base types
+<code>bool</code>/<code>i64</code>/<code>string</code>). A pure prim that is NOT rep-inlinable
+(base-value <code>ordering-min/max</code>, f64 <code>!=</code>, or any unrecognized value prim
+like <code>+</code>/<code>int-div</code>/<code>string-concat</code>) is NOT rejected — it ROUTES to the
+on-circuit call-prim engine, which evaluates the real prim semantics on
+actual values. Only an IMPURE prim (or a shape above the row-width cap)
+makes the rule ineligible — and that PANICS.</li>
+</ul>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.FusedJoinImpl.html" title="struct egglog_bridge_feldera::dbsp_join::FusedJoinImpl">Fused<wbr>Join<wbr>Impl</a></dt><dd>A fused, delta-fed body join for a WHOLE ruleset, MONOMORPHIZED to a fixed
+row-width bucket <code>R</code>. Built once via <a href="struct.FusedJoinImpl.html#method.build" title="associated function egglog_bridge_feldera::dbsp_join::FusedJoinImpl::build"><code>FusedJoinImpl::build</code></a>; driven via
+<a href="struct.FusedJoinImpl.html#method.step" title="method egglog_bridge_feldera::dbsp_join::FusedJoinImpl::step"><code>FusedJoinImpl::step</code></a> with a SINGLE <code>transaction()</code> per call.</dd><dt><a class="struct" href="struct.JoinPlan.html" title="struct egglog_bridge_feldera::dbsp_join::JoinPlan">Join<wbr>Plan</a></dt><dd>The analysis of a DBSP-eligible rule body: canonical variable order, the
+table atoms, and the boolean guards inlined from pure body prims.</dd><dt><a class="struct" href="struct.PersistentJoin.html" title="struct egglog_bridge_feldera::dbsp_join::PersistentJoin">Persistent<wbr>Join</a></dt><dd>A persistent, delta-fed body join for one rule. Built once via
+<a href="struct.PersistentJoin.html#method.build" title="associated function egglog_bridge_feldera::dbsp_join::PersistentJoin::build"><code>PersistentJoin::build</code></a>; driven across iterations via <a href="struct.PersistentJoin.html#method.step" title="method egglog_bridge_feldera::dbsp_join::PersistentJoin::step"><code>PersistentJoin::step</code></a>.</dd></dl><h2 id="enums" class="section-header">Enums<a href="#enums" class="anchor">§</a></h2><dl class="item-table"><dt><a class="enum" href="enum.FusedJoin.html" title="enum egglog_bridge_feldera::dbsp_join::FusedJoin">Fused<wbr>Join</a></dt><dd>A fused body join for a whole ruleset, width-dispatched: the row carried
+through the circuit is the SMALLEST bucket ([<code>WIDTH_BUCKETS</code>]) that fits the
+ruleset’s max binding-row width, so narrow rulesets pay 4x less per-row
+memory/hash/compare cost across every DBSP operator (the integrals are large,
+and every join/map_index/consolidate touches the full fixed-width row).</dd></dl><h2 id="constants" class="section-header">Constants<a href="#constants" class="anchor">§</a></h2><dl class="item-table"><dt><a class="constant" href="constant.JOIN_WIDTH.html" title="constant egglog_bridge_feldera::dbsp_join::JOIN_WIDTH">JOIN_<wbr>WIDTH</a></dt><dd>Hard upper bound on distinct body variables / atom columns the DBSP join
+supports (the WIDEST fixed-arity <code>DBData</code> row bucket).</dd></dl><h2 id="traits" class="section-header">Traits<a href="#traits" class="anchor">§</a></h2><dl class="item-table"><dt><a class="trait" href="trait.Row.html" title="trait egglog_bridge_feldera::dbsp_join::Row">Row</a></dt><dd>A fixed-width binding/relation row flowing through the DBSP circuit, abstract
+over the bucket width so every circuit-building function is monomorphized per
+chosen width. <code>bind[i]</code> is the value of the rule’s <code>i</code>-th canonical body
+variable (0 if not yet bound / unused).</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.plan_join.html" title="fn egglog_bridge_feldera::dbsp_join::plan_join">plan_<wbr>join</a></dt><dd>Build the body-join <a href="struct.JoinPlan.html" title="struct egglog_bridge_feldera::dbsp_join::JoinPlan"><code>JoinPlan</code></a> for <code>rule</code> on the persistent DBSP engine, or
+return <code>Err(reason)</code> if the rule is genuinely ineligible (the caller then
+panics — the persistent circuit is the ONLY join path, there is no host
+fallback). Ineligibility means an IMPURE body prim, an arity/var count above
+the fixed <a href="constant.JOIN_WIDTH.html" title="constant egglog_bridge_feldera::dbsp_join::JOIN_WIDTH"><code>JOIN_WIDTH</code></a> row, or a structural shape the lowering cannot
+express. PURE prims are never a rejection cause: rep-comparable ones inline
+into the join (the no-lock fast path), all others (base-value
+<code>ordering-min/max</code>, f64 <code>!=</code>, arbitrary value prims like <code>+</code>/<code>int-div</code>) route
+to the on-circuit call-prim path that re-evaluates the REAL prim on actual
+values through the shared engine. Atom-less rules are handled by the caller
+before this is reached.</dd></dl></section></div></main></body></html>

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["REL_EDGE","REL_HOP","REL_PATH"],"fn":["emit_build_rs","emit_cargo_toml","emit_dl","emit_main_rs"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"mod":["altneu","calculus","operators"],"struct":["CollectionExtender","CollectionIndex"],"trait":["PrefixExtender","ProposeExtensionMethod","ValidateExtensionMethod"]};

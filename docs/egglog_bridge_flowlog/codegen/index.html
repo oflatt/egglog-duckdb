@@ -1,0 +1,44 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Runtime translation of an egglog rule (the trait-level `RuleBuilderOps` IR) into a FlowLog `.dl` program plus a thin driver crate, for the M2 shell-out architecture."><title>egglog_bridge_flowlog::codegen - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-e56847b5.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="egglog_bridge_flowlog" data-themes="" data-resource-suffix="" data-rustdoc-version="1.91.0 (f8297e351 2025-10-28)" data-channel="1.91.0" data-search-js="search-e256b49e.js" data-stringdex-js="stringdex-c3e638e9.js" data-settings-js="settings-c38705f0.js" ><script src="../../static.files/storage-e2aeef58.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-6dc2a7f3.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-263c88ec.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module codegen</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../egglog_bridge_flowlog/index.html">egglog_<wbr>bridge_<wbr>flowlog</a><span class="version">2.0.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module codegen</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#what-is-generated-at-runtime" title="What is generated, at runtime">What is generated, at runtime</a></li><li><a href="#the-non-recursive-single-join-shape" title="The non-recursive single-join shape">The non-recursive single-join shape</a></li></ul><h3><a href="#constants">Module Items</a></h3><ul class="block"><li><a href="#constants" title="Constants">Constants</a></li><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate egglog_<wbr>bridge_<wbr>flowlog</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">egglog_bridge_flowlog</a></div><h1>Module <span>codegen</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/egglog_bridge_flowlog/codegen.rs.html#1-219">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Runtime translation of an egglog rule (the trait-level <code>RuleBuilderOps</code> IR)
+into a FlowLog <code>.dl</code> program plus a thin <strong>driver</strong> crate, for the M2
+shell-out architecture.</p>
+<h3 id="what-is-generated-at-runtime"><a class="doc-anchor" href="#what-is-generated-at-runtime">§</a>What is generated, at runtime</h3>
+<p>M1 compiled a <em>build-time-fixed</em> <code>transitive_step.dl</code> and recognized the
+rule shape structurally. M2 instead takes the rule the frontend builds <strong>at
+runtime</strong> (<code>StepShape</code>, recognized from the live <code>RuleIr</code>) and emits:</p>
+<ol>
+<li>a <code>.dl</code> for it (a non-recursive single-join step — one <code>commit()</code> = one
+bounded hop, exactly the M1 per-iteration model, but the relation names,
+join columns, and head come from the runtime rule, not a fixed file);</li>
+<li>a driver <code>main.rs</code> that <code>include!</code>s the flowlog-build-generated engine and
+speaks a line-based <strong>stdin/stdout command protocol</strong> (see <code>protocol</code>);</li>
+<li>a <code>Cargo.toml</code> + <code>build.rs</code> so the temp crate compiles standalone.</li>
+</ol>
+<p>The caller (<code>subprocess.rs</code>) hashes the <code>.dl</code>, builds the crate <strong>once</strong> per
+rule-set (<code>cargo build</code>, ~tens of seconds cold), caches the binary by hash,
+then spawns it and drives it over the pipe for the whole program — so the
+flowlog incremental engine stays warm and incrementality is preserved.</p>
+<h3 id="the-non-recursive-single-join-shape"><a class="doc-anchor" href="#the-non-recursive-single-join-shape">§</a>The non-recursive single-join shape</h3>
+<p>The recognized step is <code>head(x, z) :- path(x, y), edge(y, z)</code>. We emit two
+command-staged input relations (<code>path</code>, <code>edge</code>) and one output <code>hop</code>:</p>
+<div class="example-wrap"><pre class="language-text"><code>.decl edge(src: int32, dst: int32)
+.input edge(IO=&quot;command&quot;, delimiter=&quot;,&quot;)
+.decl path(src: int32, dst: int32)
+.input path(IO=&quot;command&quot;, delimiter=&quot;,&quot;)
+.decl hop(src: int32, dst: int32)
+hop(x, z) :- path(x, y), edge(y, z).
+.output hop</code></pre></div>
+<p>The host (<code>lib.rs::run_one_hop_shellout</code>) folds each commit’s <code>hop</code> deltas
+into the Rust-side mirror and re-stages the new <code>path</code> rows next round, the
+same bounded host-feedback loop M1 used — only now driving a <em>subprocess</em>
+over a pipe instead of an in-process engine.</p>
+</div></details><h2 id="constants" class="section-header">Constants<a href="#constants" class="anchor">§</a></h2><dl class="item-table"><dt><a class="constant" href="constant.REL_EDGE.html" title="constant egglog_bridge_flowlog::codegen::REL_EDGE">REL_<wbr>EDGE</a></dt><dd>The fixed relation names the generated <code>.dl</code> and driver use. The runtime
+rule’s actual <code>FunctionId</code>s are mapped onto these three roles by the host
+(<code>StepShape</code>); the <code>.dl</code> itself only needs stable lowercase idents so the
+generated engine’s API (<code>insert_path</code> / <code>insert_edge</code> / <code>IncrementalResults. hop</code>) and the driver’s protocol dispatch are predictable.</dd><dt><a class="constant" href="constant.REL_HOP.html" title="constant egglog_bridge_flowlog::codegen::REL_HOP">REL_HOP</a></dt><dt><a class="constant" href="constant.REL_PATH.html" title="constant egglog_bridge_flowlog::codegen::REL_PATH">REL_<wbr>PATH</a></dt></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.emit_build_rs.html" title="fn egglog_bridge_flowlog::codegen::emit_build_rs">emit_<wbr>build_<wbr>rs</a></dt><dd>The driver crate’s <code>build.rs</code>: compile the runtime-emitted <code>program.dl</code> into
+<code>$OUT_DIR/program.rs</code> in incremental mode. Identical in spirit to the M1
+build.rs, but the <code>.dl</code> it compiles was written at runtime.</dd><dt><a class="fn" href="fn.emit_cargo_toml.html" title="fn egglog_bridge_flowlog::codegen::emit_cargo_toml">emit_<wbr>cargo_<wbr>toml</a></dt><dd>The driver crate’s <code>Cargo.toml</code>, parameterized by the absolute path to the
+local flowlog-rs clone (so the temp crate finds <code>flowlog-runtime</code> /
+<code>flowlog-build</code>). The crate is intentionally NOT a workspace member
+(<code>[workspace]</code> empty table) so it builds standalone in its temp dir.</dd><dt><a class="fn" href="fn.emit_dl.html" title="fn egglog_bridge_flowlog::codegen::emit_dl">emit_dl</a></dt><dd>Emit the runtime <code>.dl</code> for a recognized transitive-closure step.</dd><dt><a class="fn" href="fn.emit_main_rs.html" title="fn egglog_bridge_flowlog::codegen::emit_main_rs">emit_<wbr>main_<wbr>rs</a></dt><dd>The driver <code>main.rs</code>: include the generated engine, then run the line-based
+stdin/stdout command protocol. The host side that speaks this wire format is
+<a href="../subprocess/struct.DriverHandle.html" title="struct egglog_bridge_flowlog::subprocess::DriverHandle"><code>crate::subprocess::DriverHandle</code></a>.</dd></dl></section></div></main></body></html>

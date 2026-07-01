@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["W"],"fn":["dd_prof_dump","dd_ruleset_prof_dump","plan_join"],"struct":["FusedDdJoin","JoinPlan","PersistentDdJoin","Row"]};

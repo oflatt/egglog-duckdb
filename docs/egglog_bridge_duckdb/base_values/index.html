@@ -1,0 +1,31 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="`DuckdbBaseValuePool` — Phase 2 Commit 11."><title>egglog_bridge_duckdb::base_values - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-e56847b5.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="egglog_bridge_duckdb" data-themes="" data-resource-suffix="" data-rustdoc-version="1.91.0 (f8297e351 2025-10-28)" data-channel="1.91.0" data-search-js="search-e256b49e.js" data-stringdex-js="stringdex-c3e638e9.js" data-settings-js="settings-c38705f0.js" ><script src="../../static.files/storage-e2aeef58.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-6dc2a7f3.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-263c88ec.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module base_values</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../egglog_bridge_duckdb/index.html">egglog_<wbr>bridge_<wbr>duckdb</a><span class="version">2.0.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module base_<wbr>values</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#why-reuse-basevalues" title="Why reuse `BaseValues`?">Why reuse <code>BaseValues</code>?</a></li><li><a href="#wiring" title="Wiring">Wiring</a></li></ul><h3><a href="#structs">Module Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate egglog_<wbr>bridge_<wbr>duckdb</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">egglog_bridge_duckdb</a></div><h1>Module <span>base_<wbr>values</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/egglog_bridge_duckdb/base_values.rs.html#1-181">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p><code>DuckdbBaseValuePool</code> — Phase 2 Commit 11.</p>
+<p>The DuckDB backend re-uses <code>egglog_core_relations::BaseValues</code> directly
+as its primitive registry. The wrapping <code>DuckdbBaseValuePool</code> exists
+only to bridge the trait’s <code>BaseValuePool</code> API into the inner
+<code>BaseValues</code> (which has the same shape but lives outside the
+<code>egglog-backend-trait</code> crate).</p>
+<h3 id="why-reuse-basevalues"><a class="doc-anchor" href="#why-reuse-basevalues">§</a>Why reuse <code>BaseValues</code>?</h3>
+<p><code>BaseValues</code> already handles two encoding strategies for every
+registered base-value type:</p>
+<ol>
+<li><strong>Inline-encodable types</strong> (<code>i64</code>, <code>bool</code>, <code>f64</code>, <code>Unit</code>) — the
+<code>Value</code> itself IS the encoded primitive (with <code>MAY_UNBOX</code> and a
+sign-extension offset for <code>i64</code>). The fast path in
+<code>BaseInternTable::intern</code> returns immediately via <code>try_box</code> without
+touching any hash table.</li>
+<li><strong>Non-unboxable types</strong> (<code>String</code>, <code>BigInt</code>, <code>BigRat</code>, <code>Rational64</code>,
+and user-defined <code>BaseValue</code> impls) — keyed by their <code>Hash + Eq</code>
+implementation through an in-memory intern table.</li>
+</ol>
+<p>Both paths are exactly what DuckDB needs. Concrete DuckDB SQL columns
+store the <code>Value</code>’s <code>u32</code> as <code>BIGINT</code>; the pool provides the mapping
+back to typed values for inspection / serialization.</p>
+<h3 id="wiring"><a class="doc-anchor" href="#wiring">§</a>Wiring</h3>
+<p><code>EGraph</code> holds a <code>backend_base_value_pool: DuckdbBaseValuePool</code> field.
+<code>Backend::base_value_pool</code> / <code>base_value_pool_mut</code> return <code>&amp;</code> /
+<code>&amp;mut</code> borrows of this field, cast to <code>&amp;dyn BaseValuePool</code> /
+<code>&amp;mut dyn BaseValuePool</code>.</p>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.DuckdbBaseValuePool.html" title="struct egglog_bridge_duckdb::base_values::DuckdbBaseValuePool">Duckdb<wbr>Base<wbr>Value<wbr>Pool</a></dt><dd>DuckDB-backend base-value pool. Thin wrapper around
+<code>egglog_core_relations::BaseValues</code>. Public so the egglog
+frontend can reach <code>inner()</code> for <code>Sort::reconstruct_termdag_base</code>
+(which takes <code>&amp;BaseValues</code>).</dd></dl></section></div></main></body></html>

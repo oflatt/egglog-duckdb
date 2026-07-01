@@ -1,0 +1,33 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Dataflow operator for delta joins over partially ordered timestamps."><title>differential_dogs3::operators::half_join - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-e56847b5.css"><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="differential_dogs3" data-themes="" data-resource-suffix="" data-rustdoc-version="1.91.0 (f8297e351 2025-10-28)" data-channel="1.91.0" data-search-js="search-e256b49e.js" data-stringdex-js="stringdex-c3e638e9.js" data-settings-js="settings-c38705f0.js" ><script src="../../../static.files/storage-e2aeef58.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../../static.files/main-6dc2a7f3.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-263c88ec.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module half_join</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../../differential_dogs3/index.html">differential_<wbr>dogs3</a><span class="version">0.24.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module half_<wbr>join</a></h2><h3><a href="#functions">Module Items</a></h3><ul class="block"><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="../index.html">In differential_<wbr>dogs3::<wbr>operators</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../../index.html">differential_dogs3</a>::<wbr><a href="../index.html">operators</a></div><h1>Module <span>half_<wbr>join</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../../src/differential_dogs3/operators/half_join.rs.html#1-368">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Dataflow operator for delta joins over partially ordered timestamps.</p>
+<p>Given multiple streams of updates <code>(data, time, diff)</code> that are each
+defined over the same partially ordered <code>time</code>, we want to form the
+full cross-join of all relations (we will <em>later</em> apply some filters
+and instead equijoin on keys).</p>
+<p>The “correct” output is the outer join of these triples, where</p>
+<ol>
+<li>The <code>data</code> entries are just tuple’d up together,</li>
+<li>The <code>time</code> entries are subjected to the lattice <code>join</code> operator,</li>
+<li>The <code>diff</code> entries are multiplied.</li>
+</ol>
+<p>One way to produce the correct output is to form independent dataflow
+fragments for each input stream, such that each intended output is then
+produced by exactly one of these input streams.</p>
+<p>There are several incorrect ways one might do this, but here is one way
+that I hope is not incorrect:</p>
+<p>Each input stream of updates is joined with each other input collection,
+where each input update is matched against each other input update that
+has a <code>time</code> that is less-than the input update’s <code>time</code>, <em>UNDER A TOTAL
+ORDER ON <code>time</code></em>. The output are the <code>(data, time, diff)</code> entries that
+follow the rules above, except that we additionally preserve the input’s
+initial <code>time</code> as well, for use in subsequent joins with the other input
+collections.</p>
+<p>There are some caveats about ties, and we should treat each <code>time</code> for
+each input as occurring at distinct times, one after the other (so that
+ties are resolved by the index of the input). There is also the matter
+of logical compaction, which should not be done in a way that prevents
+the correct determination of the total order comparison.</p>
+</div></details><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.half_join.html" title="fn differential_dogs3::operators::half_join::half_join">half_<wbr>join</a></dt><dd>A binary equijoin that responds to updates on only its first input.</dd><dt><a class="fn" href="fn.half_join_internal_unsafe.html" title="fn differential_dogs3::operators::half_join::half_join_internal_unsafe">half_<wbr>join_<wbr>internal_<wbr>unsafe</a></dt><dd>An unsafe variant of <code>half_join</code> where the <code>output_func</code> closure takes
+additional arguments a vector of <code>time</code> and <code>diff</code> tuples as input and
+writes its outputs at a container builder. The container builder
+can, but isn’t required to, accept <code>(data, time, diff)</code> triplets.
+This allows for more flexibility, but is more error-prone.</dd></dl></section></div></main></body></html>

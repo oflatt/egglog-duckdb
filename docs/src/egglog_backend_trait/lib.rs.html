@@ -1,0 +1,1430 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `egglog-backend-trait/src/lib.rs`."><title>lib.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-e56847b5.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="egglog_backend_trait" data-themes="" data-resource-suffix="" data-rustdoc-version="1.91.0 (f8297e351 2025-10-28)" data-channel="1.91.0" data-search-js="search-e256b49e.js" data-stringdex-js="stringdex-c3e638e9.js" data-settings-js="settings-c38705f0.js" ><script src="../../static.files/storage-e2aeef58.js"></script><script defer src="../../static.files/src-script-813739b1.js"></script><script defer src="../../src-files.js"></script><script defer src="../../static.files/main-6dc2a7f3.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-263c88ec.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content"><div class="main-heading"><h1><div class="sub-heading">egglog_backend_trait/</div>lib.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-4"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="doccomment">//! # egglog-backend-trait
+<a href=#2 id=2 data-nosnippet>2</a>//!
+<a href=#3 id=3 data-nosnippet>3</a>//! A backend-agnostic interface to an egglog egraph. This crate exposes the
+<a href=#4 id=4 data-nosnippet>4</a>//! [`Backend`] trait, along with companion traits ([`RuleBuilderOps`],
+<a href=#5 id=5 data-nosnippet>5</a>//! [`BaseValuePool`], [`ContainerPool`]), so that the frontend `EGraph` in
+<a href=#6 id=6 data-nosnippet>6</a>//! the top-level `egglog` crate can drive either the in-memory reference
+<a href=#7 id=7 data-nosnippet>7</a>//! backend (`egglog_bridge::EGraph`) or the DuckDB-backed backend
+<a href=#8 id=8 data-nosnippet>8</a>//! (`egglog_bridge_duckdb::EGraph`) through a single dyn-compatible API.
+<a href=#9 id=9 data-nosnippet>9</a>//!
+<a href=#10 id=10 data-nosnippet>10</a>//! ## Design principles
+<a href=#11 id=11 data-nosnippet>11</a>//!
+<a href=#12 id=12 data-nosnippet>12</a>//! - **Minimal IR changes.** This crate intentionally does NOT introduce a new
+<a href=#13 id=13 data-nosnippet>13</a>//!   neutral rule IR. [`RuleBuilderOps`] mirrors `egglog_bridge::RuleBuilder`
+<a href=#14 id=14 data-nosnippet>14</a>//!   one-for-one. The reference backend's `RuleBuilderOps` impl is a trivial
+<a href=#15 id=15 data-nosnippet>15</a>//!   passthrough; the DuckDB backend's impl accumulates calls into its
+<a href=#16 id=16 data-nosnippet>16</a>//!   internal data IR and submits them to the existing `compile_rule`
+<a href=#17 id=17 data-nosnippet>17</a>//!   pipeline on `build()`. Frontend code (`BackendRule` in
+<a href=#18 id=18 data-nosnippet>18</a>//!   `src/lib.rs::EGraph`) is unchanged in shape.
+<a href=#19 id=19 data-nosnippet>19</a>//! - **Basic id and config types live here.** As of Phase 2 Commit 3,
+<a href=#20 id=20 data-nosnippet>20</a>//!   `FunctionId`, `RuleId`, `ColumnTy`, `FunctionRow`, `FunctionConfig`,
+<a href=#21 id=21 data-nosnippet>21</a>//!   `MergeFn`, `DefaultVal`, `QueryEntry`, `Variable`, and `VariableId` are
+<a href=#22 id=22 data-nosnippet>22</a>//!   defined in this crate. `egglog-bridge` re-exports them so existing
+<a href=#23 id=23 data-nosnippet>23</a>//!   callers continue to work. `Value`, `BaseValueId`, `ContainerValueId`,
+<a href=#24 id=24 data-nosnippet>24</a>//!   `ExecutionState`, `ExternalFunction`, and `ExternalFunctionId` remain in
+<a href=#25 id=25 data-nosnippet>25</a>//!   `egglog-core-relations` (already a neutral crate) and are re-exported
+<a href=#26 id=26 data-nosnippet>26</a>//!   here for caller convenience.
+<a href=#27 id=27 data-nosnippet>27</a>//! - **`Backend` is `Send + Sync` and dyn-compatible.** Methods that need
+<a href=#28 id=28 data-nosnippet>28</a>//!   `T: BaseValue` or `C: ContainerValue` are factored onto
+<a href=#29 id=29 data-nosnippet>29</a>//!   [`BaseValuePool`] and [`ContainerPool`], which expose Any-based dynamic
+<a href=#30 id=30 data-nosnippet>30</a>//!   dispatch. A small set of generic helper functions (see the bottom of
+<a href=#31 id=31 data-nosnippet>31</a>//!   this module) reintroduce the per-`T` sugar on top of those dyn traits.
+<a href=#32 id=32 data-nosnippet>32</a>//! - **Cloning.** Backends must be cloneable via [`Backend::clone_boxed`].
+<a href=#33 id=33 data-nosnippet>33</a>//!   The reference backend already derives `Clone`; DuckDB will need a
+<a href=#34 id=34 data-nosnippet>34</a>//!   bespoke `clone_boxed` (e.g. database snapshot or replay buffer) when
+<a href=#35 id=35 data-nosnippet>35</a>//!   it implements this trait.
+<a href=#36 id=36 data-nosnippet>36</a>//!
+<a href=#37 id=37 data-nosnippet>37</a>//! ## What is intentionally NOT in this trait
+<a href=#38 id=38 data-nosnippet>38</a>//!
+<a href=#39 id=39 data-nosnippet>39</a>//! - `with_execution_state`. The four callers in `src/` are migrated to
+<a href=#40 id=40 data-nosnippet>40</a>//!   dedicated trait methods in a follow-up commit; this keeps `Backend`
+<a href=#41 id=41 data-nosnippet>41</a>//!   dyn-compatible and avoids leaking the lifetime semantics of
+<a href=#42 id=42 data-nosnippet>42</a>//!   `ExecutionState`.
+<a href=#43 id=43 data-nosnippet>43</a>//! - `TableAction` / `UnionAction`. Under the minimal-change posture these
+<a href=#44 id=44 data-nosnippet>44</a>//!   remain inherent methods on the bridge. The frontend keeps using them
+<a href=#45 id=45 data-nosnippet>45</a>//!   directly. Backends that don't support them (DuckDB) error at the
+<a href=#46 id=46 data-nosnippet>46</a>//!   primitive-registration call sites that touch them. The
+<a href=#47 id=47 data-nosnippet>47</a>//!   [`Backend::supports_inline_table_lookups`] capability flag gates this.
+<a href=#48 id=48 data-nosnippet>48</a>//! - A neutral rule IR. [`RuleBuilderOps`] is the seam instead.
+<a href=#49 id=49 data-nosnippet>49</a>
+<a href=#50 id=50 data-nosnippet>50</a></span><span class="kw">use </span>std::any::{Any, TypeId};
+<a href=#51 id=51 data-nosnippet>51</a>
+<a href=#52 id=52 data-nosnippet>52</a><span class="kw">use </span>anyhow::Result;
+<a href=#53 id=53 data-nosnippet>53</a>
+<a href=#54 id=54 data-nosnippet>54</a><span class="kw">use </span>egglog_numeric_id::define_id;
+<a href=#55 id=55 data-nosnippet>55</a>
+<a href=#56 id=56 data-nosnippet>56</a><span class="comment">// ---------------------------------------------------------------------------
+<a href=#57 id=57 data-nosnippet>57</a>// Re-exports
+<a href=#58 id=58 data-nosnippet>58</a>// ---------------------------------------------------------------------------
+<a href=#59 id=59 data-nosnippet>59</a>//
+<a href=#60 id=60 data-nosnippet>60</a>// Types that live in neutral lower-level crates and are re-exported here for
+<a href=#61 id=61 data-nosnippet>61</a>// caller convenience.
+<a href=#62 id=62 data-nosnippet>62</a>
+<a href=#63 id=63 data-nosnippet>63</a></span><span class="kw">pub use </span>egglog_core_relations::{
+<a href=#64 id=64 data-nosnippet>64</a>    BaseValue, BaseValueId, BaseValues, ContainerValue, ContainerValueId, DynamicInternTable,
+<a href=#65 id=65 data-nosnippet>65</a>    ExecutionState, ExternalFunction, ExternalFunctionId, Value,
+<a href=#66 id=66 data-nosnippet>66</a>};
+<a href=#67 id=67 data-nosnippet>67</a>
+<a href=#68 id=68 data-nosnippet>68</a><span class="kw">pub use </span>egglog_reports::{IterationReport, ReportLevel};
+<a href=#69 id=69 data-nosnippet>69</a>
+<a href=#70 id=70 data-nosnippet>70</a><span class="comment">// ---------------------------------------------------------------------------
+<a href=#71 id=71 data-nosnippet>71</a>// Basic id types
+<a href=#72 id=72 data-nosnippet>72</a>// ---------------------------------------------------------------------------
+<a href=#73 id=73 data-nosnippet>73</a>//
+<a href=#74 id=74 data-nosnippet>74</a>// Each backend interprets these handles in its own internal map. The trait
+<a href=#75 id=75 data-nosnippet>75</a>// promises only "we return one to you, you give it back". The bridge's
+<a href=#76 id=76 data-nosnippet>76</a>// internal `TableId` / `core_relations::RuleId` are separate types not
+<a href=#77 id=77 data-nosnippet>77</a>// surfaced through the trait.
+<a href=#78 id=78 data-nosnippet>78</a>
+<a href=#79 id=79 data-nosnippet>79</a></span><span class="macro">define_id!</span>(<span class="kw">pub </span>RuleId, u32, <span class="string">"An egglog-style rule"</span>);
+<a href=#80 id=80 data-nosnippet>80</a><span class="macro">define_id!</span>(<span class="kw">pub </span>FunctionId, u32, <span class="string">"An id representing an egglog function"</span>);
+<a href=#81 id=81 data-nosnippet>81</a>
+<a href=#82 id=82 data-nosnippet>82</a><span class="comment">// ---------------------------------------------------------------------------
+<a href=#83 id=83 data-nosnippet>83</a>// ColumnTy
+<a href=#84 id=84 data-nosnippet>84</a>// ---------------------------------------------------------------------------
+<a href=#85 id=85 data-nosnippet>85</a>
+<a href=#86 id=86 data-nosnippet>86</a></span><span class="doccomment">/// The type of a column (or `QueryEntry`): either an eq-sort / container id,
+<a href=#87 id=87 data-nosnippet>87</a>/// or a base value (with the [`BaseValueId`] identifying which base type).
+<a href=#88 id=88 data-nosnippet>88</a></span><span class="attr">#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+<a href=#89 id=89 data-nosnippet>89</a></span><span class="kw">pub enum </span>ColumnTy {
+<a href=#90 id=90 data-nosnippet>90</a>    Id,
+<a href=#91 id=91 data-nosnippet>91</a>    Base(BaseValueId),
+<a href=#92 id=92 data-nosnippet>92</a>}
+<a href=#93 id=93 data-nosnippet>93</a>
+<a href=#94 id=94 data-nosnippet>94</a><span class="comment">// ---------------------------------------------------------------------------
+<a href=#95 id=95 data-nosnippet>95</a>// FunctionConfig / DefaultVal / MergeFn
+<a href=#96 id=96 data-nosnippet>96</a>// ---------------------------------------------------------------------------
+<a href=#97 id=97 data-nosnippet>97</a>
+<a href=#98 id=98 data-nosnippet>98</a></span><span class="doccomment">/// Properties of a function added to an [`Backend`].
+<a href=#99 id=99 data-nosnippet>99</a></span><span class="kw">pub struct </span>FunctionConfig {
+<a href=#100 id=100 data-nosnippet>100</a>    <span class="doccomment">/// The function's schema. The last column in the schema is the return type.
+<a href=#101 id=101 data-nosnippet>101</a>    </span><span class="kw">pub </span>schema: Vec&lt;ColumnTy&gt;,
+<a href=#102 id=102 data-nosnippet>102</a>    <span class="doccomment">/// The behavior of the function when lookups are made on keys not currently present.
+<a href=#103 id=103 data-nosnippet>103</a>    </span><span class="kw">pub </span>default: DefaultVal,
+<a href=#104 id=104 data-nosnippet>104</a>    <span class="doccomment">/// How to resolve FD conflicts for the function.
+<a href=#105 id=105 data-nosnippet>105</a>    </span><span class="kw">pub </span>merge: MergeFn,
+<a href=#106 id=106 data-nosnippet>106</a>    <span class="doccomment">/// The function's name
+<a href=#107 id=107 data-nosnippet>107</a>    </span><span class="kw">pub </span>name: String,
+<a href=#108 id=108 data-nosnippet>108</a>    <span class="doccomment">/// Whether or not subsumption is enabled for this function.
+<a href=#109 id=109 data-nosnippet>109</a>    </span><span class="kw">pub </span>can_subsume: bool,
+<a href=#110 id=110 data-nosnippet>110</a>}
+<a href=#111 id=111 data-nosnippet>111</a>
+<a href=#112 id=112 data-nosnippet>112</a><span class="doccomment">/// Proof-mode configuration for a UF-backed function (see
+<a href=#113 id=113 data-nosnippet>113</a>/// [`Backend::add_uf_function`]).
+<a href=#114 id=114 data-nosnippet>114</a>///
+<a href=#115 id=115 data-nosnippet>115</a>/// When present, the UF function is backed by a provenance-tracking
+<a href=#116 id=116 data-nosnippet>116</a>/// union-find: writes carry a per-edge proof column, and on each leader change
+<a href=#117 id=117 data-nosnippet>117</a>/// the callback composes a proof that the displaced leader equals the new
+<a href=#118 id=118 data-nosnippet>118</a>/// leader (reconstructed from the union-find's proof graph) and writes it into
+<a href=#119 id=119 data-nosnippet>119</a>/// the onchange relation's trailing proof column. The composition interns
+<a href=#120 id=120 data-nosnippet>120</a>/// `Trans` / `Sym` proof-constructor rows, so their backend [`FunctionId`]s are
+<a href=#121 id=121 data-nosnippet>121</a>/// required here.
+<a href=#122 id=122 data-nosnippet>122</a></span><span class="attr">#[derive(Copy, Clone)]
+<a href=#123 id=123 data-nosnippet>123</a></span><span class="kw">pub struct </span>UfProofConfig {
+<a href=#124 id=124 data-nosnippet>124</a>    <span class="doccomment">/// `Trans` proof constructor: `(Trans Proof Proof) -&gt; Proof`.
+<a href=#125 id=125 data-nosnippet>125</a>    </span><span class="kw">pub </span>trans: FunctionId,
+<a href=#126 id=126 data-nosnippet>126</a>    <span class="doccomment">/// `Sym` proof constructor: `(Sym Proof) -&gt; Proof`.
+<a href=#127 id=127 data-nosnippet>127</a>    </span><span class="kw">pub </span>sym: FunctionId,
+<a href=#128 id=128 data-nosnippet>128</a>}
+<a href=#129 id=129 data-nosnippet>129</a>
+<a href=#130 id=130 data-nosnippet>130</a><span class="doccomment">/// How defaults are computed for the given function.
+<a href=#131 id=131 data-nosnippet>131</a></span><span class="attr">#[derive(Copy, Clone)]
+<a href=#132 id=132 data-nosnippet>132</a></span><span class="kw">pub enum </span>DefaultVal {
+<a href=#133 id=133 data-nosnippet>133</a>    <span class="doccomment">/// Generate a fresh UF id.
+<a href=#134 id=134 data-nosnippet>134</a>    </span>FreshId,
+<a href=#135 id=135 data-nosnippet>135</a>    <span class="doccomment">/// Cause an egglog-level panic if a lookup fails.
+<a href=#136 id=136 data-nosnippet>136</a>    </span>Fail,
+<a href=#137 id=137 data-nosnippet>137</a>    <span class="doccomment">/// Insert a constant of some kind.
+<a href=#138 id=138 data-nosnippet>138</a>    </span>Const(Value),
+<a href=#139 id=139 data-nosnippet>139</a>    <span class="doccomment">/// Identity-on-miss ("lookup-or-self"): a failing lookup returns the
+<a href=#140 id=140 data-nosnippet>140</a>    /// (single) lookup key unchanged, and does NOT insert a row. Only valid
+<a href=#141 id=141 data-nosnippet>141</a>    /// for single-key functions whose key and return column share a type
+<a href=#142 id=142 data-nosnippet>142</a>    /// (e.g. the term-encoder's flat union-find index `@UF_Sf`). Used by the
+<a href=#143 id=143 data-nosnippet>143</a>    /// canonicalize-at-creation encoding to express a `find` against the
+<a href=#144 id=144 data-nosnippet>144</a>    /// frozen UF_old table.
+<a href=#145 id=145 data-nosnippet>145</a>    </span>Identity,
+<a href=#146 id=146 data-nosnippet>146</a>}
+<a href=#147 id=147 data-nosnippet>147</a>
+<a href=#148 id=148 data-nosnippet>148</a><span class="doccomment">/// How to resolve FD conflicts for a table.
+<a href=#149 id=149 data-nosnippet>149</a></span><span class="attr">#[derive(Clone, Debug)]
+<a href=#150 id=150 data-nosnippet>150</a></span><span class="kw">pub enum </span>MergeFn {
+<a href=#151 id=151 data-nosnippet>151</a>    <span class="doccomment">/// Panic if the old and new values don't match.
+<a href=#152 id=152 data-nosnippet>152</a>    </span>AssertEq,
+<a href=#153 id=153 data-nosnippet>153</a>    <span class="doccomment">/// Use congruence to resolve FD conflicts: union the two colliding output
+<a href=#154 id=154 data-nosnippet>154</a>    /// ids into the GLOBAL union-find (`$uf`). The standard congruence merge.
+<a href=#155 id=155 data-nosnippet>155</a>    </span>UnionId,
+<a href=#156 id=156 data-nosnippet>156</a>    <span class="doccomment">/// `--native-merge`: like [`MergeFn::UnionId`], but union the two colliding
+<a href=#157 id=157 data-nosnippet>157</a>    /// output ids directly into the named per-sort UF-backed function's
+<a href=#158 id=158 data-nosnippet>158</a>    /// union-find (its `@UF_Sf`) instead of the global `$uf`. Used by an FD-keyed
+<a href=#159 id=159 data-nosnippet>159</a>    /// constructor view `(children) -&gt; eclass` so the FD-conflict congruence
+<a href=#160 id=160 data-nosnippet>160</a>    /// edge lands in exactly the union-find that owns the view's eclass column,
+<a href=#161 id=161 data-nosnippet>161</a>    /// whose leader changes the view's relational rebuild then re-canonicalizes.
+<a href=#162 id=162 data-nosnippet>162</a>    /// The `FunctionId` names that UF-backed function (the same association the
+<a href=#163 id=163 data-nosnippet>163</a>    /// uniform [`Backend::register_native_merge_view`] contract records). Only
+<a href=#164 id=164 data-nosnippet>164</a>    /// the native bridge resolves this variant; the dataflow/SQL backends route
+<a href=#165 id=165 data-nosnippet>165</a>    /// the union via their own host-pass `native_merge_uf` association.
+<a href=#166 id=166 data-nosnippet>166</a>    </span>UnionIntoUf(FunctionId),
+<a href=#167 id=167 data-nosnippet>167</a>    <span class="doccomment">/// `--native-merge` WITHOUT `--native-uf` (the RELATIONAL union-find path):
+<a href=#168 id=168 data-nosnippet>168</a>    /// like [`MergeFn::UnionIntoUf`], but the colliding output ids are written as
+<a href=#169 id=169 data-nosnippet>169</a>    /// a union EDGE into the per-sort RELATIONAL parent table `@UF_S`
+<a href=#170 id=170 data-nosnippet>170</a>    /// (`(S S) -&gt; Unit :merge old`) — exactly the row the rule-encoded
+<a href=#171 id=171 data-nosnippet>171</a>    /// `union()` helper writes: `(set (@UF_S larger smaller) ())`, where
+<a href=#172 id=172 data-nosnippet>172</a>    /// `larger = max(cur, new)` and `smaller = min(cur, new)`. The merge returns
+<a href=#173 id=173 data-nosnippet>173</a>    /// `min(cur, new)`. The relational maintenance rulesets
+<a href=#174 id=174 data-nosnippet>174</a>    /// (singleparent / path_compress / uf_function_index) then propagate the edge
+<a href=#175 id=175 data-nosnippet>175</a>    /// into `@UF_Sf`, and the view's relational `@rebuild_rule*` re-canonicalizes —
+<a href=#176 id=176 data-nosnippet>176</a>    /// i.e. the rule-based rebuild absorbs the congruence cascade in batched
+<a href=#177 id=177 data-nosnippet>177</a>    /// seminaive delta passes (no native-UF onchange re-scan blowup).
+<a href=#178 id=178 data-nosnippet>178</a>    ///
+<a href=#179 id=179 data-nosnippet>179</a>    /// Fields:
+<a href=#180 id=180 data-nosnippet>180</a>    /// - `parent_table`: the relational `@UF_S` parent table to write the edge into.
+<a href=#181 id=181 data-nosnippet>181</a>    /// - `unit`: the interned `Unit` value for the parent table's value column.
+<a href=#182 id=182 data-nosnippet>182</a>    ///
+<a href=#183 id=183 data-nosnippet>183</a>    /// Native bridge only (relational native-merge). The dataflow/SQL backends
+<a href=#184 id=184 data-nosnippet>184</a>    /// keep their `--native-uf`-driven native-merge path.
+<a href=#185 id=185 data-nosnippet>185</a>    </span>UnionIntoParentTable {
+<a href=#186 id=186 data-nosnippet>186</a>        parent_table: FunctionId,
+<a href=#187 id=187 data-nosnippet>187</a>        unit: Value,
+<a href=#188 id=188 data-nosnippet>188</a>    },
+<a href=#189 id=189 data-nosnippet>189</a>    <span class="doccomment">/// `--native-merge` PROOF mode on a SINGLE-OUTPUT backend (FlowLog/Feldera):
+<a href=#190 id=190 data-nosnippet>190</a>    /// the proof-carrying, relational-UF counterpart of
+<a href=#191 id=191 data-nosnippet>191</a>    /// [`MergeFn::UnionIntoParentTable`]. The 2-TABLE proof-congruence merge.
+<a href=#192 id=192 data-nosnippet>192</a>    ///
+<a href=#193 id=193 data-nosnippet>193</a>    /// It resolves the FD conflict of a single-output FD-keyed constructor view
+<a href=#194 id=194 data-nosnippet>194</a>    /// `(children) -&gt; eclass` whose per-row view proof (`eclass = f(children)`)
+<a href=#195 id=195 data-nosnippet>195</a>    /// lives NOT in a second output column (the backend cannot host tuple output)
+<a href=#196 id=196 data-nosnippet>196</a>    /// but in a separate single-output SIDE-TABLE `@&lt;F&gt;ViewProof :
+<a href=#197 id=197 data-nosnippet>197</a>    /// (children..., eclass) -&gt; proof`. On an FD conflict (same children, two
+<a href=#198 id=198 data-nosnippet>198</a>    /// eclasses) it:
+<a href=#199 id=199 data-nosnippet>199</a>    ///   1. reads each colliding row's view proof from `proof_side_table`, keyed
+<a href=#200 id=200 data-nosnippet>200</a>    ///      `(children..., that_row_eclass)` — canon-at-creation guarantees a hit;
+<a href=#201 id=201 data-nosnippet>201</a>    ///   2. composes the congruence edge proof `Trans(larger_pf, Sym(smaller_pf))`
+<a href=#202 id=202 data-nosnippet>202</a>    ///      (same orientation as the rule-encoded `@congruence_rule`), where
+<a href=#203 id=203 data-nosnippet>203</a>    ///      `larger = max(cur, new)`, `smaller = min(cur, new)`;
+<a href=#204 id=204 data-nosnippet>204</a>    ///   3. writes the edge `[larger, smaller, edge_proof]` into the RELATIONAL
+<a href=#205 id=205 data-nosnippet>205</a>    ///      proof-UF `@UF_S` (`parent_table`, `(S S) -&gt; Proof :merge old`) — the
+<a href=#206 id=206 data-nosnippet>206</a>    ///      same row the rule-encoded `union()` helper writes. The relational
+<a href=#207 id=207 data-nosnippet>207</a>    ///      maintenance rules (singleparent / path_compress) then propagate it;
+<a href=#208 id=208 data-nosnippet>208</a>    ///   4. returns the surviving (min) eclass.
+<a href=#209 id=209 data-nosnippet>209</a>    ///
+<a href=#210 id=210 data-nosnippet>210</a>    /// Fields:
+<a href=#211 id=211 data-nosnippet>211</a>    /// - `parent_table`: the relational `@UF_S` proof-UF to write the edge into.
+<a href=#212 id=212 data-nosnippet>212</a>    /// - `proof_side_table`: the `@&lt;F&gt;ViewProof` side-table to read view proofs from.
+<a href=#213 id=213 data-nosnippet>213</a>    /// - `trans` / `sym`: the `Trans` / `Sym` proof constructors composing the edge.
+<a href=#214 id=214 data-nosnippet>214</a>    ///
+<a href=#215 id=215 data-nosnippet>215</a>    /// Only the FlowLog (and, later, Feldera) backends resolve this variant; the
+<a href=#216 id=216 data-nosnippet>216</a>    /// native bridge has the A2 tuple proof view instead and treats it as
+<a href=#217 id=217 data-nosnippet>217</a>    /// unsupported.
+<a href=#218 id=218 data-nosnippet>218</a>    </span>UnionIntoParentTableWithProof {
+<a href=#219 id=219 data-nosnippet>219</a>        parent_table: FunctionId,
+<a href=#220 id=220 data-nosnippet>220</a>        proof_side_table: FunctionId,
+<a href=#221 id=221 data-nosnippet>221</a>        trans: FunctionId,
+<a href=#222 id=222 data-nosnippet>222</a>        sym: FunctionId,
+<a href=#223 id=223 data-nosnippet>223</a>    },
+<a href=#224 id=224 data-nosnippet>224</a>    <span class="doccomment">/// `--native-merge` in PROOF mode: the proof-carrying counterpart of
+<a href=#225 id=225 data-nosnippet>225</a>    /// [`MergeFn::UnionIntoUf`]. Used by the `col0` (eclass) merge of a
+<a href=#226 id=226 data-nosnippet>226</a>    /// tuple-output FD-keyed constructor view `(children) -&gt; (eclass, proof)`.
+<a href=#227 id=227 data-nosnippet>227</a>    ///
+<a href=#228 id=228 data-nosnippet>228</a>    /// On an FD conflict (same children, two `(eclass, proof)` output rows) it
+<a href=#229 id=229 data-nosnippet>229</a>    /// stages a proof-carrying congruence edge into the named proof-mode
+<a href=#230 id=230 data-nosnippet>230</a>    /// per-sort `@UF_Sf` (a `DisplacedTableWithProvenance`, 4-column writes
+<a href=#231 id=231 data-nosnippet>231</a>    /// `[lhs, rhs, proof, ts]`), then returns the surviving (min) eclass. The
+<a href=#232 id=232 data-nosnippet>232</a>    /// staged edge proof is composed as `Trans(larger_proof, Sym(smaller_proof))`
+<a href=#233 id=233 data-nosnippet>233</a>    /// over the two rows' proof columns, EXACTLY matching the orientation of the
+<a href=#234 id=234 data-nosnippet>234</a>    /// rule-encoded `@congruence_rule` it replaces (which writes
+<a href=#235 id=235 data-nosnippet>235</a>    /// `(set (@UF_Sf larger smaller) (Trans larger_pf (Sym smaller_pf)))`).
+<a href=#236 id=236 data-nosnippet>236</a>    ///
+<a href=#237 id=237 data-nosnippet>237</a>    /// Fields:
+<a href=#238 id=238 data-nosnippet>238</a>    /// - `uf`: the proof-mode `@UF_Sf` UF-backed function to union into.
+<a href=#239 id=239 data-nosnippet>239</a>    /// - `trans` / `sym`: the `Trans` / `Sym` proof constructors used to compose
+<a href=#240 id=240 data-nosnippet>240</a>    ///   the edge proof.
+<a href=#241 id=241 data-nosnippet>241</a>    /// - `eclass_col`: the value-column index of the eclass (this column's own
+<a href=#242 id=242 data-nosnippet>242</a>    ///   index; the merge resolving `col0`).
+<a href=#243 id=243 data-nosnippet>243</a>    /// - `proof_col`: the value-column index of the per-row term proof
+<a href=#244 id=244 data-nosnippet>244</a>    ///   (`eclass = f(children)`).
+<a href=#245 id=245 data-nosnippet>245</a>    ///
+<a href=#246 id=246 data-nosnippet>246</a>    /// Only the native bridge resolves this variant; the dataflow/SQL backends
+<a href=#247 id=247 data-nosnippet>247</a>    /// have no proof-mode native-UF and treat it as unsupported (the proof half
+<a href=#248 id=248 data-nosnippet>248</a>    /// of native-merge is bridge-only).
+<a href=#249 id=249 data-nosnippet>249</a>    </span>UnionIntoUfWithProof {
+<a href=#250 id=250 data-nosnippet>250</a>        uf: FunctionId,
+<a href=#251 id=251 data-nosnippet>251</a>        trans: FunctionId,
+<a href=#252 id=252 data-nosnippet>252</a>        sym: FunctionId,
+<a href=#253 id=253 data-nosnippet>253</a>        eclass_col: usize,
+<a href=#254 id=254 data-nosnippet>254</a>        proof_col: usize,
+<a href=#255 id=255 data-nosnippet>255</a>    },
+<a href=#256 id=256 data-nosnippet>256</a>    <span class="doccomment">/// `--native-merge` in PROOF mode: the `col1` (proof) merge companion of
+<a href=#257 id=257 data-nosnippet>257</a>    /// [`MergeFn::UnionIntoUfWithProof`]. Returns the term proof
+<a href=#258 id=258 data-nosnippet>258</a>    /// (`eclass = f(children)`) of the SURVIVING (min) eclass — i.e. the proof of
+<a href=#259 id=259 data-nosnippet>259</a>    /// whichever row has the smaller eclass value, matching the eclass kept by
+<a href=#260 id=260 data-nosnippet>260</a>    /// the UF leader tie-break (`min`). This expresses the select-by-min that the
+<a href=#261 id=261 data-nosnippet>261</a>    /// scalar `Old`/`New` leaves cannot.
+<a href=#262 id=262 data-nosnippet>262</a>    ///
+<a href=#263 id=263 data-nosnippet>263</a>    /// `eclass_col` / `proof_col` are the value-column indices of the eclass and
+<a href=#264 id=264 data-nosnippet>264</a>    /// the proof, respectively. Bridge-only, like its companion.
+<a href=#265 id=265 data-nosnippet>265</a>    </span>EclassMinProof { eclass_col: usize, proof_col: usize },
+<a href=#266 id=266 data-nosnippet>266</a>    <span class="doccomment">/// The output of a merge is determined by applying the given ExternalFunction to the result
+<a href=#267 id=267 data-nosnippet>267</a>    /// of the argument merge functions.
+<a href=#268 id=268 data-nosnippet>268</a>    </span>Primitive(ExternalFunctionId, Vec&lt;MergeFn&gt;),
+<a href=#269 id=269 data-nosnippet>269</a>    <span class="doccomment">/// The output of a merge is determined by looking up the value for the given function and the
+<a href=#270 id=270 data-nosnippet>270</a>    /// given arguments in the egraph.
+<a href=#271 id=271 data-nosnippet>271</a>    </span>Function(FunctionId, Vec&lt;MergeFn&gt;),
+<a href=#272 id=272 data-nosnippet>272</a>    <span class="doccomment">/// Always return the old value for *this* value column (the column this merge resolves).
+<a href=#273 id=273 data-nosnippet>273</a>    </span>Old,
+<a href=#274 id=274 data-nosnippet>274</a>    <span class="doccomment">/// Always return the new value for *this* value column.
+<a href=#275 id=275 data-nosnippet>275</a>    </span>New,
+<a href=#276 id=276 data-nosnippet>276</a>    <span class="doccomment">/// The old value of value column `i`. Used by tuple-output (multi-value) merges, where a
+<a href=#277 id=277 data-nosnippet>277</a>    /// column's merge may reference any output column of the OLD row. For a single-output
+<a href=#278 id=278 data-nosnippet>278</a>    /// function, `OldCol(0)` is equivalent to [`MergeFn::Old`].
+<a href=#279 id=279 data-nosnippet>279</a>    </span>OldCol(usize),
+<a href=#280 id=280 data-nosnippet>280</a>    <span class="doccomment">/// The new value of value column `i`. The multi-value counterpart of [`MergeFn::New`].
+<a href=#281 id=281 data-nosnippet>281</a>    </span>NewCol(usize),
+<a href=#282 id=282 data-nosnippet>282</a>    <span class="doccomment">/// The value of KEY (input) column `i` (`cur[i]`). In an FD-conflict merge the
+<a href=#283 id=283 data-nosnippet>283</a>    /// two rows share the same key, so the old and new key columns are equal —
+<a href=#284 id=284 data-nosnippet>284</a>    /// hence a single `KeyCol(i)`. Lets a term-building custom `:merge` reference
+<a href=#285 id=285 data-nosnippet>285</a>    /// the merge's input keys (e.g. to reconstruct the `(f keys merged)` view-term
+<a href=#286 id=286 data-nosnippet>286</a>    /// proof). Bridge-only — the dataflow/SQL backends have no term-build proof
+<a href=#287 id=287 data-nosnippet>287</a>    /// merge.
+<a href=#288 id=288 data-nosnippet>288</a>    </span>KeyCol(usize),
+<a href=#289 id=289 data-nosnippet>289</a>    <span class="doccomment">/// Always overwrite the new value for the given function with a constant. This is more useful
+<a href=#290 id=290 data-nosnippet>290</a>    /// as a "base case" in a more complicated merge function (e.g. one that clamps a value between
+<a href=#291 id=291 data-nosnippet>291</a>    /// 1 and 100) than it is as a standalone merge function.
+<a href=#292 id=292 data-nosnippet>292</a>    </span>Const(Value),
+<a href=#293 id=293 data-nosnippet>293</a>    <span class="doccomment">/// A merge for a tuple-output (multi-value) function: one [`MergeFn`] per value (return)
+<a href=#294 id=294 data-nosnippet>294</a>    /// column. Each inner `MergeFn` produces that column's merged value and may reference any
+<a href=#295 id=295 data-nosnippet>295</a>    /// output column via [`MergeFn::OldCol`] / [`MergeFn::NewCol`]. Its length determines the
+<a href=#296 id=296 data-nosnippet>296</a>    /// number of value columns of the function (`n_vals`); `n_keys = schema.len() - n_vals`.
+<a href=#297 id=297 data-nosnippet>297</a>    ///
+<a href=#298 id=298 data-nosnippet>298</a>    /// `Columns` must appear only at the top level: a nested `Columns` (e.g. as an argument to a
+<a href=#299 id=299 data-nosnippet>299</a>    /// [`MergeFn::Primitive`] or inside another `Columns`) is an error. A single-output function
+<a href=#300 id=300 data-nosnippet>300</a>    /// uses a bare scalar merge (`Old`/`New`/`UnionId`/…), which is exactly a `Columns` of
+<a href=#301 id=301 data-nosnippet>301</a>    /// length 1.
+<a href=#302 id=302 data-nosnippet>302</a>    </span>Columns(Vec&lt;MergeFn&gt;),
+<a href=#303 id=303 data-nosnippet>303</a>    <span class="doccomment">/// Insert a row into the given function's table (the `args` evaluate to the
+<a href=#304 id=304 data-nosnippet>304</a>    /// full row), respecting that table's own merge. Returns the OLD value of the
+<a href=#305 id=305 data-nosnippet>305</a>    /// resolving column (its return is meant to be discarded inside a
+<a href=#306 id=306 data-nosnippet>306</a>    /// [`MergeFn::Seq`]). Models a `(set (f ...) v)` action inside a merge;
+<a href=#307 id=307 data-nosnippet>307</a>    /// declares `f`'s table as a write-dependency so the side write is safe during
+<a href=#308 id=308 data-nosnippet>308</a>    /// batched merges. Ported from PR #933 (`:merge`-multiple-actions). Bridge-only
+<a href=#309 id=309 data-nosnippet>309</a>    /// — the dataflow/SQL backends treat it as unsupported.
+<a href=#310 id=310 data-nosnippet>310</a>    </span>TableInsert(FunctionId, Vec&lt;MergeFn&gt;),
+<a href=#311 id=311 data-nosnippet>311</a>    <span class="doccomment">/// Evaluate each merge function in order (for their effects) and return the
+<a href=#312 id=312 data-nosnippet>312</a>    /// value of the last one. Models an action-block merge: the leading entries
+<a href=#313 id=313 data-nosnippet>313</a>    /// are effects (e.g. [`MergeFn::TableInsert`] / [`MergeFn::Construct`]) and the
+<a href=#314 id=314 data-nosnippet>314</a>    /// last is the value. Used to lower a term-building custom `:merge` body into a
+<a href=#315 id=315 data-nosnippet>315</a>    /// single native merge. Ported from PR #933. Bridge-only.
+<a href=#316 id=316 data-nosnippet>316</a>    </span>Seq(Vec&lt;MergeFn&gt;),
+<a href=#317 id=317 data-nosnippet>317</a>    <span class="doccomment">/// Mint a pair-valued constructor inside a merge and return its output e-class.
+<a href=#318 id=318 data-nosnippet>318</a>    /// `args` evaluate to the key (children); the first value column (the output) is
+<a href=#319 id=319 data-nosnippet>319</a>    /// minted (the table's `FreshId` default) and the remaining value columns are
+<a href=#320 id=320 data-nosnippet>320</a>    /// written from `value_args` (e.g. the term proof). Used to express a nested
+<a href=#321 id=321 data-nosnippet>321</a>    /// constructor application inside a term-building custom `:merge` body. Ported
+<a href=#322 id=322 data-nosnippet>322</a>    /// from PR #933 (FD proof encoding). Bridge-only.
+<a href=#323 id=323 data-nosnippet>323</a>    </span>Construct(FunctionId, Vec&lt;MergeFn&gt;, Vec&lt;MergeFn&gt;),
+<a href=#324 id=324 data-nosnippet>324</a>    <span class="doccomment">/// Conditional merge: evaluate `a` and `b`; if their values are EQUAL run and
+<a href=#325 id=325 data-nosnippet>325</a>    /// return `then`, otherwise run and return `els`. Used to guard a term-building
+<a href=#326 id=326 data-nosnippet>326</a>    /// custom `:merge` body (a [`MergeFn::Seq`]) so it only mints helper terms when
+<a href=#327 id=327 data-nosnippet>327</a>    /// the function's old/new values genuinely differ — mirroring the rule-encoded
+<a href=#328 id=328 data-nosnippet>328</a>    /// `@merge_rule`'s `(!= old new)` body guard. When `a == b` the rule-encoded
+<a href=#329 id=329 data-nosnippet>329</a>    /// merge rule never fires, so no helper term is created; this variant reproduces
+<a href=#330 id=330 data-nosnippet>330</a>    /// that exactly (return the already-equal value, no side effects). Bridge-only.
+<a href=#331 id=331 data-nosnippet>331</a>    </span>IfEq {
+<a href=#332 id=332 data-nosnippet>332</a>        a: Box&lt;MergeFn&gt;,
+<a href=#333 id=333 data-nosnippet>333</a>        b: Box&lt;MergeFn&gt;,
+<a href=#334 id=334 data-nosnippet>334</a>        then: Box&lt;MergeFn&gt;,
+<a href=#335 id=335 data-nosnippet>335</a>        els: Box&lt;MergeFn&gt;,
+<a href=#336 id=336 data-nosnippet>336</a>    },
+<a href=#337 id=337 data-nosnippet>337</a>}
+<a href=#338 id=338 data-nosnippet>338</a>
+<a href=#339 id=339 data-nosnippet>339</a><span class="comment">// ---------------------------------------------------------------------------
+<a href=#340 id=340 data-nosnippet>340</a>// FunctionRow
+<a href=#341 id=341 data-nosnippet>341</a>// ---------------------------------------------------------------------------
+<a href=#342 id=342 data-nosnippet>342</a>
+<a href=#343 id=343 data-nosnippet>343</a></span><span class="doccomment">/// A struct representing the content of a row in a function table
+<a href=#344 id=344 data-nosnippet>344</a></span><span class="attr">#[derive(Clone, Debug)]
+<a href=#345 id=345 data-nosnippet>345</a></span><span class="kw">pub struct </span>FunctionRow&lt;<span class="lifetime">'a</span>&gt; {
+<a href=#346 id=346 data-nosnippet>346</a>    <span class="kw">pub </span>vals: <span class="kw-2">&amp;</span><span class="lifetime">'a </span>[Value],
+<a href=#347 id=347 data-nosnippet>347</a>    <span class="kw">pub </span>subsumed: bool,
+<a href=#348 id=348 data-nosnippet>348</a>}
+<a href=#349 id=349 data-nosnippet>349</a>
+<a href=#350 id=350 data-nosnippet>350</a><span class="comment">// ---------------------------------------------------------------------------
+<a href=#351 id=351 data-nosnippet>351</a>// Variable / VariableId / QueryEntry
+<a href=#352 id=352 data-nosnippet>352</a>// ---------------------------------------------------------------------------
+<a href=#353 id=353 data-nosnippet>353</a>
+<a href=#354 id=354 data-nosnippet>354</a></span><span class="macro">define_id!</span>(<span class="kw">pub </span>VariableId, u32, <span class="string">"A variable in an egglog query"</span>);
+<a href=#355 id=355 data-nosnippet>355</a>
+<a href=#356 id=356 data-nosnippet>356</a><span class="doccomment">/// A variable in a rule body / RHS, with an optional display name for
+<a href=#357 id=357 data-nosnippet>357</a>/// debugging.
+<a href=#358 id=358 data-nosnippet>358</a></span><span class="attr">#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+<a href=#359 id=359 data-nosnippet>359</a></span><span class="kw">pub struct </span>Variable {
+<a href=#360 id=360 data-nosnippet>360</a>    <span class="kw">pub </span>id: VariableId,
+<a href=#361 id=361 data-nosnippet>361</a>    <span class="kw">pub </span>name: <span class="prelude-ty">Option</span>&lt;Box&lt;str&gt;&gt;,
+<a href=#362 id=362 data-nosnippet>362</a>}
+<a href=#363 id=363 data-nosnippet>363</a>
+<a href=#364 id=364 data-nosnippet>364</a><span class="kw">impl </span>Variable {
+<a href=#365 id=365 data-nosnippet>365</a>    <span class="doccomment">/// Construct an unnamed variable from a [`VariableId`].
+<a href=#366 id=366 data-nosnippet>366</a>    </span><span class="kw">pub fn </span>from_id(id: VariableId) -&gt; <span class="self">Self </span>{
+<a href=#367 id=367 data-nosnippet>367</a>        Variable { id, name: <span class="prelude-val">None </span>}
+<a href=#368 id=368 data-nosnippet>368</a>    }
+<a href=#369 id=369 data-nosnippet>369</a>}
+<a href=#370 id=370 data-nosnippet>370</a>
+<a href=#371 id=371 data-nosnippet>371</a><span class="doccomment">/// A reference in a rule body or RHS: either a variable or a typed constant.
+<a href=#372 id=372 data-nosnippet>372</a></span><span class="attr">#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+<a href=#373 id=373 data-nosnippet>373</a></span><span class="kw">pub enum </span>QueryEntry {
+<a href=#374 id=374 data-nosnippet>374</a>    Var(Variable),
+<a href=#375 id=375 data-nosnippet>375</a>    Const {
+<a href=#376 id=376 data-nosnippet>376</a>        val: Value,
+<a href=#377 id=377 data-nosnippet>377</a>        <span class="comment">// Constants can have a type plumbed through, particularly if they
+<a href=#378 id=378 data-nosnippet>378</a>        // correspond to a base value constant in egglog.
+<a href=#379 id=379 data-nosnippet>379</a>        </span>ty: ColumnTy,
+<a href=#380 id=380 data-nosnippet>380</a>    },
+<a href=#381 id=381 data-nosnippet>381</a>}
+<a href=#382 id=382 data-nosnippet>382</a>
+<a href=#383 id=383 data-nosnippet>383</a><span class="kw">impl </span>From&lt;Variable&gt; <span class="kw">for </span>QueryEntry {
+<a href=#384 id=384 data-nosnippet>384</a>    <span class="kw">fn </span>from(var: Variable) -&gt; <span class="self">Self </span>{
+<a href=#385 id=385 data-nosnippet>385</a>        QueryEntry::Var(var)
+<a href=#386 id=386 data-nosnippet>386</a>    }
+<a href=#387 id=387 data-nosnippet>387</a>}
+<a href=#388 id=388 data-nosnippet>388</a>
+<a href=#389 id=389 data-nosnippet>389</a><span class="comment">// ---------------------------------------------------------------------------
+<a href=#390 id=390 data-nosnippet>390</a>// The `Backend` trait
+<a href=#391 id=391 data-nosnippet>391</a>// ---------------------------------------------------------------------------
+<a href=#392 id=392 data-nosnippet>392</a>
+<a href=#393 id=393 data-nosnippet>393</a></span><span class="doccomment">/// A backend that drives an egglog egraph.
+<a href=#394 id=394 data-nosnippet>394</a>///
+<a href=#395 id=395 data-nosnippet>395</a>/// Implementations: `egglog_bridge::EGraph` (reference, in-memory) and
+<a href=#396 id=396 data-nosnippet>396</a>/// `egglog_bridge_duckdb::EGraph` (DuckDB-backed). The frontend `EGraph` in
+<a href=#397 id=397 data-nosnippet>397</a>/// the `egglog` crate holds a `Box&lt;dyn Backend&gt;` and dispatches all state
+<a href=#398 id=398 data-nosnippet>398</a>/// access through this trait.
+<a href=#399 id=399 data-nosnippet>399</a>///
+<a href=#400 id=400 data-nosnippet>400</a>/// ## Method correspondence
+<a href=#401 id=401 data-nosnippet>401</a>///
+<a href=#402 id=402 data-nosnippet>402</a>/// Each method's doc comment names the inherent method on
+<a href=#403 id=403 data-nosnippet>403</a>/// `egglog_bridge::EGraph` that the bridge's `impl Backend` wraps. The
+<a href=#404 id=404 data-nosnippet>404</a>/// reference backend's impl is meant to be one line per method
+<a href=#405 id=405 data-nosnippet>405</a>/// (`fn foo(&amp;self, ...) -&gt; X { self.foo(...) }`). The DuckDB backend's
+<a href=#406 id=406 data-nosnippet>406</a>/// translations are documented in `docs/backend_trait_design.md`.
+<a href=#407 id=407 data-nosnippet>407</a>///
+<a href=#408 id=408 data-nosnippet>408</a>/// ## Dyn-compatibility
+<a href=#409 id=409 data-nosnippet>409</a>///
+<a href=#410 id=410 data-nosnippet>410</a>/// All methods are object-safe. Methods that would otherwise be generic over
+<a href=#411 id=411 data-nosnippet>411</a>/// `T: BaseValue` or `C: ContainerValue` live on the
+<a href=#412 id=412 data-nosnippet>412</a>/// [`BaseValuePool`] / [`ContainerPool`] sub-traits, which use Any-based
+<a href=#413 id=413 data-nosnippet>413</a>/// dynamic dispatch internally.
+<a href=#414 id=414 data-nosnippet>414</a>///
+<a href=#415 id=415 data-nosnippet>415</a>/// ## Bridge-only escape hatch via [`Backend::as_any`]
+<a href=#416 id=416 data-nosnippet>416</a>///
+<a href=#417 id=417 data-nosnippet>417</a>/// A handful of frontend constructs — most notably `TableAction::new` /
+<a href=#418 id=418 data-nosnippet>418</a>/// `UnionAction::new` used inside `rust_rule` and `query` primitive
+<a href=#419 id=419 data-nosnippet>419</a>/// `apply()` bodies in `src/prelude.rs` — depend on bridge-specific state
+<a href=#420 id=420 data-nosnippet>420</a>/// (`egglog_bridge::EGraph`) that does not fit cleanly behind the trait
+<a href=#421 id=421 data-nosnippet>421</a>/// surface. The Phase 1 design (see `docs/backend_trait_design.md`,
+<a href=#422 id=422 data-nosnippet>422</a>/// "How `TableAction` and `UnionAction` are handled") explicitly keeps
+<a href=#423 id=423 data-nosnippet>423</a>/// these types as bridge inherent methods rather than lifting them onto
+<a href=#424 id=424 data-nosnippet>424</a>/// the trait.
+<a href=#425 id=425 data-nosnippet>425</a>///
+<a href=#426 id=426 data-nosnippet>426</a>/// To let callers reach the bridge-specific state when the backend field
+<a href=#427 id=427 data-nosnippet>427</a>/// is `Box&lt;dyn Backend&gt;`, the trait exposes an `Any`-based downcast pair:
+<a href=#428 id=428 data-nosnippet>428</a>///
+<a href=#429 id=429 data-nosnippet>429</a>/// ```ignore
+<a href=#430 id=430 data-nosnippet>430</a>/// // Inside a primitive that needs TableAction:
+<a href=#431 id=431 data-nosnippet>431</a>/// let bridge = self
+<a href=#432 id=432 data-nosnippet>432</a>///     .backend
+<a href=#433 id=433 data-nosnippet>433</a>///     .as_any()
+<a href=#434 id=434 data-nosnippet>434</a>///     .downcast_ref::&lt;egglog_bridge::EGraph&gt;()
+<a href=#435 id=435 data-nosnippet>435</a>///     .expect("table actions are bridge-only");
+<a href=#436 id=436 data-nosnippet>436</a>/// let action = egglog_bridge::TableAction::new(bridge, func_id);
+<a href=#437 id=437 data-nosnippet>437</a>/// ```
+<a href=#438 id=438 data-nosnippet>438</a>///
+<a href=#439 id=439 data-nosnippet>439</a>/// The DuckDB backend's `as_any` returns a different concrete type
+<a href=#440 id=440 data-nosnippet>440</a>/// (`egglog_bridge_duckdb::EGraph`); the downcast to
+<a href=#441 id=441 data-nosnippet>441</a>/// `&amp;egglog_bridge::EGraph` therefore fails on DuckDB. This is correct: the
+<a href=#442 id=442 data-nosnippet>442</a>/// primitives that go through this path (`rust_rule` / `query` table-lookup
+<a href=#443 id=443 data-nosnippet>443</a>/// helpers) are gated by [`Backend::supports_inline_table_lookups`] and
+<a href=#444 id=444 data-nosnippet>444</a>/// are documented as unsupported on DuckDB in v1.
+<a href=#445 id=445 data-nosnippet>445</a>///
+<a href=#446 id=446 data-nosnippet>446</a>/// Using `&amp;dyn Any` keeps this trait crate from having to name
+<a href=#447 id=447 data-nosnippet>447</a>/// `egglog_bridge::EGraph` directly, which would re-introduce the
+<a href=#448 id=448 data-nosnippet>448</a>/// `egglog-bridge ↔ egglog-backend-trait` dependency cycle that Phase 2
+<a href=#449 id=449 data-nosnippet>449</a>/// Commit 3 deliberately broke.
+<a href=#450 id=450 data-nosnippet>450</a></span><span class="kw">pub trait </span>Backend: Send + Sync {
+<a href=#451 id=451 data-nosnippet>451</a>    <span class="comment">// -- table lifecycle ----------------------------------------------------
+<a href=#452 id=452 data-nosnippet>452</a>
+<a href=#453 id=453 data-nosnippet>453</a>    </span><span class="doccomment">/// Register a function/relation/constructor and return its handle.
+<a href=#454 id=454 data-nosnippet>454</a>    ///
+<a href=#455 id=455 data-nosnippet>455</a>    /// Wraps `egglog_bridge::EGraph::add_table`.
+<a href=#456 id=456 data-nosnippet>456</a>    </span><span class="kw">fn </span>add_table(<span class="kw-2">&amp;mut </span><span class="self">self</span>, config: FunctionConfig) -&gt; FunctionId;
+<a href=#457 id=457 data-nosnippet>457</a>
+<a href=#458 id=458 data-nosnippet>458</a>    <span class="doccomment">/// Peek the [`FunctionId`] the next [`Backend::add_table`] call will return,
+<a href=#459 id=459 data-nosnippet>459</a>    /// WITHOUT registering anything. Used for "knot-tying" a self-referential
+<a href=#460 id=460 data-nosnippet>460</a>    /// `:merge`: the relational native-merge union-find function `@UF_Sf` needs
+<a href=#461 id=461 data-nosnippet>461</a>    /// its OWN id while building its merge (a `MergeFn::TableInsert` into itself
+<a href=#462 id=462 data-nosnippet>462</a>    /// for the recursive parent-union). The caller peeks the id immediately before
+<a href=#463 id=463 data-nosnippet>463</a>    /// `add_table`.
+<a href=#464 id=464 data-nosnippet>464</a>    ///
+<a href=#465 id=465 data-nosnippet>465</a>    /// Bridge-only (this whole path is `--native-merge` on the native bridge). The
+<a href=#466 id=466 data-nosnippet>466</a>    /// default panics: the dataflow/SQL backends never declare a self-referential
+<a href=#467 id=467 data-nosnippet>467</a>    /// merge, matching the inert handling of the other bridge-only merge variants
+<a href=#468 id=468 data-nosnippet>468</a>    /// (`Seq` / `TableInsert` / `IfEq`).
+<a href=#469 id=469 data-nosnippet>469</a>    </span><span class="kw">fn </span>peek_next_function_id(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; FunctionId {
+<a href=#470 id=470 data-nosnippet>470</a>        <span class="macro">panic!</span>(<span class="string">"peek_next_function_id is only supported on the native bridge backend"</span>)
+<a href=#471 id=471 data-nosnippet>471</a>    }
+<a href=#472 id=472 data-nosnippet>472</a>
+<a href=#473 id=473 data-nosnippet>473</a>    <span class="doccomment">/// `--nativerb` (native bridge, term-encoding native-UF, non-proof): register
+<a href=#474 id=474 data-nosnippet>474</a>    /// a `@&lt;F&gt;View` view function (`view_func`) to be re-canonicalized by the
+<a href=#475 id=475 data-nosnippet>475</a>    /// engine's native table rebuild against the per-sort `@UF_Sf` UF-backed
+<a href=#476 id=476 data-nosnippet>476</a>    /// function (`uf_func`), replacing the encoding-level `@rebuild_rule*` rules.
+<a href=#477 id=477 data-nosnippet>477</a>    /// The frontend calls this once per view function after all functions are
+<a href=#478 id=478 data-nosnippet>478</a>    /// registered. Default no-op: only the native bridge supports a native table
+<a href=#479 id=479 data-nosnippet>479</a>    /// rebuild; the dataflow/SQL backends drive their own host-pass rebuild.
+<a href=#480 id=480 data-nosnippet>480</a>    </span><span class="kw">fn </span>register_nativerb_view(<span class="kw-2">&amp;mut </span><span class="self">self</span>, _uf_func: FunctionId, _view_func: FunctionId) {}
+<a href=#481 id=481 data-nosnippet>481</a>
+<a href=#482 id=482 data-nosnippet>482</a>    <span class="doccomment">/// `--native-merge` (term-encoding native-UF, non-proof): associate an
+<a href=#483 id=483 data-nosnippet>483</a>    /// FD-keyed constructor view (`view_func`, keyed `(children) -&gt; eclass`) with
+<a href=#484 id=484 data-nosnippet>484</a>    /// the union-find (`uf_func`) that owns its eclass (OUTPUT) column. The view's
+<a href=#485 id=485 data-nosnippet>485</a>    /// `MergeFn::UnionId` merge then injects a union into this UF on an FD conflict
+<a href=#486 id=486 data-nosnippet>486</a>    /// (same children, two eclasses) — congruence done INLINE at insert time
+<a href=#487 id=487 data-nosnippet>487</a>    /// instead of by a self-join rule. The frontend calls this before each run for
+<a href=#488 id=488 data-nosnippet>488</a>    /// each not-yet-registered native-merge view. Default no-op: only backends
+<a href=#489 id=489 data-nosnippet>489</a>    /// that inject the union on FD-conflict (currently FlowLog) implement it.
+<a href=#490 id=490 data-nosnippet>490</a>    </span><span class="kw">fn </span>register_native_merge_view(<span class="kw-2">&amp;mut </span><span class="self">self</span>, _uf_func: FunctionId, _view_func: FunctionId) {}
+<a href=#491 id=491 data-nosnippet>491</a>
+<a href=#492 id=492 data-nosnippet>492</a>    <span class="doccomment">/// `--native-merge --proofs` on a `native_merge_views_coexist()` + single-output
+<a href=#493 id=493 data-nosnippet>493</a>    /// backend (DuckDB): associate a constructor view (`view_func`, the all-columns
+<a href=#494 id=494 data-nosnippet>494</a>    /// COEXIST shape `(children..., eclass) -&gt; Proof`) with everything its
+<a href=#495 id=495 data-nosnippet>495</a>    /// between-statement proof-congruence host pass needs. `parent_table` is the
+<a href=#496 id=496 data-nosnippet>496</a>    /// RELATIONAL proof-UF `@UF_S` (`(S S) -&gt; Proof :merge old`) the composed
+<a href=#497 id=497 data-nosnippet>497</a>    /// congruence edge is written into; `proof_side_table` is the `@&lt;F&gt;ViewProof`
+<a href=#498 id=498 data-nosnippet>498</a>    /// side-table `(children..., eclass) -&gt; proof` the per-row view proofs are read
+<a href=#499 id=499 data-nosnippet>499</a>    /// from; `trans` / `sym` are the `Trans` / `Sym` proof constructors used to
+<a href=#500 id=500 data-nosnippet>500</a>    /// compose the congruence edge proof `Trans(larger_pf, Sym(smaller_pf))`.
+<a href=#501 id=501 data-nosnippet>501</a>    ///
+<a href=#502 id=502 data-nosnippet>502</a>    /// On an FD conflict (same children, two eclasses) the host pass self-joins the
+<a href=#503 id=503 data-nosnippet>503</a>    /// coexisting view, reads both rows' proofs from the side-table, mints the edge
+<a href=#504 id=504 data-nosnippet>504</a>    /// proof, and writes `(larger, smaller, edge_proof)` into `parent_table` — exactly
+<a href=#505 id=505 data-nosnippet>505</a>    /// the row the dropped `@congruence_rule*` wrote. The frontend calls this before
+<a href=#506 id=506 data-nosnippet>506</a>    /// each run for each not-yet-registered proof-mode native-merge view. Default
+<a href=#507 id=507 data-nosnippet>507</a>    /// no-op: only DuckDB (the between-statement proof-congruence host pass)
+<a href=#508 id=508 data-nosnippet>508</a>    /// implements it; the bridge / FlowLog / Feldera resolve the proof merge in their
+<a href=#509 id=509 data-nosnippet>509</a>    /// own `UnionIntoParentTableWithProof` / tuple-merge path.
+<a href=#510 id=510 data-nosnippet>510</a>    </span><span class="kw">fn </span>register_native_merge_proof_view(
+<a href=#511 id=511 data-nosnippet>511</a>        <span class="kw-2">&amp;mut </span><span class="self">self</span>,
+<a href=#512 id=512 data-nosnippet>512</a>        _view_func: FunctionId,
+<a href=#513 id=513 data-nosnippet>513</a>        _parent_table: FunctionId,
+<a href=#514 id=514 data-nosnippet>514</a>        _proof_side_table: FunctionId,
+<a href=#515 id=515 data-nosnippet>515</a>        _trans: FunctionId,
+<a href=#516 id=516 data-nosnippet>516</a>        _sym: FunctionId,
+<a href=#517 id=517 data-nosnippet>517</a>    ) {
+<a href=#518 id=518 data-nosnippet>518</a>    }
+<a href=#519 id=519 data-nosnippet>519</a>
+<a href=#520 id=520 data-nosnippet>520</a>    <span class="doccomment">/// Register a union-find-backed function (see upstream PR #782).
+<a href=#521 id=521 data-nosnippet>521</a>    ///
+<a href=#522 id=522 data-nosnippet>522</a>    /// The function has schema `(S) S` for an EqSort `S` and records leader
+<a href=#523 id=523 data-nosnippet>523</a>    /// changes in the underlying union-find. When `onchange` is `Some(rel)`,
+<a href=#524 id=524 data-nosnippet>524</a>    /// each leader change is recorded into the relation `rel` (5 columns:
+<a href=#525 id=525 data-nosnippet>525</a>    /// `write_lhs write_rhs lhs_leader rhs_leader new_leader`, looked-up-or-
+<a href=#526 id=526 data-nosnippet>526</a>    /// inserted to mint a fresh id, since relations are constructor-backed).
+<a href=#527 id=527 data-nosnippet>527</a>    /// Returns the function's handle and the [`ExternalFunctionId`] of the
+<a href=#528 id=528 data-nosnippet>528</a>    /// canonicalizer primitive (find-or-self against the union-find).
+<a href=#529 id=529 data-nosnippet>529</a>    ///
+<a href=#530 id=530 data-nosnippet>530</a>    /// When `proof` is `Some(_)`, the function is backed by a
+<a href=#531 id=531 data-nosnippet>531</a>    /// provenance-tracking union-find: the onchange relation gains a trailing
+<a href=#532 id=532 data-nosnippet>532</a>    /// proof column (so it is `(S S S S S Proof)`), and the leader-change
+<a href=#533 id=533 data-nosnippet>533</a>    /// callback composes that proof from the union-find's proof graph (see
+<a href=#534 id=534 data-nosnippet>534</a>    /// [`UfProofConfig`]).
+<a href=#535 id=535 data-nosnippet>535</a>    ///
+<a href=#536 id=536 data-nosnippet>536</a>    /// Wraps `egglog_bridge::EGraph::add_uf_function`. Backends that do not
+<a href=#537 id=537 data-nosnippet>537</a>    /// support UF-backed functions (DuckDB, Feldera, FlowLog) return an error.
+<a href=#538 id=538 data-nosnippet>538</a>    </span><span class="kw">fn </span>add_uf_function(
+<a href=#539 id=539 data-nosnippet>539</a>        <span class="kw-2">&amp;mut </span><span class="self">self</span>,
+<a href=#540 id=540 data-nosnippet>540</a>        name: String,
+<a href=#541 id=541 data-nosnippet>541</a>        onchange: <span class="prelude-ty">Option</span>&lt;FunctionId&gt;,
+<a href=#542 id=542 data-nosnippet>542</a>        proof: <span class="prelude-ty">Option</span>&lt;UfProofConfig&gt;,
+<a href=#543 id=543 data-nosnippet>543</a>    ) -&gt; <span class="prelude-ty">Result</span>&lt;(FunctionId, ExternalFunctionId)&gt;;
+<a href=#544 id=544 data-nosnippet>544</a>
+<a href=#545 id=545 data-nosnippet>545</a>    <span class="doccomment">/// Number of rows currently in the given function's table.
+<a href=#546 id=546 data-nosnippet>546</a>    ///
+<a href=#547 id=547 data-nosnippet>547</a>    /// Wraps `egglog_bridge::EGraph::table_size`.
+<a href=#548 id=548 data-nosnippet>548</a>    </span><span class="kw">fn </span>table_size(<span class="kw-2">&amp;</span><span class="self">self</span>, table: FunctionId) -&gt; usize;
+<a href=#549 id=549 data-nosnippet>549</a>
+<a href=#550 id=550 data-nosnippet>550</a>    <span class="doccomment">/// Approximate size; backends may return a fast estimate.
+<a href=#551 id=551 data-nosnippet>551</a>    ///
+<a href=#552 id=552 data-nosnippet>552</a>    /// Wraps `egglog_bridge::EGraph::approx_table_size`.
+<a href=#553 id=553 data-nosnippet>553</a>    </span><span class="kw">fn </span>approx_table_size(<span class="kw-2">&amp;</span><span class="self">self</span>, table: FunctionId) -&gt; usize;
+<a href=#554 id=554 data-nosnippet>554</a>
+<a href=#555 id=555 data-nosnippet>555</a>    <span class="comment">// -- iteration ----------------------------------------------------------
+<a href=#556 id=556 data-nosnippet>556</a>
+<a href=#557 id=557 data-nosnippet>557</a>    </span><span class="doccomment">/// Iterate over every row in `table`, calling `f` on each.
+<a href=#558 id=558 data-nosnippet>558</a>    ///
+<a href=#559 id=559 data-nosnippet>559</a>    /// Wraps `egglog_bridge::EGraph::for_each`.
+<a href=#560 id=560 data-nosnippet>560</a>    ///
+<a href=#561 id=561 data-nosnippet>561</a>    /// The closure's `FunctionRow` is borrowed from a transient per-call
+<a href=#562 id=562 data-nosnippet>562</a>    /// buffer (a `TaggedRowBuffer` in the bridge; a row cursor in DuckDB).
+<a href=#563 id=563 data-nosnippet>563</a>    /// The HRTB lifetime `for&lt;'r&gt;` reflects that the row reference is
+<a href=#564 id=564 data-nosnippet>564</a>    /// scoped to the closure invocation, not the outer `&amp;self` borrow.
+<a href=#565 id=565 data-nosnippet>565</a>    </span><span class="kw">fn </span>for_each(<span class="kw-2">&amp;</span><span class="self">self</span>, table: FunctionId, f: <span class="kw-2">&amp;mut </span><span class="kw">dyn for</span>&lt;<span class="lifetime">'r</span>&gt; FnMut(FunctionRow&lt;<span class="lifetime">'r</span>&gt;)) {
+<a href=#566 id=566 data-nosnippet>566</a>        <span class="comment">// The default implementation cannot be written here without a wrapper
+<a href=#567 id=567 data-nosnippet>567</a>        // because the closure types differ. Implementations should override
+<a href=#568 id=568 data-nosnippet>568</a>        // this to avoid the boolean threading overhead; the no-default
+<a href=#569 id=569 data-nosnippet>569</a>        // alternative would be to require both methods. We mark this as
+<a href=#570 id=570 data-nosnippet>570</a>        // mandatory below to keep impls explicit.
+<a href=#571 id=571 data-nosnippet>571</a>        </span><span class="kw">let _ </span>= (table, f);
+<a href=#572 id=572 data-nosnippet>572</a>        <span class="macro">unimplemented!</span>(
+<a href=#573 id=573 data-nosnippet>573</a>            <span class="string">"Backend impls must override for_each; the default exists only \
+<a href=#574 id=574 data-nosnippet>574</a>             to satisfy dyn-compatibility lint chains."
+<a href=#575 id=575 data-nosnippet>575</a>        </span>)
+<a href=#576 id=576 data-nosnippet>576</a>    }
+<a href=#577 id=577 data-nosnippet>577</a>
+<a href=#578 id=578 data-nosnippet>578</a>    <span class="doccomment">/// Iterate over rows in `table`, stopping early when `f` returns `false`.
+<a href=#579 id=579 data-nosnippet>579</a>    ///
+<a href=#580 id=580 data-nosnippet>580</a>    /// Wraps `egglog_bridge::EGraph::for_each_while`.
+<a href=#581 id=581 data-nosnippet>581</a>    ///
+<a href=#582 id=582 data-nosnippet>582</a>    /// See [`Backend::for_each`] for why the closure uses an HRTB.
+<a href=#583 id=583 data-nosnippet>583</a>    </span><span class="kw">fn </span>for_each_while(<span class="kw-2">&amp;</span><span class="self">self</span>, table: FunctionId, f: <span class="kw-2">&amp;mut </span><span class="kw">dyn for</span>&lt;<span class="lifetime">'r</span>&gt; FnMut(FunctionRow&lt;<span class="lifetime">'r</span>&gt;) -&gt; bool);
+<a href=#584 id=584 data-nosnippet>584</a>
+<a href=#585 id=585 data-nosnippet>585</a>    <span class="comment">// -- direct access ------------------------------------------------------
+<a href=#586 id=586 data-nosnippet>586</a>
+<a href=#587 id=587 data-nosnippet>587</a>    </span><span class="doccomment">/// Look up the output value associated with `key` in `func`.
+<a href=#588 id=588 data-nosnippet>588</a>    ///
+<a href=#589 id=589 data-nosnippet>589</a>    /// Wraps `egglog_bridge::EGraph::lookup_id`.
+<a href=#590 id=590 data-nosnippet>590</a>    </span><span class="kw">fn </span>lookup_id(<span class="kw-2">&amp;</span><span class="self">self</span>, func: FunctionId, key: <span class="kw-2">&amp;</span>[Value]) -&gt; <span class="prelude-ty">Option</span>&lt;Value&gt;;
+<a href=#591 id=591 data-nosnippet>591</a>
+<a href=#592 id=592 data-nosnippet>592</a>    <span class="doccomment">/// Bulk-insert one or many rows across one or many functions.
+<a href=#593 id=593 data-nosnippet>593</a>    ///
+<a href=#594 id=594 data-nosnippet>594</a>    /// Wraps `egglog_bridge::EGraph::add_values`. (The boxed iterator is
+<a href=#595 id=595 data-nosnippet>595</a>    /// used to keep this method dyn-compatible.)
+<a href=#596 id=596 data-nosnippet>596</a>    </span><span class="kw">fn </span>add_values(<span class="kw-2">&amp;mut </span><span class="self">self</span>, values: Box&lt;<span class="kw">dyn </span>Iterator&lt;Item = (FunctionId, Vec&lt;Value&gt;)&gt; + <span class="lifetime">'_</span>&gt;);
+<a href=#597 id=597 data-nosnippet>597</a>
+<a href=#598 id=598 data-nosnippet>598</a>    <span class="doccomment">/// Add a term-shaped row: stage `(inputs ... fresh_id)` and return the
+<a href=#599 id=599 data-nosnippet>599</a>    /// canonical id of the freshly allocated output.
+<a href=#600 id=600 data-nosnippet>600</a>    ///
+<a href=#601 id=601 data-nosnippet>601</a>    /// Wraps `egglog_bridge::EGraph::add_term`. On DuckDB this maps to an
+<a href=#602 id=602 data-nosnippet>602</a>    /// `INSERT ... RETURNING` against the function's table.
+<a href=#603 id=603 data-nosnippet>603</a>    </span><span class="kw">fn </span>add_term(<span class="kw-2">&amp;mut </span><span class="self">self</span>, func: FunctionId, inputs: <span class="kw-2">&amp;</span>[Value]) -&gt; Value;
+<a href=#604 id=604 data-nosnippet>604</a>
+<a href=#605 id=605 data-nosnippet>605</a>    <span class="doccomment">/// Stage a batch of complete rows into `table`.
+<a href=#606 id=606 data-nosnippet>606</a>    ///
+<a href=#607 id=607 data-nosnippet>607</a>    /// Each entry in `rows` is the full row for the table (key columns
+<a href=#608 id=608 data-nosnippet>608</a>    /// followed by the value column, where applicable). The rows are staged
+<a href=#609 id=609 data-nosnippet>609</a>    /// against a single internal execution state; callers should invoke
+<a href=#610 id=610 data-nosnippet>610</a>    /// [`Backend::flush_updates`] afterward to merge them into the database.
+<a href=#611 id=611 data-nosnippet>611</a>    ///
+<a href=#612 id=612 data-nosnippet>612</a>    /// Unlike [`Backend::add_values`], this is scoped to a single table and
+<a href=#613 id=613 data-nosnippet>613</a>    /// does not call `flush_updates` itself, which makes it suitable for
+<a href=#614 id=614 data-nosnippet>614</a>    /// scenarios that interleave many table-level insertions before a final
+<a href=#615 id=615 data-nosnippet>615</a>    /// flush (e.g. parsing an input file, scheduler match dispatch).
+<a href=#616 id=616 data-nosnippet>616</a>    ///
+<a href=#617 id=617 data-nosnippet>617</a>    /// The bridge's impl wraps `with_execution_state` around a loop of
+<a href=#618 id=618 data-nosnippet>618</a>    /// `TableAction::insert` calls.
+<a href=#619 id=619 data-nosnippet>619</a>    </span><span class="kw">fn </span>insert_rows(<span class="kw-2">&amp;mut </span><span class="self">self</span>, table: FunctionId, rows: <span class="kw-2">&amp;</span>[Vec&lt;Value&gt;]);
+<a href=#620 id=620 data-nosnippet>620</a>
+<a href=#621 id=621 data-nosnippet>621</a>    <span class="doccomment">/// Stage a batch of constructor-style lookup-or-insert rows.
+<a href=#622 id=622 data-nosnippet>622</a>    ///
+<a href=#623 id=623 data-nosnippet>623</a>    /// Each entry in `rows` is a key for the constructor `table` (without the
+<a href=#624 id=624 data-nosnippet>624</a>    /// output column); the bridge calls `TableAction::lookup` per row, which
+<a href=#625 id=625 data-nosnippet>625</a>    /// either returns the existing output or allocates a fresh id. As with
+<a href=#626 id=626 data-nosnippet>626</a>    /// [`Backend::insert_rows`], callers should invoke
+<a href=#627 id=627 data-nosnippet>627</a>    /// [`Backend::flush_updates`] afterward.
+<a href=#628 id=628 data-nosnippet>628</a>    ///
+<a href=#629 id=629 data-nosnippet>629</a>    /// The bridge's impl wraps `with_execution_state` around a loop of
+<a href=#630 id=630 data-nosnippet>630</a>    /// `TableAction::lookup` calls.
+<a href=#631 id=631 data-nosnippet>631</a>    </span><span class="kw">fn </span>lookup_constructor_rows(<span class="kw-2">&amp;mut </span><span class="self">self</span>, table: FunctionId, rows: <span class="kw-2">&amp;</span>[Vec&lt;Value&gt;]);
+<a href=#632 id=632 data-nosnippet>632</a>
+<a href=#633 id=633 data-nosnippet>633</a>    <span class="doccomment">/// Get the canonical representative of `val` according to `ty`.
+<a href=#634 id=634 data-nosnippet>634</a>    ///
+<a href=#635 id=635 data-nosnippet>635</a>    /// For `ColumnTy::Id` this is the union-find canonicalization. For
+<a href=#636 id=636 data-nosnippet>636</a>    /// `ColumnTy::Base(_)` it returns `val` unchanged.
+<a href=#637 id=637 data-nosnippet>637</a>    ///
+<a href=#638 id=638 data-nosnippet>638</a>    /// Wraps `egglog_bridge::EGraph::get_canon_repr`.
+<a href=#639 id=639 data-nosnippet>639</a>    </span><span class="kw">fn </span>get_canon_repr(<span class="kw-2">&amp;</span><span class="self">self</span>, val: Value, ty: ColumnTy) -&gt; Value;
+<a href=#640 id=640 data-nosnippet>640</a>
+<a href=#641 id=641 data-nosnippet>641</a>    <span class="doccomment">/// Allocate a fresh egraph id (counter increment, returned as a `Value`).
+<a href=#642 id=642 data-nosnippet>642</a>    ///
+<a href=#643 id=643 data-nosnippet>643</a>    /// Wraps `egglog_bridge::EGraph::fresh_id`.
+<a href=#644 id=644 data-nosnippet>644</a>    </span><span class="kw">fn </span>fresh_id(<span class="kw-2">&amp;mut </span><span class="self">self</span>) -&gt; Value;
+<a href=#645 id=645 data-nosnippet>645</a>
+<a href=#646 id=646 data-nosnippet>646</a>    <span class="doccomment">/// Remove every row from the given function's table.
+<a href=#647 id=647 data-nosnippet>647</a>    ///
+<a href=#648 id=648 data-nosnippet>648</a>    /// Wraps `egglog_bridge::EGraph::clear_table`.
+<a href=#649 id=649 data-nosnippet>649</a>    </span><span class="kw">fn </span>clear_table(<span class="kw-2">&amp;mut </span><span class="self">self</span>, func: FunctionId);
+<a href=#650 id=650 data-nosnippet>650</a>
+<a href=#651 id=651 data-nosnippet>651</a>    <span class="doccomment">/// Access the backend's [`BaseValues`] registry directly.
+<a href=#652 id=652 data-nosnippet>652</a>    ///
+<a href=#653 id=653 data-nosnippet>653</a>    /// Wraps `egglog_bridge::EGraph::base_values`. This returns the concrete
+<a href=#654 id=654 data-nosnippet>654</a>    /// `egglog_core_relations::BaseValues` (re-exported here) so callers can
+<a href=#655 id=655 data-nosnippet>655</a>    /// use the generic-over-`T` `get::&lt;T&gt;` / `unwrap::&lt;T&gt;` sugar that the
+<a href=#656 id=656 data-nosnippet>656</a>    /// dyn-friendly [`BaseValuePool`] does not expose.
+<a href=#657 id=657 data-nosnippet>657</a>    </span><span class="kw">fn </span>base_values(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span>BaseValues;
+<a href=#658 id=658 data-nosnippet>658</a>
+<a href=#659 id=659 data-nosnippet>659</a>    <span class="doccomment">/// Run `f` against a fresh execution state, dyn-compatible form.
+<a href=#660 id=660 data-nosnippet>660</a>    ///
+<a href=#661 id=661 data-nosnippet>661</a>    /// Wraps `egglog_bridge::EGraph::with_execution_state`. The generic,
+<a href=#662 id=662 data-nosnippet>662</a>    /// result-returning ergonomic wrapper is provided as the inherent
+<a href=#663 id=663 data-nosnippet>663</a>    /// [`Backend::with_execution_state`] method on `dyn Backend`; this
+<a href=#664 id=664 data-nosnippet>664</a>    /// erased form exists so the trait stays object-safe.
+<a href=#665 id=665 data-nosnippet>665</a>    </span><span class="kw">fn </span>with_execution_state_dyn(<span class="kw-2">&amp;</span><span class="self">self</span>, f: <span class="kw-2">&amp;mut </span><span class="kw">dyn </span>FnMut(<span class="kw-2">&amp;mut </span>ExecutionState&lt;<span class="lifetime">'_</span>&gt;));
+<a href=#666 id=666 data-nosnippet>666</a>
+<a href=#667 id=667 data-nosnippet>667</a>    <span class="doccomment">/// Type-erased access to the backend's action registry handle.
+<a href=#668 id=668 data-nosnippet>668</a>    ///
+<a href=#669 id=669 data-nosnippet>669</a>    /// Wraps `egglog_bridge::EGraph::action_registry`, which returns a
+<a href=#670 id=670 data-nosnippet>670</a>    /// `&amp;Arc&lt;RwLock&lt;ActionRegistry&gt;&gt;`. `ActionRegistry` is defined in the
+<a href=#671 id=671 data-nosnippet>671</a>    /// `egglog-bridge` crate, which depends on this crate; naming it here
+<a href=#672 id=672 data-nosnippet>672</a>    /// would re-introduce the dependency cycle that Phase 2 deliberately
+<a href=#673 id=673 data-nosnippet>673</a>    /// broke. So the object-safe form erases the handle to `&amp;dyn Any`, and
+<a href=#674 id=674 data-nosnippet>674</a>    /// the generic inherent [`Backend::action_registry`] downcasts it back
+<a href=#675 id=675 data-nosnippet>675</a>    /// to the caller-inferred concrete registry type.
+<a href=#676 id=676 data-nosnippet>676</a>    ///
+<a href=#677 id=677 data-nosnippet>677</a>    /// The `&amp;dyn Any` is expected to be an `Arc&lt;RwLock&lt;ActionRegistry&gt;&gt;`.
+<a href=#678 id=678 data-nosnippet>678</a>    /// Backends without an action registry (e.g. duckdb) panic.
+<a href=#679 id=679 data-nosnippet>679</a>    </span><span class="kw">fn </span>action_registry_any(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span>(<span class="kw">dyn </span>Any + Send + Sync);
+<a href=#680 id=680 data-nosnippet>680</a>
+<a href=#681 id=681 data-nosnippet>681</a>    <span class="comment">// -- rule management ----------------------------------------------------
+<a href=#682 id=682 data-nosnippet>682</a>
+<a href=#683 id=683 data-nosnippet>683</a>    </span><span class="doccomment">/// Begin building a new rule. Returns a builder whose lifetime is tied to
+<a href=#684 id=684 data-nosnippet>684</a>    /// `&amp;mut self`. Callers populate the builder via [`RuleBuilderOps`] and
+<a href=#685 id=685 data-nosnippet>685</a>    /// finalize with [`RuleBuilderOps::build`].
+<a href=#686 id=686 data-nosnippet>686</a>    ///
+<a href=#687 id=687 data-nosnippet>687</a>    /// Wraps `egglog_bridge::EGraph::new_rule`.
+<a href=#688 id=688 data-nosnippet>688</a>    </span><span class="kw">fn </span>new_rule&lt;<span class="lifetime">'a</span>&gt;(<span class="kw-2">&amp;</span><span class="lifetime">'a </span><span class="kw-2">mut </span><span class="self">self</span>, desc: <span class="kw-2">&amp;</span>str, seminaive: bool) -&gt; Box&lt;<span class="kw">dyn </span>RuleBuilderOps + <span class="lifetime">'a</span>&gt;;
+<a href=#689 id=689 data-nosnippet>689</a>
+<a href=#690 id=690 data-nosnippet>690</a>    <span class="doccomment">/// Drop a registered rule. The handle becomes invalid.
+<a href=#691 id=691 data-nosnippet>691</a>    ///
+<a href=#692 id=692 data-nosnippet>692</a>    /// Wraps `egglog_bridge::EGraph::free_rule`.
+<a href=#693 id=693 data-nosnippet>693</a>    </span><span class="kw">fn </span>free_rule(<span class="kw-2">&amp;mut </span><span class="self">self</span>, id: RuleId);
+<a href=#694 id=694 data-nosnippet>694</a>
+<a href=#695 id=695 data-nosnippet>695</a>    <span class="doccomment">/// Run one iteration of the given rule set. Returns timing and change
+<a href=#696 id=696 data-nosnippet>696</a>    /// counts; the database may have been modified even if `changed` is
+<a href=#697 id=697 data-nosnippet>697</a>    /// false (e.g. timestamps advanced).
+<a href=#698 id=698 data-nosnippet>698</a>    ///
+<a href=#699 id=699 data-nosnippet>699</a>    /// Wraps `egglog_bridge::EGraph::run_rules`.
+<a href=#700 id=700 data-nosnippet>700</a>    </span><span class="kw">fn </span>run_rules(<span class="kw-2">&amp;mut </span><span class="self">self</span>, rules: <span class="kw-2">&amp;</span>[RuleId]) -&gt; <span class="prelude-ty">Result</span>&lt;IterationReport&gt;;
+<a href=#701 id=701 data-nosnippet>701</a>
+<a href=#702 id=702 data-nosnippet>702</a>    <span class="doccomment">/// Drain staged inserts and run a rebuild pass if the UF changed.
+<a href=#703 id=703 data-nosnippet>703</a>    /// Returns whether the database changed.
+<a href=#704 id=704 data-nosnippet>704</a>    ///
+<a href=#705 id=705 data-nosnippet>705</a>    /// Wraps `egglog_bridge::EGraph::flush_updates`.
+<a href=#706 id=706 data-nosnippet>706</a>    </span><span class="kw">fn </span>flush_updates(<span class="kw-2">&amp;mut </span><span class="self">self</span>) -&gt; bool;
+<a href=#707 id=707 data-nosnippet>707</a>
+<a href=#708 id=708 data-nosnippet>708</a>    <span class="comment">// -- primitives ---------------------------------------------------------
+<a href=#709 id=709 data-nosnippet>709</a>
+<a href=#710 id=710 data-nosnippet>710</a>    </span><span class="doccomment">/// Register a user-defined primitive (`ExternalFunction`).
+<a href=#711 id=711 data-nosnippet>711</a>    ///
+<a href=#712 id=712 data-nosnippet>712</a>    /// Wraps `egglog_bridge::EGraph::register_external_func`.
+<a href=#713 id=713 data-nosnippet>713</a>    ///
+<a href=#714 id=714 data-nosnippet>714</a>    /// On DuckDB, primitives that synchronously call back into table state
+<a href=#715 id=715 data-nosnippet>715</a>    /// (e.g. `TableAction::lookup` in the apply body) are not supported in
+<a href=#716 id=716 data-nosnippet>716</a>    /// v1. See [`Backend::supports_inline_table_lookups`].
+<a href=#717 id=717 data-nosnippet>717</a>    </span><span class="kw">fn </span>register_external_func(
+<a href=#718 id=718 data-nosnippet>718</a>        <span class="kw-2">&amp;mut </span><span class="self">self</span>,
+<a href=#719 id=719 data-nosnippet>719</a>        func: Box&lt;<span class="kw">dyn </span>ExternalFunction + <span class="lifetime">'static</span>&gt;,
+<a href=#720 id=720 data-nosnippet>720</a>    ) -&gt; ExternalFunctionId;
+<a href=#721 id=721 data-nosnippet>721</a>
+<a href=#722 id=722 data-nosnippet>722</a>    <span class="doccomment">/// Drop a user-defined primitive.
+<a href=#723 id=723 data-nosnippet>723</a>    ///
+<a href=#724 id=724 data-nosnippet>724</a>    /// Wraps `egglog_bridge::EGraph::free_external_func`.
+<a href=#725 id=725 data-nosnippet>725</a>    </span><span class="kw">fn </span>free_external_func(<span class="kw-2">&amp;mut </span><span class="self">self</span>, func: ExternalFunctionId);
+<a href=#726 id=726 data-nosnippet>726</a>
+<a href=#727 id=727 data-nosnippet>727</a>    <span class="doccomment">/// Register a deferred-panic primitive that stops rule execution when
+<a href=#728 id=728 data-nosnippet>728</a>    /// invoked. The returned id can be used as a fallback target in
+<a href=#729 id=729 data-nosnippet>729</a>    /// `lookup_with_fallback` and similar.
+<a href=#730 id=730 data-nosnippet>730</a>    ///
+<a href=#731 id=731 data-nosnippet>731</a>    /// Wraps `egglog_bridge::EGraph::new_panic`.
+<a href=#732 id=732 data-nosnippet>732</a>    </span><span class="kw">fn </span>new_panic(<span class="kw-2">&amp;mut </span><span class="self">self</span>, message: String) -&gt; ExternalFunctionId;
+<a href=#733 id=733 data-nosnippet>733</a>
+<a href=#734 id=734 data-nosnippet>734</a>    <span class="doccomment">/// Evaluate a registered primitive on the given (already-interned) argument
+<a href=#735 id=735 data-nosnippet>735</a>    /// `Value`s, returning its result, or `None` if the primitive fails
+<a href=#736 id=736 data-nosnippet>736</a>    /// (e.g. `!=` of equal arguments, or a guard that does not hold).
+<a href=#737 id=737 data-nosnippet>737</a>    ///
+<a href=#738 id=738 data-nosnippet>738</a>    /// This is the **backend-agnostic primitive entry point**. It lets a
+<a href=#739 id=739 data-nosnippet>739</a>    /// backend evaluate a primitive *inline* (e.g. inside a DBSP map/filter
+<a href=#740 id=740 data-nosnippet>740</a>    /// operator, or a host-side join loop) without owning or borrowing a
+<a href=#741 id=741 data-nosnippet>741</a>    /// `core_relations::ExecutionState`, which is the type
+<a href=#742 id=742 data-nosnippet>742</a>    /// [`ExternalFunction::invoke`] requires.
+<a href=#743 id=743 data-nosnippet>743</a>    ///
+<a href=#744 id=744 data-nosnippet>744</a>    /// ## Contract
+<a href=#745 id=745 data-nosnippet>745</a>    ///
+<a href=#746 id=746 data-nosnippet>746</a>    /// - `args` are interned `Value`s in the backend's value space (same
+<a href=#747 id=747 data-nosnippet>747</a>    ///   representation `for_each` / `lookup_id` use).
+<a href=#748 id=748 data-nosnippet>748</a>    /// - The result, if any, is an interned `Value` in that same space.
+<a href=#749 id=749 data-nosnippet>749</a>    /// - For backends that evaluate primitives against an execution state
+<a href=#750 id=750 data-nosnippet>750</a>    ///   (reference, feldera), this is `with_execution_state(|st|
+<a href=#751 id=751 data-nosnippet>751</a>    ///   st.call_external_func(id, args))`.
+<a href=#752 id=752 data-nosnippet>752</a>    /// - Pure primitives (comparisons, arithmetic, string ops) do not touch
+<a href=#753 id=753 data-nosnippet>753</a>    ///   the database, so they evaluate identically regardless of which
+<a href=#754 id=754 data-nosnippet>754</a>    ///   backend hosts them. Primitives that reenter table state are only
+<a href=#755 id=755 data-nosnippet>755</a>    ///   well-defined on backends whose
+<a href=#756 id=756 data-nosnippet>756</a>    ///   [`Backend::supports_inline_table_lookups`] is `true`.
+<a href=#757 id=757 data-nosnippet>757</a>    </span><span class="kw">fn </span>eval_prim(<span class="kw-2">&amp;</span><span class="self">self</span>, id: ExternalFunctionId, args: <span class="kw-2">&amp;</span>[Value]) -&gt; <span class="prelude-ty">Option</span>&lt;Value&gt;;
+<a href=#758 id=758 data-nosnippet>758</a>
+<a href=#759 id=759 data-nosnippet>759</a>    <span class="comment">// -- typed value handles (sub-traits) -----------------------------------
+<a href=#760 id=760 data-nosnippet>760</a>
+<a href=#761 id=761 data-nosnippet>761</a>    </span><span class="doccomment">/// Access the backend's [`BaseValuePool`] for typed base-value queries.
+<a href=#762 id=762 data-nosnippet>762</a>    ///
+<a href=#763 id=763 data-nosnippet>763</a>    /// Wraps `egglog_bridge::EGraph::base_values` (returns `&amp;BaseValues`,
+<a href=#764 id=764 data-nosnippet>764</a>    /// which implements this sub-trait either directly or via a thin shim
+<a href=#765 id=765 data-nosnippet>765</a>    /// the bridge provides).
+<a href=#766 id=766 data-nosnippet>766</a>    </span><span class="kw">fn </span>base_value_pool(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span><span class="kw">dyn </span>BaseValuePool;
+<a href=#767 id=767 data-nosnippet>767</a>
+<a href=#768 id=768 data-nosnippet>768</a>    <span class="doccomment">/// Mutable access to the [`BaseValuePool`]. Used to register new
+<a href=#769 id=769 data-nosnippet>769</a>    /// `BaseValue` types.
+<a href=#770 id=770 data-nosnippet>770</a>    ///
+<a href=#771 id=771 data-nosnippet>771</a>    /// Wraps `egglog_bridge::EGraph::base_values_mut`.
+<a href=#772 id=772 data-nosnippet>772</a>    </span><span class="kw">fn </span>base_value_pool_mut(<span class="kw-2">&amp;mut </span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;mut </span><span class="kw">dyn </span>BaseValuePool;
+<a href=#773 id=773 data-nosnippet>773</a>
+<a href=#774 id=774 data-nosnippet>774</a>    <span class="doccomment">/// Access the backend's [`ContainerPool`].
+<a href=#775 id=775 data-nosnippet>775</a>    ///
+<a href=#776 id=776 data-nosnippet>776</a>    /// Wraps `egglog_bridge::EGraph::container_values`.
+<a href=#777 id=777 data-nosnippet>777</a>    ///
+<a href=#778 id=778 data-nosnippet>778</a>    /// On DuckDB this returns an empty stub (see [`ContainerPool`]'s docs).
+<a href=#779 id=779 data-nosnippet>779</a>    /// All container-using egglog programs are gated out of DuckDB by the
+<a href=#780 id=780 data-nosnippet>780</a>    /// existing `program_supports_proofs` check, so the stub is never
+<a href=#781 id=781 data-nosnippet>781</a>    /// reached in practice.
+<a href=#782 id=782 data-nosnippet>782</a>    </span><span class="kw">fn </span>container_pool(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span><span class="kw">dyn </span>ContainerPool;
+<a href=#783 id=783 data-nosnippet>783</a>
+<a href=#784 id=784 data-nosnippet>784</a>    <span class="doccomment">/// Mutable access to the [`ContainerPool`].
+<a href=#785 id=785 data-nosnippet>785</a>    ///
+<a href=#786 id=786 data-nosnippet>786</a>    /// Wraps `egglog_bridge::EGraph::container_values_mut`.
+<a href=#787 id=787 data-nosnippet>787</a>    </span><span class="kw">fn </span>container_pool_mut(<span class="kw-2">&amp;mut </span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;mut </span><span class="kw">dyn </span>ContainerPool;
+<a href=#788 id=788 data-nosnippet>788</a>
+<a href=#789 id=789 data-nosnippet>789</a>    <span class="doccomment">/// Build a [`QueryEntry`] constant for a base value of dynamic type.
+<a href=#790 id=790 data-nosnippet>790</a>    ///
+<a href=#791 id=791 data-nosnippet>791</a>    /// `value` is the interned `Value`; `ty` is the base-value-type id
+<a href=#792 id=792 data-nosnippet>792</a>    /// returned by `BaseValuePool::register_type` /
+<a href=#793 id=793 data-nosnippet>793</a>    /// `BaseValuePool::get_ty_by_type_id`.
+<a href=#794 id=794 data-nosnippet>794</a>    ///
+<a href=#795 id=795 data-nosnippet>795</a>    /// Wraps `egglog_bridge::EGraph::base_value_constant`. (The bridge's
+<a href=#796 id=796 data-nosnippet>796</a>    /// inherent method is generic over `T: BaseValue`; the dyn-friendly form
+<a href=#797 id=797 data-nosnippet>797</a>    /// takes the already-interned `Value` and the `BaseValueId`. A generic
+<a href=#798 id=798 data-nosnippet>798</a>    /// helper that wraps this is provided below
+<a href=#799 id=799 data-nosnippet>799</a>    /// (`base_value_constant&lt;T&gt;`).)
+<a href=#800 id=800 data-nosnippet>800</a>    </span><span class="kw">fn </span>base_value_constant_dyn(<span class="kw-2">&amp;</span><span class="self">self</span>, value: Value, ty: BaseValueId) -&gt; QueryEntry;
+<a href=#801 id=801 data-nosnippet>801</a>
+<a href=#802 id=802 data-nosnippet>802</a>    <span class="comment">// -- capability flags ---------------------------------------------------
+<a href=#803 id=803 data-nosnippet>803</a>
+<a href=#804 id=804 data-nosnippet>804</a>    </span><span class="doccomment">/// Whether this backend's user-defined primitives can synchronously
+<a href=#805 id=805 data-nosnippet>805</a>    /// call back into table state during their `apply()` body.
+<a href=#806 id=806 data-nosnippet>806</a>    ///
+<a href=#807 id=807 data-nosnippet>807</a>    /// Reference backend: `true`. DuckDB: `false` (primitives run inside
+<a href=#808 id=808 data-nosnippet>808</a>    /// DuckDB VScalar UDFs and cannot reenter the database).
+<a href=#809 id=809 data-nosnippet>809</a>    ///
+<a href=#810 id=810 data-nosnippet>810</a>    /// Callers that need `rust_rule` / `query` should gate on this flag.
+<a href=#811 id=811 data-nosnippet>811</a>    </span><span class="kw">fn </span>supports_inline_table_lookups(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; bool;
+<a href=#812 id=812 data-nosnippet>812</a>
+<a href=#813 id=813 data-nosnippet>813</a>    <span class="doccomment">/// Whether this backend supports the `subsume` action and the
+<a href=#814 id=814 data-nosnippet>814</a>    /// `is_subsumed` filter on table atoms.
+<a href=#815 id=815 data-nosnippet>815</a>    ///
+<a href=#816 id=816 data-nosnippet>816</a>    /// Reference backend: `true`. DuckDB: `false` in v1 — the trait
+<a href=#817 id=817 data-nosnippet>817</a>    /// surfaces `subsume` on [`RuleBuilderOps`] but the DuckDB impl returns
+<a href=#818 id=818 data-nosnippet>818</a>    /// an error when called.
+<a href=#819 id=819 data-nosnippet>819</a>    </span><span class="kw">fn </span>supports_subsumption(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; bool;
+<a href=#820 id=820 data-nosnippet>820</a>
+<a href=#821 id=821 data-nosnippet>821</a>    <span class="doccomment">/// Whether this backend supports `MergeFn::Function` and
+<a href=#822 id=822 data-nosnippet>822</a>    /// `MergeFn::Primitive`.
+<a href=#823 id=823 data-nosnippet>823</a>    ///
+<a href=#824 id=824 data-nosnippet>824</a>    /// Reference backend: `true`. DuckDB: `false` in v1.
+<a href=#825 id=825 data-nosnippet>825</a>    </span><span class="kw">fn </span>supports_complex_merge(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; bool;
+<a href=#826 id=826 data-nosnippet>826</a>
+<a href=#827 id=827 data-nosnippet>827</a>    <span class="doccomment">/// Whether this backend can run a pure VALUE-FOLD custom `:merge` NATIVELY in
+<a href=#828 id=828 data-nosnippet>828</a>    /// its FD-conflict resolver — a fold of primitives / literals over `old`/`new`
+<a href=#829 id=829 data-nosnippet>829</a>    /// that yields a plain value (no e-node creation, no cross-table writes), e.g.
+<a href=#830 id=830 data-nosnippet>830</a>    /// `(from-string (to-string (* new old)))`. Gates
+<a href=#831 id=831 data-nosnippet>831</a>    /// `EncodeContext::native_value_fold_merge`: when `true` such a merge is lowered
+<a href=#832 id=832 data-nosnippet>832</a>    /// to a `MergeFn` tree and run host-side; when `false` it is rule-encoded as
+<a href=#833 id=833 data-nosnippet>833</a>    /// `@merge_rule` / `@merge_cleanup`.
+<a href=#834 id=834 data-nosnippet>834</a>    ///
+<a href=#835 id=835 data-nosnippet>835</a>    /// Defaults to [`Backend::supports_complex_merge`] so the bridge/duckdb/feldera
+<a href=#836 id=836 data-nosnippet>836</a>    /// behavior is unchanged. The flowlog backend overrides this to `true` (it
+<a href=#837 id=837 data-nosnippet>837</a>    /// evaluates the value-fold tree natively) while keeping `supports_complex_merge`
+<a href=#838 id=838 data-nosnippet>838</a>    /// / [`Backend::supports_term_build_merge`] `false`.
+<a href=#839 id=839 data-nosnippet>839</a>    </span><span class="kw">fn </span>supports_value_fold_merge(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; bool {
+<a href=#840 id=840 data-nosnippet>840</a>        <span class="self">self</span>.supports_complex_merge()
+<a href=#841 id=841 data-nosnippet>841</a>    }
+<a href=#842 id=842 data-nosnippet>842</a>
+<a href=#843 id=843 data-nosnippet>843</a>    <span class="doccomment">/// Whether this backend can run a TERM-BUILDING custom `:merge` NATIVELY — a
+<a href=#844 id=844 data-nosnippet>844</a>    /// merge body that mints e-nodes via constructor calls (a `MergeFn::Seq` of
+<a href=#845 id=845 data-nosnippet>845</a>    /// `Construct` / `TableInsert` / union variants), e.g.
+<a href=#846 id=846 data-nosnippet>846</a>    /// `(C2 (C1 old new) (C2 old new))`. Gates
+<a href=#847 id=847 data-nosnippet>847</a>    /// `EncodeContext::native_term_build_merge`.
+<a href=#848 id=848 data-nosnippet>848</a>    ///
+<a href=#849 id=849 data-nosnippet>849</a>    /// Defaults to [`Backend::supports_complex_merge`] so the bridge/duckdb/feldera
+<a href=#850 id=850 data-nosnippet>850</a>    /// behavior is unchanged. (The dataflow backends keep this `false`; term-build
+<a href=#851 id=851 data-nosnippet>851</a>    /// native merge is a later increment.)
+<a href=#852 id=852 data-nosnippet>852</a>    </span><span class="kw">fn </span>supports_term_build_merge(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; bool {
+<a href=#853 id=853 data-nosnippet>853</a>        <span class="self">self</span>.supports_complex_merge()
+<a href=#854 id=854 data-nosnippet>854</a>    }
+<a href=#855 id=855 data-nosnippet>855</a>
+<a href=#856 id=856 data-nosnippet>856</a>    <span class="doccomment">/// Whether this backend can do CONSTRUCTOR congruence INLINE via a native
+<a href=#857 id=857 data-nosnippet>857</a>    /// merge — the `--native-merge` FD-keyed `@&lt;C&gt;View (children) -&gt; eclass` whose
+<a href=#858 id=858 data-nosnippet>858</a>    /// `UnionId`/`UnionIntoUf` merge unions colliding eclasses at insert time,
+<a href=#859 id=859 data-nosnippet>859</a>    /// dropping the `@congruence_rule*` self-join. Gates
+<a href=#860 id=860 data-nosnippet>860</a>    /// `EncodeContext::native_congruence_view`: when `false`, constructor congruence
+<a href=#861 id=861 data-nosnippet>861</a>    /// stays RULE-ENCODED even under `--native-merge` (so a backend can enable
+<a href=#862 id=862 data-nosnippet>862</a>    /// `--native-merge` purely for value-fold merges without taking the congruence
+<a href=#863 id=863 data-nosnippet>863</a>    /// path it cannot execute).
+<a href=#864 id=864 data-nosnippet>864</a>    ///
+<a href=#865 id=865 data-nosnippet>865</a>    /// Defaults to `true` so the bridge / flowlog / feldera backends are unchanged
+<a href=#866 id=866 data-nosnippet>866</a>    /// (they wire `register_native_merge_view` + a host-pass rebuild). DuckDB
+<a href=#867 id=867 data-nosnippet>867</a>    /// overrides this to `false`: it has no native congruence wiring
+<a href=#868 id=868 data-nosnippet>868</a>    /// (`register_native_merge_view` is the no-op default), so under
+<a href=#869 id=869 data-nosnippet>869</a>    /// `--native-merge` only value-fold merges run natively; constructor congruence
+<a href=#870 id=870 data-nosnippet>870</a>    /// keeps the rule encoding.
+<a href=#871 id=871 data-nosnippet>871</a>    </span><span class="kw">fn </span>supports_native_congruence_merge(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; bool {
+<a href=#872 id=872 data-nosnippet>872</a>        <span class="bool-val">true
+<a href=#873 id=873 data-nosnippet>873</a>    </span>}
+<a href=#874 id=874 data-nosnippet>874</a>
+<a href=#875 id=875 data-nosnippet>875</a>    <span class="doccomment">/// Whether this backend's native-merge FD view (`(children) -&gt; eclass`) keeps
+<a href=#876 id=876 data-nosnippet>876</a>    /// CONFLICTING `(children, eclass)` rows COEXISTING until a host pass resolves
+<a href=#877 id=877 data-nosnippet>877</a>    /// them, rather than collapsing children -&gt; eclass at insert time inside the
+<a href=#878 id=878 data-nosnippet>878</a>    /// merge.
+<a href=#879 id=879 data-nosnippet>879</a>    ///
+<a href=#880 id=880 data-nosnippet>880</a>    /// The reference bridge / FlowLog / Feldera resolve the FD conflict INSIDE the
+<a href=#881 id=881 data-nosnippet>881</a>    /// merge (the `UnionId`/`UnionIntoUf` merge unions the eclasses and keeps one
+<a href=#882 id=882 data-nosnippet>882</a>    /// row per children), so there is only ever one row per children — the rebuild
+<a href=#883 id=883 data-nosnippet>883</a>    /// can safely delete the stale row by CHILDREN ONLY. They return `false`.
+<a href=#884 id=884 data-nosnippet>884</a>    ///
+<a href=#885 id=885 data-nosnippet>885</a>    /// DuckDB registers the view ALL-COLUMNS keyed so two `(set (@&lt;C&gt;View children)
+<a href=#886 id=886 data-nosnippet>886</a>    /// eclass)` writes with different eclasses COEXIST until `emit_native_congruence`
+<a href=#887 id=887 data-nosnippet>887</a>    /// resolves them at the iteration boundary. A children-only rebuild delete would
+<a href=#888 id=888 data-nosnippet>888</a>    /// wipe BOTH coexisting rows (destroying the conflict before the host pass sees
+<a href=#889 id=889 data-nosnippet>889</a>    /// it), so DuckDB returns `true` and the encoder keys the rebuild / delete /
+<a href=#890 id=890 data-nosnippet>890</a>    /// subsume of a native-merge view on the FULL `(children, eclass)` row instead.
+<a href=#891 id=891 data-nosnippet>891</a>    /// Only consulted when `supports_native_congruence_merge()` is also true; gates
+<a href=#892 id=892 data-nosnippet>892</a>    /// `view_delete` (and the related view body / subsume forms) in the encoder.
+<a href=#893 id=893 data-nosnippet>893</a>    </span><span class="kw">fn </span>native_merge_views_coexist(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; bool {
+<a href=#894 id=894 data-nosnippet>894</a>        <span class="bool-val">false
+<a href=#895 id=895 data-nosnippet>895</a>    </span>}
+<a href=#896 id=896 data-nosnippet>896</a>
+<a href=#897 id=897 data-nosnippet>897</a>    <span class="doccomment">/// Whether this backend can host a TUPLE-output (multi-value) function table —
+<a href=#898 id=898 data-nosnippet>898</a>    /// a function whose row has more than one output column, resolved by a
+<a href=#899 id=899 data-nosnippet>899</a>    /// [`MergeFn::Columns`] of length &gt; 1.
+<a href=#900 id=900 data-nosnippet>900</a>    ///
+<a href=#901 id=901 data-nosnippet>901</a>    /// Gates the PROOF-mode `--native-merge` view encoding. The reference bridge
+<a href=#902 id=902 data-nosnippet>902</a>    /// returns `true` and uses the A2 TUPLE proof view `(children) -&gt; (eclass,
+<a href=#903 id=903 data-nosnippet>903</a>    /// proof)` (a `Columns([UnionIntoUfWithProof, EclassMinProof])` merge). The
+<a href=#904 id=904 data-nosnippet>904</a>    /// single-output dataflow backends (FlowLog, Feldera) return `false`: they
+<a href=#905 id=905 data-nosnippet>905</a>    /// cannot express a 2-output view, so the encoder emits the 2-TABLE form
+<a href=#906 id=906 data-nosnippet>906</a>    /// instead — a single-output eclass view `(children) -&gt; eclass` PLUS a
+<a href=#907 id=907 data-nosnippet>907</a>    /// single-output proof SIDE-TABLE `(children, eclass) -&gt; proof` — with the
+<a href=#908 id=908 data-nosnippet>908</a>    /// proof-congruence done by [`MergeFn::UnionIntoParentTableWithProof`].
+<a href=#909 id=909 data-nosnippet>909</a>    ///
+<a href=#910 id=910 data-nosnippet>910</a>    /// DuckDB returns `supports_native_congruence_merge() == false`, so it never
+<a href=#911 id=911 data-nosnippet>911</a>    /// reaches either proof-view form (congruence stays rule-encoded); its value
+<a href=#912 id=912 data-nosnippet>912</a>    /// here is irrelevant and keeps the `true` default.
+<a href=#913 id=913 data-nosnippet>913</a>    </span><span class="kw">fn </span>supports_tuple_output_views(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; bool {
+<a href=#914 id=914 data-nosnippet>914</a>        <span class="bool-val">true
+<a href=#915 id=915 data-nosnippet>915</a>    </span>}
+<a href=#916 id=916 data-nosnippet>916</a>
+<a href=#917 id=917 data-nosnippet>917</a>    <span class="doccomment">/// Whether this backend supports `Vec` / `Set` / `Map` / `MultiSet`
+<a href=#918 id=918 data-nosnippet>918</a>    /// container sorts.
+<a href=#919 id=919 data-nosnippet>919</a>    ///
+<a href=#920 id=920 data-nosnippet>920</a>    /// Reference backend: `true`. DuckDB: `false` (container sorts are
+<a href=#921 id=921 data-nosnippet>921</a>    /// excluded from DuckDB test combos by the existing `supports_proofs`
+<a href=#922 id=922 data-nosnippet>922</a>    /// gate; see `docs/backend_trait_inventory.md` Section 6.3).
+<a href=#923 id=923 data-nosnippet>923</a>    </span><span class="kw">fn </span>supports_containers(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; bool;
+<a href=#924 id=924 data-nosnippet>924</a>
+<a href=#925 id=925 data-nosnippet>925</a>    <span class="doccomment">/// Whether this backend exposes the in-memory `ActionRegistry` /
+<a href=#926 id=926 data-nosnippet>926</a>    /// `ExecutionState` that registry-backed primitives
+<a href=#927 id=927 data-nosnippet>927</a>    /// (`ReadPrim`/`WritePrim`/`FullPrim`) dispatch through. The reference
+<a href=#928 id=928 data-nosnippet>928</a>    /// (bridge) backend wraps each such primitive in a `RegistryPrimWrapper`
+<a href=#929 id=929 data-nosnippet>929</a>    /// that clones `action_registry()` at registration time; the dataflow /
+<a href=#930 id=930 data-nosnippet>930</a>    /// SQL backends (`action_registry_any()` = `unimplemented!()`) cannot, so
+<a href=#931 id=931 data-nosnippet>931</a>    /// the egglog frontend registers a registry-free placeholder/snapshot
+<a href=#932 id=932 data-nosnippet>932</a>    /// wrapper instead (see `register_registry_primitive` in
+<a href=#933 id=933 data-nosnippet>933</a>    /// `typechecking.rs`).
+<a href=#934 id=934 data-nosnippet>934</a>    ///
+<a href=#935 id=935 data-nosnippet>935</a>    /// Reference backend: `true`. DuckDB / FlowLog / Feldera: `false`.
+<a href=#936 id=936 data-nosnippet>936</a>    </span><span class="kw">fn </span>supports_action_registry(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; bool;
+<a href=#937 id=937 data-nosnippet>937</a>
+<a href=#938 id=938 data-nosnippet>938</a>    <span class="comment">// -- diagnostics --------------------------------------------------------
+<a href=#939 id=939 data-nosnippet>939</a>
+<a href=#940 id=940 data-nosnippet>940</a>    </span><span class="doccomment">/// Set the verbosity of the per-rule-iteration timing report.
+<a href=#941 id=941 data-nosnippet>941</a>    ///
+<a href=#942 id=942 data-nosnippet>942</a>    /// Wraps `egglog_bridge::EGraph::set_report_level`.
+<a href=#943 id=943 data-nosnippet>943</a>    </span><span class="kw">fn </span>set_report_level(<span class="kw-2">&amp;mut </span><span class="self">self</span>, level: ReportLevel);
+<a href=#944 id=944 data-nosnippet>944</a>
+<a href=#945 id=945 data-nosnippet>945</a>    <span class="doccomment">/// Dump the database state to the `log::info!` channel (debug only).
+<a href=#946 id=946 data-nosnippet>946</a>    ///
+<a href=#947 id=947 data-nosnippet>947</a>    /// Wraps `egglog_bridge::EGraph::dump_debug_info`.
+<a href=#948 id=948 data-nosnippet>948</a>    </span><span class="kw">fn </span>dump_debug_info(<span class="kw-2">&amp;</span><span class="self">self</span>);
+<a href=#949 id=949 data-nosnippet>949</a>
+<a href=#950 id=950 data-nosnippet>950</a>    <span class="comment">// -- cloning ------------------------------------------------------------
+<a href=#951 id=951 data-nosnippet>951</a>
+<a href=#952 id=952 data-nosnippet>952</a>    </span><span class="doccomment">/// Produce a deep clone of this backend.
+<a href=#953 id=953 data-nosnippet>953</a>    ///
+<a href=#954 id=954 data-nosnippet>954</a>    /// The frontend uses this for push/pop snapshot support. The reference
+<a href=#955 id=955 data-nosnippet>955</a>    /// backend derives `Clone`, so its impl is a one-liner
+<a href=#956 id=956 data-nosnippet>956</a>    /// (`Box::new(self.clone())`). The DuckDB backend will need a bespoke
+<a href=#957 id=957 data-nosnippet>957</a>    /// implementation (database snapshot / replay buffer); see
+<a href=#958 id=958 data-nosnippet>958</a>    /// `docs/backend_trait_design.md` for the chosen strategy.
+<a href=#959 id=959 data-nosnippet>959</a>    </span><span class="kw">fn </span>clone_boxed(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; Box&lt;<span class="kw">dyn </span>Backend&gt;;
+<a href=#960 id=960 data-nosnippet>960</a>
+<a href=#961 id=961 data-nosnippet>961</a>    <span class="comment">// -- bridge-only escape hatch ------------------------------------------
+<a href=#962 id=962 data-nosnippet>962</a>
+<a href=#963 id=963 data-nosnippet>963</a>    </span><span class="doccomment">/// Return `&amp;self` as `&amp;dyn Any`, enabling callers to downcast to the
+<a href=#964 id=964 data-nosnippet>964</a>    /// concrete backend type (e.g. `&amp;egglog_bridge::EGraph`).
+<a href=#965 id=965 data-nosnippet>965</a>    ///
+<a href=#966 id=966 data-nosnippet>966</a>    /// This is the supported path for invoking bridge-only inherent
+<a href=#967 id=967 data-nosnippet>967</a>    /// methods such as `TableAction::new` / `UnionAction::new` from
+<a href=#968 id=968 data-nosnippet>968</a>    /// frontend code whose `backend` field is a `Box&lt;dyn Backend&gt;`. See the
+<a href=#969 id=969 data-nosnippet>969</a>    /// trait-level documentation for the rationale (Any-based downcast
+<a href=#970 id=970 data-nosnippet>970</a>    /// keeps the trait crate free of `egglog-bridge` dependencies, avoiding
+<a href=#971 id=971 data-nosnippet>971</a>    /// a dependency cycle).
+<a href=#972 id=972 data-nosnippet>972</a>    ///
+<a href=#973 id=973 data-nosnippet>973</a>    /// Implementations are expected to be one-liners: `fn as_any(&amp;self) -&gt;
+<a href=#974 id=974 data-nosnippet>974</a>    /// &amp;dyn Any { self }`. The trait can't supply a default body because
+<a href=#975 id=975 data-nosnippet>975</a>    /// `dyn Backend` is not `Sized` and `&amp;dyn Any` requires
+<a href=#976 id=976 data-nosnippet>976</a>    /// `Self: 'static + Sized` — but every concrete backend type satisfies
+<a href=#977 id=977 data-nosnippet>977</a>    /// both, so each impl trivially provides the body.
+<a href=#978 id=978 data-nosnippet>978</a>    </span><span class="kw">fn </span>as_any(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span><span class="kw">dyn </span>Any;
+<a href=#979 id=979 data-nosnippet>979</a>
+<a href=#980 id=980 data-nosnippet>980</a>    <span class="doccomment">/// Mutable counterpart of [`Backend::as_any`]. Implementations are
+<a href=#981 id=981 data-nosnippet>981</a>    /// expected to return `self`.
+<a href=#982 id=982 data-nosnippet>982</a>    </span><span class="kw">fn </span>as_any_mut(<span class="kw-2">&amp;mut </span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;mut </span><span class="kw">dyn </span>Any;
+<a href=#983 id=983 data-nosnippet>983</a>}
+<a href=#984 id=984 data-nosnippet>984</a>
+<a href=#985 id=985 data-nosnippet>985</a><span class="kw">impl </span>Clone <span class="kw">for </span>Box&lt;<span class="kw">dyn </span>Backend&gt; {
+<a href=#986 id=986 data-nosnippet>986</a>    <span class="kw">fn </span>clone(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="self">Self </span>{
+<a href=#987 id=987 data-nosnippet>987</a>        <span class="self">self</span>.clone_boxed()
+<a href=#988 id=988 data-nosnippet>988</a>    }
+<a href=#989 id=989 data-nosnippet>989</a>}
+<a href=#990 id=990 data-nosnippet>990</a>
+<a href=#991 id=991 data-nosnippet>991</a><span class="kw">impl dyn </span>Backend {
+<a href=#992 id=992 data-nosnippet>992</a>    <span class="doccomment">/// Run `f` against a fresh execution state and return its result.
+<a href=#993 id=993 data-nosnippet>993</a>    ///
+<a href=#994 id=994 data-nosnippet>994</a>    /// Ergonomic, generic-over-`R` wrapper around the object-safe
+<a href=#995 id=995 data-nosnippet>995</a>    /// [`Backend::with_execution_state_dyn`]. The result is threaded back
+<a href=#996 id=996 data-nosnippet>996</a>    /// out through a captured slot rather than `Box&lt;dyn Any&gt;`, so `R` does
+<a href=#997 id=997 data-nosnippet>997</a>    /// not need to be `'static`. Mirrors
+<a href=#998 id=998 data-nosnippet>998</a>    /// `egglog_bridge::EGraph::with_execution_state`.
+<a href=#999 id=999 data-nosnippet>999</a>    </span><span class="kw">pub fn </span>with_execution_state&lt;R&gt;(<span class="kw-2">&amp;</span><span class="self">self</span>, f: <span class="kw">impl </span>FnOnce(<span class="kw-2">&amp;mut </span>ExecutionState&lt;<span class="lifetime">'_</span>&gt;) -&gt; R) -&gt; R {
+<a href=#1000 id=1000 data-nosnippet>1000</a>        <span class="kw">let </span><span class="kw-2">mut </span>f = <span class="prelude-val">Some</span>(f);
+<a href=#1001 id=1001 data-nosnippet>1001</a>        <span class="kw">let </span><span class="kw-2">mut </span>out: <span class="prelude-ty">Option</span>&lt;R&gt; = <span class="prelude-val">None</span>;
+<a href=#1002 id=1002 data-nosnippet>1002</a>        <span class="self">self</span>.with_execution_state_dyn(<span class="kw-2">&amp;mut </span>|es| {
+<a href=#1003 id=1003 data-nosnippet>1003</a>            <span class="kw">let </span>f = f.take().expect(<span class="string">"with_execution_state closure called once"</span>);
+<a href=#1004 id=1004 data-nosnippet>1004</a>            out = <span class="prelude-val">Some</span>(f(es));
+<a href=#1005 id=1005 data-nosnippet>1005</a>        });
+<a href=#1006 id=1006 data-nosnippet>1006</a>        out.expect(<span class="string">"with_execution_state_dyn must invoke its closure exactly once"</span>)
+<a href=#1007 id=1007 data-nosnippet>1007</a>    }
+<a href=#1008 id=1008 data-nosnippet>1008</a>
+<a href=#1009 id=1009 data-nosnippet>1009</a>    <span class="doccomment">/// A handle to the live action registry for this backend.
+<a href=#1010 id=1010 data-nosnippet>1010</a>    ///
+<a href=#1011 id=1011 data-nosnippet>1011</a>    /// Generic ergonomic wrapper around [`Backend::action_registry_any`].
+<a href=#1012 id=1012 data-nosnippet>1012</a>    /// `R` is the concrete registry type (`egglog_bridge::ActionRegistry`),
+<a href=#1013 id=1013 data-nosnippet>1013</a>    /// inferred at the call site so this crate never has to name it (which
+<a href=#1014 id=1014 data-nosnippet>1014</a>    /// would re-introduce the `egglog-bridge -&gt; egglog-backend-trait`
+<a href=#1015 id=1015 data-nosnippet>1015</a>    /// dependency cycle). Mirrors `egglog_bridge::EGraph::action_registry`.
+<a href=#1016 id=1016 data-nosnippet>1016</a>    ///
+<a href=#1017 id=1017 data-nosnippet>1017</a>    /// # Panics
+<a href=#1018 id=1018 data-nosnippet>1018</a>    ///
+<a href=#1019 id=1019 data-nosnippet>1019</a>    /// Panics if the backend has no action registry (e.g. duckdb) or if the
+<a href=#1020 id=1020 data-nosnippet>1020</a>    /// erased handle is not an `Arc&lt;RwLock&lt;R&gt;&gt;`.
+<a href=#1021 id=1021 data-nosnippet>1021</a>    </span><span class="kw">pub fn </span>action_registry&lt;R: Any + Send + Sync&gt;(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span>std::sync::Arc&lt;std::sync::RwLock&lt;R&gt;&gt; {
+<a href=#1022 id=1022 data-nosnippet>1022</a>        <span class="self">self</span>.action_registry_any()
+<a href=#1023 id=1023 data-nosnippet>1023</a>            .downcast_ref::&lt;std::sync::Arc&lt;std::sync::RwLock&lt;R&gt;&gt;&gt;()
+<a href=#1024 id=1024 data-nosnippet>1024</a>            .expect(<span class="string">"action_registry: backend has no action registry of the requested type"</span>)
+<a href=#1025 id=1025 data-nosnippet>1025</a>    }
+<a href=#1026 id=1026 data-nosnippet>1026</a>}
+<a href=#1027 id=1027 data-nosnippet>1027</a>
+<a href=#1028 id=1028 data-nosnippet>1028</a><span class="comment">// ---------------------------------------------------------------------------
+<a href=#1029 id=1029 data-nosnippet>1029</a>// `RuleBuilderOps` — mirrors `egglog_bridge::RuleBuilder` one-for-one
+<a href=#1030 id=1030 data-nosnippet>1030</a>// ---------------------------------------------------------------------------
+<a href=#1031 id=1031 data-nosnippet>1031</a>
+<a href=#1032 id=1032 data-nosnippet>1032</a></span><span class="doccomment">/// A lazily-computed failure message for RHS lookups / external calls.
+<a href=#1033 id=1033 data-nosnippet>1033</a>///
+<a href=#1034 id=1034 data-nosnippet>1034</a>/// The message is only built if the lookup or call actually fails at
+<a href=#1035 id=1035 data-nosnippet>1035</a>/// runtime. Deferring it matters because the usual message form is
+<a href=#1036 id=1036 data-nosnippet>1036</a>/// `format!("{span}: ...")`, and formatting a `Span` calls
+<a href=#1037 id=1037 data-nosnippet>1037</a>/// `SrcFile::get_location`, which scans the source-file prefix. Building it
+<a href=#1038 id=1038 data-nosnippet>1038</a>/// eagerly for every action in every rule is `O(rules * file)` — quadratic
+<a href=#1039 id=1039 data-nosnippet>1039</a>/// when many generated rules (term/proof encoding) are compiled against a
+<a href=#1040 id=1040 data-nosnippet>1040</a>/// large source file. Boxed so the trait stays dyn-compatible.
+<a href=#1041 id=1041 data-nosnippet>1041</a></span><span class="kw">pub type </span>PanicMsg = Box&lt;<span class="kw">dyn </span>FnOnce() -&gt; String + Send&gt;;
+<a href=#1042 id=1042 data-nosnippet>1042</a>
+<a href=#1043 id=1043 data-nosnippet>1043</a><span class="doccomment">/// Operations on an in-progress rule.
+<a href=#1044 id=1044 data-nosnippet>1044</a>///
+<a href=#1045 id=1045 data-nosnippet>1045</a>/// This trait mirrors the public methods on
+<a href=#1046 id=1046 data-nosnippet>1046</a>/// `egglog_bridge::RuleBuilder`. The bridge's impl is a trivial newtype
+<a href=#1047 id=1047 data-nosnippet>1047</a>/// passthrough; the DuckDB impl accumulates calls into its internal
+<a href=#1048 id=1048 data-nosnippet>1048</a>/// `duck::Rule` data IR and submits to `compile_rule` on
+<a href=#1049 id=1049 data-nosnippet>1049</a>/// [`RuleBuilderOps::build`].
+<a href=#1050 id=1050 data-nosnippet>1050</a>///
+<a href=#1051 id=1051 data-nosnippet>1051</a>/// ## Variable creation
+<a href=#1052 id=1052 data-nosnippet>1052</a>///
+<a href=#1053 id=1053 data-nosnippet>1053</a>/// `new_var` and `new_var_named` allocate new variables. The returned
+<a href=#1054 id=1054 data-nosnippet>1054</a>/// `QueryEntry` can be passed back to body atoms / actions. Each `QueryEntry`
+<a href=#1055 id=1055 data-nosnippet>1055</a>/// carries its [`ColumnTy`] for runtime arity / type checking.
+<a href=#1056 id=1056 data-nosnippet>1056</a>///
+<a href=#1057 id=1057 data-nosnippet>1057</a>/// ## Unsupported on DuckDB
+<a href=#1058 id=1058 data-nosnippet>1058</a>///
+<a href=#1059 id=1059 data-nosnippet>1059</a>/// - [`RuleBuilderOps::subsume`][]: error.
+<a href=#1060 id=1060 data-nosnippet>1060</a>/// - Complex `MergeFn::Function` / `MergeFn::Primitive` referenced via
+<a href=#1061 id=1061 data-nosnippet>1061</a>///   `query_prim`: error at `build()` time when the rule references such a
+<a href=#1062 id=1062 data-nosnippet>1062</a>///   merge.
+<a href=#1063 id=1063 data-nosnippet>1063</a></span><span class="kw">pub trait </span>RuleBuilderOps {
+<a href=#1064 id=1064 data-nosnippet>1064</a>    <span class="doccomment">/// Bind a new variable of the given type.
+<a href=#1065 id=1065 data-nosnippet>1065</a>    ///
+<a href=#1066 id=1066 data-nosnippet>1066</a>    /// Wraps `RuleBuilder::new_var`.
+<a href=#1067 id=1067 data-nosnippet>1067</a>    </span><span class="kw">fn </span>new_var(<span class="kw-2">&amp;mut </span><span class="self">self</span>, ty: ColumnTy) -&gt; QueryEntry;
+<a href=#1068 id=1068 data-nosnippet>1068</a>
+<a href=#1069 id=1069 data-nosnippet>1069</a>    <span class="doccomment">/// Bind a new variable of the given type with a display name (eases
+<a href=#1070 id=1070 data-nosnippet>1070</a>    /// debugging).
+<a href=#1071 id=1071 data-nosnippet>1071</a>    ///
+<a href=#1072 id=1072 data-nosnippet>1072</a>    /// Wraps `RuleBuilder::new_var_named`.
+<a href=#1073 id=1073 data-nosnippet>1073</a>    </span><span class="kw">fn </span>new_var_named(<span class="kw-2">&amp;mut </span><span class="self">self</span>, ty: ColumnTy, name: <span class="kw-2">&amp;</span>str) -&gt; QueryEntry;
+<a href=#1074 id=1074 data-nosnippet>1074</a>
+<a href=#1075 id=1075 data-nosnippet>1075</a>    <span class="doccomment">/// Add a table body atom. The final entry is the function's return
+<a href=#1076 id=1076 data-nosnippet>1076</a>    /// value. When `is_subsumed` is `Some`, the atom is constrained to rows
+<a href=#1077 id=1077 data-nosnippet>1077</a>    /// with that subsumption bit.
+<a href=#1078 id=1078 data-nosnippet>1078</a>    ///
+<a href=#1079 id=1079 data-nosnippet>1079</a>    /// Wraps `RuleBuilder::query_table`.
+<a href=#1080 id=1080 data-nosnippet>1080</a>    </span><span class="kw">fn </span>query_table(
+<a href=#1081 id=1081 data-nosnippet>1081</a>        <span class="kw-2">&amp;mut </span><span class="self">self</span>,
+<a href=#1082 id=1082 data-nosnippet>1082</a>        func: FunctionId,
+<a href=#1083 id=1083 data-nosnippet>1083</a>        entries: <span class="kw-2">&amp;</span>[QueryEntry],
+<a href=#1084 id=1084 data-nosnippet>1084</a>        is_subsumed: <span class="prelude-ty">Option</span>&lt;bool&gt;,
+<a href=#1085 id=1085 data-nosnippet>1085</a>    ) -&gt; <span class="prelude-ty">Result</span>&lt;()&gt;;
+<a href=#1086 id=1086 data-nosnippet>1086</a>
+<a href=#1087 id=1087 data-nosnippet>1087</a>    <span class="doccomment">/// Add a primitive body atom. The final entry is the return value.
+<a href=#1088 id=1088 data-nosnippet>1088</a>    ///
+<a href=#1089 id=1089 data-nosnippet>1089</a>    /// Wraps `RuleBuilder::query_prim`.
+<a href=#1090 id=1090 data-nosnippet>1090</a>    </span><span class="kw">fn </span>query_prim(
+<a href=#1091 id=1091 data-nosnippet>1091</a>        <span class="kw-2">&amp;mut </span><span class="self">self</span>,
+<a href=#1092 id=1092 data-nosnippet>1092</a>        func: ExternalFunctionId,
+<a href=#1093 id=1093 data-nosnippet>1093</a>        entries: <span class="kw-2">&amp;</span>[QueryEntry],
+<a href=#1094 id=1094 data-nosnippet>1094</a>        ret_ty: ColumnTy,
+<a href=#1095 id=1095 data-nosnippet>1095</a>    ) -&gt; <span class="prelude-ty">Result</span>&lt;()&gt;;
+<a href=#1096 id=1096 data-nosnippet>1096</a>
+<a href=#1097 id=1097 data-nosnippet>1097</a>    <span class="doccomment">/// Call an external function in the RHS, panicking with `panic_msg` on
+<a href=#1098 id=1098 data-nosnippet>1098</a>    /// failure. Returns the result variable.
+<a href=#1099 id=1099 data-nosnippet>1099</a>    ///
+<a href=#1100 id=1100 data-nosnippet>1100</a>    /// Wraps `RuleBuilder::call_external_func`. `panic_msg` is a [`PanicMsg`]
+<a href=#1101 id=1101 data-nosnippet>1101</a>    /// closure, evaluated only if the call actually fails.
+<a href=#1102 id=1102 data-nosnippet>1102</a>    </span><span class="kw">fn </span>call_external_func(
+<a href=#1103 id=1103 data-nosnippet>1103</a>        <span class="kw-2">&amp;mut </span><span class="self">self</span>,
+<a href=#1104 id=1104 data-nosnippet>1104</a>        func: ExternalFunctionId,
+<a href=#1105 id=1105 data-nosnippet>1105</a>        args: <span class="kw-2">&amp;</span>[QueryEntry],
+<a href=#1106 id=1106 data-nosnippet>1106</a>        ret_ty: ColumnTy,
+<a href=#1107 id=1107 data-nosnippet>1107</a>        panic_msg: PanicMsg,
+<a href=#1108 id=1108 data-nosnippet>1108</a>    ) -&gt; QueryEntry;
+<a href=#1109 id=1109 data-nosnippet>1109</a>
+<a href=#1110 id=1110 data-nosnippet>1110</a>    <span class="doccomment">/// RHS: look up the value of `func(entries)`, with the function's
+<a href=#1111 id=1111 data-nosnippet>1111</a>    /// configured default behavior on miss.
+<a href=#1112 id=1112 data-nosnippet>1112</a>    ///
+<a href=#1113 id=1113 data-nosnippet>1113</a>    /// Wraps `RuleBuilder::lookup`. `panic_msg` is a [`PanicMsg`] closure
+<a href=#1114 id=1114 data-nosnippet>1114</a>    /// (evaluated only on miss when the function is `DefaultVal::Fail`).
+<a href=#1115 id=1115 data-nosnippet>1115</a>    </span><span class="kw">fn </span>lookup(
+<a href=#1116 id=1116 data-nosnippet>1116</a>        <span class="kw-2">&amp;mut </span><span class="self">self</span>,
+<a href=#1117 id=1117 data-nosnippet>1117</a>        func: FunctionId,
+<a href=#1118 id=1118 data-nosnippet>1118</a>        entries: <span class="kw-2">&amp;</span>[QueryEntry],
+<a href=#1119 id=1119 data-nosnippet>1119</a>        panic_msg: PanicMsg,
+<a href=#1120 id=1120 data-nosnippet>1120</a>    ) -&gt; QueryEntry;
+<a href=#1121 id=1121 data-nosnippet>1121</a>
+<a href=#1122 id=1122 data-nosnippet>1122</a>    <span class="doccomment">/// RHS: subsume the row keyed by `entries` in `func`.
+<a href=#1123 id=1123 data-nosnippet>1123</a>    ///
+<a href=#1124 id=1124 data-nosnippet>1124</a>    /// Wraps `RuleBuilder::subsume`.
+<a href=#1125 id=1125 data-nosnippet>1125</a>    ///
+<a href=#1126 id=1126 data-nosnippet>1126</a>    /// **DuckDB**: errors at this call site. Programs that need subsume
+<a href=#1127 id=1127 data-nosnippet>1127</a>    /// must use the reference backend in v1.
+<a href=#1128 id=1128 data-nosnippet>1128</a>    </span><span class="kw">fn </span>subsume(<span class="kw-2">&amp;mut </span><span class="self">self</span>, func: FunctionId, entries: <span class="kw-2">&amp;</span>[QueryEntry]) -&gt; <span class="prelude-ty">Result</span>&lt;()&gt;;
+<a href=#1129 id=1129 data-nosnippet>1129</a>
+<a href=#1130 id=1130 data-nosnippet>1130</a>    <span class="doccomment">/// RHS: set `func(entries[..n-1])` to `entries[n-1]`.
+<a href=#1131 id=1131 data-nosnippet>1131</a>    ///
+<a href=#1132 id=1132 data-nosnippet>1132</a>    /// Wraps `RuleBuilder::set`.
+<a href=#1133 id=1133 data-nosnippet>1133</a>    </span><span class="kw">fn </span>set(<span class="kw-2">&amp;mut </span><span class="self">self</span>, func: FunctionId, entries: <span class="kw-2">&amp;</span>[QueryEntry]);
+<a href=#1134 id=1134 data-nosnippet>1134</a>
+<a href=#1135 id=1135 data-nosnippet>1135</a>    <span class="doccomment">/// RHS: remove the row keyed by `entries` from `func`.
+<a href=#1136 id=1136 data-nosnippet>1136</a>    ///
+<a href=#1137 id=1137 data-nosnippet>1137</a>    /// Wraps `RuleBuilder::remove`.
+<a href=#1138 id=1138 data-nosnippet>1138</a>    </span><span class="kw">fn </span>remove(<span class="kw-2">&amp;mut </span><span class="self">self</span>, func: FunctionId, entries: <span class="kw-2">&amp;</span>[QueryEntry]);
+<a href=#1139 id=1139 data-nosnippet>1139</a>
+<a href=#1140 id=1140 data-nosnippet>1140</a>    <span class="doccomment">/// RHS: merge two values in the union-find.
+<a href=#1141 id=1141 data-nosnippet>1141</a>    ///
+<a href=#1142 id=1142 data-nosnippet>1142</a>    /// Wraps `RuleBuilder::union`.
+<a href=#1143 id=1143 data-nosnippet>1143</a>    </span><span class="kw">fn </span>union(<span class="kw-2">&amp;mut </span><span class="self">self</span>, l: QueryEntry, r: QueryEntry);
+<a href=#1144 id=1144 data-nosnippet>1144</a>
+<a href=#1145 id=1145 data-nosnippet>1145</a>    <span class="doccomment">/// RHS: panic with the given message.
+<a href=#1146 id=1146 data-nosnippet>1146</a>    ///
+<a href=#1147 id=1147 data-nosnippet>1147</a>    /// Wraps `RuleBuilder::panic`.
+<a href=#1148 id=1148 data-nosnippet>1148</a>    </span><span class="kw">fn </span>panic(<span class="kw-2">&amp;mut </span><span class="self">self</span>, message: String);
+<a href=#1149 id=1149 data-nosnippet>1149</a>
+<a href=#1150 id=1150 data-nosnippet>1150</a>    <span class="doccomment">/// Register a deferred-panic external function on the underlying egraph
+<a href=#1151 id=1151 data-nosnippet>1151</a>    /// and return its id. Used (e.g. by `unstable-fn`) to bake a panic id
+<a href=#1152 id=1152 data-nosnippet>1152</a>    /// into a wrapped function's call site.
+<a href=#1153 id=1153 data-nosnippet>1153</a>    ///
+<a href=#1154 id=1154 data-nosnippet>1154</a>    /// Wraps `RuleBuilder::new_panic`. Default panics for backends that do
+<a href=#1155 id=1155 data-nosnippet>1155</a>    /// not support it; the bridge forwards to its `RuleBuilder`.
+<a href=#1156 id=1156 data-nosnippet>1156</a>    </span><span class="kw">fn </span>new_panic(<span class="kw-2">&amp;mut </span><span class="self">self</span>, _message: String) -&gt; ExternalFunctionId {
+<a href=#1157 id=1157 data-nosnippet>1157</a>        <span class="macro">unimplemented!</span>(<span class="string">"new_panic is not supported on this backend"</span>)
+<a href=#1158 id=1158 data-nosnippet>1158</a>    }
+<a href=#1159 id=1159 data-nosnippet>1159</a>
+<a href=#1160 id=1160 data-nosnippet>1160</a>    <span class="doccomment">/// Skip tree-decomposition during query planning for this rule
+<a href=#1161 id=1161 data-nosnippet>1161</a>    /// (the `:no-decomp` option / `--no-decomp`). Default no-op for
+<a href=#1162 id=1162 data-nosnippet>1162</a>    /// backends that don't decompose (e.g. duckdb); the bridge
+<a href=#1163 id=1163 data-nosnippet>1163</a>    /// forwards it to its `RuleBuilder`.
+<a href=#1164 id=1164 data-nosnippet>1164</a>    </span><span class="kw">fn </span>set_no_decomp(<span class="kw-2">&amp;mut </span><span class="self">self</span>, _no_decomp: bool) {}
+<a href=#1165 id=1165 data-nosnippet>1165</a>
+<a href=#1166 id=1166 data-nosnippet>1166</a>    <span class="doccomment">/// Exclude the given function's table from being a seminaive delta focus
+<a href=#1167 id=1167 data-nosnippet>1167</a>    /// for this rule: the rule never fires on *new* rows of this table joined
+<a href=#1168 id=1168 data-nosnippet>1168</a>    /// against *old* rows of the others. Used by the term-encoding
+<a href=#1169 id=1169 data-nosnippet>1169</a>    /// fast-rebuild (`--fast-rebuild` on the native bridge) to drop the
+<a href=#1170 id=1170 data-nosnippet>1170</a>    /// always-empty `δview ⋈ uf_old` variant of the `view ⋈ @UF_Sf` rebuild
+<a href=#1171 id=1171 data-nosnippet>1171</a>    /// rule (excludes the view table), keeping only `view ⋈ δuf`. Bit-exact
+<a href=#1172 id=1172 data-nosnippet>1172</a>    /// with the full rebuild under canonicalize-at-creation.
+<a href=#1173 id=1173 data-nosnippet>1173</a>    ///
+<a href=#1174 id=1174 data-nosnippet>1174</a>    /// Default no-op: the dataflow/SQL backends implement their own
+<a href=#1175 id=1175 data-nosnippet>1175</a>    /// fast-rebuild (`enable_fast_rebuild()`) and never receive these encoding
+<a href=#1176 id=1176 data-nosnippet>1176</a>    /// rebuild rules in fast-rebuild mode; only the bridge forwards this to its
+<a href=#1177 id=1177 data-nosnippet>1177</a>    /// `RuleBuilder`.
+<a href=#1178 id=1178 data-nosnippet>1178</a>    </span><span class="kw">fn </span>set_focus_exclude_table(<span class="kw-2">&amp;mut </span><span class="self">self</span>, _func: FunctionId) {}
+<a href=#1179 id=1179 data-nosnippet>1179</a>
+<a href=#1180 id=1180 data-nosnippet>1180</a>    <span class="doccomment">/// Finalize the rule. Returns the registered [`RuleId`].
+<a href=#1181 id=1181 data-nosnippet>1181</a>    ///
+<a href=#1182 id=1182 data-nosnippet>1182</a>    /// Wraps `RuleBuilder::build`. The DuckDB impl hands the accumulated
+<a href=#1183 id=1183 data-nosnippet>1183</a>    /// `duck::Rule` IR off to `compile_rule` and inserts it into the
+<a href=#1184 id=1184 data-nosnippet>1184</a>    /// backend's rule registry. If any accumulated call referenced a
+<a href=#1185 id=1185 data-nosnippet>1185</a>    /// feature the backend does not support (e.g. subsume on DuckDB), this
+<a href=#1186 id=1186 data-nosnippet>1186</a>    /// is where the error surfaces.
+<a href=#1187 id=1187 data-nosnippet>1187</a>    </span><span class="kw">fn </span>build(<span class="self">self</span>: Box&lt;<span class="self">Self</span>&gt;) -&gt; <span class="prelude-ty">Result</span>&lt;RuleId&gt;;
+<a href=#1188 id=1188 data-nosnippet>1188</a>
+<a href=#1189 id=1189 data-nosnippet>1189</a>    <span class="doccomment">/// Consume the builder and check whether its accumulated body
+<a href=#1190 id=1190 data-nosnippet>1190</a>    /// matches at least one assignment in the current database.
+<a href=#1191 id=1191 data-nosnippet>1191</a>    /// Actions accumulated in the builder are ignored. The bridge
+<a href=#1192 id=1192 data-nosnippet>1192</a>    /// backend's default implementation panics; the DuckDB backend
+<a href=#1193 id=1193 data-nosnippet>1193</a>    /// overrides this to compile the body to SQL and run it.
+<a href=#1194 id=1194 data-nosnippet>1194</a>    /// Used by `(check …)` on the DuckDB path; the bridge keeps its
+<a href=#1195 id=1195 data-nosnippet>1195</a>    /// existing external-func side-channel approach in `check_facts`.
+<a href=#1196 id=1196 data-nosnippet>1196</a>    </span><span class="kw">fn </span>build_check(<span class="self">self</span>: Box&lt;<span class="self">Self</span>&gt;) -&gt; <span class="prelude-ty">Result</span>&lt;bool&gt; {
+<a href=#1197 id=1197 data-nosnippet>1197</a>        <span class="prelude-val">Err</span>(<span class="macro">anyhow::anyhow!</span>(
+<a href=#1198 id=1198 data-nosnippet>1198</a>            <span class="string">"build_check is not implemented for this backend"
+<a href=#1199 id=1199 data-nosnippet>1199</a>        </span>))
+<a href=#1200 id=1200 data-nosnippet>1200</a>    }
+<a href=#1201 id=1201 data-nosnippet>1201</a>
+<a href=#1202 id=1202 data-nosnippet>1202</a>    <span class="doccomment">/// Rename an already-registered primitive on the backend so that
+<a href=#1203 id=1203 data-nosnippet>1203</a>    /// the per-id name reflects the call-site's concrete type. Used
+<a href=#1204 id=1204 data-nosnippet>1204</a>    /// to disambiguate built-in primitives whose egglog name is
+<a href=#1205 id=1205 data-nosnippet>1205</a>    /// overloaded across sorts (e.g. `^` is XOR for i64 and POWER for
+<a href=#1206 id=1206 data-nosnippet>1206</a>    /// f64; `+` for String is concat). The bridge backend doesn't
+<a href=#1207 id=1207 data-nosnippet>1207</a>    /// need this (it dispatches via the typed `ExternalFunction`
+<a href=#1208 id=1208 data-nosnippet>1208</a>    /// directly), so the default is a no-op. The duck rule-builder
+<a href=#1209 id=1209 data-nosnippet>1209</a>    /// routes the call through the egraph it already holds mutably.
+<a href=#1210 id=1210 data-nosnippet>1210</a>    </span><span class="kw">fn </span>rename_prim(<span class="kw-2">&amp;mut </span><span class="self">self</span>, _id: ExternalFunctionId, _name: String) {}
+<a href=#1211 id=1211 data-nosnippet>1211</a>}
+<a href=#1212 id=1212 data-nosnippet>1212</a>
+<a href=#1213 id=1213 data-nosnippet>1213</a><span class="comment">// ---------------------------------------------------------------------------
+<a href=#1214 id=1214 data-nosnippet>1214</a>// `BaseValuePool` — dyn-compatible base-value registry
+<a href=#1215 id=1215 data-nosnippet>1215</a>// ---------------------------------------------------------------------------
+<a href=#1216 id=1216 data-nosnippet>1216</a>
+<a href=#1217 id=1217 data-nosnippet>1217</a></span><span class="doccomment">/// A registry for base-value types, exposed through dynamic dispatch so it
+<a href=#1218 id=1218 data-nosnippet>1218</a>/// fits inside `dyn Backend`.
+<a href=#1219 id=1219 data-nosnippet>1219</a>///
+<a href=#1220 id=1220 data-nosnippet>1220</a>/// Generic-over-`T: BaseValue` helpers are provided at the bottom of this
+<a href=#1221 id=1221 data-nosnippet>1221</a>/// module (`pool_get&lt;T&gt;`, `pool_unwrap&lt;T&gt;`, `pool_register_type&lt;T&gt;`,
+<a href=#1222 id=1222 data-nosnippet>1222</a>/// `pool_get_ty&lt;T&gt;`); they wrap the dyn methods below.
+<a href=#1223 id=1223 data-nosnippet>1223</a>///
+<a href=#1224 id=1224 data-nosnippet>1224</a>/// The bridge's impl forwards to `egglog_core_relations::BaseValues`
+<a href=#1225 id=1225 data-nosnippet>1225</a>/// directly. The DuckDB impl maintains its own `BaseValues`-shaped registry
+<a href=#1226 id=1226 data-nosnippet>1226</a>/// in-process; entries for `i64`/`f64`/`bool`/`String`/`()` are encoded
+<a href=#1227 id=1227 data-nosnippet>1227</a>/// inline into SQL columns where possible, and exotic types fall back to
+<a href=#1228 id=1228 data-nosnippet>1228</a>/// an in-memory intern table identical to the bridge's.
+<a href=#1229 id=1229 data-nosnippet>1229</a></span><span class="kw">pub trait </span>BaseValuePool: Send + Sync {
+<a href=#1230 id=1230 data-nosnippet>1230</a>    <span class="doccomment">/// Register a new base-value type using its `TypeId` plus a factory
+<a href=#1231 id=1231 data-nosnippet>1231</a>    /// that constructs a fresh typed intern table for the type.
+<a href=#1232 id=1232 data-nosnippet>1232</a>    ///
+<a href=#1233 id=1233 data-nosnippet>1233</a>    /// The factory is invoked at most once: if a type with the same
+<a href=#1234 id=1234 data-nosnippet>1234</a>    /// `TypeId` is already registered, the existing [`BaseValueId`] is
+<a href=#1235 id=1235 data-nosnippet>1235</a>    /// returned and the factory is dropped.
+<a href=#1236 id=1236 data-nosnippet>1236</a>    ///
+<a href=#1237 id=1237 data-nosnippet>1237</a>    /// Callers typically use [`pool_register_type`], the generic-over-`T`
+<a href=#1238 id=1238 data-nosnippet>1238</a>    /// helper below, which constructs the appropriate factory and threads
+<a href=#1239 id=1239 data-nosnippet>1239</a>    /// it through.
+<a href=#1240 id=1240 data-nosnippet>1240</a>    ///
+<a href=#1241 id=1241 data-nosnippet>1241</a>    /// Wraps `BaseValues::register_type_dyn` on the bridge side.
+<a href=#1242 id=1242 data-nosnippet>1242</a>    </span><span class="kw">fn </span>register_type_dyn(
+<a href=#1243 id=1243 data-nosnippet>1243</a>        <span class="kw-2">&amp;mut </span><span class="self">self</span>,
+<a href=#1244 id=1244 data-nosnippet>1244</a>        type_id: TypeId,
+<a href=#1245 id=1245 data-nosnippet>1245</a>        factory: Box&lt;<span class="kw">dyn </span>FnOnce() -&gt; Box&lt;<span class="kw">dyn </span>DynamicInternTable&gt;&gt;,
+<a href=#1246 id=1246 data-nosnippet>1246</a>    ) -&gt; BaseValueId;
+<a href=#1247 id=1247 data-nosnippet>1247</a>
+<a href=#1248 id=1248 data-nosnippet>1248</a>    <span class="doccomment">/// Look up the `BaseValueId` for a registered base-value type by its
+<a href=#1249 id=1249 data-nosnippet>1249</a>    /// Rust `TypeId`.
+<a href=#1250 id=1250 data-nosnippet>1250</a>    ///
+<a href=#1251 id=1251 data-nosnippet>1251</a>    /// Wraps `BaseValues::get_ty_by_id`.
+<a href=#1252 id=1252 data-nosnippet>1252</a>    </span><span class="kw">fn </span>get_ty_by_type_id(<span class="kw-2">&amp;</span><span class="self">self</span>, type_id: TypeId) -&gt; BaseValueId;
+<a href=#1253 id=1253 data-nosnippet>1253</a>
+<a href=#1254 id=1254 data-nosnippet>1254</a>    <span class="doccomment">/// Intern an opaque (already-boxed) base value, returning its `Value`
+<a href=#1255 id=1255 data-nosnippet>1255</a>    /// handle. The `Box&lt;dyn Any&gt;` must contain a value of the type
+<a href=#1256 id=1256 data-nosnippet>1256</a>    /// previously registered as `ty`.
+<a href=#1257 id=1257 data-nosnippet>1257</a>    ///
+<a href=#1258 id=1258 data-nosnippet>1258</a>    /// Wraps the dyn dispatch over `BaseValues::get&lt;P&gt;`. Concrete-`T`
+<a href=#1259 id=1259 data-nosnippet>1259</a>    /// callers should prefer `pool_get&lt;T&gt;` below, which special-cases
+<a href=#1260 id=1260 data-nosnippet>1260</a>    /// `T::MAY_UNBOX` and avoids boxing.
+<a href=#1261 id=1261 data-nosnippet>1261</a>    </span><span class="kw">fn </span>intern_dyn(<span class="kw-2">&amp;</span><span class="self">self</span>, ty: BaseValueId, value: Box&lt;<span class="kw">dyn </span>Any + Send + Sync&gt;) -&gt; Value;
+<a href=#1262 id=1262 data-nosnippet>1262</a>
+<a href=#1263 id=1263 data-nosnippet>1263</a>    <span class="doccomment">/// Extract a base value of the registered type `ty` from `val`. The
+<a href=#1264 id=1264 data-nosnippet>1264</a>    /// returned `Box&lt;dyn Any&gt;` holds a value of the same type that was
+<a href=#1265 id=1265 data-nosnippet>1265</a>    /// previously interned with `intern_dyn`.
+<a href=#1266 id=1266 data-nosnippet>1266</a>    ///
+<a href=#1267 id=1267 data-nosnippet>1267</a>    /// Wraps the dyn dispatch over `BaseValues::unwrap&lt;P&gt;`. Concrete-`T`
+<a href=#1268 id=1268 data-nosnippet>1268</a>    /// callers should prefer `pool_unwrap&lt;T&gt;` below.
+<a href=#1269 id=1269 data-nosnippet>1269</a>    </span><span class="kw">fn </span>unwrap_dyn(<span class="kw-2">&amp;</span><span class="self">self</span>, ty: BaseValueId, val: Value) -&gt; Box&lt;<span class="kw">dyn </span>Any + Send + Sync&gt;;
+<a href=#1270 id=1270 data-nosnippet>1270</a>
+<a href=#1271 id=1271 data-nosnippet>1271</a>    <span class="doccomment">/// True iff a base-value type with the given `TypeId` is registered.
+<a href=#1272 id=1272 data-nosnippet>1272</a>    </span><span class="kw">fn </span>has_ty(<span class="kw-2">&amp;</span><span class="self">self</span>, type_id: TypeId) -&gt; bool;
+<a href=#1273 id=1273 data-nosnippet>1273</a>}
+<a href=#1274 id=1274 data-nosnippet>1274</a>
+<a href=#1275 id=1275 data-nosnippet>1275</a><span class="doccomment">/// Generic helper: register a `T: BaseValue` with the pool and return its
+<a href=#1276 id=1276 data-nosnippet>1276</a>/// [`BaseValueId`]. Equivalent to `BaseValues::register_type::&lt;T&gt;`.
+<a href=#1277 id=1277 data-nosnippet>1277</a>///
+<a href=#1278 id=1278 data-nosnippet>1278</a>/// This sits outside the trait so the trait remains dyn-compatible. It
+<a href=#1279 id=1279 data-nosnippet>1279</a>/// builds the typed intern-table factory closure that
+<a href=#1280 id=1280 data-nosnippet>1280</a>/// [`BaseValuePool::register_type_dyn`] requires.
+<a href=#1281 id=1281 data-nosnippet>1281</a></span><span class="kw">pub fn </span>pool_register_type&lt;T: BaseValue&gt;(pool: <span class="kw-2">&amp;mut </span><span class="kw">dyn </span>BaseValuePool) -&gt; BaseValueId {
+<a href=#1282 id=1282 data-nosnippet>1282</a>    pool.register_type_dyn(
+<a href=#1283 id=1283 data-nosnippet>1283</a>        TypeId::of::&lt;T&gt;(),
+<a href=#1284 id=1284 data-nosnippet>1284</a>        Box::new(|| egglog_core_relations::new_intern_table::&lt;T&gt;()),
+<a href=#1285 id=1285 data-nosnippet>1285</a>    )
+<a href=#1286 id=1286 data-nosnippet>1286</a>}
+<a href=#1287 id=1287 data-nosnippet>1287</a>
+<a href=#1288 id=1288 data-nosnippet>1288</a><span class="doccomment">/// Generic helper: look up the `BaseValueId` for `T: BaseValue`.
+<a href=#1289 id=1289 data-nosnippet>1289</a></span><span class="kw">pub fn </span>pool_get_ty&lt;T: BaseValue&gt;(pool: <span class="kw-2">&amp;</span><span class="kw">dyn </span>BaseValuePool) -&gt; BaseValueId {
+<a href=#1290 id=1290 data-nosnippet>1290</a>    pool.get_ty_by_type_id(TypeId::of::&lt;T&gt;())
+<a href=#1291 id=1291 data-nosnippet>1291</a>}
+<a href=#1292 id=1292 data-nosnippet>1292</a>
+<a href=#1293 id=1293 data-nosnippet>1293</a><span class="doccomment">/// Generic helper: intern a typed base value into the pool, returning its
+<a href=#1294 id=1294 data-nosnippet>1294</a>/// `Value`. Mirrors `BaseValues::get&lt;T&gt;`. Honors `T::MAY_UNBOX` for
+<a href=#1295 id=1295 data-nosnippet>1295</a>/// inline-encodable types.
+<a href=#1296 id=1296 data-nosnippet>1296</a></span><span class="kw">pub fn </span>pool_get&lt;T: BaseValue&gt;(pool: <span class="kw-2">&amp;</span><span class="kw">dyn </span>BaseValuePool, value: T) -&gt; Value {
+<a href=#1297 id=1297 data-nosnippet>1297</a>    <span class="kw">if </span>T::MAY_UNBOX
+<a href=#1298 id=1298 data-nosnippet>1298</a>        &amp;&amp; <span class="kw">let </span><span class="prelude-val">Some</span>(v) = value.try_box()
+<a href=#1299 id=1299 data-nosnippet>1299</a>    {
+<a href=#1300 id=1300 data-nosnippet>1300</a>        <span class="kw">return </span>v;
+<a href=#1301 id=1301 data-nosnippet>1301</a>    }
+<a href=#1302 id=1302 data-nosnippet>1302</a>    <span class="kw">let </span>ty = pool_get_ty::&lt;T&gt;(pool);
+<a href=#1303 id=1303 data-nosnippet>1303</a>    pool.intern_dyn(ty, Box::new(value))
+<a href=#1304 id=1304 data-nosnippet>1304</a>}
+<a href=#1305 id=1305 data-nosnippet>1305</a>
+<a href=#1306 id=1306 data-nosnippet>1306</a><span class="doccomment">/// Generic helper: extract a typed base value of `T` from a `Value`.
+<a href=#1307 id=1307 data-nosnippet>1307</a>/// Mirrors `BaseValues::unwrap&lt;T&gt;`. Honors `T::MAY_UNBOX`.
+<a href=#1308 id=1308 data-nosnippet>1308</a>///
+<a href=#1309 id=1309 data-nosnippet>1309</a>/// # Panics
+<a href=#1310 id=1310 data-nosnippet>1310</a>///
+<a href=#1311 id=1311 data-nosnippet>1311</a>/// Panics if `val` does not correspond to a value of type `T` previously
+<a href=#1312 id=1312 data-nosnippet>1312</a>/// interned in `pool` (matching the bridge's existing semantics).
+<a href=#1313 id=1313 data-nosnippet>1313</a></span><span class="kw">pub fn </span>pool_unwrap&lt;T: BaseValue&gt;(pool: <span class="kw-2">&amp;</span><span class="kw">dyn </span>BaseValuePool, val: Value) -&gt; T {
+<a href=#1314 id=1314 data-nosnippet>1314</a>    <span class="kw">if </span>T::MAY_UNBOX
+<a href=#1315 id=1315 data-nosnippet>1315</a>        &amp;&amp; <span class="kw">let </span><span class="prelude-val">Some</span>(p) = T::try_unbox(val)
+<a href=#1316 id=1316 data-nosnippet>1316</a>    {
+<a href=#1317 id=1317 data-nosnippet>1317</a>        <span class="kw">return </span>p;
+<a href=#1318 id=1318 data-nosnippet>1318</a>    }
+<a href=#1319 id=1319 data-nosnippet>1319</a>    <span class="kw">let </span>ty = pool_get_ty::&lt;T&gt;(pool);
+<a href=#1320 id=1320 data-nosnippet>1320</a>    <span class="kw">let </span>boxed = pool.unwrap_dyn(ty, val);
+<a href=#1321 id=1321 data-nosnippet>1321</a>    <span class="kw-2">*</span>boxed
+<a href=#1322 id=1322 data-nosnippet>1322</a>        .downcast::&lt;T&gt;()
+<a href=#1323 id=1323 data-nosnippet>1323</a>        .expect(<span class="string">"BaseValuePool::unwrap_dyn returned wrong type"</span>)
+<a href=#1324 id=1324 data-nosnippet>1324</a>}
+<a href=#1325 id=1325 data-nosnippet>1325</a>
+<a href=#1326 id=1326 data-nosnippet>1326</a><span class="comment">// ---------------------------------------------------------------------------
+<a href=#1327 id=1327 data-nosnippet>1327</a>// `ContainerPool` — stub-friendly container registry
+<a href=#1328 id=1328 data-nosnippet>1328</a>// ---------------------------------------------------------------------------
+<a href=#1329 id=1329 data-nosnippet>1329</a>
+<a href=#1330 id=1330 data-nosnippet>1330</a></span><span class="doccomment">/// A registry for container values (`Vec` / `Set` / `Map` / `MultiSet` /
+<a href=#1331 id=1331 data-nosnippet>1331</a>/// user-defined `ContainerValue` impls).
+<a href=#1332 id=1332 data-nosnippet>1332</a>///
+<a href=#1333 id=1333 data-nosnippet>1333</a>/// ## Two implementations
+<a href=#1334 id=1334 data-nosnippet>1334</a>///
+<a href=#1335 id=1335 data-nosnippet>1335</a>/// - **Reference backend**: delegates to
+<a href=#1336 id=1336 data-nosnippet>1336</a>///   `egglog_core_relations::ContainerValues`. All methods succeed; the
+<a href=#1337 id=1337 data-nosnippet>1337</a>///   pool participates in the EGraph's rebuild loop.
+<a href=#1338 id=1338 data-nosnippet>1338</a>/// - **DuckDB backend**: an empty stub. All accessor methods return `None`
+<a href=#1339 id=1339 data-nosnippet>1339</a>///   / empty iterators; all mutators return errors. This is safe because
+<a href=#1340 id=1340 data-nosnippet>1340</a>///   the term-encoding gate (`program_supports_proofs` in
+<a href=#1341 id=1341 data-nosnippet>1341</a>///   `src/proofs/proof_encoding_helpers.rs`) excludes every container-using
+<a href=#1342 id=1342 data-nosnippet>1342</a>///   program from DuckDB's test combos. The stub's error path is a
+<a href=#1343 id=1343 data-nosnippet>1343</a>///   defensive measure for programmer error, never a routine code path.
+<a href=#1344 id=1344 data-nosnippet>1344</a>///
+<a href=#1345 id=1345 data-nosnippet>1345</a>/// ## Why not just generic-over-`C`?
+<a href=#1346 id=1346 data-nosnippet>1346</a>///
+<a href=#1347 id=1347 data-nosnippet>1347</a>/// `register_val&lt;C&gt;` / `for_each&lt;C&gt;` are generic over `C: ContainerValue`,
+<a href=#1348 id=1348 data-nosnippet>1348</a>/// which is incompatible with `dyn Backend`. We expose Any-based dynamic
+<a href=#1349 id=1349 data-nosnippet>1349</a>/// dispatch here; concrete-`C` sugar is implemented as free functions in a
+<a href=#1350 id=1350 data-nosnippet>1350</a>/// future commit (the call sites in `src/lib.rs:1924`, `serialize.rs`,
+<a href=#1351 id=1351 data-nosnippet>1351</a>/// `extract.rs` will each adopt the dyn API directly because they already
+<a href=#1352 id=1352 data-nosnippet>1352</a>/// thread a `TypeId` through).
+<a href=#1353 id=1353 data-nosnippet>1353</a></span><span class="kw">pub trait </span>ContainerPool: Send + Sync {
+<a href=#1354 id=1354 data-nosnippet>1354</a>    <span class="doccomment">/// True iff a container type with the given `TypeId` is registered.
+<a href=#1355 id=1355 data-nosnippet>1355</a>    </span><span class="kw">fn </span>has_container_type(<span class="kw-2">&amp;</span><span class="self">self</span>, type_id: TypeId) -&gt; bool;
+<a href=#1356 id=1356 data-nosnippet>1356</a>
+<a href=#1357 id=1357 data-nosnippet>1357</a>    <span class="doccomment">/// True iff this backend supports containers at all.
+<a href=#1358 id=1358 data-nosnippet>1358</a>    ///
+<a href=#1359 id=1359 data-nosnippet>1359</a>    /// Reference: `true`. DuckDB: `false`. Provided as a convenience so
+<a href=#1360 id=1360 data-nosnippet>1360</a>    /// callers don't need to consult [`Backend::supports_containers`].
+<a href=#1361 id=1361 data-nosnippet>1361</a>    </span><span class="kw">fn </span>enabled(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; bool;
+<a href=#1362 id=1362 data-nosnippet>1362</a>
+<a href=#1363 id=1363 data-nosnippet>1363</a>    <span class="doccomment">/// Look up the container value associated with `val`. Returns `None`
+<a href=#1364 id=1364 data-nosnippet>1364</a>    /// when no entry is registered.
+<a href=#1365 id=1365 data-nosnippet>1365</a>    ///
+<a href=#1366 id=1366 data-nosnippet>1366</a>    /// The returned `Box&lt;dyn Any&gt;` holds an instance of the container's
+<a href=#1367 id=1367 data-nosnippet>1367</a>    /// registered Rust type.
+<a href=#1368 id=1368 data-nosnippet>1368</a>    ///
+<a href=#1369 id=1369 data-nosnippet>1369</a>    /// Wraps `ContainerValues::get_val`. On DuckDB always returns `None`.
+<a href=#1370 id=1370 data-nosnippet>1370</a>    </span><span class="kw">fn </span>get_dyn(<span class="kw-2">&amp;</span><span class="self">self</span>, ty: TypeId, val: Value) -&gt; <span class="prelude-ty">Option</span>&lt;Box&lt;<span class="kw">dyn </span>Any + Send + Sync&gt;&gt;;
+<a href=#1371 id=1371 data-nosnippet>1371</a>
+<a href=#1372 id=1372 data-nosnippet>1372</a>    <span class="doccomment">/// Register a Rust container value, returning a fresh `Value` handle.
+<a href=#1373 id=1373 data-nosnippet>1373</a>    ///
+<a href=#1374 id=1374 data-nosnippet>1374</a>    /// On DuckDB this returns an error (containers unsupported).
+<a href=#1375 id=1375 data-nosnippet>1375</a>    </span><span class="kw">fn </span>register_val_dyn(<span class="kw-2">&amp;mut </span><span class="self">self</span>, ty: TypeId, value: Box&lt;<span class="kw">dyn </span>Any + Send + Sync&gt;) -&gt; <span class="prelude-ty">Result</span>&lt;Value&gt;;
+<a href=#1376 id=1376 data-nosnippet>1376</a>
+<a href=#1377 id=1377 data-nosnippet>1377</a>    <span class="doccomment">/// Iterate (id, container) pairs for all registered values of a
+<a href=#1378 id=1378 data-nosnippet>1378</a>    /// container type. The callback receives the container as a
+<a href=#1379 id=1379 data-nosnippet>1379</a>    /// `&amp;dyn Any` of the registered concrete type.
+<a href=#1380 id=1380 data-nosnippet>1380</a>    ///
+<a href=#1381 id=1381 data-nosnippet>1381</a>    /// Wraps `ContainerValues::for_each&lt;C&gt;`. On DuckDB this is a no-op
+<a href=#1382 id=1382 data-nosnippet>1382</a>    /// (the stub registry is empty).
+<a href=#1383 id=1383 data-nosnippet>1383</a>    </span><span class="kw">fn </span>for_each_dyn(<span class="kw-2">&amp;</span><span class="self">self</span>, ty: TypeId, f: <span class="kw-2">&amp;mut </span><span class="kw">dyn </span>FnMut(Value, <span class="kw-2">&amp;</span><span class="kw">dyn </span>Any));
+<a href=#1384 id=1384 data-nosnippet>1384</a>
+<a href=#1385 id=1385 data-nosnippet>1385</a>    <span class="doccomment">/// Number of registered values of the given container type.
+<a href=#1386 id=1386 data-nosnippet>1386</a>    </span><span class="kw">fn </span>size(<span class="kw-2">&amp;</span><span class="self">self</span>, ty: TypeId) -&gt; usize;
+<a href=#1387 id=1387 data-nosnippet>1387</a>}
+<a href=#1388 id=1388 data-nosnippet>1388</a>
+<a href=#1389 id=1389 data-nosnippet>1389</a><span class="doccomment">/// Generic helper: register a `C: ContainerValue` with the pool, returning
+<a href=#1390 id=1390 data-nosnippet>1390</a>/// its `Value`. On DuckDB this returns an error.
+<a href=#1391 id=1391 data-nosnippet>1391</a></span><span class="kw">pub fn </span>container_register_val&lt;C: ContainerValue&gt;(
+<a href=#1392 id=1392 data-nosnippet>1392</a>    pool: <span class="kw-2">&amp;mut </span><span class="kw">dyn </span>ContainerPool,
+<a href=#1393 id=1393 data-nosnippet>1393</a>    value: C,
+<a href=#1394 id=1394 data-nosnippet>1394</a>) -&gt; <span class="prelude-ty">Result</span>&lt;Value&gt; {
+<a href=#1395 id=1395 data-nosnippet>1395</a>    pool.register_val_dyn(TypeId::of::&lt;C&gt;(), Box::new(value))
+<a href=#1396 id=1396 data-nosnippet>1396</a>}
+<a href=#1397 id=1397 data-nosnippet>1397</a>
+<a href=#1398 id=1398 data-nosnippet>1398</a><span class="comment">// ---------------------------------------------------------------------------
+<a href=#1399 id=1399 data-nosnippet>1399</a>// Trait sanity checks
+<a href=#1400 id=1400 data-nosnippet>1400</a>// ---------------------------------------------------------------------------
+<a href=#1401 id=1401 data-nosnippet>1401</a>
+<a href=#1402 id=1402 data-nosnippet>1402</a></span><span class="attr">#[cfg(test)]
+<a href=#1403 id=1403 data-nosnippet>1403</a></span><span class="kw">mod </span>tests {
+<a href=#1404 id=1404 data-nosnippet>1404</a>    <span class="kw">use super</span>::<span class="kw-2">*</span>;
+<a href=#1405 id=1405 data-nosnippet>1405</a>
+<a href=#1406 id=1406 data-nosnippet>1406</a>    <span class="doccomment">/// Compile-time check that `Backend` is dyn-compatible.
+<a href=#1407 id=1407 data-nosnippet>1407</a>    </span><span class="attr">#[allow(dead_code)]
+<a href=#1408 id=1408 data-nosnippet>1408</a>    </span><span class="kw">fn </span>assert_dyn_backend(<span class="kw">_</span>: <span class="kw-2">&amp;</span><span class="kw">dyn </span>Backend) {}
+<a href=#1409 id=1409 data-nosnippet>1409</a>
+<a href=#1410 id=1410 data-nosnippet>1410</a>    <span class="doccomment">/// Compile-time check that `RuleBuilderOps` is dyn-compatible.
+<a href=#1411 id=1411 data-nosnippet>1411</a>    </span><span class="attr">#[allow(dead_code)]
+<a href=#1412 id=1412 data-nosnippet>1412</a>    </span><span class="kw">fn </span>assert_dyn_rule_builder(<span class="kw">_</span>: <span class="kw-2">&amp;mut </span><span class="kw">dyn </span>RuleBuilderOps) {}
+<a href=#1413 id=1413 data-nosnippet>1413</a>
+<a href=#1414 id=1414 data-nosnippet>1414</a>    <span class="doccomment">/// Compile-time check that `BaseValuePool` is dyn-compatible.
+<a href=#1415 id=1415 data-nosnippet>1415</a>    </span><span class="attr">#[allow(dead_code)]
+<a href=#1416 id=1416 data-nosnippet>1416</a>    </span><span class="kw">fn </span>assert_dyn_base_pool(<span class="kw">_</span>: <span class="kw-2">&amp;</span><span class="kw">dyn </span>BaseValuePool) {}
+<a href=#1417 id=1417 data-nosnippet>1417</a>
+<a href=#1418 id=1418 data-nosnippet>1418</a>    <span class="doccomment">/// Compile-time check that `ContainerPool` is dyn-compatible.
+<a href=#1419 id=1419 data-nosnippet>1419</a>    </span><span class="attr">#[allow(dead_code)]
+<a href=#1420 id=1420 data-nosnippet>1420</a>    </span><span class="kw">fn </span>assert_dyn_container_pool(<span class="kw">_</span>: <span class="kw-2">&amp;</span><span class="kw">dyn </span>ContainerPool) {}
+<a href=#1421 id=1421 data-nosnippet>1421</a>
+<a href=#1422 id=1422 data-nosnippet>1422</a>    <span class="doccomment">/// Compile-time check that `Box&lt;dyn Backend&gt;` is `Send + Sync` and
+<a href=#1423 id=1423 data-nosnippet>1423</a>    /// `Clone`.
+<a href=#1424 id=1424 data-nosnippet>1424</a>    </span><span class="attr">#[allow(dead_code)]
+<a href=#1425 id=1425 data-nosnippet>1425</a>    </span><span class="kw">fn </span>assert_box_backend_send_sync_clone(b: Box&lt;<span class="kw">dyn </span>Backend&gt;) -&gt; Box&lt;<span class="kw">dyn </span>Backend&gt; {
+<a href=#1426 id=1426 data-nosnippet>1426</a>        <span class="kw">fn </span>require_send_sync&lt;T: Send + Sync&gt;() {}
+<a href=#1427 id=1427 data-nosnippet>1427</a>        require_send_sync::&lt;Box&lt;<span class="kw">dyn </span>Backend&gt;&gt;();
+<a href=#1428 id=1428 data-nosnippet>1428</a>        b.clone()
+<a href=#1429 id=1429 data-nosnippet>1429</a>    }
+<a href=#1430 id=1430 data-nosnippet>1430</a>}</code></pre></div></section></main></body></html>
