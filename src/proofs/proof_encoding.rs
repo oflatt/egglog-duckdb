@@ -18,15 +18,6 @@ pub(crate) struct EncodingState {
     pub proofs_enabled: bool,
     pub proof_testing: bool,
     pub proof_names: EncodingNames,
-    /// Canonicalize-at-creation: when on, each eq-sort child of a constructor
-    /// (and custom-function view) created in a rule RHS is replaced with its
-    /// UF_old leader via an identity-on-miss lookup against the flat UF index
-    /// `@UF_Sf` (frozen at the last completed rebuild). This makes every newly
-    /// inserted view row canonical w.r.t. UF_old, which lets the FlowLog DD
-    /// backend skip the `δ(constructor) ⋈ UF_old` rebuild join soundly.
-    /// Default OFF; the default encoding is byte-for-byte unchanged. Gated by
-    /// the `EGGLOG_CANON_AT_CREATION` environment variable.
-    pub canon_at_creation: bool,
     /// Transient flag set while instrumenting a single rule's actions: true once
     /// a canonicalize-at-creation `find_UFold` lookup has been emitted into the
     /// RHS, so the generated rule must opt into `:unsafe-seminaive` (RHS
@@ -64,6 +55,12 @@ pub(crate) struct EncodingState {
     /// their own fast-rebuild via `enable_fast_rebuild()`; this flag drives
     /// only the bridge's encoding-level drop. Default OFF.
     pub fast_rebuild: bool,
+    /// The fast term encoding's dedup rebuild (relational native-merge, non-proof)
+    /// maps eq-sort name -> the `@canon_read_S` primitive name (a `ReadPrim` that
+    /// reads the relational `@UF_Sf` leader, identity-on-miss). Cached so the
+    /// primitive is named once and its typecheck-time registration (via the
+    /// `:internal-canon-read-prim` annotation on `@UF_Sf`) agrees.
+    pub canon_read_prim: HashMap<String, String>,
     /// Native-merge mode (`--native-merge`, term-encoding + native-UF + non-proof,
     /// FlowLog backend only for now). When on, a CONSTRUCTOR's `@<F>View` is keyed
     /// on its CHILDREN ONLY (an FD view `(children) -> eclass`) with a side-effecting
@@ -224,17 +221,13 @@ impl EncodingState {
             proofs_enabled: false,
             proof_names: EncodingNames::new(symbol_gen),
             proof_testing: false,
-            // Canonicalize-at-creation is always-on for all term-encoding
-            // backends in TERM mode. It is additionally gated off in PROOF mode
-            // at the emission sites in `add_term_and_view` (the `@UF_Sf` lookup
-            // returns an `@UFPair_Sort` in proof mode, not a bare sort).
-            canon_at_creation: true,
             emitted_canon_lookup: false,
             native_uf: false,
             canon_prim: HashMap::default(),
             uf_change_rel: HashMap::default(),
             uf_change_drained: HashSet::default(),
             fast_rebuild: false,
+            canon_read_prim: HashMap::default(),
             native_merge: false,
             native_merge_views: HashSet::default(),
             native_merge_uf_functions: HashSet::default(),
@@ -576,6 +569,12 @@ impl<'a> ProofInstrumentor<'a> {
             .proof_state
             .native_merge_uf_functions
             .insert(uf_function_name.clone());
+
+        // Pre-mint the `@canon_read_S` primitive name (cached in `canon_read_prim`)
+        // so the `@UF_Sf` Function typecheck arm can register the `ReadPrim` against
+        // this sort. The fast dedup rebuild rules read `@UF_Sf` via this primitive
+        // (current-state read) instead of a per-column join-atom.
+        let _ = self.canon_read_prim_name(sort_name);
 
         // `@UF_Sf : (S) -> S`. The source `:merge (ordering-min old new)` is a
         // valid value-fold (so the function typechecks), but `declare_function`
@@ -1236,6 +1235,19 @@ impl<'a> ProofInstrumentor<'a> {
             return self.rebuilding_rules_native_uf(fdecl, &types);
         }
 
+        // Relational native-merge (non-proof term encoding) always uses the
+        // per-column dedup rebuild: one rule PER eq-sort column that fires each
+        // stale row exactly once (on its FIRST stale column) and fully
+        // re-canonicalizes it via the `@canon_read_S` primitive. This is THE
+        // fast term encoding — bit-exact with the plain all-columns rebuild
+        // below (still used by proof mode via `rebuilding_rules`), but with
+        // de-duped matches and a single `@UF_Sf` join-atom per rule. The
+        // relational native-merge path stores leaders in `@UF_Sf : (S) -> S`,
+        // which is what the canon-read primitive reads.
+        if self.native_merge_relational() {
+            return self.rebuilding_rules_dedup(fdecl, &types);
+        }
+
         let view_name = self.view_name(&fdecl.name);
         let child = |i: usize| format!("c{i}_");
         let children_vec: Vec<String> = (0..types.len()).map(child).collect();
@@ -1381,6 +1393,153 @@ impl<'a> ProofInstrumentor<'a> {
             self.proof_names().rebuilding_ruleset_name
         );
         self.parse_program(&rule)
+    }
+
+    /// The fast dedup rebuild (relational native-merge, non-proof). This is THE
+    /// term-encoding rebuild on that path; the plain all-columns `rebuilding_rules`
+    /// above is retained only for proof mode.
+    ///
+    /// The plain rebuild emits ONE rule per constructor with a `@UF_Sf` join-atom
+    /// PER eq-sort column and an `(or ...)` guard, so a view row that is stale in
+    /// `m` columns is matched `m` times (once per column whose leader differs)
+    /// across the seminaive `view ⋈ δuf` passes — the double-counting the plain
+    /// rebuild's 938K matches reflect.
+    ///
+    /// Here we emit ONE rule PER eq-sort column position `p_i`, mutually
+    /// exclusive so each stale row fires exactly ONCE — on its FIRST stale
+    /// eq-sort column:
+    ///   - Body:
+    ///       `(= eclass (@FView children))`                     — the view row
+    ///       `(= leader_ (@UF_Sf c{p_i}))`                      — the SINGLE UF
+    ///          join-atom = the seminaive trigger (fires on this column's δuf
+    ///          delta and on new view rows)
+    ///       `(guard (bool-!= c{p_i} leader_))`                 — column p_i stale
+    ///       for each earlier eq-sort column p_j (j < i):
+    ///       `(= (@canon_read c{p_j}) c{p_j})`                  — p_j canonical,
+    ///          an equality FACT whose LHS is a PRIMITIVE current-state read of
+    ///          `@UF_Sf` (both sides bound, so it acts as a filter — NOT a
+    ///          join-atom). Plain `(= ...)` rather than `(guard ...)`: `guard`
+    ///          needs a `bool` and there is no eq-sort `bool-=`.
+    ///   - Action (recanon — one firing is complete): delete the stale view row,
+    ///       then re-insert the fully re-canonicalized row. Leader-reuse (always
+    ///       on) trims redundant reads: the trigger column uses the bound
+    ///       `leader_` var, EARLIER eq-sort columns pass through directly (their
+    ///       mutual-exclusion guard already proved them canonical this firing), and
+    ///       only LATER eq-sort columns call `(@canon_read c_k)`. Bit-exact with a
+    ///       full per-column `@canon_read` recanon.
+    ///
+    /// The `@canon_read_S` reads mid-round `@UF_Sf` state, so the rules run under
+    /// `:unsafe-seminaive` — the same reason canon-at-creation reads the live UF.
+    /// One UF join-atom + primitive canon calls per rule, replacing the baseline's
+    /// k join-atoms; and de-duped firing (each stale row once) instead of once per
+    /// stale column.
+    fn rebuilding_rules_dedup(
+        &mut self,
+        fdecl: &ResolvedFunctionDecl,
+        types: &[ArcSort],
+    ) -> Vec<Command> {
+        let child = |i: usize| format!("c{i}_");
+        let children_vec: Vec<String> = (0..types.len()).map(child).collect();
+
+        // The eq-sort column positions, in order.
+        let eq_positions: Vec<usize> = types
+            .iter()
+            .enumerate()
+            .filter(|(_, ty)| ty.is_eq_sort())
+            .map(|(i, _)| i)
+            .collect();
+
+        let view_name = self.view_name(&fdecl.name);
+        let (query_view, _view_prf) = self.query_view_and_get_proof(&fdecl.name, &children_vec);
+        let delete_view = self.view_delete(&fdecl.name, &children_vec);
+        let rebuilding_ruleset = self.proof_names().rebuilding_ruleset_name.clone();
+
+        let mut rules = String::new();
+        for (idx, &pos) in eq_positions.iter().enumerate() {
+            let ci = child(pos);
+            let leader_var = format!("c{pos}_leader_");
+            let uf_function_name = self.uf_function_name(types[pos].name());
+
+            // The single UF join-atom (seminaive trigger) + this-column-stale guard.
+            let mut body = vec![
+                query_view.clone(),
+                format!("(= {leader_var} ({uf_function_name} {ci}))"),
+                format!("(guard (bool-!= {ci} {leader_var}))"),
+            ];
+            // Earlier eq-sort columns must be canonical (mutual exclusion): a row
+            // fires only on its FIRST stale column. Current-state primitive reads.
+            for &earlier in &eq_positions[..idx] {
+                let ce = child(earlier);
+                let canon_read = self.canon_read_prim_name(types[earlier].name());
+                body.push(format!("(= ({canon_read} {ce}) {ce})"));
+            }
+
+            // Leader-reuse: build the recanonicalized action row PER rule,
+            // reusing values already known canonical within THIS firing instead of
+            // re-issuing `@canon_read`:
+            //   - trigger col `pos`: use the bound `leader_var` (= `(@UF_Sf c{pos})`),
+            //   - EARLIER eq-sort cols (`eq_positions[..idx]`): pass `c_j` directly —
+            //     the mutual-exclusion guard `(= (@canon_read c_j) c_j)` above already
+            //     proved it canonical this firing,
+            //   - LATER eq-sort cols (`eq_positions[idx+1..]`): keep `(@canon_read c_k)`
+            //     (canonicity unknown),
+            //   - non-eq cols: pass through unchanged.
+            // Bit-exact with a full per-column recanon (every reused value equals
+            // what `@canon_read` would return), while trimming the redundant reads.
+            // Earlier eq-sort columns = the ones this rule's mutual-exclusion
+            // guards already proved canonical (`eq_positions[..idx]`).
+            let earlier = &eq_positions[..idx];
+            let per_rule_children: Vec<String> = types
+                .iter()
+                .enumerate()
+                .map(|(i, ty)| {
+                    if !ty.is_eq_sort() {
+                        child(i)
+                    } else if i == pos {
+                        leader_var.clone()
+                    } else if earlier.contains(&i) {
+                        child(i)
+                    } else {
+                        let canon_read = self.canon_read_prim_name(ty.name());
+                        format!("({canon_read} {})", child(i))
+                    }
+                })
+                .collect();
+            let updated_view = self.update_view(&fdecl.name, &per_rule_children, "()");
+
+            let fresh_name = self.egraph.parser.symbol_gen.fresh("rebuild_rule");
+
+            // `--fast-rebuild` on the dedup path: the view is atom 0 of every
+            // per-column rule, and the (single) `@UF_Sf` join-atom is the real
+            // seminaive trigger. Drop the `focus=view` variant (δview ⋈ uf_old):
+            // under canonicalize-at-creation new view rows are born canonical, so
+            // that term does no recanon work — it only re-scans δview each round.
+            // Excluding the view atom keeps only `view(all) ⋈ δuf`; `drop_old_bound`
+            // (bridge) then lets the surviving variant scan the view UNBOUNDED. The
+            // action (delete stale + insert fully-recanon) is idempotent, so any
+            // over-count from the unbounded scan is harmless — the dedup design's
+            // per-column mutual-exclusion still fires each stale row once per column
+            // whose δuf triggers it. Term-mode only (non-proof), so always sound.
+            if self.fast_rebuild() {
+                self.egraph
+                    .proof_state
+                    .rebuild_view_exclude
+                    .insert(fresh_name.clone(), view_name.clone());
+            }
+
+            let body_str = body.join("\n                    ");
+            rules.push_str(&format!(
+                "(rule ({body_str}
+                       )
+                     (
+                      {updated_view}
+                      {delete_view}
+                     )
+                      :ruleset {rebuilding_ruleset} :name \"{fresh_name}\" :unsafe-seminaive)\n"
+            ));
+        }
+
+        self.parse_program(&rules)
     }
 
     /// Native-UF variant of `rebuilding_rules`. The relational rebuild
@@ -2381,7 +2540,7 @@ impl<'a> ProofInstrumentor<'a> {
         // proof mode we build `fv` from the ORIGINAL args, and canonicalize the
         // VIEW columns separately below, threading each child's `child = leader`
         // proof into the view proof via congruence (mirroring `rebuilding_rules`).
-        let term_args: Vec<String> = if self.egraph.proof_state.canon_at_creation && !proof_mode {
+        let term_args: Vec<String> = if !proof_mode {
             args.iter()
                 .enumerate()
                 .map(|(i, a)| {
@@ -2481,7 +2640,6 @@ impl<'a> ProofInstrumentor<'a> {
         // The representative column is `fv`'s leader `rep` (via the output canon),
         // with `rep_pf : fv = rep`; the view proof (which must prove
         // `rep = (name leaders)`) is `Trans(Sym(rep_pf), cc)`.
-        let canon = self.egraph.proof_state.canon_at_creation;
         // Proof-mode canon-at-creation is bridge-only (it needs inline table
         // lookups for the `@uf_find_or_refl_S` ReadPrim). On duckdb/feldera/
         // flowlog proof runs it is OFF — the view rows are born from the original
@@ -2495,11 +2653,11 @@ impl<'a> ProofInstrumentor<'a> {
         let proof_canon =
             self.proof_canon_at_creation() && func_type.subtype == FunctionSubtype::Constructor;
         // Output (representative-column) canon applies for constructors in:
-        //  - term mode (any backend) when canon is on, or
+        //  - term mode (any backend), or
         //  - proof mode only on the bridge (`proof_canon`).
         let do_canon_output = func_type.subtype == FunctionSubtype::Constructor
             && func_type.output.is_eq_sort()
-            && if proof_mode { proof_canon } else { canon };
+            && if proof_mode { proof_canon } else { true };
 
         // Build the view child columns (canonicalized) and, in proof mode, the
         // congruence-chain proof `cc : fv = (name view_children)`.
@@ -2604,7 +2762,22 @@ impl<'a> ProofInstrumentor<'a> {
         res.push(self.update_view(&func_type.name, &args_with_fv, &view_proof_expr));
 
         // add to uf table to initialize eclass for constructors
-        if func_type.subtype == FunctionSubtype::Constructor {
+        //
+        // Relational native-merge (non-proof term encoding) always SKIPS this
+        // `fv -> fv` seed. On that path `@UF_Sf : (S) -> S` has
+        // `DefaultVal::Identity`, so a canonical value with no stored row reads
+        // back as itself — every canon path (`canon_arg`/output-canon table
+        // lookups and the `@canon_read` primitive) is already identity-on-miss, so
+        // the self-loop is pure dead weight. Worse, a stored `fv -> fv` is an
+        // `@UF_Sf` delta that TRIGGERS the seminaive rebuild rule
+        // `(= leader (@UF_Sf c_i))` for a canonical value, which then guard-rejects
+        // its view rows — search overhead. Skipping the seed makes the trigger fire
+        // only on REAL unions. Guarded by `native_merge_relational()` (which itself
+        // implies term + non-proof + non-native-uf), so proof-mode reflexivity
+        // edges and the native-UF / legacy-relational self-registration are
+        // untouched.
+        let skip_selfloop = self.native_merge_relational();
+        if func_type.subtype == FunctionSubtype::Constructor && !skip_selfloop {
             res.push(self.union(
                 func_type.output.name(),
                 &fv,

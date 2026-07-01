@@ -1120,7 +1120,7 @@ impl EGraph {
         sort_name: &str,
         inner: egglog_bridge::MergeFn,
     ) -> egglog_bridge::MergeFn {
-        if !self.proof_state.canon_at_creation || self.proof_state.proofs_enabled {
+        if self.proof_state.proofs_enabled {
             return inner;
         }
         match self
@@ -1842,8 +1842,7 @@ impl EGraph {
                 // (where the encoder emits no `find_UFold` lookup, so the
                 // Identity default would be inert at best and a behavior change
                 // at worst — proof mode stays baseline).
-                let is_uf_index = self.proof_state.canon_at_creation
-                    && !self.proof_state.proofs_enabled
+                let is_uf_index = !self.proof_state.proofs_enabled
                     && self
                         .proof_state
                         .uf_function

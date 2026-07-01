@@ -422,8 +422,7 @@ impl ProofInstrumentor<'_> {
     /// run proofs without canon-at-creation, so this is also gated off there —
     /// keeping their proof-mode encoding byte-identical to before this feature.
     pub(crate) fn proof_canon_at_creation(&self) -> bool {
-        self.egraph.proof_state.canon_at_creation
-            && self.egraph.proof_state.proofs_enabled
+        self.egraph.proof_state.proofs_enabled
             && self.egraph.backend.supports_inline_table_lookups()
             && !self.native_uf()
     }
@@ -434,6 +433,29 @@ impl ProofInstrumentor<'_> {
     /// canonicalize-at-creation; never set in proof mode.
     pub(crate) fn fast_rebuild(&self) -> bool {
         self.egraph.proof_state.fast_rebuild
+    }
+
+    /// Returns the `@canon_read_S` primitive name for `sort` (the fast dedup
+    /// rebuild, relational native-merge non-proof). This is a `ReadPrim` that reads the
+    /// relational `@UF_Sf` leader (`(S) -> S`, identity-on-miss) as a current-state
+    /// primitive — never a seminaive join-atom. Cached per eq-sort so the name is
+    /// emitted once (in the `:internal-canon-read-prim` annotation on `@UF_Sf`) and
+    /// its typecheck-time registration agrees.
+    pub(crate) fn canon_read_prim_name(&mut self, sort: &str) -> String {
+        if let Some(name) = self.egraph.proof_state.canon_read_prim.get(sort) {
+            name.clone()
+        } else {
+            let fresh_name = self
+                .egraph
+                .parser
+                .symbol_gen
+                .fresh(&format!("canon_read_{sort}"));
+            self.egraph
+                .proof_state
+                .canon_read_prim
+                .insert(sort.to_string(), fresh_name.clone());
+            fresh_name
+        }
     }
 
     /// True when native-merge mode is active (`--native-merge`). A CONSTRUCTOR's

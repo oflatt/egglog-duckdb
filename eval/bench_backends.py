@@ -243,11 +243,19 @@ def conditions():
                 yield (base_label, backend, encoding, list(base_flags), False, False)
                 continue
 
-            # native-UF + proofs validates on bridge, feldera, AND flowlog (proofs
-            # are tracked at the encoding level, independent of the host-pass
-            # rebuild -- verified via --proof-testing). Only duckdb can't build
-            # proof-mode native-UF functions, so exclude its +nuf-on-proofs cells.
-            nuf_ok = (encoding == "term-encoding") or (backend != "duckdb")
+            # The BRIDGE `--native-uf` path (engine displaced-union-find) was
+            # retired -- it is strictly slower than the relational native-merge
+            # default and blowup-prone, and the CLI now rejects it. So the bridge
+            # gets no `+nuf` / `+nuf+fastrb` cells (they would error). native-UF
+            # stays a dataflow-backend treatment only (flowlog/feldera/duckdb).
+            #
+            # native-UF + proofs validates on feldera AND flowlog (proofs are
+            # tracked at the encoding level, independent of the host-pass rebuild
+            # -- verified via --proof-testing). Only duckdb can't build proof-mode
+            # native-UF functions, so exclude its +nuf-on-proofs cells.
+            nuf_ok = backend != "bridge" and (
+                (encoding == "term-encoding") or (backend != "duckdb")
+            )
 
             # The four rebuild cells (suffix, native_uf, fast_rebuild). All four
             # are real, distinct, and bit-exact. +fastrb / +nuf+fastrb add the

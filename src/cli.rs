@@ -292,6 +292,26 @@ pub fn cli(mut egraph: EGraph) {
         std::process::exit(1);
     }
 
+    // The BRIDGE `--native-uf` path (engine displaced-union-find,
+    // `:impl displaced-union-find`) is retired: it is strictly worse than the
+    // relational native-merge default (~22s vs ~10.6s on math-micro) and
+    // blowup-prone. Reject it on the native bridge (no experimental backend
+    // selected) and point at the default. `--native-uf` combined with an
+    // experimental backend (`--duckdb`/`--flowlog`/`--feldera`) is still
+    // supported — those backends' fast host-pass rebuild depends on it — and the
+    // dataflow native-merge forcing above only sets `args.native_uf` when such a
+    // backend is present, so this guard never fires for them.
+    if args.native_uf && !any_experimental_backend {
+        log::error!(
+            "--native-uf on the native bridge is no longer supported (the engine \
+             displaced-union-find path was retired as strictly slower and blowup-prone). \
+             Use the relational native-merge default (drop --native-uf; term encoding \
+             turns on native `:merge` automatically), or combine --native-uf with an \
+             experimental backend (--duckdb / --flowlog / --feldera)."
+        );
+        std::process::exit(1);
+    }
+
     // The native-UF encoding mode (PR #782's `:impl displaced-union-find`
     // UF-backed function) runs on the native bridge AND all three experimental
     // backends (`--flowlog`/`--feldera`/`--duckdb`): each honours the UF-backed
@@ -360,6 +380,14 @@ pub fn cli(mut egraph: EGraph) {
     if args.fast_rebuild && !args.duckdb_backend && !args.feldera_backend && !args.flowlog_backend {
         egraph = egraph.with_fast_rebuild();
     }
+
+    // The relational native-merge non-proof path (auto-enabled by
+    // `--term-encoding` above) always uses the fast term encoding: per-eq-sort-
+    // column dedup rebuild rules that fire each stale row once, no `@UF_Sf`
+    // self-loop seed, and leader-reuse in the rebuild action. These are wired
+    // unconditionally in the encoder (gated on `native_merge_relational()`), so
+    // there are no flags to apply here. `--fast-rebuild` (above) is the sole
+    // remaining rebuild hint.
 
     // `--nativerb` (native-engine table rebuild) is native-bridge + non-proof
     // only: it drives the bridge engine's `apply_rebuild` over the view tables,

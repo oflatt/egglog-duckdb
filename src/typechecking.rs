@@ -435,6 +435,52 @@ impl ReadPrim for UfFindLeaderPrimitive {
     }
 }
 
+/// Term-mode (relational native-merge, non-proof) canon read primitive for the
+/// fast dedup rebuild.
+///
+/// Signature `(S) -> S`. Resolves `(@UF_Sf x)` — the relational union-find
+/// `(S) -> S` function whose value column IS the plain leader (no `(leader,
+/// proof)` pair in term mode) — to its stored leader, or, on a lookup MISS
+/// (`x` is its own leader, the `DefaultVal::Identity` case), to `x` itself. No
+/// row is inserted. It reads CURRENT `@UF_Sf` state via `state.lookup`, so it is
+/// a primitive, never a seminaive join-atom: the dedup-rebuild rule uses it both
+/// for the mutual-exclusion guards ("earlier eq-sort columns are canonical") and
+/// to fully re-canonicalize every eq-sort column in a single firing.
+#[derive(Clone)]
+struct UfCanonReadPrimitive {
+    name: String,
+    /// The eq-sort `S` (argument and output).
+    eq_sort: ArcSort,
+    /// The relational UF function name `@UF_Sf`.
+    uf_function: String,
+}
+
+impl Primitive for UfCanonReadPrimitive {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn get_type_constraints(&self, span: &Span) -> Box<dyn TypeConstraint> {
+        constraint::AllEqualTypeConstraint::new(&self.name, span.clone())
+            .with_all_arguments_sort(self.eq_sort.clone())
+            .with_exact_length(2)
+            .into_box()
+    }
+}
+
+impl ReadPrim for UfCanonReadPrimitive {
+    fn apply<'a, 'db>(&self, state: ReadState<'a, 'db>, args: &[Value]) -> Option<Value> {
+        use crate::exec_state::Read;
+        let x = args[0];
+        // Hit: the value column of `@UF_Sf` is the leader itself (term mode).
+        if let Some(leader) = state.lookup(&self.uf_function, &[x]) {
+            return Some(leader);
+        }
+        // Miss: x is its own leader.
+        Some(x)
+    }
+}
+
 /// Stores resolved typechecking information.
 #[derive(Clone, Default)]
 pub struct TypeInfo {
@@ -596,6 +642,33 @@ impl EGraph {
         self.add_read_primitive(
             UfFindLeaderPrimitive {
                 name: find_leader_prim.to_string(),
+                eq_sort,
+                uf_function: uf_function.to_string(),
+            },
+            None,
+        );
+    }
+
+    /// Register the fast dedup rebuild's term-mode canon read primitive
+    /// (`@canon_read_S`, signature `(S) -> S`) that reads the relational
+    /// `@UF_Sf : (S) -> S` leader, identity-on-miss. Idempotent (the encoder may
+    /// declare a sort more than once across desugar passes). Called from
+    /// `declare_function` when `@UF_Sf` is a relational native-merge UF.
+    pub(crate) fn register_canon_read_primitive(
+        &mut self,
+        prim_name: &str,
+        eqsort_name: &str,
+        uf_function: &str,
+    ) {
+        if self.type_info.is_primitive(prim_name) {
+            return;
+        }
+        let Some(eq_sort) = self.type_info.get_sort_by_name(eqsort_name).cloned() else {
+            return;
+        };
+        self.add_read_primitive(
+            UfCanonReadPrimitive {
+                name: prim_name.to_string(),
                 eq_sort,
                 uf_function: uf_function.to_string(),
             },
@@ -805,6 +878,30 @@ impl EGraph {
                         sort: sort.clone(),
                     };
                     self.add_pure_primitive(prim, None);
+                }
+                // Fast dedup rebuild: register the `@canon_read_S` read primitive
+                // for the relational native-merge `@UF_Sf : (S) -> S` (recorded by
+                // the encoder in `native_merge_uf_functions`, which is populated only
+                // on the relational native-merge path). The eqsort S is the
+                // function's sole input; it is already declared, so registration
+                // happens now (before any constructor rebuild rule typechecks and
+                // references the primitive).
+                if self
+                    .proof_state
+                    .native_merge_uf_functions
+                    .contains(&resolved.name)
+                {
+                    let eqsort_name = resolved.schema.input.first().cloned();
+                    if let Some(eqsort_name) = eqsort_name {
+                        let prim_name = self.proof_state.canon_read_prim.get(&eqsort_name).cloned();
+                        if let Some(prim_name) = prim_name {
+                            self.register_canon_read_primitive(
+                                &prim_name,
+                                &eqsort_name,
+                                &resolved.name,
+                            );
+                        }
+                    }
                 }
                 ResolvedNCommand::Function(resolved)
             }
