@@ -918,8 +918,8 @@ pub trait ContainerSort: Any + Send + Sync + Debug {
     /// Optional: a container that supports proofs returns its canonical
     /// constructor head and the validator that canonicalizes its term form (e.g.
     /// `set-of` sorts and dedups). `None` (the default) means proofs are
-    /// unsupported for this container. See [`Sort::container_term_normalizer`].
-    fn container_term_normalizer(&self) -> Option<(String, PrimitiveValidator)> {
+    /// unsupported for this container. See [`Sort::rebuild_container_normalizer`].
+    fn rebuild_container_normalizer(&self) -> Option<(String, PrimitiveValidator)> {
         None
     }
 
@@ -994,22 +994,8 @@ impl<T: ContainerSort> Sort for ContainerSortImpl<T> {
             .reconstruct_termdag(container_values, value, termdag, element_terms)
     }
 
-    fn container_term_normalizer(&self) -> Option<(String, PrimitiveValidator)> {
-        self.0.container_term_normalizer()
-    }
-
-    fn rebuild_container_with_leaders(
-        &self,
-        container_values: &ContainerValues,
-        exec_state: &mut ExecutionState,
-        value: Value,
-        leaders: &crate::util::HashMap<Value, Value>,
-    ) -> Value {
-        // Generic over every container type: clone the container, remap each
-        // contained value to its union-find leader, and re-intern.
-        container_values.rebuild_val_with::<T::Container>(value, exec_state, &|v| {
-            leaders.get(&v).copied().unwrap_or(v)
-        })
+    fn rebuild_container_normalizer(&self) -> Option<(String, PrimitiveValidator)> {
+        self.0.rebuild_container_normalizer()
     }
 }
 

@@ -164,22 +164,27 @@ impl ContainerValues {
 
     /// Rebuild a single container value by remapping each contained value
     /// through `remap`, returning the (possibly new) interned value, or `value`
-    /// unchanged if it is not a registered container of type `C`.
+    /// unchanged if it is not a registered container of the type behind
+    /// `type_id`.
     ///
     /// Unlike [`ContainerValues::rebuild_all`], which drives rebuilds off the
-    /// backend union-find, the caller supplies the remapping explicitly.
-    pub fn rebuild_val_with<C: ContainerValue>(
+    /// backend union-find, the caller supplies the remapping explicitly and
+    /// identifies the container type dynamically by its [`TypeId`].
+    pub fn rebuild_val_with(
         &self,
+        type_id: TypeId,
         value: Value,
         exec_state: &mut ExecutionState,
         remap: &(dyn Fn(Value) -> Value + Send + Sync),
     ) -> Value {
-        let Some(mut container) = self.get_val::<C>(value).map(|g| g.clone()) else {
+        let Some(id) = self.container_ids.get(&type_id) else {
             return value;
         };
-        let rebuilder = ClosureRebuilder { remap };
-        container.rebuild_contents(&rebuilder);
-        self.register_val(container, exec_state)
+        let Some(env) = self.data.get(id) else {
+            return value;
+        };
+        env.rebuild_val_with(value, exec_state, remap)
+            .unwrap_or(value)
     }
 
     /// Apply the given rebuild to the contents of each container.
@@ -312,6 +317,15 @@ pub trait DynamicContainerEnv: Any + dyn_clone::DynClone + Send + Sync {
     /// [`ContainerValue::iter`] and lets callers climb from dirty child ids to
     /// all directly containing parent container ids.
     fn extend_containers_containing(&self, values: &IndexSet<Value>, out: &mut IndexSet<Value>);
+    /// Rebuild the single container `value` by remapping each contained value
+    /// through `remap`, returning the (possibly new) interned value, or `None`
+    /// if `value` is not registered in this environment.
+    fn rebuild_val_with(
+        &self,
+        value: Value,
+        exec_state: &mut ExecutionState,
+        remap: &(dyn Fn(Value) -> Value + Send + Sync),
+    ) -> Option<Value>;
 }
 
 // Implements `Clone` for `Box<dyn DynamicContainerEnv>`.
@@ -369,6 +383,19 @@ impl<C: ContainerValue> DynamicContainerEnv for ContainerEnv<C> {
                 out.extend(containers.iter().copied());
             }
         }
+    }
+
+    fn rebuild_val_with(
+        &self,
+        value: Value,
+        exec_state: &mut ExecutionState,
+        remap: &(dyn Fn(Value) -> Value + Send + Sync),
+    ) -> Option<Value> {
+        // Clone out of the guard before re-interning to avoid deadlocking on
+        // the underlying map.
+        let mut container = self.get_container(value)?.clone();
+        container.rebuild_contents(&ClosureRebuilder { remap });
+        Some(self.get_or_insert(&container, exec_state))
     }
 }
 

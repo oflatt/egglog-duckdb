@@ -1127,17 +1127,6 @@ impl TypeInfo {
         self.primitives.get(sym).map(Vec::as_slice)
     }
 
-    /// Map from a container's constructor head to the validator that canonicalizes
-    /// its term form, collected from the container sorts that support proofs (see
-    /// [`Sort::container_term_normalizer`]). Proof checking uses this to normalize
-    /// a container term by its head.
-    pub(crate) fn container_term_normalizers(&self) -> HashMap<String, PrimitiveValidator> {
-        self.sorts
-            .values()
-            .filter_map(|sort| sort.container_term_normalizer())
-            .collect()
-    }
-
     pub fn is_primitive(&self, sym: &str) -> bool {
         self.primitives.contains_key(sym) || self.reserved_primitives.contains(sym)
     }

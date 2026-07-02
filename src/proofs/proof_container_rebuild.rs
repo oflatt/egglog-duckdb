@@ -96,6 +96,24 @@ fn collect_container_proof_names(eg: &EGraph, sort: &ArcSort, out: &mut HashMap<
     }
 }
 
+/// Re-intern container `value` of `sort` with each contained value remapped
+/// through `leaders` (an old-value -> union-find-leader map); the value-level
+/// half of the container rebuild performed by the rebuild rules.
+fn rebuild_with_leaders(
+    cvs: &ContainerValues,
+    es: &mut ExecutionState,
+    sort: &ArcSort,
+    value: Value,
+    leaders: &HashMap<Value, Value>,
+) -> Value {
+    let type_id = sort
+        .value_type()
+        .expect("container sorts have a value type");
+    cvs.rebuild_val_with(type_id, value, es, &|v| {
+        leaders.get(&v).copied().unwrap_or(v)
+    })
+}
+
 /// Recursively canonicalize a container `value` of sort `sort` for the term
 /// encoding, returning the rebuilt interned value. Each element is resolved by
 /// a uniform per-child rule: an eq-sort element maps to its union-find leader
@@ -130,7 +148,7 @@ fn rebuild_container_value_rec(
     }
     let cvs = state.container_values();
     let es = state.raw_exec_state();
-    Some(sort.rebuild_container_with_leaders(cvs, es, value, &leaders))
+    Some(rebuild_with_leaders(cvs, es, sort, value, &leaders))
 }
 
 /// Look up an eq-sort element's union-find leader, if a `UF_<E>f` row exists.
@@ -305,7 +323,7 @@ fn rebuild_container_proof_rec(
     let rebuilt = {
         let cvs = state.container_values();
         let es = state.raw_exec_state();
-        sort.rebuild_container_with_leaders(cvs, es, value, &leaders)
+        rebuild_with_leaders(cvs, es, sort, value, &leaders)
     };
 
     // Fold a `Congr` step per changed child onto the reflexive base. This

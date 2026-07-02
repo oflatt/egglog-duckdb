@@ -45,6 +45,16 @@ fn vec_term_children(termdag: &TermDag, term: TermId) -> Option<Vec<TermId>> {
     }
 }
 
+/// Intern the canonical vec term for `children`: `(vec-of e0 ...)`, or
+/// `(vec-empty)` when empty. The inverse of [`vec_term_children`].
+fn vec_term(termdag: &mut TermDag, children: Vec<TermId>) -> TermId {
+    if children.is_empty() {
+        termdag.app("vec-empty".into(), vec![])
+    } else {
+        termdag.app("vec-of".into(), children)
+    }
+}
+
 impl Presort for VecSort {
     fn presort_name() -> &'static str {
         "Vec"
@@ -127,12 +137,7 @@ impl ContainerSort for VecSort {
         // when empty, matching `reconstruct_termdag`. The validator lets the
         // proof checker evaluate `vec-of`/`vec-empty` applications.
         let vec_of_validator = |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
-            let head = if args.is_empty() {
-                "vec-empty"
-            } else {
-                "vec-of"
-            };
-            Some(termdag.app(head.into(), args.to_vec()))
+            Some(vec_term(termdag, args.to_vec()))
         };
         let vec_empty_validator = |termdag: &mut TermDag, _args: &[TermId]| -> Option<TermId> {
             Some(termdag.app("vec-empty".into(), vec![]))
@@ -227,23 +232,14 @@ impl ContainerSort for VecSort {
         termdag: &mut TermDag,
         element_terms: Vec<TermId>,
     ) -> TermId {
-        if element_terms.is_empty() {
-            termdag.app("vec-empty".into(), vec![])
-        } else {
-            termdag.app("vec-of".into(), element_terms)
-        }
+        vec_term(termdag, element_terms)
     }
 
-    fn container_term_normalizer(&self) -> Option<(String, PrimitiveValidator)> {
+    fn rebuild_container_normalizer(&self) -> Option<(String, PrimitiveValidator)> {
         Some((
             "vec-of".to_owned(),
             Arc::new(|termdag: &mut TermDag, args: &[TermId]| {
-                let head = if args.is_empty() {
-                    "vec-empty"
-                } else {
-                    "vec-of"
-                };
-                Some(termdag.app(head.into(), args.to_vec()))
+                Some(vec_term(termdag, args.to_vec()))
             }),
         ))
     }

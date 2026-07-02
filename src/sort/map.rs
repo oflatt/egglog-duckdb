@@ -36,63 +36,57 @@ impl ContainerValue for MapContainer {
     }
 }
 
-/// Canonicalize a `map-of`/`map-empty`/`map-insert` term to a flat `(map-of k0
-/// v0 ...)` in sorted key order, with last-write-wins on duplicate keys.
-/// Returns `None` for a malformed map term (an odd-arity `map-of`, a
-/// `map-insert` not of arity 3, or a spine not bottoming out in
-/// `map-empty`/`map-of`), so callers leave such terms unchanged.
-fn normalize_map_term(termdag: &mut TermDag, term_id: TermId) -> Option<TermId> {
-    let entries = collect_map_entries(termdag, term_id)?;
-    let mut pairs: Vec<(TermId, TermId)> = Vec::new();
-    for (k, v) in entries {
-        pairs.retain(|(ek, _)| *ek != k);
-        pairs.push((k, v));
-    }
-    pairs.sort_by(|(ka, _), (kb, _)| termdag.ast_cmp(*ka, *kb));
-    let mut flat = Vec::with_capacity(pairs.len() * 2);
-    for (k, v) in pairs {
-        flat.push(k);
-        flat.push(v);
-    }
-    Some(termdag.app("map-of".to_string(), flat))
-}
-
-/// Collect `(key, value)` pairs in insertion order from a flat `map-of` or a
-/// `map-insert`/`map-empty` spine (innermost insert first). Returns `None` for
-/// a malformed map (see [`normalize_map_term`]).
-fn collect_map_entries(termdag: &TermDag, term_id: TermId) -> Option<Vec<(TermId, TermId)>> {
-    let mut out = Vec::new();
-    collect_map_entries_into(termdag, term_id, &mut out)?;
-    Some(out)
-}
-
-fn collect_map_entries_into(
-    termdag: &TermDag,
+/// A map term — a flat `map-of`, or a `map-insert` spine bottoming out in
+/// `map-empty`/`map-of` — as a Rust `BTreeMap` in canonical key order, with
+/// `MapContainer`'s last-write-wins semantics on duplicate keys. Returns
+/// `None` for a malformed map term.
+fn map_term_to_btreemap<'a>(
+    termdag: &'a TermDag,
     term_id: TermId,
-    out: &mut Vec<(TermId, TermId)>,
-) -> Option<()> {
+) -> Option<BTreeMap<OrdTerm<'a>, TermId>> {
     match termdag.get(term_id) {
         Term::App(head, args) if head == "map-insert" => {
             let [inner, k, v] = args.as_slice() else {
                 return None;
             };
-            let (inner, k, v) = (*inner, *k, *v);
-            collect_map_entries_into(termdag, inner, out)?;
-            out.push((k, v));
-            Some(())
+            let (k, v) = (*k, *v);
+            let mut map = map_term_to_btreemap(termdag, *inner)?;
+            map.insert(termdag.ord_term(k), v);
+            Some(map)
         }
-        Term::App(head, args) if head == "map-of" => {
-            if !args.len().is_multiple_of(2) {
-                return None;
-            }
-            for chunk in args.chunks(2) {
-                out.push((chunk[0], chunk[1]));
-            }
-            Some(())
-        }
-        Term::App(head, args) if head == "map-empty" && args.is_empty() => Some(()),
+        Term::App(head, args) if head == "map-of" => map_of_args_to_btreemap(termdag, args),
+        Term::App(head, args) if head == "map-empty" && args.is_empty() => Some(BTreeMap::new()),
         _ => None,
     }
+}
+
+/// Alternating `[k0, v0, ...]` `map-of` arguments as a `BTreeMap` (see
+/// [`map_term_to_btreemap`]); `None` on odd arity.
+fn map_of_args_to_btreemap<'a>(
+    termdag: &'a TermDag,
+    args: &[TermId],
+) -> Option<BTreeMap<OrdTerm<'a>, TermId>> {
+    if !args.len().is_multiple_of(2) {
+        return None;
+    }
+    Some(
+        args.chunks_exact(2)
+            .map(|kv| (termdag.ord_term(kv[0]), kv[1]))
+            .collect(),
+    )
+}
+
+/// Flatten a map back to the `[k0, v0, k1, v1, ...]` argument list of its
+/// canonical `(map-of ...)` term (sorted by key order, deduplicated).
+fn map_term_args(map: BTreeMap<OrdTerm<'_>, TermId>) -> Vec<TermId> {
+    map.into_iter().flat_map(|(k, v)| [k.id(), v]).collect()
+}
+
+/// Canonicalize alternating `[k0, v0, ...]` arguments to the flat
+/// `(map-of ...)` term; `None` on odd arity.
+fn normalize_map_term(termdag: &mut TermDag, args: &[TermId]) -> Option<TermId> {
+    let flat = map_term_args(map_of_args_to_btreemap(termdag, args)?);
+    Some(termdag.app("map-of".to_string(), flat))
 }
 
 /// A map from a key type to a value type supporting these primitives:
@@ -201,49 +195,44 @@ impl ContainerSort for MapSort {
 
         // The proof "term form" of a map is the flat `(map-of k0 v0 k1 v1 ...)`
         // in canonical key order (like `set-of`/`vec-of`), matching
-        // `reconstruct_termdag`. The `map-empty`/`map-insert` validators
-        // normalize into that flat form too, so the checker evaluates
-        // user-written map terms to the same canonical term.
+        // `reconstruct_termdag`. Each validator round-trips through a Rust
+        // `BTreeMap` (see `map_term_to_btreemap`), so it evaluates map terms
+        // with `MapContainer`'s semantics; `None` for a malformed map term
+        // fails the proof.
         let map_empty_validator = |termdag: &mut TermDag, _args: &[TermId]| -> Option<TermId> {
             Some(termdag.app("map-of".into(), vec![]))
         };
-        // `normalize_map_term` returns `None` for malformed terms (e.g. odd-arity
-        // `map-of` or a `map-insert` of the wrong arity), which fails the proof.
-        let map_of_validator = |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
-            let raw = termdag.app("map-of".into(), args.to_vec());
-            normalize_map_term(termdag, raw)
-        };
         let map_insert_validator = |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
-            let raw = termdag.app("map-insert".into(), args.to_vec());
-            normalize_map_term(termdag, raw)
+            let [map, key, value] = args else {
+                return None;
+            };
+            let mut map = map_term_to_btreemap(termdag, *map)?;
+            map.insert(termdag.ord_term(*key), *value);
+            let flat = map_term_args(map);
+            Some(termdag.app("map-of".into(), flat))
         };
         let map_get_validator = |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
             let [map, key] = args else { return None };
-            // Last-write-wins: take the last matching key.
-            collect_map_entries(termdag, *map)?
-                .into_iter()
-                .rev()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v)
+            map_term_to_btreemap(termdag, *map)?
+                .get(&termdag.ord_term(*key))
+                .copied()
         };
         let map_length_validator = |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
             let [map] = args else { return None };
-            let len = collect_map_entries(termdag, *map)?.len() as i64;
+            let len = map_term_to_btreemap(termdag, *map)?.len() as i64;
             Some(termdag.lit(Literal::Int(len)))
         };
         let map_contains_validator = |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
             let [map, key] = args else { return None };
-            collect_map_entries(termdag, *map)?
-                .iter()
-                .any(|(k, _)| k == key)
-                .then(|| termdag.lit(Literal::Unit))
+            let contains =
+                map_term_to_btreemap(termdag, *map)?.contains_key(&termdag.ord_term(*key));
+            contains.then(|| termdag.lit(Literal::Unit))
         };
         let map_not_contains_validator =
             |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
                 let [map, key] = args else { return None };
-                let contains = collect_map_entries(termdag, *map)?
-                    .iter()
-                    .any(|(k, _)| k == key);
+                let contains =
+                    map_term_to_btreemap(termdag, *map)?.contains_key(&termdag.ord_term(*key));
                 (!contains).then(|| termdag.lit(Literal::Unit))
             };
 
@@ -263,7 +252,7 @@ impl ContainerSort for MapSort {
                 key: self.key.clone(),
                 value: self.value.clone(),
             },
-            Some(std::sync::Arc::new(map_of_validator)),
+            Some(std::sync::Arc::new(normalize_map_term)),
         );
 
         add_primitive_with_validator!(eg, "map-get"    = |    xs: @MapContainer (arc), x: # (self.key())                     | -?> # (self.value()) { xs.data.get(&x).copied() }, map_get_validator);
@@ -285,18 +274,11 @@ impl ContainerSort for MapSort {
         // Flat `(map-of k0 v0 k1 v1 ...)` in canonical key order, so proof
         // checking can reproduce it from terms alone (and the rebuild proof's
         // Congr indices are flat, like `set-of`/`vec-of`).
-        let raw = termdag.app("map-of".into(), element_terms);
-        normalize_map_term(termdag, raw).unwrap_or(raw)
+        normalize_map_term(termdag, &element_terms).expect("map elements come in key/value pairs")
     }
 
-    fn container_term_normalizer(&self) -> Option<(String, PrimitiveValidator)> {
-        Some((
-            "map-of".to_owned(),
-            Arc::new(|termdag: &mut TermDag, args: &[TermId]| {
-                let raw = termdag.app("map-of".into(), args.to_vec());
-                normalize_map_term(termdag, raw)
-            }),
-        ))
+    fn rebuild_container_normalizer(&self) -> Option<(String, PrimitiveValidator)> {
+        Some(("map-of".to_owned(), Arc::new(normalize_map_term)))
     }
 
     fn serialized_name(&self, _container_values: &ContainerValues, _: Value) -> String {

@@ -23,6 +23,44 @@ pub struct TermDag {
     nodes: IndexSet<Term>,
 }
 
+/// A [`TermId`] paired with its [`TermDag`] so it can be ordered by
+/// [`TermDag::ast_cmp`], for use in ordered collections like
+/// `BTreeMap`/`BTreeSet` (see [`TermDag::ord_term`]). Only compare wrappers
+/// from the same [`TermDag`].
+#[derive(Copy, Clone)]
+pub struct OrdTerm<'a> {
+    termdag: &'a TermDag,
+    id: TermId,
+}
+
+impl OrdTerm<'_> {
+    /// The wrapped [`TermId`].
+    pub fn id(&self) -> TermId {
+        self.id
+    }
+}
+
+impl PartialEq for OrdTerm<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        // Terms are hashconsed, so id equality is structural equality.
+        self.id == other.id
+    }
+}
+
+impl Eq for OrdTerm<'_> {}
+
+impl PartialOrd for OrdTerm<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrdTerm<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.termdag.ast_cmp(self.id, other.id)
+    }
+}
+
 const MAX_PRETTY_LINE_WIDTH: usize = 80;
 const PRETTY_INDENT_STEP: usize = 2;
 const MIN_SHARED_TERM_SIZE: usize = 4;
@@ -162,6 +200,12 @@ impl TermDag {
     /// building block for canonicalizing container elements.
     pub fn sort_terms_by_ast(&self, terms: &mut [TermId]) {
         terms.sort_by(|a, b| self.ast_cmp(*a, *b));
+    }
+
+    /// Wrap `id` so it is ordered by [`ast_cmp`](Self::ast_cmp), e.g. as a key
+    /// in a `BTreeMap`/`BTreeSet` when canonicalizing container terms.
+    pub fn ord_term(&self, id: TermId) -> OrdTerm<'_> {
+        OrdTerm { termdag: self, id }
     }
 
     /// Make and return a [`Term::App`] with the given head symbol and children,

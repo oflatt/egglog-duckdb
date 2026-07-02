@@ -23,19 +23,29 @@ impl ContainerValue for SetContainer {
     }
 }
 
-fn set_term_children(termdag: &TermDag, term: TermId) -> Option<Vec<TermId>> {
+/// The elements of a `(set-of e0 ...)` term as a Rust `BTreeSet` in AST
+/// order, matching `SetContainer`'s semantics; `None` for any other term.
+fn set_term_to_btreeset<'a>(termdag: &'a TermDag, term: TermId) -> Option<BTreeSet<OrdTerm<'a>>> {
     match termdag.get(term) {
-        Term::App(head, children) if head == "set-of" => Some(children.clone()),
+        Term::App(head, children) if head == "set-of" => {
+            Some(children.iter().map(|c| termdag.ord_term(*c)).collect())
+        }
         _ => None,
     }
 }
 
-/// Canonical set term form `(set-of e0 e1 ...)`: elements sorted by
+/// Flatten a set back to the element list of its canonical `(set-of ...)`
+/// term (sorted by AST order and deduplicated by construction).
+fn set_term_args(set: BTreeSet<OrdTerm<'_>>) -> Vec<TermId> {
+    set.into_iter().map(|e| e.id()).collect()
+}
+
+/// Canonicalize `elements` to the `(set-of e0 e1 ...)` term form: sorted by
 /// [`TermDag::ast_cmp`] and deduplicated, so proof checking can reproduce it.
-fn normalize_set_term(termdag: &mut TermDag, mut children: Vec<TermId>) -> TermId {
-    termdag.sort_terms_by_ast(&mut children);
-    children.dedup();
-    termdag.app("set-of".into(), children)
+fn normalize_set_term(termdag: &mut TermDag, elements: &[TermId]) -> TermId {
+    let set: BTreeSet<_> = elements.iter().map(|e| termdag.ord_term(*e)).collect();
+    let elements = set_term_args(set);
+    termdag.app("set-of".into(), elements)
 }
 
 #[derive(Clone, Debug)]
@@ -125,11 +135,12 @@ impl ContainerSort for SetSort {
     fn register_primitives(&self, eg: &mut EGraph) {
         let arc = self.clone().to_arcsort();
 
-        // Proof term form of a set: `(set-of e0 e1 ...)`, matching
-        // `reconstruct_termdag`. (Element dedup/ordering for proof checking of
-        // collapsing sets is refined in the Set proof stage.)
+        // Proof term form of a set: `(set-of e0 e1 ...)` sorted and
+        // deduplicated, matching `reconstruct_termdag`. Each validator
+        // round-trips through a Rust `BTreeSet` (see `set_term_to_btreeset`),
+        // so it evaluates set terms with `SetContainer`'s semantics.
         let set_of_validator = |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
-            Some(normalize_set_term(termdag, args.to_vec()))
+            Some(normalize_set_term(termdag, args))
         };
         let set_empty_validator = |termdag: &mut TermDag, _args: &[TermId]| -> Option<TermId> {
             Some(termdag.app("set-of".into(), vec![]))
@@ -142,78 +153,80 @@ impl ContainerSort for SetSort {
                 return None;
             };
             let index = usize::try_from(*index).ok()?;
-            set_term_children(termdag, *set)?.get(index).copied()
+            set_term_to_btreeset(termdag, *set)?
+                .iter()
+                .nth(index)
+                .map(|e| e.id())
         };
         let set_insert_validator = |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
             let [set, value] = args else {
                 return None;
             };
-            let mut children = set_term_children(termdag, *set)?;
-            children.push(*value);
-            Some(normalize_set_term(termdag, children))
+            let mut set = set_term_to_btreeset(termdag, *set)?;
+            set.insert(termdag.ord_term(*value));
+            let elements = set_term_args(set);
+            Some(termdag.app("set-of".into(), elements))
         };
         let set_remove_validator = |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
             let [set, value] = args else {
                 return None;
             };
-            let children = set_term_children(termdag, *set)?
-                .into_iter()
-                .filter(|child| child != value)
-                .collect();
-            Some(normalize_set_term(termdag, children))
+            let mut set = set_term_to_btreeset(termdag, *set)?;
+            set.remove(&termdag.ord_term(*value));
+            let elements = set_term_args(set);
+            Some(termdag.app("set-of".into(), elements))
         };
         let set_length_validator = |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
             let [set] = args else {
                 return None;
             };
-            let len = set_term_children(termdag, *set)?.len() as i64;
+            let len = set_term_to_btreeset(termdag, *set)?.len() as i64;
             Some(termdag.lit(Literal::Int(len)))
         };
         let set_contains_validator = |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
             let [set, value] = args else {
                 return None;
             };
-            set_term_children(termdag, *set)?
-                .contains(value)
-                .then(|| termdag.lit(Literal::Unit))
+            let contains = set_term_to_btreeset(termdag, *set)?.contains(&termdag.ord_term(*value));
+            contains.then(|| termdag.lit(Literal::Unit))
         };
-        let set_not_contains_validator =
-            |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
-                let [set, value] = args else {
-                    return None;
-                };
-                let contains = set_term_children(termdag, *set)?.contains(value);
-                (!contains).then(|| termdag.lit(Literal::Unit))
+        let set_not_contains_validator = |termdag: &mut TermDag,
+                                          args: &[TermId]|
+         -> Option<TermId> {
+            let [set, value] = args else {
+                return None;
             };
+            let contains = set_term_to_btreeset(termdag, *set)?.contains(&termdag.ord_term(*value));
+            (!contains).then(|| termdag.lit(Literal::Unit))
+        };
         let set_union_validator = |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
             let [left, right] = args else {
                 return None;
             };
-            let mut children = set_term_children(termdag, *left)?;
-            children.extend(set_term_children(termdag, *right)?);
-            Some(normalize_set_term(termdag, children))
+            let mut set = set_term_to_btreeset(termdag, *left)?;
+            set.extend(set_term_to_btreeset(termdag, *right)?);
+            let elements = set_term_args(set);
+            Some(termdag.app("set-of".into(), elements))
         };
         let set_diff_validator = |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
             let [left, right] = args else {
                 return None;
             };
-            let right = set_term_children(termdag, *right)?;
-            let children = set_term_children(termdag, *left)?
-                .into_iter()
-                .filter(|child| !right.contains(child))
-                .collect();
-            Some(normalize_set_term(termdag, children))
+            let mut set = set_term_to_btreeset(termdag, *left)?;
+            let right = set_term_to_btreeset(termdag, *right)?;
+            set.retain(|e| !right.contains(e));
+            let elements = set_term_args(set);
+            Some(termdag.app("set-of".into(), elements))
         };
         let set_intersect_validator = |termdag: &mut TermDag, args: &[TermId]| -> Option<TermId> {
             let [left, right] = args else {
                 return None;
             };
-            let right = set_term_children(termdag, *right)?;
-            let children = set_term_children(termdag, *left)?
-                .into_iter()
-                .filter(|child| right.contains(child))
-                .collect();
-            Some(normalize_set_term(termdag, children))
+            let mut set = set_term_to_btreeset(termdag, *left)?;
+            let right = set_term_to_btreeset(termdag, *right)?;
+            set.retain(|e| right.contains(e));
+            let elements = set_term_args(set);
+            Some(termdag.app("set-of".into(), elements))
         };
 
         add_primitive_with_validator!(eg, "set-empty" = {self.clone(): SetSort} |                      | -> @SetContainer (arc) { SetContainer {
@@ -247,14 +260,14 @@ impl ContainerSort for SetSort {
     ) -> TermId {
         // Canonical form (sorted by deterministic AST order, deduped) so proof
         // checking can reproduce it from terms alone.
-        normalize_set_term(termdag, element_terms)
+        normalize_set_term(termdag, &element_terms)
     }
 
-    fn container_term_normalizer(&self) -> Option<(String, PrimitiveValidator)> {
+    fn rebuild_container_normalizer(&self) -> Option<(String, PrimitiveValidator)> {
         Some((
             "set-of".to_owned(),
             Arc::new(|termdag: &mut TermDag, args: &[TermId]| {
-                Some(normalize_set_term(termdag, args.to_vec()))
+                Some(normalize_set_term(termdag, args))
             }),
         ))
     }

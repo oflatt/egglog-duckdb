@@ -262,7 +262,7 @@ impl ContainerSort for MultiSetSort {
         normalize_multiset_term(termdag, element_terms)
     }
 
-    fn container_term_normalizer(&self) -> Option<(String, PrimitiveValidator)> {
+    fn rebuild_container_normalizer(&self) -> Option<(String, PrimitiveValidator)> {
         Some((
             "multiset-of".to_owned(),
             Arc::new(|termdag: &mut TermDag, args: &[TermId]| {

@@ -70,7 +70,7 @@ use std::ops::Deref;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-pub use termdag::{Term, TermDag, TermId};
+pub use termdag::{OrdTerm, Term, TermDag, TermId};
 use thiserror::Error;
 pub use typechecking::PrimitiveValidator;
 pub use typechecking::TypeError;
